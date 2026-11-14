@@ -10,6 +10,29 @@ M.defaults = {
   -- Agent used when none is specified explicitly.
   agent = "opencode",
 
+  -- Which implementation drives the chat.
+  --   "direct"  the Lua ACP client in this plugin (the only one that works today)
+  --   "service" nvim_ade_server (S1: it does not carry chat yet)
+  --   "auto"    use the service when it is reachable, otherwise direct
+  -- The default stays direct so S0 changes nothing about existing behaviour;
+  -- "service"/"auto" currently only affect :Ade service and :checkhealth.
+  ---@type "direct"|"service"|"auto"
+  backend = "direct",
+
+  -- nvim_ade_server installation and startup.
+  service = {
+    -- A binary to use instead of the managed install. When set, install only
+    -- checks `<path> version`; nothing is downloaded or compiled.
+    path = nil,
+    -- Where prebuilt archives are downloaded from.
+    release_base = "https://github.com/btstream/ade.nvim/releases/download",
+    -- Milliseconds for one `:Ade service install` run (download + extract, or
+    -- a full cargo build).
+    install_timeout = 10 * 60 * 1000,
+    -- Milliseconds to wait for the service's ready line after spawning it.
+    start_timeout = 5000,
+  },
+
   ---@type table<string, AdeAgentConfig>
   agents = {
     opencode = {
@@ -576,6 +599,28 @@ end
 
 function M.validate(cfg)
   M.normalize_keymaps(cfg)
+  check_enum(cfg.backend, { "direct", "service", "auto" }, "backend")
+  local service = cfg.service
+  if type(service) ~= "table" then
+    fail("service must be a table, got %s", type(service))
+  end
+  if service.path ~= nil and service.path ~= "" then
+    if type(service.path) ~= "string" then
+      fail("service.path must be a string or nil")
+    end
+    if service.path:find("\0", 1, true) then
+      fail("service.path must not contain NUL")
+    end
+  end
+  if type(service.release_base) ~= "string" then
+    fail("service.release_base must be an https:// URL")
+  end
+  local base_error = require("ade.service.url").release_base_error(service.release_base)
+  if base_error then
+    fail("%s", base_error)
+  end
+  check_number(service.install_timeout, 1000, 3600000, "service.install_timeout")
+  check_number(service.start_timeout, 100, 120000, "service.start_timeout")
   local completion = cfg.completion
   if type(completion) ~= "table" or type(completion.files) ~= "table" then
     fail("completion and completion.files must be tables")

@@ -184,6 +184,32 @@ Add to your edgy config:
   else
     health.error("vim.json is required")
   end
+  -- Service (S0): report what is installed and whether it is reachable. This
+  -- section must stay read-only: `:checkhealth` is a diagnostic, and installing
+  -- or starting a background process from it would be a surprise.
+  local ok_service, status = pcall(function()
+    return require("ade.service.status").collect({ config = require("ade.config").effective() })
+  end)
+  health.start("ade.nvim service")
+  if not ok_service then
+    health.error("service status failed: " .. tostring(status))
+  else
+    local lines = require("ade.service.status").lines(status)
+    for _, line in ipairs(lines) do
+      if line.level == "ok" then
+        health.ok(line.text)
+      elseif line.level == "warn" then
+        health.warn(line.text)
+      elseif line.level == "error" then
+        health.error(line.text)
+      else
+        health.info(line.text)
+      end
+    end
+    if status.backend ~= "direct" then
+      health.info("backend " .. status.backend .. " is configured; S0 still routes chat through the direct client")
+    end
+  end
 end
 
 return M

@@ -1002,4 +1002,49 @@ follow_cursor = false 让输入框停在打开时的位置。审查内容随窗�
 命令支持行范围；显式 diff/write 优先于 always-accept 和 filetype 配置。
 审查按结果到达时的 filetype 解析，<C-d> 切换本次模式；同一时间只运行一个请求。
 
+==============================================================================
+24. 服务后端（nvim_ade_server）                          *ade-service*
+
+后续版本把 agent 的管理搬到 Rust 后台服务 nvim_ade_server。**目前服务还没接管聊天**：
+默认仍是 Lua 直连（backend = "direct"），本节只涉及服务的安装与状态查看。
+
+安装（lazy.nvim 的 build 钩子）：
+
+    {
+      "btstream/ade.nvim",
+      build = function() require("ade.service.install").run() end,
+    }
+
+其他插件管理器在安装或更新后执行一次 `:Ade service install`。安装流程：已装所需版本
+则跳过；否则先下载对应平台的预编译包并用 SHA256SUMS 校验（不一致直接拒绝），下载不可用时
+用 cargo 本地编译；两者都失败只给出提示，插件继续以直连模式工作。服务使用
+service/rust-toolchain.toml 锁定日期的 nightly 工具链，**建议安装 rustup**，它会自动获取
+指定的 nightly；编译仍失败时，提示会写明需要 rustup，或者用 service.path 指向自己编译
+的二进制。设置 service.path 后只运行 `<path> version` 做版本检查，不下载也不编译。
+
+    service = {
+      path = nil,                     -- 自备二进制，设置后跳过下载与编译
+      release_base = "https://github.com/btstream/ade.nvim/releases/download", -- 必须 https（回环 http 例外）
+      install_timeout = 10 * 60 * 1000,
+      start_timeout = 5000,
+    },
+    backend = "direct",               -- "direct" | "service" | "auto"
+
+release_base 必须是 https://：压缩包与 SHA256SUMS 同源，明文 http 下中间人可同时替换两者，
+校验失效；下载时 curl 也限制 --proto =https --proto-redir =https，不允许跟随重定向降级。
+唯一例外是回环地址（localhost、127.0.0.1、[::1]）可用 http://，用于本地测试服务器。
+URL 中出现反斜杠、空白或控制字符，或 authority 里带 @（userinfo）一律拒绝：这些写法在
+不同 URL 解析器里含义不一致（浏览器会把反斜杠当路径分隔符），不适合指定发布源。
+
+命令：
+
+    :Ade service install    安装服务（异步，进度用通知显示）
+    :Ade service status     已安装版本、二进制、是否在运行、api_version 是否匹配
+    :Ade service start      在后台启动服务；已在运行则复用
+    :Ade service stop       让服务退出
+
+`:checkhealth ade` 中的 “ade.nvim service” 一节与 status 相同，只报告不修改。
+服务目录、socket 与令牌路径：优先 $NVIM_ADE_SERVER_DIR，其次 $XDG_RUNTIME_DIR/ade、
+$XDG_STATE_HOME/ade，最后 ~/.local/state/ade。
+
 vim:tw=78:ts=8:noet:ft=help:norl:
