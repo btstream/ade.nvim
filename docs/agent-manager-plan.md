@@ -13,10 +13,10 @@
 ### 1.1 用户体验
 
 ```vim
-:Acp agents
-:Acp install claude
-:Acp install pi
-:Acp agent claude
+:Ade agents
+:Ade install claude
+:Ade install pi
+:Ade agent claude
 ```
 
 安装与切换是两个独立操作：安装完成**不会自动切换 Agent、打开会话或登录**。
@@ -37,14 +37,14 @@
 
 | 当前入口 | 现状 | 需要的变化 |
 |---|---|---|
-| `lua/acp/config.lua` | 预设与用户配置递归合并 | 增加管理器配置，保存命令来源信息 |
-| `lua/acp/app/connection.lua` | 将 `cfg.agents[cfg.agent]` 直接传给 client | 启动前统一解析托管或外部命令 |
-| `lua/acp/protocol/client.lua` | 持有实际启动的 agent 配置 | 保存解析后的启动快照与安装版本身份 |
-| `lua/acp/app/auth.lua` | 登录使用配置中的 command/args | 优先复用当前 client 的实际启动快照 |
-| `plugin/acp.lua` | 手写 `:Acp` 子命令分发 | 增加管理命令与上下文补全 |
-| `lua/acp/health.lua` | 检查配置命令是否可执行 | 展示实际解析来源、托管版本与依赖状态 |
-| `lua/acp/app/presenter.lua` | 服务层访问 UI 的边界 | 增加管理界面与确认入口 |
-| `lua/acp/app/stores.lua` | 连接、会话、视图分离 | 只保存必要的管理界面引用，不混入安装文件状态 |
+| `lua/ade/config.lua` | 预设与用户配置递归合并 | 增加管理器配置，保存命令来源信息 |
+| `lua/ade/app/connection.lua` | 将 `cfg.agents[cfg.agent]` 直接传给 client | 启动前统一解析托管或外部命令 |
+| `lua/ade/protocol/client.lua` | 持有实际启动的 agent 配置 | 保存解析后的启动快照与安装版本身份 |
+| `lua/ade/app/auth.lua` | 登录使用配置中的 command/args | 优先复用当前 client 的实际启动快照 |
+| `plugin/ade.lua` | 手写 `:Ade` 子命令分发 | 增加管理命令与上下文补全 |
+| `lua/ade/health.lua` | 检查配置命令是否可执行 | 展示实际解析来源、托管版本与依赖状态 |
+| `lua/ade/app/presenter.lua` | 服务层访问 UI 的边界 | 增加管理界面与确认入口 |
+| `lua/ade/app/stores.lua` | 连接、会话、视图分离 | 只保存必要的管理界面引用，不混入安装文件状态 |
 
 原则：不重写 transport、JSON-RPC、会话事务、交互中心与 inline。
 安装管理器使用独立异步任务，不把 npm 命令塞进会话 prompt task。
@@ -100,7 +100,7 @@ OpenCode 的托管安装作为后续独立任务，不阻塞 Claude/pi 首版。
 
 ### 3.2 Registry 数据结构
 
-内置静态清单放入 `lua/acp/manager/registry.lua`，只包含元数据，不包含任意 shell 模板：
+内置静态清单放入 `lua/ade/manager/registry.lua`，只包含元数据，不包含任意 shell 模板：
 
 ```lua
 {
@@ -116,15 +116,15 @@ OpenCode 的托管安装作为后续独立任务，不阻塞 Claude/pi 首版。
 }
 ```
 
-协议 profile 仍由 `acp.agents` 管理；安装元数据与模式、提问、终端输出等协议知识分离。
+协议 profile 仍由 `ade.agents` 管理；安装元数据与模式、提问、终端输出等协议知识分离。
 第一版 Registry 随插件发布，不从网络动态执行或加载 Lua。
 
 ## 4. 目录与安装记录
 
-默认根目录：`stdpath("data") .. "/acp/agents"`。
+默认根目录：`stdpath("data") .. "/ade/agents"`。
 
 ```text
-stdpath("data")/acp/agents/
+stdpath("data")/ade/agents/
 ├── claude/
 │   ├── current.json
 │   └── releases/
@@ -181,10 +181,10 @@ Claude 更新与 pi 更新可并行，同一个 Agent 必须串行。
 下面是**拟新增**配置，不是当前 API：
 
 ```lua
-require("acp").setup({
+require("ade").setup({
   agent = "claude",
   manager = {
-    root = vim.fn.stdpath("data") .. "/acp/agents",
+    root = vim.fn.stdpath("data") .. "/ade/agents",
     npm = "npm",                   -- 可设绝对路径
     node = "node",                 -- 不支持 shell 命令字符串或隐式参数
     install_timeout = 300000,       -- 毫秒，首版要求正数
@@ -230,7 +230,7 @@ launch_origin[agent_id] = { command_explicit, args_explicit }
 
 接线要求：
 
-- `acp.setup(opts)`、直接 `controller.setup(opts)` 都能采集。
+- `ade.setup(opts)`、直接 `controller.setup(opts)` 都能采集。
 - 内置 agent 切换当前会 deepcopy 合并配置再 setup；必须显式携带原 provenance，不能把
   所有默认字段误标成用户覆盖。
 - 用户主动重新调用 setup 时重新计算来源，不沿用上一次的隐含标记。
@@ -352,25 +352,25 @@ root 不能是 `/`、用户 home、项目根或仅靠字符串前缀判断的任
 
 ## 8. 命令与 Lua API
 
-以下命令拟新增，原有 `:Acp agent [name]` 保持切换语义：
+以下命令拟新增，原有 `:Ade agent [name]` 保持切换语义：
 
 | 命令 | 行为 |
 |---|---|
-| `:Acp agents` | 打开安装管理器，不启动模型、不联网 |
-| `:Acp install <id> [version]` | 安装；默认 latest，第一次必须确认 |
-| `:Acp update <id> [version]` | 更新已安装副本；未安装则提示使用 install |
-| `:Acp uninstall <id>` | 确认后移除托管副本 |
+| `:Ade agents` | 打开安装管理器，不启动模型、不联网 |
+| `:Ade install <id> [version]` | 安装；默认 latest，第一次必须确认 |
+| `:Ade update <id> [version]` | 更新已安装副本；未安装则提示使用 install |
+| `:Ade uninstall <id>` | 确认后移除托管副本 |
 
-首版取消与查看日志通过管理窗口操作，不增加一组模糊的 `:Acp stop` 重载语义。
-`:Acp stop` 继续只取消模型回合。
+首版取消与查看日志通过管理窗口操作，不增加一组模糊的 `:Ade stop` 重载语义。
+`:Ade stop` 继续只取消模型回合。
 
 Lua API 拟采用 opts 表，不接受一个任意 shell 命令字符串：
 
 ```lua
-require("acp").manage_agents()
-require("acp").install_agent("claude", { version = "latest" })
-require("acp").update_agent("claude", { version = "精确版本" })
-require("acp").uninstall_agent("pi")
+require("ade").manage_agents()
+require("ade").install_agent("claude", { version = "latest" })
+require("ade").update_agent("claude", { version = "精确版本" })
+require("ade").uninstall_agent("pi")
 ```
 
 公共 API 同样走确认与占用保护，首版不提供默认跳过确认的参数。
@@ -386,7 +386,7 @@ install 不应通过 `ensure()` 隐式创建 chat/input 或断开当前 Agent。
 
 ## 9. 管理界面
 
-独立浮窗，filetype 为 `acp_agents`，不占用 `acp_chat` / `acp_input`，不用重建 panel。
+独立浮窗，filetype 为 `ade_agents`，不占用 `ade_chat` / `ade_input`，不用重建 panel。
 
 ```text
 ACP Agents
@@ -397,7 +397,7 @@ OpenCode     external  PATH     /.../opencode
 
 当前项：Claude ACP
 安装包：@agentclientprotocol/claude-agent-acp
-位置：.../acp/agents/claude
+位置：.../ade/agents/claude
 状态：空闲
 
 i 安装   u 更新   d 卸载   Enter 使用
@@ -416,7 +416,7 @@ l 日志   c 取消任务   r 刷新本地状态   q 关闭
 ## 10. 模块方案
 
 ```text
-plugin/acp.lua + acp/init.lua
+plugin/ade.lua + ade/init.lua
   └─ app/agent_manager.lua          用户动作编排与确认、配置代际
        ├─ manager/registry.lua     本地包元数据
        ├─ manager/state.lua        操作状态、订阅、单次结算
@@ -535,7 +535,7 @@ fixtures 放在专用测试数据目录，禁止测试触碰用户真实 npm 或
 
 ### 阶段 4：管理界面
 
-- 实现 `:Acp agents`、状态订阅、安装/更新/卸载、日志、取消、使用。
+- 实现 `:Ade agents`、状态订阅、安装/更新/卸载、日志、取消、使用。
 - 完成命令补全与 health 的实际启动来源展示。
 - 窗口关闭、重配置和迟到操作有完整身份保护。
 
@@ -545,7 +545,7 @@ fixtures 放在专用测试数据目录，禁止测试触碰用户真实 npm 或
 ### 阶段 5：真实验证、文档与发布
 
 - 按平台清单实测 Claude/pi，记录 npm 包版本、adapter 版本、Node/npm、OS。
-- 更新 README、`:help acp.nvim`、architecture、status。
+- 更新 README、`:help ade.nvim`、architecture、status。
 - 写迁移说明：旧 command/args 仍有效；auto/managed/external 的选择；认证目录不变。
 - 记录支持/实验性平台与已知限制。
 
@@ -575,7 +575,7 @@ fixtures 放在专用测试数据目录，禁止测试触碰用户真实 npm 或
 `@geohar/pi-acp`。以下其他选择仍是建议。
 
 1. 首版只托管 Claude/pi adapter，OpenCode 保留外部安装。
-2. 使用专用 `stdpath("data")/acp/agents`；Node/npm 由用户安装。
+2. 使用专用 `stdpath("data")/ade/agents`；Node/npm 由用户安装。
 3. 安装必须确认；打开面板不自动安装；不做静默更新。
 4. 默认 source=auto，但显式 command/args 永远保留优先权；严格托管可选 managed。
 5. 被会话或登录占用时拒绝更新/卸载，不自动断开连接。

@@ -1,4 +1,24 @@
-# acp.nvim
+# ade.nvim
+
+> **改名说明**：本插件原名 `acp.nvim`，现已改名为 `ade.nvim`。改名是直接切换，
+> **不保留兼容层**：旧的 `require("acp")` 和 `:Acp` 系列命令都不再存在，必须改配置
+> （安装 spec、`require("ade").setup(...)`、键位与补全配置里的模块路径）。
+> 旧数据目录会在首次启动时自动迁移，已安装的托管 Agent 和未发送的草稿无需重装或重写。
+> 指 ACP 协议、ACP agent 或外部程序的名称不变。
+>
+> | 项目 | 旧 | 新 |
+> |---|---|---|
+> | 模块 | `require("acp")`、`acp.*` | `require("ade")`、`ade.*` |
+> | 命令 | `:Acp`、`:AcpLog`、`:AcpDebug`、`:AcpCompletionRefresh` | `:Ade`、`:AdeLog`、`:AdeDebug`、`:AdeCompletionRefresh` |
+> | healthcheck | `:checkhealth acp` | `:checkhealth ade` |
+> | 高亮组前缀 | `Acp*`（如 `AcpUser`、`AcpReviewAdd`） | `Ade*`（如 `AdeUser`、`AdeReviewAdd`） |
+> | filetype | `acp_chat`、`acp_input` | `ade_chat`、`ade_input` |
+> | 补全 source | nvim-cmp `name = "acp"`、blink `providers.acp` | `name = "ade"`、`providers.ade` |
+> | 数据目录 | `stdpath("data")/acp/`、`stdpath("state")/acp/` | `stdpath("data")/ade/`、`stdpath("state")/ade/` |
+> | 帮助 | `:help acp.nvim` | `:help ade.nvim` |
+>
+> `require("acp")` 不会被别名到 `ade`：改配置后请重启 Neovim，让旧的 `package.loaded`
+> 与 `plugin/acp.lua` 一起消失。
 
 Neovim 原生的 [Agent Client Protocol](https://agentclientprotocol.com) 客户端，界面参照
 [Zed 的 Agent Panel](https://zed.dev/docs/ai/agent-panel)，默认连接
@@ -41,7 +61,7 @@ Neovim 原生的 [Agent Client Protocol](https://agentclientprotocol.com) 客户
   100ms 防抖，期间流式内容照常更新。阅读历史时尽量保持所在 block 与视口，不误报新消息。
 - **全局状态栏友好**：所有操作信息走 winbar，`laststatus=0/2/3` 都能正常工作；
   不修改 `statusline` 或 `laststatus`，另外提供可选的状态栏组件。
-- **edgy 兼容**：两个普通视图（`acp_chat` / `acp_input`），由 edgy 决定位置与尺寸。
+- **edgy 兼容**：两个普通视图（`ade_chat` / `ade_input`），由 edgy 决定位置与尺寸。
 - **纯 Lua，零运行时依赖**：不强制依赖补全框架、UI 框架或图标字体。
 - **优先适配 OpenCode**：模型 / 模式选择、slash 命令补全、历史会话与删除，渲染 Agent 提供的子代理、重试、压缩与用量信息。
 
@@ -49,7 +69,7 @@ Neovim 原生的 [Agent Client Protocol](https://agentclientprotocol.com) 客户
 
 - Neovim 0.10 或更新（推荐 0.12+；0.10/0.11 使用兼容高亮语法）
 - 代码块语法高亮可选依赖对应语言的 Tree-sitter parser 与 highlights query；缺失时显示纯文本，不影响对话。
-- 一个已登录的 ACP Agent。默认是 OpenCode；首次使用可以打开 `:Acp` 后运行 `:Acp login`，
+- 一个已登录的 ACP Agent。默认是 OpenCode；首次使用可以打开 `:Ade` 后运行 `:Ade login`，
   插件会执行 Agent 自己提供的登录方式：
 
 ```bash
@@ -62,9 +82,9 @@ opencode auth login      # 也可以在终端里手动完成
 
 ```lua
 {
-  "you/acp.nvim",
+  "btstream/ade.nvim",
   dependencies = { "folke/edgy.nvim" }, -- 可选，但推荐
-  cmd = { "Acp", "AcpLog", "AcpDebug" },
+  cmd = { "Ade", "AdeLog", "AdeDebug" },
   opts = {},
 }
 ```
@@ -72,35 +92,35 @@ opencode auth login      # 也可以在终端里手动完成
 最小配置即可使用：
 
 ```lua
-require("acp").setup({})
+require("ade").setup({})
 ```
 
 ## 使用
 
 | 命令 | 说明 |
 |---|---|
-| `:Acp` 或 `:Acp toggle` | 打开 / 隐藏面板 |
-| `:Acp open` / `:Acp hide` | 显式打开 / 隐藏 |
-| `:Acp new` | 新建会话 |
-| `:Acp stop` | 中止当前回合 |
-| `:Acp sessions` | 打开会话浏览器：`<CR>` 切换、`<C-d>` 删除、输入即过滤 |
-| `:Acp delete` | 打开同一个会话浏览器，用 `<C-d>` 删除选中会话 |
-| `:Acp model` / `:Acp mode` | 切换模型 / 模式 |
-| `:Acp reconnect` | Agent 崩溃后重连并恢复当前会话 |
-| `:Acp disconnect` | 停止 Agent 进程（保留面板） |
-| `:Acp permission` | 重新打开待确认的权限请求 |
-| `:Acp file` | 附加当前文件 |
-| `:Acp diagnostics` | 附加当前 buffer 的诊断 |
-| `:AcpLog` | 打开日志 |
-| `:AcpDebug` | 打印控制器状态 |
+| `:Ade` 或 `:Ade toggle` | 打开 / 隐藏面板 |
+| `:Ade open` / `:Ade hide` | 显式打开 / 隐藏 |
+| `:Ade new` | 新建会话 |
+| `:Ade stop` | 中止当前回合 |
+| `:Ade sessions` | 打开会话浏览器：`<CR>` 切换、`<C-d>` 删除、输入即过滤 |
+| `:Ade delete` | 打开同一个会话浏览器，用 `<C-d>` 删除选中会话 |
+| `:Ade model` / `:Ade mode` | 切换模型 / 模式 |
+| `:Ade reconnect` | Agent 崩溃后重连并恢复当前会话 |
+| `:Ade disconnect` | 停止 Agent 进程（保留面板） |
+| `:Ade permission` | 重新打开待确认的权限请求 |
+| `:Ade file` | 附加当前文件 |
+| `:Ade diagnostics` | 附加当前 buffer 的诊断 |
+| `:AdeLog` | 打开日志 |
+| `:AdeDebug` | 打印控制器状态 |
 
 ### 工作指示器
 
 输入区的 spinner 默认每 120ms 更新，使用 libuv timer 并合并 UI 回调；焦点在其他窗口时
-也会明确刷新 ACP winbar。隐藏面板或切到其他标签页时停止，返回后恢复。已停止/关闭的
+也会明确刷新 ade.nvim 的 winbar。隐藏面板或切到其他标签页时停止，返回后恢复。已停止/关闭的
 timer 会在下一次状态、窗口或焦点同步时重建，不需要重启插件。
 
-卡住时查看 `:AcpDebug` 的 `spinner`：
+卡住时查看 `:AdeDebug` 的 `spinner`：
 
 - `state` / `timer_active`：区分正常动画、隐藏、关闭动画和失效 timer。
 - `ticks` / `frame_changes`：帧推进情况；`max_tick_gap_ms` 是历史最大 tick 间隔，
@@ -118,7 +138,7 @@ JSON 解码、单块排版或 Treesitter 解析很重时仍可能暂停，恢复
 
 ### 输入区
 
-进入 `acp_input` 窗口或缓冲区时自动切换到插入模式，离开时退出插入模式，避免把输入
+进入 `ade_input` 窗口或缓冲区时自动切换到插入模式，离开时退出插入模式，避免把输入
 状态带到转录区或编辑窗口。按 `<Esc>` 可暂时在输入区使用普通模式；再次进入时恢复插入。
 
 下表的按键都是默认值，全部可以通过 `keymaps.input` 修改。
@@ -166,31 +186,31 @@ JSON 解码、单块排版或 Treesitter 解析很重时仍可能暂停，恢复
 
 ### 输入区补全：blink.cmp / nvim-cmp / 原生菜单
 
-`/` 补全当前 Agent 提供的命令名称和说明，`@` 模糊查找项目文件。只在 `acp_input`
+`/` 补全当前 Agent 提供的命令名称和说明，`@` 模糊查找项目文件。只在 `ade_input`
 生效，不补全聊天转录、不调用命令、不自动发送消息。两个框架**二选一**，均为可选依赖。
 
 **blink.cmp**：将下面配置合并进已有 `setup` / lazy.nvim `opts`，不要再次调用 setup：
 
 ```lua
 sources = {
-  per_filetype = { acp_input = { "acp" } },
+  per_filetype = { ade_input = { "ade" } },
   providers = {
-    acp = { name = "ACP", module = "acp.completion.blink" },
+    ade = { name = "ade", module = "ade.completion.blink" },
   },
 }
 ```
 
 参见 [`examples/completion_blink.lua`](examples/completion_blink.lua)。接受候选使用现有 blink
-按键；若自定义 `enabled` 排除了 `nofile` buffer，请为 `acp_input` 放行。
+按键；若自定义 `enabled` 排除了 `nofile` buffer，请为 `ade_input` 放行。
 
-**nvim-cmp**：在 nvim-cmp 和 acp.nvim 都能被 require 后注册 source，配置仅作用于输入区：
+**nvim-cmp**：在 nvim-cmp 和 ade.nvim 都能被 require 后注册 source，配置仅作用于输入区：
 
 ```lua
 local cmp = require("cmp")
-require("acp.completion.cmp").setup() -- 幂等注册名为 acp 的 source
-cmp.setup.filetype("acp_input", {
+require("ade.completion.cmp").setup() -- 幂等注册名为 ade 的 source
+cmp.setup.filetype("ade_input", {
   enabled = true,
-  sources = { { name = "acp", keyword_length = 0 } },
+  sources = { { name = "ade", keyword_length = 0 } },
   matching = { disallow_symbol_nonprefix_matching = false },
 })
 ```
@@ -202,7 +222,7 @@ cmp.setup.filetype("acp_input", {
 **不安装框架**：仍可用 `<C-x><C-u>`，文件索引异步完成后显示原生菜单。支持例如：
 
 ```text
-@lua/acp/ui/chat.lua
+@lua/ade/ui/chat.lua
 @Makefile
 @"docs/中文 file.txt"
 ```
@@ -217,7 +237,7 @@ cmp.setup.filetype("acp_input", {
 最后回退到异步目录遍历，无外部工具也能使用。内置遍历不解析 ignore 文件，建议安装 rg / fd。
 
 ```lua
-require("acp").setup({
+require("ade").setup({
   completion = {
     native = true,      -- 保留原生触发；不会自动与框架同时弹两个菜单
     max_items = 200,    -- 只限制原生菜单，先在完整索引中匹配再截取
@@ -238,23 +258,23 @@ require("acp").setup({
 ```
 
 框架获得完整索引并自行模糊排序，不会先截断前 200 个文件。`max_bytes` 是索引路径和条目
-开销的估算预算，不是总 RSS 上限；超限会明确报错而非提供不完整索引，可在 `:AcpLog` 查看原因。
+开销的估算预算，不是总 RSS 上限；超限会明确报错而非提供不完整索引，可在 `:AdeLog` 查看原因。
 隐藏和忽略规则遵循所选工具；`.git` 元数据固定排除。`ignored=true` 可能纳入敏感的被忽略文件，
-请谨慎启用。缓存按项目/选项复用，过期重建；`:AcpCompletionRefresh` 清理缓存，下一次请求重新扫描。
+请谨慎启用。缓存按项目/选项复用，过期重建；`:AdeCompletionRefresh` 清理缓存，下一次请求重新扫描。
 会话在仓库子目录时，插入路径相对会话目录，必要时使用 `../`，确保发送时能解析到同一文件。
 
 #### 使用 fzf / 其它文件选择器
 
-打开输入区后，`:Acp files` 或 `require("acp").pick_file()` 使用上述 `completion.picker`
+打开输入区后，`:Ade files` 或 `require("ade").pick_file()` 使用上述 `completion.picker`
 选择器；也可单次指定：
 
 ```lua
-require("acp").pick_file({ backend = "fzf-lua" })
+require("ade").pick_file({ backend = "fzf-lua" })
 ```
 
 fzf-lua、Telescope 和 Snacks 都复用同一个完整项目索引；`"vim"` 使用 `vim.ui.select`，
 也支持已有的 dressing / UI 接管。选择结果插入 `@路径`，**不打开文件、不发送消息**。
-与原有 `:Acp file`（附加当前文件）不同。原始 fzf 二进制不是补全菜单的强依赖，
+与原有 `:Ade file`（附加当前文件）不同。原始 fzf 二进制不是补全菜单的强依赖，
 fzf-lua 只是可选的交互式搜索入口，不会在每次按键时重新扫描项目或弹出终端。
 
 ### 图像附件
@@ -265,7 +285,7 @@ fzf-lua 只是可选的交互式搜索入口，不会在每次按键时重新扫
 这比直接拒绝更有用——Agent 至少能看到图片所在的文件。
 
 ```lua
-require("acp").setup({
+require("ade").setup({
   context = {
     images = {
       enabled = true,
@@ -284,21 +304,21 @@ require("acp").setup({
 
 | 方式 | 说明 |
 |---|---|
-| `:Acp image` | 读取系统剪贴板中的截图并附加 |
-| `:Acp image path/to.png` | 附加指定文件 |
+| `:Ade image` | 读取系统剪贴板中的截图并附加 |
+| `:Ade image path/to.png` | 附加指定文件 |
 | 直接粘贴 / 拖拽图像文件路径 | 只对输入区生效，识别 `file://`、引号和转义路径 |
 
-`require("acp").paste_image()`、`require("acp").add_image(path)` 是对应 API。
+`require("ade").paste_image()`、`require("ade").add_image(path)` 是对应 API。
 `paste_image` 默认绑定 `<C-v>`（普通模式和插入模式），与 OpenCode TUI、pi 的习惯一致。
 这会覆盖输入区的 `i_CTRL-V`（字面量插入）和普通模式 `CTRL-V`（块选择）；只在
-`acp_input` 内生效，不影响其它 buffer。需要改用其它键时：
+`ade_input` 内生效，不影响其它 buffer。需要改用其它键时：
 
 ```lua
 keymaps = { input = { paste_image = "<M-v>" } },
 ```
 
-附加图像会在 **`acp_input` 的粘贴光标处**显示浅黄色底、深色粗体的行内标签 `[Image 1]`，
-多张图片使用独立编号，不再放到 winbar。可通过 `ui.highlights.AcpInputImage` 覆盖样式。
+附加图像会在 **`ade_input` 的粘贴光标处**显示浅黄色底、深色粗体的行内标签 `[Image 1]`，
+多张图片使用独立编号，不再放到 winbar。可通过 `ui.highlights.AdeInputImage` 覆盖样式。
 标签是可编辑占位符，不是图片预览：粘贴后光标位于标签之后，可正常移动到两侧。
 标签后按退格、标签前按 Delete 可整块删除图片附件；支持撤销/重做。
 发送时只移除受跟踪的图片占位符，不会移除用户自己输入的同名文字；图片仍单独作为附件发送。
@@ -314,7 +334,7 @@ Neovim；OSC 5522 需要终端专用协商并改变普通粘贴处理，本插�
 与 OpenCode TUI、pi 等终端客户端的做法一致。
 
 图像数据只在发送时编码：草稿、本地队列和会话块里只有路径、大小和摘要，避免 base64
-在三个地方各放大 33%。字节按 sha256 存在 `stdpath("state")/acp/images`（目录 0700、
+在三个地方各放大 33%。字节按 sha256 存在 `stdpath("state")/ade/images`（目录 0700、
 文件 0600，按 `ttl_hours` 与 `max_cache_bytes` 回收）。`max_bytes` 会与
 `transport.max_line_bytes` 交叉校验，配置阶段就拒绝无法装进一条消息的上限。
 清理时保护草稿（含持久化）、内存队列与会话块仍引用的图片；活跃引用可能使缓存超过预算。
@@ -338,7 +358,7 @@ Neovim；OSC 5522 需要终端专用协商并改变普通粘贴处理，本插�
 
 ### 内联编辑
 
-`require("acp").inline()`（默认 `<leader>ai`，普通和 Visual 模式）在光标处或选区上方
+`require("ade").inline()`（默认 `<leader>ai`，普通和 Visual 模式）在光标处或选区上方
 打开输入框，让 Agent 修改当前 buffer。字符/行选区默认按整行处理，块选区保留列范围；
 `inline.expand_selection = false` 保留字符选区的精确范围。无选区（普通模式）时不会把请求
 限制成“只能在光标处插入”：Agent 按用户请求修改副本，光标位置只作为提示。
@@ -346,7 +366,7 @@ Neovim；OSC 5522 需要终端专用协商并改变普通粘贴处理，本插�
 
 通过当前 session 提交正常 prompt 回合，回复保留在聊天记录中，不创建新 session。
 当前回合或队列未完成时拒绝 inline 提交；inline 运行时，普通聊天仍可排队。
-要求 Agent 编辑同目录下的私有副本（`.acp-inline-*`）：
+要求 Agent 编辑同目录下的私有副本（`.ade-inline-*`）：
 
 - 读/搜索/思考/取回默认放行；编辑权限仅授权本次登记的副本，其它写入或命令默认拒绝。
   `inline.allow_commands` 只放开 shell 命令（`execute`）；`delete`、`move` 与未知 kind 需要
@@ -354,7 +374,7 @@ Neovim；OSC 5522 需要终端专用协商并改变普通粘贴处理，本插�
 - 结果按选区范围过滤，精确字符/块选区不扩大为整行；越界改动提示丢弃数量。
 - 等待或审查期间源内容、文件名或换行约定变化时，拒绝应用冲突结果。
 - 回合进行期间源 buffer 被锁定：既不能编辑，`:w`/`:update`/自动保存也不会写盘，并提示
-  `inline edit in progress`。取消（`:Acp inline-stop`）或回合结束才解锁；应用结果和审查前
+  `inline edit in progress`。取消（`:Ade inline-stop`）或回合结束才解锁；应用结果和审查前
   必定先解锁。
 - 回合结束后会比对源文件在磁盘上的 mtime、大小与内容 hash。Agent 或其它程序在回合中改了原文件
   时中止应用，并让你选择「从磁盘重新加载 / 保留 buffer / 查看差异」。
@@ -403,13 +423,13 @@ card 视图（同样的 diff 背景与语法高亮）。
 - `]c` / `[c`（或 `]h` / `[h`）按审查顺序循环跳到下一个/上一个块，已决定的块仍可访问；
   光标留在当前栏。`u` 把当前块的决定清回 pending。
 - `g2` / `g3` 全部接受 / 全部拒绝，`g1` 全部接受并永久改用直接写回，
-  `q` / `<Esc>` 拒绝剩余部分并关闭；`:Acp inline-reset` 清除 always-accept。
+  `q` / `<Esc>` 拒绝剩余部分并关闭；`:Ade inline-reset` 清除 always-accept。
 - 结果列只用于展示决定结果，是 `nomodifiable`；手动编辑会被下一次决定覆盖，因此被禁止。
 - 审查不修改 `diffopt`，也不开启任何窗口的 `diff`。
 - 按结果到达时的 filetype 解析：精确 filetype、复合 filetype 的第一段、`"*"`、默认值。
 
-`:Acp inline [diff|write]`、`:Acp inline-stop`、`:Acp inline-reset` 是对应命令。
-命令支持行范围（如 `:'<,'>Acp inline diff`）。显式 `diff|write` 优先于 always-accept
+`:Ade inline [diff|write]`、`:Ade inline-stop`、`:Ade inline-reset` 是对应命令。
+命令支持行范围（如 `:'<,'>Ade inline diff`）。显式 `diff|write` 优先于 always-accept
 和 filetype 配置；`<C-d>` 切换本次模式。同一时间只运行一个 inline 请求。
 
 浮窗外观可配置；颜色仍由 highlight group 决定：
@@ -421,9 +441,9 @@ inline = {
     title_pos = "left",     -- left | center | right
     style = "minimal",      -- minimal | default
     highlights = {          -- 只映射窗口 chrome，可用 ui.highlights 改颜色
-      normal = "AcpInlinePrompt",
-      border = "AcpInlineBorder",
-      title = "AcpInlineTitle",
+      normal = "AdeInlinePrompt",
+      border = "AdeInlineBorder",
+      title = "AdeInlineTitle",
     },
     prompt = {
       placement = "cursor", -- cursor（跟随光标）| window（窗口左上）
@@ -468,44 +488,44 @@ inline = {
 
   | 栏 | pending | 已接受 | 已拒绝 |
   |---|---|---|---|
-  | 原文 | `AcpReviewDelete` + 字符级 `AcpReviewDeleteText` | `AcpReviewDimmed`（被替换） | 无底色（保留） |
-  | 结果 | `AcpReviewPending` | `AcpReviewAdd` + 字符级 `AcpReviewAddText` | 无底色 |
-  | 提案 | `AcpReviewAdd` + 字符级 `AcpReviewAddText` | `AcpReviewAdd`（已采用） | `AcpReviewDimmed`（被丢弃） |
+  | 原文 | `AdeReviewDelete` + 字符级 `AdeReviewDeleteText` | `AdeReviewDimmed`（被替换） | 无底色（保留） |
+  | 结果 | `AdeReviewPending` | `AdeReviewAdd` + 字符级 `AdeReviewAddText` | 无底色 |
+  | 提案 | `AdeReviewAdd` + 字符级 `AdeReviewAddText` | `AdeReviewAdd`（已采用） | `AdeReviewDimmed`（被丢弃） |
 
 - 字符级标记只用于相似的行对；一行里超过一半都变了（改写、翻译）时只用整行底色，避免满行碎片。
 - 行号列由 `statuscolumn` 绘制：最左一格是块的状态条（`▎`，已接受/已拒绝块的首行为 `✓`/`✗`），
-  颜色为 `AcpReviewStatePending/Current/Accepted/Rejected`，三栏同一行同色；后面是**真实行号**
+  颜色为 `AdeReviewStatePending/Current/Accepted/Rejected`，三栏同一行同色；后面是**真实行号**
   （原文/提案保留各自文件的行号，结果列按当前结果计数），filler 行没有行号。
   行号列里没有折叠列（`foldcolumn` 恒为 0，`foldcolumn` 配置项已废弃并被忽略）。
-- 光标所在块在结果列行尾显示 `ga accept · gr reject · ]c next`（`AcpReviewHint`，`hints = false` 关闭）。
+- 光标所在块在结果列行尾显示 `ga accept · gr reject · ]c next`（`AdeReviewHint`，`hints = false` 关闭）。
 - `winbar` 每栏一个彩色徽章（`A` 原文 / `→` 结果 / `B` 提案），只有结果列显示
   `hunk i/n · ✓/✗/pending` 计数。
-- 光标行使用 `AcpReviewCursorLine`（复制主题 `CursorLine` 的底色、去掉下划线），
+- 光标行使用 `AdeReviewCursorLine`（复制主题 `CursorLine` 的底色、去掉下划线），
   避免 `cursorbind` 把下划线画到三栏。
-- filler 用 `AcpReviewFiller`：固定的低对比灰 `fg`，不跟随主题。
-- 所有组都是**静态定义**：运行期不做混色。`AcpReviewAdd/Delete/Pending` 的底色复制自主题的
+- filler 用 `AdeReviewFiller`：固定的低对比灰 `fg`，不跟随主题。
+- 所有组都是**静态定义**：运行期不做混色。`AdeReviewAdd/Delete/Pending` 的底色复制自主题的
   `DiffAdd/DiffDelete/DiffChange`，字符级标记复制自 `DiffText`（只复制 `bg`，不带主题的前景与下划线；
   `ColorScheme` 时重新复制）。主题的颜色区分度不够时，用 `ui.highlights` 覆盖。
-- card 回退沿用 `AcpDiffAdd/AcpDiffDelete`，状态用 `AcpInlineAccepted/Rejected`。
+- card 回退沿用 `AdeDiffAdd/AdeDiffDelete`，状态用 `AdeInlineAccepted/Rejected`。
 
 审查配色示例（放入 `setup()`，颜色按你的主题调整）：
 
 ```lua
 ui = {
   highlights = {
-    AcpReviewAdd = { bg = "#243c2c" },        -- 新增 / 提案侧
-    AcpReviewDelete = { bg = "#44292e" },     -- 删除 / 原文侧
-    AcpReviewPending = { bg = "#26384a" },    -- 结果列中未决定的块
-    AcpReviewAddText = { bg = "#2f5a3a" },    -- 提案侧变化的字符
-    AcpReviewDeleteText = { bg = "#6a3038" }, -- 原文侧变化的字符
-    AcpReviewFiller = { fg = "#4b5260" },
+    AdeReviewAdd = { bg = "#243c2c" },        -- 新增 / 提案侧
+    AdeReviewDelete = { bg = "#44292e" },     -- 删除 / 原文侧
+    AdeReviewPending = { bg = "#26384a" },    -- 结果列中未决定的块
+    AdeReviewAddText = { bg = "#2f5a3a" },    -- 提案侧变化的字符
+    AdeReviewDeleteText = { bg = "#6a3038" }, -- 原文侧变化的字符
+    AdeReviewFiller = { fg = "#4b5260" },
   },
 }
 ```
 
-也可在 `setup()` 之后用 `vim.api.nvim_set_hl(0, "AcpReviewPending", { bg = "#26384a" })`
+也可在 `setup()` 之后用 `vim.api.nvim_set_hl(0, "AdeReviewPending", { bg = "#26384a" })`
 即时调整；希望切换主题后仍保留配置时，推荐使用上面的 `ui.highlights`。
-card 里的 diff 使用 `AcpDiffAdd/AcpDiffDelete`。
+card 里的 diff 使用 `AdeDiffAdd/AdeDiffDelete`。
 
 审查窗口的行为约束：
 
@@ -527,7 +547,7 @@ card 里的 diff 使用 `AcpDiffAdd/AcpDiffDelete`。
 ui = {
   render = {
     lazy_syntax = true, -- A：仅在视口附近解析/绘制代码、diff 语法颜色
-    profile = false,   -- true 时在 :AcpDebug 的 render.timings 查看分层耗时
+    profile = false,   -- true 时在 :AdeDebug 的 render.timings 查看分层耗时
     budget_ms = 4,     -- 共享调度器的主循环软预算；同步操作不可抢占
     overscan = 1,      -- 可见区上下各预加载一屏
     commit_rows = 2000, -- 超过此行数时提交也分片；0 关闭
@@ -589,7 +609,7 @@ diff 行还会按**被编辑文件自己的文件类型**着色：`.lua` 用 Lua
 `rawInput` 里的变更，完成后替换成权威的 diff。
 
 - 用户按 `<Tab>` 手动折叠后，后续更新不会再把它弹开；
-- 从历史会话加载（`:Acp sessions`）或重连恢复的卡片默认折叠，避免一次展开几十个
+- 从历史会话加载（`:Ade sessions`）或重连恢复的卡片默认折叠，避免一次展开几十个
   diff；回放提交后，再新产生的 diff 恢复默认展开，历史卡片保持折叠；
 - 同进程内切回仍在运行的缓存会话时，展开状态原样保留；
 - `write` 拿不到旧文件内容，因此按“全新增”展示并标注 `(new content)`。
@@ -597,7 +617,7 @@ diff 行还会按**被编辑文件自己的文件类型**着色：`.lua` 用 Lua
 配置示例：
 
 ```lua
-require("acp").setup({
+require("ade").setup({
   keymaps = {
     input = {
       send = "<C-CR>",                       -- 单个键
@@ -623,17 +643,17 @@ require("acp").setup({
 
 ## 安装 Agent
 
-不需要 `npm install -g`：acp.nvim 可以把 ACP adapter 装到 Neovim 的数据目录里。
+不需要 `npm install -g`：ade.nvim 可以把 ACP adapter 装到 Neovim 的数据目录里。
 
 ```vim
-:Acp agents           " 打开管理界面（类似 :Mason）
-:Acp install claude   " 开始安装并打开管理界面显示进度
-:Acp install pi
-:Acp update           " 更新所有有新版本的托管 Agent
-:Acp uninstall pi
+:Ade agents           " 打开管理界面（类似 :Mason）
+:Ade install claude   " 开始安装并打开管理界面显示进度
+:Ade install pi
+:Ade update           " 更新所有有新版本的托管 Agent
+:Ade uninstall pi
 ```
 
-安装位置是 `stdpath("data")/acp/agents/<agent>/releases/<版本>/`，与插件目录、项目目录
+安装位置是 `stdpath("data")/ade/agents/<agent>/releases/<版本>/`，与插件目录、项目目录
 和全局 npm 目录都分开。每个 Agent 只保留一个版本：更新成功后旧版本被删除（正在被某个
 会话使用的版本除外）。安装完成**不会**自动切换 Agent、打开会话或登录。
 
@@ -655,10 +675,10 @@ npm 输出实时显示在对应行下面；打开时会在后台用 `npm view` �
 
 | 命令 | 说明 |
 |---|---|
-| `:Acp agents` | 打开管理界面 |
-| `:Acp install <id> [version]` | 安装；版本可写精确版本或省略（用 latest）。不带参数时打开管理界面 |
-| `:Acp update [<id> [version]]` | 更新一个；不带参数时更新全部有新版本的 |
-| `:Acp uninstall <id>` | 移除托管副本；凭据和会话历史不受影响 |
+| `:Ade agents` | 打开管理界面 |
+| `:Ade install <id> [version]` | 安装；版本可写精确版本或省略（用 latest）。不带参数时打开管理界面 |
+| `:Ade update [<id> [version]]` | 更新一个；不带参数时更新全部有新版本的 |
+| `:Ade uninstall <id>` | 移除托管副本；凭据和会话历史不受影响 |
 
 想在启动后自动安装缺失的 Agent，可以写 `manager.ensure_installed = { "claude", "pi" }`。
 
@@ -679,7 +699,7 @@ OpenCode 以独立 CLI 分发，仍需自行安装，管理器只报告它是否
 每个 Agent 可以用 `source` 指定从哪里启动：
 
 ```lua
-require("acp").setup({
+require("ade").setup({
   agent = "claude",
   agents = {
     claude = { source = "auto" },   -- 默认
@@ -702,7 +722,7 @@ require("acp").setup({
 ## 配置
 
 ```lua
-require("acp").setup({
+require("ade").setup({
   agent = "opencode",
   agents = {
     -- 内置预设；只覆盖你想改的字段
@@ -720,7 +740,7 @@ require("acp").setup({
   -- http/sse 只有 agent 在 mcpCapabilities 中声明时才发送。
   -- 托管安装（见「安装 Agent」）
   manager = {
-    root = nil,              -- 默认 stdpath("data") .. "/acp/agents"
+    root = nil,              -- 默认 stdpath("data") .. "/ade/agents"
     node = "node",
     npm = "npm",
     install_timeout = 300000,
@@ -758,7 +778,7 @@ require("acp").setup({
     max_input_height = 24,
     focus_input_on_open = true,
     restore_focus = true,
-    -- 锁定 ACP 窗口，阻止其它 buffer 占用（winfixbuf）
+    -- 锁定 ade.nvim 窗口，阻止其它 buffer 占用（winfixbuf）
     lock_buffer = true,
   },
 
@@ -844,7 +864,7 @@ require("acp").setup({
   capabilities = {
     -- 声明给 Agent 的客户端能力；不能用的能力不要打开
     elicitation = { form = true, url = false },
-    auth_terminal = true,      -- 终端登录（:Acp login）
+    auth_terminal = true,      -- 终端登录（:Ade login）
     terminal_output_meta = true,   -- 读取 Agent 的终端输出 _meta
     boolean_config_options = true,
     fs = false,
@@ -889,14 +909,14 @@ require("acp").setup({
     vim.opt.splitkeep = "screen"  -- 打开侧栏时编辑区不跳动
   end,
   opts = function(_, opts)
-    -- 把 acp 的两个视图加到右侧 edgebar
-    require("acp.integrations.edgy").extend(opts)
+    -- 把 ade.nvim 的两个视图加到右侧 edgebar
+    require("ade.integrations.edgy").extend(opts)
   end,
 }
 ```
 
 ```lua
-require("acp").setup({
+require("ade").setup({
   layout = { backend = "external" },
 })
 ```
@@ -904,45 +924,45 @@ require("acp").setup({
 `extend()` 只是把下面两个 view 定义插入你的 `opts.right`，不会覆盖已有配置。
 
 > **注意**：两个视图必须作为**数组元素**写进列表，不能写成具名字段。
-> edgy 只遍历 `ipairs(views)`，`right = { { ft = "acp_chat" }, input = { ft = "acp_input" } }`
+> edgy 只遍历 `ipairs(views)`，`right = { { ft = "ade_chat" }, input = { ft = "ade_input" } }`
 > 里的 `input` 是具名字段，edgy 会完全忽略它，导致输入框脱离 edgebar、
 > 布局错位。
 
 ```lua
 -- 正确
 right = {
-  { ft = "acp_chat",  title = "Agent", wo = { winbar = false } },
-  { ft = "acp_input", title = "Message", size = { height = 8 }, wo = { winbar = false } },
+  { ft = "ade_chat",  title = "Agent", wo = { winbar = false } },
+  { ft = "ade_input", title = "Message", size = { height = 8 }, wo = { winbar = false } },
 }
 
--- 错误：acp_input 是具名字段，edgy 不会管理它
+-- 错误：ade_input 是具名字段，edgy 不会管理它
 right = {
-  { ft = "acp_chat", title = "Agent" },
-  input = { ft = "acp_input", title = "Message" },
+  { ft = "ade_chat", title = "Agent" },
+  input = { ft = "ade_input", title = "Message" },
 }
 ```
 
-acp.nvim 在无法接管时会给出警告，而不是静默错位。
+ade.nvim 在无法接管时会给出警告，而不是静默错位。
 
 ```lua
 right = {
-  { ft = "acp_chat",  title = "Agent",   size = { width = 0.38 }, wo = { winbar = false, winfixwidth = true } },
-  { ft = "acp_input", title = "Message", size = { height = 8 },    wo = { winbar = false, winfixwidth = true } },
+  { ft = "ade_chat",  title = "Agent",   size = { width = 0.38 }, wo = { winbar = false, winfixwidth = true } },
+  { ft = "ade_input", title = "Message", size = { height = 8 },    wo = { winbar = false, winfixwidth = true } },
 }
 ```
 
 ### 谁是 winbar 的所有者
 
-默认 **acp 拥有两个 winbar**（这里是标题栏和操作栏），edgy 只负责位置和尺寸。
+默认 **ade.nvim 拥有两个 winbar**（这里是标题栏和操作栏），edgy 只负责位置和尺寸。
 如果你希望 edgy 显示自己的标题栏：
 
 ```lua
-require("acp.integrations.edgy").views({
+require("ade.integrations.edgy").views({
   title_winbar = true,  -- chat 视图交给 edgy
   toolbar_winbar = false, -- input 视图也交给 edgy
 })
 -- 再配合：
-require("acp").setup({
+require("ade").setup({
   layout = { backend = "external" },
   ui = { title = { placement = "off" }, toolbar = { placement = "off" } },
 })
@@ -950,17 +970,17 @@ require("acp").setup({
 
 `views()` 返回 `{ chat = ..., input = ... }`，不是数组；须把两项放入 edgy 的视图列表，
 或直接在配置函数中调用 `extend(opts, { title_winbar = true, toolbar_winbar = false })`。
-左侧布局使用 `extend(opts, { position = "left" })`，并同步设置 ACP 的 `layout.position`。
+左侧布局使用 `extend(opts, { position = "left" })`，并同步设置 ade.nvim 的 `layout.position`。
 
 ### 布局语义
 
 | 操作 | 行为 |
 |---|---|
-| `:Acp hide` / `q` | 关闭两个视图，**不中断** Agent 与当前回合 |
-| 单独关闭某个视图 | 不会被强行重开；下次 `:Acp open` 才补回 |
-| `:Acp toggle` | 任一视图可见时隐藏，否则打开 |
+| `:Ade hide` / `q` | 关闭两个视图，**不中断** Agent 与当前回合 |
+| 单独关闭某个视图 | 不会被强行重开；下次 `:Ade open` 才补回 |
+| `:Ade toggle` | 任一视图可见时隐藏，否则打开 |
 
-外部布局模式下，acp 不会持续调整窗口尺寸，也不抢回被布局管理器移动的窗口。
+外部布局模式下，ade.nvim 不会持续调整窗口尺寸，也不抢回被布局管理器移动的窗口。
 
 ## 状态栏集成
 
@@ -971,10 +991,10 @@ require("acp").setup({
 
 ```lua
 -- 简短文本，例如 "◆"、"◆ ◌"、"◆ !"
-require("acp").statusline()
+require("ade").statusline()
 
 -- 结构化数据
-require("acp").status()
+require("ade").status()
 -- {
 --   connected = true, connection = "ready",
 --   running = false, waiting_permission = false, queued = 0,
@@ -987,12 +1007,12 @@ lualine 示例：
 
 ```lua
 {
-  "acp",
+  "ade",
   function()
-    return require("acp").statusline()
+    return require("ade").statusline()
   end,
   cond = function()
-    return require("acp").status().connected
+    return require("ade").status().connected
   end,
 }
 ```
@@ -1016,7 +1036,7 @@ heirline 同理，只需调用 `statusline()` 或读取 `status()`。
 | `"off"` | 不画分隔符 |
 
 ```lua
-require("acp").setup({
+require("ade").setup({
   ui = { separator = { form = "turn" } },
 })
 ```
@@ -1032,26 +1052,26 @@ require("acp").setup({
 到 treesitter 的 `@markup.*` 捕获组，所以在对话记录里的呈现和普通 Markdown buffer
 遵循主题的相应样式，但渲染器并非完整的 Markdown 实现。
 
-`acp_chat` 的标题栏（winbar）与正文共用同一个背景（`AcpNormal`），读起来是对话
-记录的页眉，而不是一条独立的色带。`acp_input` 的工具栏仍然用 `StatusLine` 的颜色，
+`ade_chat` 的标题栏（winbar）与正文共用同一个背景（`AdeNormal`），读起来是对话
+记录的页眉，而不是一条独立的色带。`ade_input` 的工具栏仍然用 `StatusLine` 的颜色，
 因为它是工具栏而非页眉。
 
-对话记录的标题行拆成了图标和文字两组：`AcpUserIcon` / `AcpUserTitle`、
-`AcpAssistantIcon` / `AcpAssistantTitle`。用户标题默认链接到用户图标；助手两组默认均链接到 `Keyword`；
-想区分时单独覆盖即可。助手回合开头的 Markdown 标题会用 `AcpAssistantTitle`，
-正文中间的标题仍保留各自的 `AcpH1`–`AcpH4` 级别。
+对话记录的标题行拆成了图标和文字两组：`AdeUserIcon` / `AdeUserTitle`、
+`AdeAssistantIcon` / `AdeAssistantTitle`。用户标题默认链接到用户图标；助手两组默认均链接到 `Keyword`；
+想区分时单独覆盖即可。助手回合开头的 Markdown 标题会用 `AdeAssistantTitle`，
+正文中间的标题仍保留各自的 `AdeH1`–`AdeH4` 级别。
 
 diff 卡片使用主题自带的 diff 组，所以红绿配色与你的 review 窗口一致：
 
 | 组 | 默认链接 | 作用 |
 |---|---|---|
-| `AcpDiffAdd` | `DiffAdd` | 新增行的整行背景 |
-| `AcpDiffDelete` | `DiffDelete` | 删除行的整行背景 |
-| `AcpDiffAddSign` | `DiffAdd` | `+` 号 |
-| `AcpDiffRemoveSign` | `DiffDelete` | `-` 号 |
-| `AcpDiffHunk` | `NonText` | 多 hunk 时的 `@@` 分隔行 |
-| `AcpDiffMeta` | `Comment` | 卡片内分隔线与“已省略 N 行”提示 |
-| `AcpDiffFile` | `Title` | 多文件时的路径表头 |
+| `AdeDiffAdd` | `DiffAdd` | 新增行的整行背景 |
+| `AdeDiffDelete` | `DiffDelete` | 删除行的整行背景 |
+| `AdeDiffAddSign` | `DiffAdd` | `+` 号 |
+| `AdeDiffRemoveSign` | `DiffDelete` | `-` 号 |
+| `AdeDiffHunk` | `NonText` | 多 hunk 时的 `@@` 分隔行 |
+| `AdeDiffMeta` | `Comment` | 卡片内分隔线与“已省略 N 行”提示 |
+| `AdeDiffFile` | `Title` | 多文件时的路径表头 |
 
 两处例外，都是为了让表格读起来安静一些：
 
@@ -1066,58 +1086,58 @@ diff 卡片使用主题自带的 diff 组，所以红绿配色与你的 review �
 2. 任何时候直接 `vim.api.nvim_set_hl`
 
 ```lua
-require("acp").setup({
+require("ade").setup({
   ui = {
     highlights = {
-      AcpUser = { link = "Identifier" },
-      AcpToolTitle = { fg = "#7aa2f7" },
+      AdeUser = { link = "Identifier" },
+      AdeToolTitle = { fg = "#7aa2f7" },
     },
   },
 })
 
 -- 等价，但不必重新 setup
-vim.api.nvim_set_hl(0, "AcpSeparator", { fg = "#3b4261" })
+vim.api.nvim_set_hl(0, "AdeSeparator", { fg = "#3b4261" })
 ```
 
 切换 colorscheme 后会重新应用内置定义与 `ui.highlights` 配置。
 直接 `nvim_set_hl` 的临时覆盖不保证跨主题保留；需持久化时使用配置或自己的 `ColorScheme` 回调。
 Neovim 0.12+ 的工具栏区域继承背景；旧版本使用兼容语法，外部插件重映射 `WinBar` 时颜色可能不同。
 
-可用的组：`AcpNormal` `AcpMuted` `AcpBorder` `AcpTitle` `AcpToolbar` `AcpToolbarAccent`
-`AcpToolbarModePlan` `AcpToolbarModeBuild` `AcpToolbarIdle` `AcpToolbarRunning`
-`AcpToolbarWaiting` `AcpToolbarCancelling` `AcpUser` `AcpUserChip` `AcpAssistant`
-`AcpUserIcon` `AcpUserTitle` `AcpAssistantIcon` `AcpAssistantTitle`
-`AcpThought` `AcpToolTitle` `AcpToolTag` `AcpCardBg` `AcpCodeBlockBg` `AcpCodeLang`
-`AcpTableHead` `AcpTableBorder` `AcpToolRunning` `AcpToolSuccess` `AcpToolError`
-`AcpToolCancelled` `AcpMdCode` `AcpBold` `AcpItalic` `AcpStrike` `AcpMdLink` `AcpH1`
-`AcpH2` `AcpH3` `AcpH4` `AcpQuote` `AcpLink` `AcpPlan` `AcpPlanDone` `AcpPlanPending`
-`AcpNotice` `AcpNoticeWarn` `AcpNoticeError` `AcpPermission` `AcpChild` `AcpSeparator`
-`AcpStreaming` `AcpSelection` `AcpPinned`
+可用的组：`AdeNormal` `AdeMuted` `AdeBorder` `AdeTitle` `AdeToolbar` `AdeToolbarAccent`
+`AdeToolbarModePlan` `AdeToolbarModeBuild` `AdeToolbarIdle` `AdeToolbarRunning`
+`AdeToolbarWaiting` `AdeToolbarCancelling` `AdeUser` `AdeUserChip` `AdeAssistant`
+`AdeUserIcon` `AdeUserTitle` `AdeAssistantIcon` `AdeAssistantTitle`
+`AdeThought` `AdeToolTitle` `AdeToolTag` `AdeCardBg` `AdeCodeBlockBg` `AdeCodeLang`
+`AdeTableHead` `AdeTableBorder` `AdeToolRunning` `AdeToolSuccess` `AdeToolError`
+`AdeToolCancelled` `AdeMdCode` `AdeBold` `AdeItalic` `AdeStrike` `AdeMdLink` `AdeH1`
+`AdeH2` `AdeH3` `AdeH4` `AdeQuote` `AdeLink` `AdePlan` `AdePlanDone` `AdePlanPending`
+`AdeNotice` `AdeNoticeWarn` `AdeNoticeError` `AdePermission` `AdeChild` `AdeSeparator`
+`AdeStreaming` `AdeSelection` `AdePinned`
 
 插件自绘的 picker（`ui.picker = "internal"` 的模型/模式/权限选择框，以及
-`:Acp sessions` 的内置窗口）另有一套组，默认都链接到主题组：
+`:Ade sessions` 的内置窗口）另有一套组，默认都链接到主题组：
 
 | 组 | 默认链接 | 作用 |
 |---|---|---|
-| `AcpPickerNormal` | `NormalFloat` | 浮窗背景与普通文字 |
-| `AcpPickerBorder` | `FloatBorder` | 圆角边框 |
-| `AcpPickerTitle` | `FloatTitle` | 浮窗标题 |
-| `AcpPickerSelection` | `AcpSelection` | 光标所在行 |
-| `AcpPickerItem` | `Normal` | 每行的标题文字 |
-| `AcpPickerMatch` | `Search` | 过滤时命中的字符 |
-| `AcpPickerCurrent` | `StatusLine` | 当前会话的箭头、`✓ current` |
-| `AcpPickerCurrentItem` | `AcpTitle` | 当前行标题（只强调前景，不画背景） |
-| `AcpPickerDescription` | `Comment` | 行尾右对齐的描述 |
-| `AcpPickerMeta` | `Comment` | 会话列表里的更新时间 |
-| `AcpPickerEmpty` | `Comment` | `no match` / `no matching sessions` |
-| `AcpPickerSeparator` | `NonText` | 列表与页脚之间的分隔线 |
-| `AcpPickerPrompt` | `AcpToolbarAccent` | 过滤提示符与输入内容 |
-| `AcpPickerFooter` | `Comment` | 页脚提示与临时状态（`deleting...`） |
+| `AdePickerNormal` | `NormalFloat` | 浮窗背景与普通文字 |
+| `AdePickerBorder` | `FloatBorder` | 圆角边框 |
+| `AdePickerTitle` | `FloatTitle` | 浮窗标题 |
+| `AdePickerSelection` | `AdeSelection` | 光标所在行 |
+| `AdePickerItem` | `Normal` | 每行的标题文字 |
+| `AdePickerMatch` | `Search` | 过滤时命中的字符 |
+| `AdePickerCurrent` | `StatusLine` | 当前会话的箭头、`✓ current` |
+| `AdePickerCurrentItem` | `AdeTitle` | 当前行标题（只强调前景，不画背景） |
+| `AdePickerDescription` | `Comment` | 行尾右对齐的描述 |
+| `AdePickerMeta` | `Comment` | 会话列表里的更新时间 |
+| `AdePickerEmpty` | `Comment` | `no match` / `no matching sessions` |
+| `AdePickerSeparator` | `NonText` | 列表与页脚之间的分隔线 |
+| `AdePickerPrompt` | `AdeToolbarAccent` | 过滤提示符与输入内容 |
+| `AdePickerFooter` | `Comment` | 页脚提示与临时状态（`deleting...`） |
 
 浮窗的边框、标题和背景通过 `winhighlight` 映射到前三个组，因此在
 `style = "minimal"` 的浮窗里也能单独改色，而不必动全局的 `NormalFloat`。
-`AcpPickerItem` 链接到 `Normal`：浮窗里 `winhighlight` 已经把 `Normal` 映射到
-`AcpPickerNormal`，而 snacks 列表里它仍然是列表自己的背景色，不会多出一层浮窗底色。
+`AdePickerItem` 链接到 `Normal`：浮窗里 `winhighlight` 已经把 `Normal` 映射到
+`AdePickerNormal`，而 snacks 列表里它仍然是列表自己的背景色，不会多出一层浮窗底色。
 
 snacks 后端只接管行内容：它的窗口沿用你已有的 snacks 主题，不套用上面三组。
 
@@ -1128,7 +1148,7 @@ snacks 后端只接管行内容：它的窗口沿用你已有的 snacks 主题�
 - ACP 本身不是沙箱，插件无法限制 Agent 进程访问文件系统。
 - 只声明真正实现的客户端能力；未实现的 `fs/*` 和 `terminal/*` 请求会返回标准 JSON-RPC 错误。
 - Agent 提供的标题、路径、链接都按不可信文本渲染，不自动执行、不自动打开。
-- 写入由 Agent 自身完成；acp.nvim 不会静默保存或覆盖你的 buffer。
+- 写入由 Agent 自身完成；ade.nvim 不会静默保存或覆盖你的 buffer。
 - 日志默认不记录密钥与完整提示词；开启 `log.protocol` 时会先脱敏再截断。
 
 ## 行为细节
@@ -1139,19 +1159,19 @@ snacks 后端只接管行内容：它的窗口沿用你已有的 snacks 主题�
 和你看到的是同一个目录。可以用 `cwd` 显式固定：
 
 ```lua
-require("acp").setup({ cwd = "/home/user/projects/my-app" })
+require("ade").setup({ cwd = "/home/user/projects/my-app" })
 ```
 
-`:Acp sessions` 的列表也按这个目录过滤。若该目录下没有会话，acp.nvim 会自动
+`:Ade sessions` 的列表也按这个目录过滤。若该目录下没有会话，ade.nvim 会自动
 退回展示 Agent 知道的所有会话，而不是提示「没有会话」。
 
-> 切换到历史会话时，acp.nvim 会使用**该会话自己的目录**发起 `session/load`。
+> 切换到历史会话时，ade.nvim 会使用**该会话自己的目录**发起 `session/load`。
 > ACP 规范要求 cwd 与会话一致，Agent 会在不匹配时拒绝该请求。目录末尾的 `/` 会被
 > 去掉（根目录除外），避免同一目录因写法不同被判成两个。
 
 ### 会话的加载、恢复与关闭
 
-打开历史会话时，acp.nvim 按 Agent 能力选择方式：
+打开历史会话时，ade.nvim 按 Agent 能力选择方式：
 
 | Agent 能力 | 行为 |
 |---|---|
@@ -1171,7 +1191,7 @@ require("acp").setup({ cwd = "/home/user/projects/my-app" })
 `mcp_servers` 会在建立会话时交给 Agent：
 
 ```lua
-require("acp").setup({
+require("ade").setup({
   mcp_servers = {
     { type = "stdio", command = "npx", args = { "-y", "@modelcontextprotocol/server-filesystem", "." } },
     { type = "sse", url = "http://localhost:8080/sse" },
@@ -1201,7 +1221,7 @@ stdio 是 ACP 的基线能力，总会被发送；`http` / `sse` 需要 Agent �
 标题显示在对话记录窗口的标题栏（winbar）里，未生成时回退为会话 ID 短码。
 
 为兼容未推送 `session_info_update` 的 OpenCode 版本，
-acp.nvim 在**会话创建后、切换会话后、以及每回合结束后**查询列表，并用
+ade.nvim 在**会话创建后、切换会话后、以及每回合结束后**查询列表，并用
 session id 做缓存，因此切换后标题立即更新。
 
 若 Agent 主动推送 `session_info_update`，该路径同样生效，两边不冲突。
@@ -1211,7 +1231,7 @@ session id 做缓存，因此切换后标题立即更新。
 
 ### 会话浏览器
 
-`:Acp sessions` 默认使用 **snacks.nvim 的 picker**：自带 fuzzy 搜索、实时预览，
+`:Ade sessions` 默认使用 **snacks.nvim 的 picker**：自带 fuzzy 搜索、实时预览，
 并沿用你已有的 snacks 主题。未安装 snacks 时自动回退到内置窗口，不会报错。
 
 | 按键 | 说明 |
@@ -1227,7 +1247,7 @@ session id 做缓存，因此切换后标题立即更新。
 想强制使用内置窗口：
 
 ```lua
-require("acp").setup({ ui = { session_picker = "internal" } })
+require("ade").setup({ ui = { session_picker = "internal" } })
 ```
 
 内置窗口（回退时）支持 `j`/`k` 移动与 `<BS>`/`<C-u>` 编辑过滤。
@@ -1240,7 +1260,7 @@ require("acp").setup({ ui = { session_picker = "internal" } })
 
 ### 窗口保护
 
-ACP 的两个窗口默认锁定到自己的 buffer（`winfixbuf`），因此 `:edit`、`:bnext`、
+ade.nvim 的两个窗口默认锁定到自己的 buffer（`winfixbuf`），因此 `:edit`、`:bnext`、
 插件里的「在当前窗口打开」等操作都不会把对话记录或输入框替换成别的文件。
 
 - 关闭窗口、`:q`、隐藏面板都仍然正常。
@@ -1248,7 +1268,7 @@ ACP 的两个窗口默认锁定到自己的 buffer（`winfixbuf`），因此 `:e
 - 需要临时解除（例如配合某些窗口管理插件）时：
 
 ```lua
-require("acp").setup({ layout = { lock_buffer = false } })
+require("ade").setup({ layout = { lock_buffer = false } })
 ```
 
 > `winfixbuf` 需要 Neovim 0.10+。更早的版本上插件会跳过锁定并记录一条 debug 日志。
@@ -1265,7 +1285,7 @@ require("acp").setup({ layout = { lock_buffer = false } })
 避免静默丢弃；先等待队列清空，或者**明确同意丢弃后**调用：
 
 ```lua
-require("acp").setup({ layout = { backend = "native" } }, { discard_queued = true })
+require("ade").setup({ layout = { backend = "native" } }, { discard_queued = true })
 ```
 
 队列目前只保存在本次 Neovim 进程内，不是持久化 outbox；正常退出或崩溃不会恢复它。
@@ -1289,7 +1309,7 @@ ui = { thoughts = { expand_while_streaming = false, collapse_on_finish = false }
 
 ### 中断与恢复
 
-Agent 崩溃或退出时，正在运行的工具会被标记为失败，并提示 `:Acp reconnect`。
+Agent 崩溃或退出时，正在运行的工具会被标记为失败，并提示 `:Ade reconnect`。
 重连会调用 `session/load` 重放 Agent 侧历史，不会自动重发上一条 prompt。
 断连会暂停各会话队列、取消旧请求并使旧选择器失效。当前会话恢复成功后继续发送尚未开始
 的排队消息；其他会话在选中并恢复后继续。已发出的 prompt 不自动重试，避免重复执行工具。
@@ -1298,7 +1318,7 @@ Agent 崩溃或退出时，正在运行的工具会被标记为失败，并提�
 ### 草稿持久化
 
 未发送的输入和附件按「项目 + 会话」保存在
-`stdpath("state")/acp/drafts.json`，重启后自动恢复。空草稿会被清除，
+`stdpath("state")/ade/drafts.json`，重启后自动恢复。空草稿会被清除，
 最多保留 50 条。
 内存中的历史草稿默认最多 20 条（`memory.max_drafts`），当前输入框不受淘汰影响。
 磁盘读写有缓存与 150ms 合并窗口，普通保存异步写入，退出时执行最终 flush；
@@ -1333,13 +1353,13 @@ Agent 崩溃或退出时，正在运行的工具会被标记为失败，并提�
    > 鼠标须在当前模式启用。默认 `mouse = "nvi"` 已覆盖普通、可视、插入模式，
    > 不需要改为 `a`；`mouse = ""` 会关闭鼠标支持。终端也须正确转发鼠标事件。
 2. 输入时按 `<M-m>` 切换模型、`<M-b>` 切换模式。
-3. 普通模式按 `M` / `m`，或执行 `:Acp model` / `:Acp mode`。
+3. 普通模式按 `M` / `m`，或执行 `:Ade model` / `:Ade mode`。
 
-`:Acp config` 把 Agent 提供的所有会话选项（模式、模型、思考级别、布尔开关及其它配置）放在
+`:Ade config` 把 Agent 提供的所有会话选项（模式、模型、思考级别、布尔开关及其它配置）放在
 一个选择器里；布尔选项选中即翻转，不再弹第二层选择器。工具栏上模式是左侧徽标，思考级别是
 它旁边的小标记。
 
-切换 Agent 用 `:Acp agent`（或 `:Acp agent claude` 直接指定）。每个 Agent 的会话标题与工作
+切换 Agent 用 `:Ade agent`（或 `:Ade agent claude` 直接指定）。每个 Agent 的会话标题与工作
 目录分开缓存，切换回来时不会串台。内置 `opencode`、`claude`、`pi` 三个预设，只覆盖你要改的
 字段即可。
 
@@ -1350,25 +1370,25 @@ telescope、fzf-lua、snacks.nvim、dressing 等插件会自动接管，无需�
 想用插件自带的浮动选择器（带模糊过滤，适合上百个模型的场景）：
 
 ```lua
-require("acp").setup({ ui = { picker = "internal" } })
+require("ade").setup({ ui = { picker = "internal" } })
 ```
 
 > 不要使用 `<C-m>`：在终端里它与 `<CR>` 是同一个键。
 
 ### 登录
 
-Agent 在 `initialize` 里声明登录方式时，`:Acp login` 会使用它：
+Agent 在 `initialize` 里声明登录方式时，`:Ade login` 会使用它：
 
 - 只有一个方式时直接执行；多个时用选择器挑选（显示名称和说明）。
 - `terminal` 类型会在新的 `:terminal` 分屏里运行**你自己配置的** Agent 命令，只追加 Agent 给出的
   参数和环境变量（ACP 规定登录方式不能指定命令）。启动前会显示实际执行的命令；命令成功退出后
-  会重启 Agent 进程并重试刚才失败的操作。连续失败会停止重试，`:Acp login` 可重新开始。分屏落在
+  会重启 Agent 进程并重试刚才失败的操作。连续失败会停止重试，`:Ade login` 可重新开始。分屏落在
   你最后编辑的窗口下方（面板记录的焦点窗口），不会顶掉聊天区或输入框；空间不足时改用新 tab。
 - `agent` 类型（或没有 type）调用 `authenticate(methodId)`，成功后直接重试。
 - `session/new`、`session/load`、`session/prompt` 返回 `auth_required`（-32000）时也会进入同一流程。
   超时、断线等本地失败使用不同的错误码，不会误触发登录。
 - Agent 完全没有提供登录方式时只提示查看它的文档。
-- `:Acp logout` 仅在 Agent 声明 `auth.logout` 时可用。
+- `:Ade logout` 仅在 Agent 声明 `auth.logout` 时可用。
 
 ### 权限请求
 
@@ -1386,7 +1406,7 @@ Agent 请求权限时弹出选择器，并在旁边打开一个只读详情浮�
 ### 提问
 
 Agent 通过 elicitation 提问时（Claude 的 AskUserQuestion、OpenCode 的 question 工具），
-acp.nvim 显示表单：
+ade.nvim 显示表单：
 
 - 只有一个单选字段时直接弹出选择器；多个字段时打开表单，`<CR>` 编辑当前字段，
   `<C-s>` 提交，`q` 取消，`d` 拒绝。
@@ -1401,7 +1421,7 @@ acp.nvim 显示表单：
 - 登录方式由 Agent 提供；插件不内置任何 Agent 专属的登录命令或凭据处理。
 - 修改审阅（逐块接受 / 拒绝）尚未提供：可以展开工具调用查看完整 diff，但不能在
   插件里应用或回滚某一块改动。
-- 会话历史来自 Agent（`session/list`），acp.nvim 不额外保存一份对话库。
+- 会话历史来自 Agent（`session/list`），ade.nvim 不额外保存一份对话库。
 - 部分能力（压缩、用量、子会话）依赖 Agent 的扩展，缺失时会自动降级。
 
 ## 开发
@@ -1427,7 +1447,7 @@ nvim --headless -u tests/minimal_init.lua -l tests/render_preview.lua
 nvim --headless -u tests/minimal_init.lua -l tests/manual_opencode.lua
 ```
 
-`:checkhealth acp` 会检查 Neovim 版本、Agent 可执行文件、edgy 与日志路径。
+`:checkhealth ade` 会检查 Neovim 版本、Agent 可执行文件、edgy 与日志路径。
 
 可运行配置位于 `examples/minimal/init.lua` 和 `examples/edgy/init.lua`。
 后者需要事先把 edgy.nvim 加入 runtimepath；这些示例不会自动安装依赖。
