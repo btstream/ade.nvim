@@ -1,0 +1,301 @@
+name: service-release
+
+# Build and publish prebuilt nvim_ade_server binaries.
+#
+# Trigger: a push to main (when service/ changed) or a manual run.
+# Version source: service/Cargo.toml. If the GitHub release
+# `nvim_ade_server-v<version>` already exists, nothing is published.
+#
+# The Rust toolchain is read from service/rust-toolchain.toml (single source of
+# truth); it is also used by `cross` for the musl targets.
+#
+# Permissions are minimal: the workflow only reads the repository, and only the
+# publishing job gets `contents: write`. Build and test run third-party build
+# scripts, so they never run with a writable token.
+#
+# Third-party actions are pinned to a full commit SHA; the version they
+# correspond to is in the trailing comment. `actions/*` stay on their major tag.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "service/**"
+      - ".github/workflows/service-release.yml"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild and re-upload assets even if the release already exists"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Test and build all targets, but do not create or modify a release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: service-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: read version / check release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      api_version: ${{ steps.version.outputs.api_version }}
+      tag: ${{ steps.version.outputs.tag }}
+      # `build`: run test + build + artifact upload (publish, or a dry run).
+      # `publish`: create/update the GitHub release (never during a dry run).
+      build: ${{ steps.check.outputs.build }}
+      publish: ${{ steps.check.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Read version and api_version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' service/Cargo.toml | head -n1)"
+          api_version="$(sed -n 's/.*API_VERSION:[[:space:]]*i64[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' service/src/lib.rs | head -n1)"
+          if [ -z "$version" ] || [ -z "$api_version" ]; then
+            echo "could not read the version or api_version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "api_version=$api_version" >> "$GITHUB_OUTPUT"
+          echo "tag=nvim_ade_server-v$version" >> "$GITHUB_OUTPUT"
+          echo "service $version, api $api_version" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Decide whether to build and publish
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          FORCE: ${{ inputs.force }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          build=false
+          publish=false
+          if [ "${DRY_RUN:-false}" = "true" ]; then
+            # Dry run: build and upload workflow artifacts, never publish.
+            echo "dry_run is set: build all targets, no release will be created" >> "$GITHUB_STEP_SUMMARY"
+            build=true
+          elif gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG already exists" >> "$GITHUB_STEP_SUMMARY"
+            if [ "${FORCE:-false}" = "true" ]; then
+              echo "force is set: rebuilding and re-uploading $TAG" >> "$GITHUB_STEP_SUMMARY"
+              build=true
+              publish=true
+            fi
+          else
+            echo "release $TAG does not exist yet: will build and publish" >> "$GITHUB_STEP_SUMMARY"
+            build=true
+            publish=true
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: test (${{ matrix.os }})
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: service
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Read toolchain from service/rust-toolchain.toml
+        id: toolchain
+        shell: bash
+        working-directory: .
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' service/rust-toolchain.toml)"
+          if [ -z "$channel" ]; then
+            echo "no channel found in service/rust-toolchain.toml" >&2
+            exit 1
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust (channel from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (master, 2026-10-16)
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: service -> target
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-targets
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: [prepare, test]
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            cross: true
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            cross: true
+            archive: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            cross: false
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            cross: false
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cross: false
+            archive: zip
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Read toolchain from service/rust-toolchain.toml
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' service/rust-toolchain.toml)"
+          if [ -z "$channel" ]; then
+            echo "no channel found in service/rust-toolchain.toml" >&2
+            exit 1
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust (channel from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (master, 2026-10-16)
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (musl targets)
+        if: matrix.cross
+        uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: cross
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: service -> target
+          key: ${{ matrix.target }}
+
+      - name: Build (cross, linux musl)
+        if: matrix.cross
+        working-directory: service
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (cargo)
+        if: ${{ !matrix.cross }}
+        working-directory: service
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          name="nvim_ade_server-${version}-${{ matrix.target }}"
+          mkdir -p dist
+          cp "service/target/${{ matrix.target }}/release/nvim_ade_server" "dist/nvim_ade_server"
+          tar -C dist -czf "dist/${name}.tar.gz" nvim_ade_server
+          rm "dist/nvim_ade_server"
+          ls -l "dist/${name}.tar.gz"
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $version = "${{ needs.prepare.outputs.version }}"
+          $target = "${{ matrix.target }}"
+          $name = "nvim_ade_server-$version-$target"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "service/target/$target/release/nvim_ade_server.exe" "dist/nvim_ade_server.exe"
+          Compress-Archive -Path "dist/nvim_ade_server.exe" -DestinationPath "dist/$name.zip" -Force
+          Remove-Item "dist/nvim_ade_server.exe"
+          Get-ChildItem dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: nvim_ade_server-${{ matrix.target }}
+          path: dist/nvim_ade_server-*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish release
+    needs: [prepare, build]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    # The only job that may write: it creates the tag and the release.
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -l
+          sha256sum nvim_ade_server-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          body: |
+            nvim_ade_server ${{ needs.prepare.outputs.version }}
+            api_version: ${{ needs.prepare.outputs.api_version }}
+
+            Prebuilt binaries for each target. Download the archive for your
+            platform and verify it against `SHA256SUMS`.
+          files: |
+            dist/nvim_ade_server-*
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
