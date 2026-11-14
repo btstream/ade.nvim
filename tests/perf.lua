@@ -1,8 +1,8 @@
 -- Performance smoke test: nvim --headless -u tests/minimal_init.lua -l tests/perf.lua
-local config = require("acp.config")
-local state = require("acp.session.state")
-local Chat = require("acp.ui.chat")
-local blocks = require("acp.ui.blocks")
+local config = require("ade.config")
+local state = require("ade.session.state")
+local Chat = require("ade.ui.chat")
+local blocks = require("ade.ui.blocks")
 
 local cfg = config.validate(config.merge(config.defaults, { ui = {} }))
 local chat = Chat.new({ config = cfg })
@@ -90,13 +90,13 @@ all_ok = check("expand one block in a long transcript", elapsed, 300) and all_ok
 -- 4. Markdown rendering of a large block.
 local big = string.rep("# Heading\n\nSome paragraph with `code` and more text.\n\n```lua\nlocal x = 1\n```\n\n", 200)
 elapsed = ms(function()
-  blocks.render_text(big, "AcpAssistant", 80)
+  blocks.render_text(big, "AdeAssistant", 80)
 end)
 all_ok = check("markdown rendering of ~1600 lines", elapsed, 400) and all_ok
 
 -- 5. Toolbar rendering is cheap and can run every animation frame.
 elapsed = ms(function()
-  local toolbar = require("acp.ui.toolbar")
+  local toolbar = require("ade.ui.toolbar")
   for _ = 1, 1000 do
     toolbar.render({ mode = "Build", model = "Claude Sonnet 5", status = "running", spinner = "*" }, 80)
   end

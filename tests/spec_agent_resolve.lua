@@ -4,9 +4,9 @@
 -- who writes the same command as the preset, a user who only overrides `env`,
 -- and a managed install that is missing or broken.
 return function(t)
-  local Config = require("acp.config")
-  local Resolve = require("acp.manager.resolve")
-  local store_mod = require("acp.manager.store")
+  local Config = require("ade.config")
+  local Resolve = require("ade.manager.resolve")
+  local store_mod = require("ade.manager.store")
 
   local function merged(raw)
     local cfg = Config.merge(Config.defaults, raw or {})
@@ -16,7 +16,7 @@ return function(t)
 
   ---A store over a temp root, optionally with a release pinned.
   local function store_with(releases)
-    local root = string.format("/tmp/opencode/acp-resolve-%d", vim.uv.hrtime())
+    local root = string.format("/tmp/opencode/ade-resolve-%d", vim.uv.hrtime())
     vim.fn.mkdir(root, "p")
     local store = store_mod.new({
       root = function()
@@ -166,7 +166,7 @@ return function(t)
     t.it("defaults the root under the data directory", function()
       local cfg = merged({})
       local root = Resolve.manager_root(cfg)
-      t.match("acp/agents$", root)
+      t.match("ade/agents$", root)
       t.truthy(root:find(vim.fn.stdpath("data"), 1, true) == 1)
     end)
 
@@ -176,8 +176,8 @@ return function(t)
     end)
 
     t.it("expands a home-relative root", function()
-      local cfg = merged({ manager = { root = "~/acp-agents" } })
-      t.eq(vim.fs.normalize(vim.fn.expand("~/acp-agents")), Resolve.manager_root(cfg))
+      local cfg = merged({ manager = { root = "~/ade-agents" } })
+      t.eq(vim.fs.normalize(vim.fn.expand("~/ade-agents")), Resolve.manager_root(cfg))
     end)
 
     t.it("makes a relative root absolute and drops a trailing slash", function()
@@ -218,10 +218,10 @@ return function(t)
 
   t.describe("launch spec and terminal login", function()
     t.it("keeps the managed release for the login command", function()
-      local Auth = require("acp.app.auth")
+      local Auth = require("ade.app.auth")
       local launch = {
         command = "node",
-        args = { "/data/acp/agents/pi/releases/v1/node_modules/@geohar/pi-acp/dist/index.js" },
+        args = { "/data/ade/agents/pi/releases/v1/node_modules/@geohar/pi-acp/dist/index.js" },
         env = { PI_HOME = "/x" },
         source = "managed",
       }
@@ -236,7 +236,7 @@ return function(t)
     end)
 
     t.it("falls back to the configured agent when there is no live client", function()
-      local Auth = require("acp.app.auth")
+      local Auth = require("ade.app.auth")
       local spec = Auth.terminal_spec({ args = { "--login" } }, { command = "npx", args = { "-y", "pkg" } })
       t.eq("npx", spec.command)
       t.eq({ "-y", "pkg", "--login" }, spec.args)
@@ -246,7 +246,7 @@ return function(t)
   t.describe("agent switch keeps provenance", function()
     t.it("a re-setup from the merged config does not turn presets into overrides", function()
       local store, root = store_with({ "pi" })
-      local controller = require("acp.controller")
+      local controller = require("ade.controller")
       controller.setup({ agent = "opencode", manager = { root = root } })
       local first = Config.current
       t.eq(false, first.launch_origin.pi ~= nil and first.launch_origin.pi.command)

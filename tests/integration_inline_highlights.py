@@ -7,14 +7,14 @@ import pynvim
 
 logging.disable(logging.CRITICAL)
 ROOT = str(Path(__file__).resolve().parent.parent)
-state = tempfile.TemporaryDirectory(prefix="acp-inline-hl-", dir="/tmp/opencode")
+state = tempfile.TemporaryDirectory(prefix="ade-inline-hl-", dir="/tmp/opencode")
 nvim = pynvim.attach("child", argv=["env", "XDG_STATE_HOME=" + state.name,
     "nvim", "--embed", "-u", "NONE", "-i", "NONE", "--noplugin"])
 attrs, cells = {}, {}
 
 
 def notification(name, args):
-    if name == "acp_probe_done":
+    if name == "ade_probe_done":
         nvim.stop_loop()
     if name != "redraw":
         return
@@ -46,7 +46,7 @@ def notification(name, args):
 
 
 def flush():
-    nvim.exec_lua("vim.cmd('redraw!'); vim.rpcnotify(..., 'acp_probe_done')", nvim.channel_id)
+    nvim.exec_lua("vim.cmd('redraw!'); vim.rpcnotify(..., 'ade_probe_done')", nvim.channel_id)
     nvim.run_loop(None, notification)
 
 
@@ -110,15 +110,15 @@ try:
         -- Theme cursor line with an underline: it must not be mirrored across
         -- the columns.
         vim.api.nvim_set_hl(0, 'CursorLine', {bg='#2a2a2a', underline=true})
-        require('acp.ui.highlights').setup({
-          AcpReviewAdd={bg='#123456'}, AcpReviewDelete={bg='#654321'},
-          AcpReviewPending={bg='#345678'}, AcpReviewAddText={bg='#0000aa'},
-          AcpReviewDeleteText={bg='#aa0000'},
-          AcpReviewFiller={fg='#778899', bg='#102030'},
-          AcpReviewDimmed={fg='#555555'},
-          AcpReviewStatePending={fg='#ddaa33'}, AcpReviewStateCurrent={fg='#33aadd'},
-          AcpInlineAccepted={fg='#55dd77'}, AcpInlineRejected={fg='#dd5577'},
-          AcpReviewGutterCur={fg='#eeeeee'}, AcpReviewGutter={fg='#777777'},
+        require('ade.ui.highlights').setup({
+          AdeReviewAdd={bg='#123456'}, AdeReviewDelete={bg='#654321'},
+          AdeReviewPending={bg='#345678'}, AdeReviewAddText={bg='#0000aa'},
+          AdeReviewDeleteText={bg='#aa0000'},
+          AdeReviewFiller={fg='#778899', bg='#102030'},
+          AdeReviewDimmed={fg='#555555'},
+          AdeReviewStatePending={fg='#ddaa33'}, AdeReviewStateCurrent={fg='#33aadd'},
+          AdeInlineAccepted={fg='#55dd77'}, AdeInlineRejected={fg='#dd5577'},
+          AdeReviewGutterCur={fg='#eeeeee'}, AdeReviewGutter={fg='#777777'},
         })
         old = {}
         for i=1,22 do old[i]='line '..i end
@@ -130,13 +130,13 @@ try:
         source=vim.api.nvim_create_buf(false,true)
         vim.api.nvim_buf_set_lines(source,0,-1,false,old)
         vim.api.nvim_set_current_buf(source)
-        local C=require('acp.config')
+        local C=require('ade.config')
         config=C.merge(C.defaults,{inline={window={review={fold=false,min_split_width=20,hints=false}}}})
     """, ROOT)
     for mode in ("2-column", "3-column"):
         nvim.exec_lua("""
             config.inline.window.review.layout = ...
-            assert(require('acp.inline.diff_session').open({bufnr=source, lines=edited, config=config}))
+            assert(require('ade.inline.diff_session').open({bufnr=source, lines=edited, config=config}))
             result_win=vim.api.nvim_get_current_win()
         """, mode)
         for stage, action in STAGES:
@@ -161,7 +161,7 @@ try:
                       for _,r in ipairs({1,2,3,4,6,10,11,16,17}) do
                         p.pos[tostring(r)]=vim.fn.screenpos(w,r,1)
                       end
-                      p.width=require('acp.inline.review.layout').gutter(vim.api.nvim_win_get_buf(w)).width
+                      p.width=require('ade.inline.review.layout').gutter(vim.api.nvim_win_get_buf(w)).width
                       out[#out+1]=p
                     end
                     return out
@@ -212,7 +212,7 @@ try:
                         # Filler rows have no line number.
                         number = "".join(cell(pos["row"], c)[0] for c in range(bar_col + 1, pos["col"])).strip()
                         assert (number == "") == (want == FILLER), (mode, stage, role, row, repr(number))
-        nvim.exec_lua("require('acp.inline.diff_session').close_all()")
+        nvim.exec_lua("require('ade.inline.diff_session').close_all()")
         print("ok: " + mode + " aligns columns with filler, paints each side by decision, marks changed characters and state bars")
 finally:
     try:

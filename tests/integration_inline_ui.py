@@ -8,7 +8,7 @@ import pynvim
 
 logging.disable(logging.CRITICAL)
 ROOT = str(Path(__file__).resolve().parent.parent)
-state = tempfile.TemporaryDirectory(prefix="acp-inline-ui-", dir="/tmp/opencode")
+state = tempfile.TemporaryDirectory(prefix="ade-inline-ui-", dir="/tmp/opencode")
 nvim = pynvim.attach("child", argv=["env", "XDG_STATE_HOME=" + state.name,
     "nvim", "--embed", "-u", "NONE", "-i", "NONE", "--noplugin"])
 
@@ -35,21 +35,21 @@ try:
         vim.notify = function(m, l)
           if l and l >= 3 then _G.last_notice = tostring(m) end
         end
-        require('acp').setup({
+        require('ade').setup({
           agents={opencode={command='python3',args={root..'/tests/mock_agent.py'}}},
           inline={review={mode='diff'}},
         })
-        vim.cmd('runtime plugin/acp.lua')
-        require('acp').open()
+        vim.cmd('runtime plugin/ade.lua')
+        require('ade').open()
     """, ROOT)
-    wait("require('acp.controller').state().session ~= nil")
+    wait("require('ade.controller').state().session ~= nil")
     nvim.exec_lua("""
         vim.cmd('wincmd p')
         vim.cmd('new')
         source = vim.api.nvim_get_current_buf()
         source_win = vim.api.nvim_get_current_win()
-        session = require('acp.controller').state().session
-        require('acp.controller').state().client.new_session = function() error('new session forbidden') end
+        session = require('ade.controller').state().session
+        require('ade.controller').state().client.new_session = function() error('new session forbidden') end
         vim.api.nvim_buf_set_lines(source,0,-1,false,{'before','INLINE_OLD','after'})
         vim.bo[source].filetype = 'lua'
         vim.api.nvim_win_set_cursor(0,{2,0})
@@ -57,9 +57,9 @@ try:
 
     # --- Visual mapping -> insert prompt -> side-by-side review ------------
     nvim.input("V ai")
-    wait("vim.bo.filetype == 'acp_inline' and vim.fn.mode() == 'i'")
+    wait("vim.bo.filetype == 'ade_inline' and vim.fn.mode() == 'i'")
     nvim.input("replace marker<CR>")
-    wait("require('acp.inline.diff_session').active(source)")
+    wait("require('ade.inline.diff_session').active(source)")
     assert nvim.exec_lua("return vim.api.nvim_buf_get_lines(source,0,-1,false)") == ["before", "INLINE_OLD", "after"]
 
     layout = nvim.exec_lua("""
@@ -78,9 +78,9 @@ try:
     assert all(t == "lua" for t in layout["types"]), layout
     # The decision count is shown once, on the result column.
     assert sum("pending" in (w or "") for w in layout["winbars"]) == 1, layout
-    assert any("AcpReviewBadgeOriginal" in (w or "") for w in layout["winbars"]), layout
-    assert any("AcpReviewBadgeResult" in (w or "") for w in layout["winbars"]), layout
-    assert any("AcpReviewBadgeProposal" in (w or "") for w in layout["winbars"]), layout
+    assert any("AdeReviewBadgeOriginal" in (w or "") for w in layout["winbars"]), layout
+    assert any("AdeReviewBadgeResult" in (w or "") for w in layout["winbars"]), layout
+    assert any("AdeReviewBadgeProposal" in (w or "") for w in layout["winbars"]), layout
     print("ok: each pane has its own badge, the result column the decision counter")
     diffopt = nvim.exec_lua("return {vim.o.diffopt, vim.api.nvim_get_option_info2('diffopt', {}).default}")
     assert diffopt[0] == diffopt[1], diffopt
@@ -94,10 +94,10 @@ try:
     # last pending hunk, settles the review.
     nvim.input("]c")
     assert nvim.exec_lua("return vim.api.nvim_win_get_cursor(0)[1]") == 2
-    wait("(require('acp.inline.review.layout').gutter(0).bars[2] or {}).group == 'AcpReviewStateCurrent'")
+    wait("(require('ade.inline.review.layout').gutter(0).bars[2] or {}).group == 'AdeReviewStateCurrent'")
     print("ok: cursor navigation updates the current-hunk state bar")
     nvim.input("ga")
-    wait("not require('acp.inline.diff_session').active(source)")
+    wait("not require('ade.inline.diff_session').active(source)")
     wait("vim.api.nvim_buf_get_lines(source,1,2,false)[1] == 'INLINE_NEW'")
     print("ok: native hunk navigation selects the changed block and accepts it")
     print("ok: the accepted hunks are applied once the review finishes")
@@ -106,29 +106,29 @@ try:
     wait("vim.api.nvim_buf_get_lines(source,1,2,false)[1] == 'INLINE_OLD'")
 
     # --- rejecting everything leaves the source untouched ------------------
-    nvim.command("2,2Acp inline diff")
-    wait("vim.bo.filetype == 'acp_inline' and vim.fn.mode() == 'i'")
+    nvim.command("2,2Ade inline diff")
+    wait("vim.bo.filetype == 'ade_inline' and vim.fn.mode() == 'i'")
     nvim.input("replace marker<CR>")
-    wait("require('acp.inline.diff_session').active(source)")
+    wait("require('ade.inline.diff_session').active(source)")
     nvim.input("]c")
     nvim.input("gr")
-    wait("not require('acp.inline.diff_session').active(source)")
+    wait("not require('ade.inline.diff_session').active(source)")
     assert nvim.exec_lua("return vim.api.nvim_buf_get_lines(source,0,-1,false)") == \
         ["before", "INLINE_OLD", "after"]
     print("ok: rejecting the only hunk leaves the source untouched")
 
     # --- card fallback on a narrow screen ----------------------------------
     nvim.exec_lua("""
-        local config = require('acp.controller').state().config
+        local config = require('ade.controller').state().config
         config.inline.window.review.min_split_width = 10000
         vim.api.nvim_set_current_win(source_win)
         vim.api.nvim_win_set_cursor(0,{2,0})
-        require('acp.inline').open({review='diff',mode='V',pos1={0,2,1,0},pos2={0,2,1,0}})
+        require('ade.inline').open({review='diff',mode='V',pos1={0,2,1,0},pos2={0,2,1,0}})
     """)
-    wait("vim.bo.filetype == 'acp_inline' and vim.fn.mode() == 'i'")
+    wait("vim.bo.filetype == 'ade_inline' and vim.fn.mode() == 'i'")
     nvim.input("replace marker<CR>")
-    wait("require('acp.inline.diff_session').active(source)")
-    wait("vim.bo.filetype == 'acp_inline_review'")
+    wait("require('ade.inline.diff_session').active(source)")
+    wait("vim.bo.filetype == 'ade_inline_review'")
     card = nvim.exec_lua("""
         local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
         local text = table.concat(lines, "\\n")
@@ -140,27 +140,27 @@ try:
     assert card["proposal"], card
     assert card["context"], card
     nvim.input("g3")
-    wait("not require('acp.inline.diff_session').active(source)")
+    wait("not require('ade.inline.diff_session').active(source)")
     print("ok: a narrow screen falls back to the card renderer")
 
     nvim.exec_lua("""
-        require('acp.controller').state().config.inline.window.review.min_split_width = 90
+        require('ade.controller').state().config.inline.window.review.min_split_width = 90
         vim.api.nvim_set_current_win(source_win)
         vim.api.nvim_win_set_cursor(0,{2,0})
     """)
 
     # --- prompt window appearance -------------------------------------------
     nvim.exec_lua("""
-        local config = require('acp.controller').state().config
+        local config = require('ade.controller').state().config
         config.inline.window.border = 'double'
         config.inline.window.title_pos = 'center'
         config.inline.window.highlights.title = 'MyInlineTitle'
         config.inline.window.prompt.width = 30
         config.inline.window.prompt.height = 2
         config.inline.window.prompt.follow_cursor = true
-        require('acp.inline').open({review='write',mode='V',pos1={0,2,1,0},pos2={0,2,1,0}})
+        require('ade.inline').open({review='write',mode='V',pos1={0,2,1,0},pos2={0,2,1,0}})
     """)
-    wait("vim.bo.filetype == 'acp_inline' and vim.fn.mode() == 'i'")
+    wait("vim.bo.filetype == 'ade_inline' and vim.fn.mode() == 'i'")
     appearance = nvim.exec_lua("""
         local config = vim.api.nvim_win_get_config(0)
         local screen = vim.fn.screenpos(source_win, 2, 1)
@@ -181,8 +181,8 @@ try:
                   "vim.api.nvim_exec_autocmds('CursorMoved',{})")
     wait("vim.api.nvim_win_get_config(0).row ~= " + str(before))
     print("ok: the prompt follows the cursor instead of a fixed screen row")
-    nvim.exec_lua("require('acp.inline').stop()")
-    wait("not require('acp.inline').is_active()")
+    nvim.exec_lua("require('ade.inline').stop()")
+    wait("not require('ade.inline').is_active()")
 
     # EOF insertion has no result-side line until accepted; the result column
     # shows filler on its display row. It must still be reachable and
@@ -193,16 +193,16 @@ try:
                 local mode = ...
                 vim.api.nvim_set_current_win(source_win)
                 vim.api.nvim_buf_set_lines(source, 0, -1, false, {'before','after'})
-                local config = require('acp.controller').state().config
+                local config = require('ade.controller').state().config
                 config.inline.window.review.layout = mode
-                assert(require('acp.inline.diff_session').open({
+                assert(require('ade.inline.diff_session').open({
                   bufnr=source, lines={'before','after','APPENDED'}, config=config,
                 }))
             """, mode)
             nvim.input("]c")
             wait("vim.api.nvim_win_get_cursor(0)[1] == 3")
             nvim.input(action)
-            wait("not require('acp.inline.diff_session').active(source)")
+            wait("not require('ade.inline.diff_session').active(source)")
             expected = ["before", "after"] + (["APPENDED"] if action == "ga" else [])
             assert nvim.exec_lua("return vim.api.nvim_buf_get_lines(source,0,-1,false)") == expected
     print("ok: both layouts navigate and decide EOF insertions individually")
@@ -212,12 +212,12 @@ try:
     nvim.exec_lua("""
         vim.api.nvim_set_current_win(source_win)
         vim.api.nvim_buf_set_lines(source, 0, -1, false, {'alpha','beta','gamma'})
-        local config = require('acp.controller').state().config
-        assert(require('acp.inline.diff_session').open({
+        local config = require('ade.controller').state().config
+        assert(require('ade.inline.diff_session').open({
           bufnr=source, lines={'alpha','BETA','gamma'}, config=config,
         }))
     """)
-    wait("require('acp.inline.diff_session').active(source)")
+    wait("require('ade.inline.diff_session').active(source)")
     for win in nvim.exec_lua("return vim.api.nvim_tabpage_list_wins(0)"):
         before = nvim.exec_lua("return vim.api.nvim_win_get_buf(...)", win)
         for command in ("edit /tmp/opencode/should-not-open.lua", "enew", "bnext"):
@@ -237,7 +237,7 @@ try:
     # A review must not linger half-alive either, and closing the tab is still
     # allowed even though every pane is pinned.
     nvim.exec_lua("vim.cmd('tabclose')")
-    wait("not require('acp.inline.diff_session').active(source)")
+    wait("not require('ade.inline.diff_session').active(source)")
     print("ok: review panes are pinned to their buffers and reject edits without blocking close")
 
     # Popups opened while a review runs must not inherit its window options and
@@ -245,12 +245,12 @@ try:
     nvim.exec_lua("""
         vim.api.nvim_set_current_win(source_win)
         vim.api.nvim_buf_set_lines(source, 0, -1, false, {'alpha','beta','gamma'})
-        local config = require('acp.controller').state().config
-        assert(require('acp.inline.diff_session').open({
+        local config = require('ade.controller').state().config
+        assert(require('ade.inline.diff_session').open({
           bufnr=source, lines={'alpha','BETA','gamma'}, config=config,
         }))
     """)
-    wait("require('acp.inline.diff_session').active(source)")
+    wait("require('ade.inline.diff_session').active(source)")
     leaked = nvim.exec_lua("""
         local win = vim.api.nvim_open_win(vim.api.nvim_create_buf(false, true), false, {
           relative='editor', row=1, col=1, width=20, height=3, style='minimal',
@@ -263,9 +263,9 @@ try:
         return out
     """)
     assert leaked["diff"] is False, leaked
-    assert "AcpReview" not in leaked["winhl"], leaked
+    assert "AdeReview" not in leaked["winhl"], leaked
     nvim.exec_lua("vim.cmd('tabclose')")
-    wait("not require('acp.inline.diff_session').active(source)")
+    wait("not require('ade.inline.diff_session').active(source)")
     print("ok: a float opened during review does not inherit diff or review window highlights")
 
     nvim.exec_lua("""
@@ -283,10 +283,10 @@ try:
         -- not about advancing: pin the old stay-put behaviour so the key
         -- sequence and its expectations below stay meaningful. A copy keeps the
         -- shared config on its default (`advance = true`) for later cases.
-        local config = vim.deepcopy(require('acp.controller').state().config)
+        local config = vim.deepcopy(require('ade.controller').state().config)
         config.inline.window.review.layout = '3-column'
         config.inline.window.review.advance = false
-        assert(require('acp.inline.diff_session').open({bufnr=source, lines=edited, config=config}))
+        assert(require('ade.inline.diff_session').open({bufnr=source, lines=edited, config=config}))
         review_result_win = vim.api.nvim_get_current_win()
     """)
     for key, row in (("]c", 3), ("ga", 3), ("]c", 11), ("]h", 21), ("[h", 11)):
@@ -306,7 +306,7 @@ try:
     print("ok: hunk order survives accepted insertions and side-pane navigation stays in its column")
 
     filler = nvim.exec_lua("""
-        local ns = vim.api.nvim_get_namespaces()['acp.inline.review']
+        local ns = vim.api.nvim_get_namespaces()['ade.inline.review']
         local out = {}
         for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
           for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(vim.api.nvim_win_get_buf(win), ns, 0, -1, {details=true})) do
@@ -320,10 +320,10 @@ try:
     """)
     assert filler, "the insertion must leave filler in the original column"
     for pane in filler:
-        assert pane["name"] == "AcpReviewFiller", pane
+        assert pane["name"] == "AdeReviewFiller", pane
         assert pane["fg"] == 0x5C6370, pane
     print("ok: filler rows use the fixed subdued grey, not the normal white foreground")
-    nvim.exec_lua("require('acp.inline.diff_session').close_all()")
+    nvim.exec_lua("require('ade.inline.diff_session').close_all()")
 
     # Advancing is on by default: deciding a hunk moves the cursor to the next
     # pending one instead of staying put.
@@ -334,17 +334,17 @@ try:
         edited[3], edited[10], edited[20] = 'changed 3', 'changed 10', 'changed 20'
         vim.api.nvim_buf_set_lines(source, 0, -1, false, old)
         vim.api.nvim_set_current_win(source_win)
-        local config = require('acp.controller').state().config
+        local config = require('ade.controller').state().config
         assert(config.inline.window.review.advance == true, 'advance must default to true')
         config.inline.window.review.layout = '3-column'
-        assert(require('acp.inline.diff_session').open({bufnr=source, lines=edited, config=config}))
+        assert(require('ade.inline.diff_session').open({bufnr=source, lines=edited, config=config}))
     """)
     nvim.input("]c")
     wait("vim.api.nvim_win_get_cursor(0)[1] == 3")
     nvim.input("ga")
     wait("vim.api.nvim_win_get_cursor(0)[1] == 10")
     print("ok: accepting a hunk advances to the next pending one by default")
-    nvim.exec_lua("require('acp.inline.diff_session').close_all()")
+    nvim.exec_lua("require('ade.inline.diff_session').close_all()")
 finally:
     try:
         nvim.command("qa!")

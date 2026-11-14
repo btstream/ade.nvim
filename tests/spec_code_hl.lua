@@ -1,8 +1,8 @@
 -- Tests for fenced-code syntax highlighting and its background.
 return function(t)
-  local CodeHL = require("acp.ui.code_hl")
-  local blocks = require("acp.ui.blocks")
-  local state = require("acp.session.state")
+  local CodeHL = require("ade.ui.code_hl")
+  local blocks = require("ade.ui.blocks")
+  local state = require("ade.session.state")
 
   local function render(text)
     local s = state.new("s", "/tmp")
@@ -89,7 +89,7 @@ return function(t)
       for _, line in ipairs(lines) do
         if line.bg then
           seen = seen + 1
-          t.eq("AcpCodeBlockBg", line.bg)
+          t.eq("AdeCodeBlockBg", line.bg)
         end
       end
       t.eq(2, seen, "the language row and the code row should be painted")
@@ -147,8 +147,8 @@ return function(t)
       local cache = {}
       local partial = "```lua\nlocal x = 1"
       local full = "```lua\nlocal x = 1\n```"
-      blocks.render_text(partial, "AcpAssistant", 80, cache)
-      local lines = blocks.render_text(full, "AcpAssistant", 80, cache)
+      blocks.render_text(partial, "AdeAssistant", 80, cache)
+      local lines = blocks.render_text(full, "AdeAssistant", 80, cache)
       local saw_syntax = false
       for _, line in ipairs(lines) do
         for _, seg in ipairs(line.segments or {}) do
@@ -178,7 +178,7 @@ return function(t)
         end
       end
       t.truthy(found, "language label missing")
-      t.eq("AcpCodeBlockBg", found.bg, "the label row is part of the block surface")
+      t.eq("AdeCodeBlockBg", found.bg, "the label row is part of the block surface")
     end)
 
     t.it("does not add a row for the closing fence", function()
@@ -224,19 +224,19 @@ return function(t)
       end
 
       for i = 1, #full do
-        blocks.render_text(full:sub(1, i), "AcpAssistant", 80, cache)
+        blocks.render_text(full:sub(1, i), "AdeAssistant", 80, cache)
       end
-      local streamed = blocks.render_text(full, "AcpAssistant", 80, cache)
-      local fresh = blocks.render_text(full, "AcpAssistant", 80)
+      local streamed = blocks.render_text(full, "AdeAssistant", 80, cache)
+      local fresh = blocks.render_text(full, "AdeAssistant", 80)
       t.eq(norm(fresh), norm(streamed), "streamed render diverged from a full render")
     end)
 
     t.it("does not duplicate syntax ranges on repeated renders", function()
       local cache = {}
       local text = "```lua\nlocal x = 1\n```"
-      blocks.render_text(text, "AcpAssistant", 80, cache)
-      local first = blocks.render_text(text, "AcpAssistant", 80, cache)
-      local second = blocks.render_text(text, "AcpAssistant", 80, cache)
+      blocks.render_text(text, "AdeAssistant", 80, cache)
+      local first = blocks.render_text(text, "AdeAssistant", 80, cache)
+      local second = blocks.render_text(text, "AdeAssistant", 80, cache)
       local function count(lines)
         local n = 0
         for _, l in ipairs(lines) do

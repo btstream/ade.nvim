@@ -1,8 +1,8 @@
 -- Tests for GFM pipe-table rendering.
 return function(t)
-  local blocks = require("acp.ui.blocks")
-  local state = require("acp.session.state")
-  local Table = require("acp.ui.table")
+  local blocks = require("ade.ui.blocks")
+  local state = require("ade.session.state")
+  local Table = require("ade.ui.table")
 
   local function render(text, width)
     local s = state.new("s", "/proj")
@@ -155,7 +155,7 @@ return function(t)
         if line.table then
           -- The first segment paints the leading border. Cell styling must
           -- never spill over any of the vertical border glyphs.
-          t.eq("AcpTableBorder", line.segments[1].group, "border group missing on: " .. line.text)
+          t.eq("AdeTableBorder", line.segments[1].group, "border group missing on: " .. line.text)
         end
       end
     end)
@@ -185,7 +185,7 @@ return function(t)
             local painted = false
             for _, seg in ipairs(line.segments) do
               if seg.s < bar - 1 + #"│" and seg.e > bar - 1 then
-                t.eq("AcpTableBorder", seg.group, "cell highlight spilled onto a border: " .. line.text)
+                t.eq("AdeTableBorder", seg.group, "cell highlight spilled onto a border: " .. line.text)
                 painted = true
               end
             end
@@ -199,11 +199,11 @@ return function(t)
     t.it("measures natural column widths using visible cell content", function()
       local marked = Table.render(
         Table.parse({ "| **标题** | `name` |", "|---|---|", "| [内容](https://long.test/url) | `abc` |" }),
-        "AcpAssistant",
+        "AdeAssistant",
         80
       )
       local plain =
-        Table.render(Table.parse({ "| 标题 | name |", "|---|---|", "| 内容 | abc |" }), "AcpAssistant", 80)
+        Table.render(Table.parse({ "| 标题 | name |", "|---|---|", "| 内容 | abc |" }), "AdeAssistant", 80)
       t.eq(texts(plain), texts(marked))
     end)
 
@@ -214,11 +214,11 @@ return function(t)
           "|---|---|",
           "| a | `alpha bravo charlie delta` **粗体文字** [链接](https://long.test/url) |",
         }),
-        "AcpAssistant",
+        "AdeAssistant",
         30
       )
       local code, bold, link = {}, {}, {}
-      local groups = { AcpMdCode = code, AcpBold = bold, AcpMdLink = link }
+      local groups = { AdeMdCode = code, AdeBold = bold, AdeMdLink = link }
       for _, line in ipairs(lines) do
         for _, seg in ipairs(line.segments) do
           local target = groups[seg.group]
@@ -312,14 +312,14 @@ return function(t)
       local groups = {}
       for _, line in ipairs(lines) do
         for _, seg in ipairs(line.segments or {}) do
-          if seg.group and seg.group ~= "AcpTableBorder" and seg.group ~= "AcpTableHead" then
+          if seg.group and seg.group ~= "AdeTableBorder" and seg.group ~= "AdeTableHead" then
             groups[seg.group] = true
           end
         end
       end
-      t.truthy(groups["AcpBold"], "bold missing in a cell")
-      t.truthy(groups["AcpItalic"], "italic missing in a cell")
-      t.truthy(groups["AcpMdCode"], "inline code missing in a cell")
+      t.truthy(groups["AdeBold"], "bold missing in a cell")
+      t.truthy(groups["AdeItalic"], "italic missing in a cell")
+      t.truthy(groups["AdeMdCode"], "inline code missing in a cell")
     end)
 
     t.it("hides markup delimiters inside cells", function()
@@ -411,8 +411,8 @@ return function(t)
       local cache = {}
       for i = 1, #source do
         local prefix = source:sub(1, i)
-        local streamed = blocks.render_text(prefix, "AcpAssistant", 40, cache)
-        local fresh = blocks.render_text(prefix, "AcpAssistant", 40)
+        local streamed = blocks.render_text(prefix, "AdeAssistant", 40, cache)
+        local fresh = blocks.render_text(prefix, "AdeAssistant", 40)
         t.eq(fresh, streamed, "incremental layout lost a table row at byte " .. i)
       end
     end)
@@ -422,8 +422,8 @@ return function(t)
       for line in source:gmatch("[^\n]*\n") do
         prefix = prefix .. line
         t.eq(
-          blocks.render_text(prefix, "AcpAssistant", 40),
-          blocks.render_text(prefix, "AcpAssistant", 40, cache),
+          blocks.render_text(prefix, "AdeAssistant", 40),
+          blocks.render_text(prefix, "AdeAssistant", 40, cache),
           "completed source rows must not vanish"
         )
       end
@@ -438,8 +438,8 @@ return function(t)
       for i = 0, vim.fn.strchars(full) - 1 do
         prefix = prefix .. vim.fn.strcharpart(full, i, 1)
         t.eq(
-          blocks.render_text(prefix, "AcpAssistant", 35),
-          blocks.render_text(prefix, "AcpAssistant", 35, cache),
+          blocks.render_text(prefix, "AdeAssistant", 35),
+          blocks.render_text(prefix, "AdeAssistant", 35, cache),
           "CJK stream differs at character " .. i
         )
       end
@@ -448,7 +448,7 @@ return function(t)
     t.it("reuses a completed table when subsequent prose streams", function()
       local prefix = "Intro\n| a | b |\n|---|---|\n| alpha | beta |\n\n"
       local cache = {}
-      blocks.render_text(prefix, "AcpAssistant", 40, cache)
+      blocks.render_text(prefix, "AdeAssistant", 40, cache)
       local stable_rule = cache.lines[2]
       local calls, original = 0, Table.render
       Table.render = function(...)
@@ -458,7 +458,7 @@ return function(t)
       local ok, err = pcall(function()
         for i = 1, 20 do
           prefix = prefix .. "x"
-          blocks.render_text(prefix, "AcpAssistant", 40, cache)
+          blocks.render_text(prefix, "AdeAssistant", 40, cache)
         end
       end)
       Table.render = original
@@ -470,8 +470,8 @@ return function(t)
     end)
 
     t.it("survives JSON null fields in tool diffs", function()
-      local Chat = require("acp.ui.chat")
-      local cfg = require("acp.config").defaults
+      local Chat = require("ade.ui.chat")
+      local cfg = require("ade.config").defaults
       local session = state.new("nil-diff", "/tmp")
       session:track_changes()
       session:append({
@@ -500,8 +500,8 @@ return function(t)
     end)
 
     t.it("matches a fresh transcript and extmarks as a mixed CJK table grows", function()
-      local Chat = require("acp.ui.chat")
-      local cfg = require("acp.config").defaults
+      local Chat = require("ade.ui.chat")
+      local cfg = require("ade.config").defaults
       local session = state.new("stream-table", "/proj")
       session:track_changes()
       local incremental, fresh = Chat.new({ config = cfg }), Chat.new({ config = cfg })
@@ -519,7 +519,7 @@ return function(t)
         local out = {}
         for _, mark in
           ipairs(
-            vim.api.nvim_buf_get_extmarks(chat.buf, vim.api.nvim_get_namespaces().acp_chat, 0, -1, { details = true })
+            vim.api.nvim_buf_get_extmarks(chat.buf, vim.api.nvim_get_namespaces().ade_chat, 0, -1, { details = true })
           )
         do
           local d = mark[4]

@@ -1,5 +1,5 @@
 return function(t)
-  local edgy_views = require("acp.integrations.edgy")
+  local edgy_views = require("ade.integrations.edgy")
 
   local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
   local has_edgy = (function()
@@ -22,13 +22,13 @@ return function(t)
       for _, view in ipairs(opts.right) do
         fts[view.ft] = true
       end
-      t.truthy(fts.acp_chat, "acp_chat missing")
-      t.truthy(fts.acp_input, "acp_input missing")
+      t.truthy(fts.ade_chat, "ade_chat missing")
+      t.truthy(fts.ade_input, "ade_input missing")
     end)
 
     if not has_edgy then
       t.it("has_view reports false without edgy", function()
-        t.falsy(edgy_views.has_view("acp_chat"))
+        t.falsy(edgy_views.has_view("ade_chat"))
       end)
       t.it("check_registered does not raise without edgy", function()
         edgy_views._checked = nil
@@ -53,18 +53,18 @@ return function(t)
 
     t.it("detects both views when configured correctly", function()
       with_edgy_config({
-        { ft = "acp_chat", title = "Agent" },
-        { ft = "acp_input", title = "Message", size = { height = 0.2 } },
+        { ft = "ade_chat", title = "Agent" },
+        { ft = "ade_input", title = "Message", size = { height = 0.2 } },
       }, function()
-        t.truthy(edgy_views.has_view("acp_chat"), "acp_chat not detected")
-        t.truthy(edgy_views.has_view("acp_input"), "acp_input not detected")
+        t.truthy(edgy_views.has_view("ade_chat"), "ade_chat not detected")
+        t.truthy(edgy_views.has_view("ade_input"), "ade_input not detected")
       end)
     end)
 
     t.it("detects a view registered by filetype string", function()
-      with_edgy_config({ "acp_chat", { ft = "acp_input" } }, function()
-        t.truthy(edgy_views.has_view("acp_chat"), "string entry not detected")
-        t.truthy(edgy_views.has_view("acp_input"))
+      with_edgy_config({ "ade_chat", { ft = "ade_input" } }, function()
+        t.truthy(edgy_views.has_view("ade_chat"), "string entry not detected")
+        t.truthy(edgy_views.has_view("ade_input"))
       end)
     end)
 
@@ -73,23 +73,23 @@ return function(t)
       -- `input = {...}` is a named key, so edgy's array part holds only one
       -- view and never builds that position.
       with_edgy_config({
-        { ft = "acp_chat", title = "Agent" },
-        input = { ft = "acp_input", title = "Message" },
+        { ft = "ade_chat", title = "Agent" },
+        input = { ft = "ade_input", title = "Message" },
       }, function()
-        t.truthy(edgy_views.has_view("acp_chat"), "acp_chat should be found")
-        t.falsy(edgy_views.has_view("acp_input"), "acp_input must be reported missing")
+        t.truthy(edgy_views.has_view("ade_chat"), "ade_chat should be found")
+        t.falsy(edgy_views.has_view("ade_input"), "ade_input must be reported missing")
       end)
     end)
 
     t.it("reports nothing when both views are registered", function()
       with_edgy_config({
-        { ft = "acp_chat" },
-        { ft = "acp_input" },
+        { ft = "ade_chat" },
+        { ft = "ade_input" },
       }, function()
         local warned = false
         local original = vim.notify
         vim.notify = function(msg, level)
-          if level == vim.log.levels.WARN and tostring(msg):find("acp.nvim", 1, true) then
+          if level == vim.log.levels.WARN and tostring(msg):find("ade.nvim", 1, true) then
             warned = true
           end
         end
@@ -102,8 +102,8 @@ return function(t)
 
     t.it("warns when a view is missing", function()
       with_edgy_config({
-        { ft = "acp_chat" },
-        input = { ft = "acp_input" },
+        { ft = "ade_chat" },
+        input = { ft = "ade_input" },
       }, function()
         local messages = {}
         local original = vim.notify
@@ -116,15 +116,15 @@ return function(t)
         vim.wait(300)
         vim.notify = original
         t.truthy(#messages > 0, "no warning was shown")
-        t.match("acp_input", messages[1])
+        t.match("ade_input", messages[1])
         t.match("array", messages[1])
       end)
     end)
 
     t.it("warns only once", function()
       with_edgy_config({
-        { ft = "acp_chat" },
-        input = { ft = "acp_input" },
+        { ft = "ade_chat" },
+        input = { ft = "ade_input" },
       }, function()
         local count = 0
         local original = vim.notify

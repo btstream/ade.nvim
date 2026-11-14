@@ -1,5 +1,5 @@
 return function(t)
-  local rpcmod = require("acp.transport.jsonrpc")
+  local rpcmod = require("ade.transport.jsonrpc")
 
   t.describe("jsonrpc", function()
     t.it("matches responses to requests", function()

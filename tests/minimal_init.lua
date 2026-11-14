@@ -2,7 +2,7 @@
 -- state holds drafts and the log, cache holds image previews. Without the
 -- state/cache overrides the suite clears the user's real drafts.json and
 -- rewrites their log.
-local isolated = string.format("/tmp/opencode/acp-test-%d", vim.uv.os_getpid())
+local isolated = string.format("/tmp/opencode/ade-test-%d", vim.uv.os_getpid())
 vim.env.XDG_DATA_HOME = isolated .. "/data"
 vim.env.XDG_STATE_HOME = isolated .. "/state"
 vim.env.XDG_CACHE_HOME = isolated .. "/cache"

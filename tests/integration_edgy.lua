@@ -1,4 +1,4 @@
--- Integration test: acp.nvim windows under edgy.nvim control.
+-- Integration test: ade.nvim windows under edgy.nvim control.
 local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
 local edgy_path = root .. "../edgy.nvim"
 local candidates = {
@@ -49,7 +49,7 @@ end
 pcall(vim.cmd, "packadd edgy.nvim")
 
 local edgy = require("edgy")
-local acp_edgy = require("acp.integrations.edgy")
+local ade_edgy = require("ade.integrations.edgy")
 
 local opts = {
   left = { "Trouble" },
@@ -62,27 +62,27 @@ local opts = {
   },
   animate = { enabled = false },
 }
-acp_edgy.extend(opts)
+ade_edgy.extend(opts)
 edgy.setup(opts)
 
-local acp = require("acp")
-local controller = require("acp.controller")
+local ade = require("ade")
+local controller = require("ade.controller")
 
-acp.setup({
+ade.setup({
   agent = "opencode",
   agents = { opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } } },
   ui = {},
   layout = { backend = "external", input_height = 6 },
 })
 
-acp.open()
+ade.open()
 local st = controller.state()
 
 wait(function()
   return st.char_set == nil and st.session ~= nil
 end, 8000, "session creation")
 
-check("edgy recognizes both acp windows", function()
+check("edgy recognizes both ade windows", function()
   local chat_ok = st.chat and st.chat:is_visible()
   local input_ok = st.input and st.input:is_visible()
   assert(chat_ok, "chat window missing under edgy")
@@ -96,13 +96,13 @@ check("edgy places the views in the right edgebar", function()
   assert(input ~= nil, "composer window is not managed by edgy")
 end)
 
-check("acp owns the composer winbar, not edgy", function()
+check("ade owns the composer winbar, not edgy", function()
   local winbar = vim.api.nvim_get_option_value("winbar", { win = st.input.win })
-  assert(winbar and winbar:find("acp_input") == nil, "edgy winbar leaked in")
+  assert(winbar and winbar:find("ade_input") == nil, "edgy winbar leaked in")
   assert(winbar and #winbar > 0, "composer winbar empty")
 end)
 
-check("acp keeps ownership of both winbars by default", function()
+check("ade keeps ownership of both winbars by default", function()
   local chat_bar = vim.api.nvim_get_option_value("winbar", { win = st.chat.win })
   local input_bar = vim.api.nvim_get_option_value("winbar", { win = st.input.win })
   local chat_res = vim.api.nvim_eval_statusline(chat_bar, {
@@ -124,7 +124,7 @@ check("main editing area is untouched", function()
   for _, win in ipairs(vim.api.nvim_list_wins()) do
     local buf = vim.api.nvim_win_get_buf(win)
     local ft = vim.bo[buf].filetype
-    if ft ~= "acp_chat" and ft ~= "acp_input" then
+    if ft ~= "ade_chat" and ft ~= "ade_input" then
       main_wins = main_wins + 1
     end
   end
@@ -140,7 +140,7 @@ check("composer keymaps are buffer local", function()
     end
   end
   assert(has_send, "send keymap missing")
-  -- Check the global table from a plain buffer that has no ACP maps. The ACP
+  -- Check the global table from a plain buffer that has no ADE maps. The ADE
   -- windows are locked to their buffers, so open a separate window.
   vim.cmd("split | enew")
   local scratch = vim.api.nvim_get_current_buf()
@@ -185,7 +185,7 @@ check("idle transcript follows edgy width changes without a session update", fun
   end, 2000, "edgy width restore")
 end)
 
--- Closing only the composer must not be re-created by acp.
+-- Closing only the composer must not be re-created by ade.
 vim.api.nvim_win_close(st.input.win, true)
 vim.wait(200)
 check("closing one view does not force it back open", function()
@@ -196,7 +196,7 @@ check("the session survives closing the composer", function()
   assert(st.session ~= nil, "session lost")
 end)
 
-acp.hide()
+ade.hide()
 
 if #failures > 0 then
   io.write("\n" .. #failures .. " edgy integration failures:\n")

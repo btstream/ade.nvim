@@ -1,16 +1,16 @@
 return function(t)
-  local acp = require("acp")
-  local controller = require("acp.controller")
-  local picker = require("acp.ui.picker")
-  local state = require("acp.session.state")
-  local agents = require("acp.agents")
-  local Options = require("acp.app.options")
+  local ade = require("ade")
+  local controller = require("ade.controller")
+  local picker = require("ade.ui.picker")
+  local state = require("ade.session.state")
+  local agents = require("ade.agents")
+  local Options = require("ade.app.options")
 
   local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
   local mock = root .. "tests/mock_agent.py"
 
   local function setup(profile)
-    acp.setup({
+    ade.setup({
       agent = profile,
       agents = {
         [profile] = {
@@ -162,7 +162,7 @@ return function(t)
       controller.hide()
     end)
 
-    t.it("lists every control in :Acp config", function()
+    t.it("lists every control in :Ade config", function()
       local S = setup("claude")
       local captured = capture(function()
         controller.pick_config()

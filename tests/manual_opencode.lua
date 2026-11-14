@@ -1,15 +1,15 @@
 -- Real OpenCode end-to-end check (requires a logged in `opencode`).
-local controller = require("acp.controller")
-local acp = require("acp")
+local controller = require("ade.controller")
+local ade = require("ade")
 
-acp.setup({
+ade.setup({
   agent = "opencode",
   agents = { opencode = { command = "opencode", args = { "acp" } } },
   ui = {},
   layout = { input_height = 6 },
 })
 
-acp.open()
+ade.open()
 local st = controller.state()
 
 vim.wait(30000, function()
@@ -21,7 +21,7 @@ if not st.session then
   return
 end
 
-local presenter = require("acp.ui.presenter")
+local presenter = require("ade.ui.presenter")
 local model, mode = presenter.toolbar_labels(st.session)
 print("MODEL:", model, "| MODE:", mode)
 print("OPTIONS:", #(st.session.config_options or {}))
@@ -38,5 +38,5 @@ print("---- usage ----")
 print(vim.inspect(st.session.usage))
 print("---- error ----")
 print(vim.inspect(st.session.last_error))
-acp.hide()
+ade.hide()
 vim.cmd("qa!")

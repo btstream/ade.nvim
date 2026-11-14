@@ -1,10 +1,10 @@
 -- Deterministic receive-limit and diagnostics tests. `jobstart` is stubbed so a
 -- single callback can be made as large (or as slow) as the scenario needs.
 return function(t)
-  local process = require("acp.transport.process")
+  local process = require("ade.transport.process")
 
   local function capture_log()
-    local Log = require("acp.log")
+    local Log = require("ade.log")
     local lines, original = {}, Log.error
     Log.error = function(fmt, ...)
       lines[#lines + 1] = string.format(fmt, ...)
@@ -231,7 +231,7 @@ return function(t)
     end)
 
     t.it("warns once at each escalating memory level", function()
-      local Log = require("acp.log")
+      local Log = require("ade.log")
       local warnings, original = {}, Log.warn
       Log.warn = function(fmt, ...)
         warnings[#warnings + 1] = string.format(fmt, ...)
@@ -450,7 +450,7 @@ return function(t)
         end
         return original(fd, size, offset)
       end
-      local Log = require("acp.log")
+      local Log = require("ade.log")
       local warnings, original_warn = {}, Log.error
       Log.error = function(fmt, ...)
         warnings[#warnings + 1] = string.format(fmt, ...)
@@ -486,14 +486,14 @@ return function(t)
     t.it("removes spill files older than the TTL only", function()
       local dir = vim.fn.tempname() .. "-spill"
       vim.fn.mkdir(dir, "p")
-      local stale, fresh = dir .. "/acp-spill-old", dir .. "/acp-spill-new"
+      local stale, fresh = dir .. "/ade-spill-old", dir .. "/ade-spill-new"
       local other = dir .. "/other"
       for _, path in ipairs({ stale, fresh, other }) do
         vim.fn.writefile({ "x" }, path)
       end
       vim.uv.fs_utime(stale, os.time() - 2 * 24 * 3600, os.time() - 2 * 24 * 3600)
       process.sweep_spill(dir)
-      t.eq({ "acp-spill-new", "other" }, vim.fn.readdir(dir))
+      t.eq({ "ade-spill-new", "other" }, vim.fn.readdir(dir))
       vim.fn.delete(dir, "rf")
     end)
 
@@ -566,7 +566,7 @@ return function(t)
     t.it("starts stale-file cleanup and releases the spool before normal exit", function()
       local dir = vim.fn.tempname() .. "-spill"
       vim.fn.mkdir(dir, "p")
-      local stale = dir .. "/acp-spill-stale"
+      local stale = dir .. "/ade-spill-stale"
       vim.fn.writefile({ "old" }, stale)
       vim.uv.fs_utime(stale, os.time() - 2 * 24 * 3600, os.time() - 2 * 24 * 3600)
       local seen, exits = {}, 0
@@ -626,7 +626,7 @@ return function(t)
     end)
 
     t.it("receives a fragmented message above 16 MiB with the default limits", function()
-      local defaults = require("acp.config").defaults.transport
+      local defaults = require("ade.config").defaults.transport
       local seen, bytes = 0, 0
       with_process({
         max_line_bytes = defaults.max_line_bytes,

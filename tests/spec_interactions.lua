@@ -1,5 +1,5 @@
 return function(t)
-  local Interactions = require("acp.app.interactions")
+  local Interactions = require("ade.app.interactions")
 
   local function harness(policies)
     local answered, shown, dismissed, settled = {}, {}, {}, {}

@@ -1,10 +1,10 @@
 return function(t)
-  local state = require("acp.session.state")
-  local context = require("acp.context")
-  local capabilities = require("acp.protocol.capabilities")
+  local state = require("ade.session.state")
+  local context = require("ade.context")
+  local capabilities = require("ade.protocol.capabilities")
 
   t.describe("session pagination", function()
-    local Catalog = require("acp.app.catalog")
+    local Catalog = require("ade.app.catalog")
 
     ---A catalog whose task calls go straight to `client`, with no coroutine.
     local function catalog_with(list_sessions)
@@ -131,7 +131,7 @@ return function(t)
   end)
 
   t.describe("mcp servers", function()
-    local mod = require("acp.protocol.client")
+    local mod = require("ade.protocol.client")
 
     ---A real client with the transport filtering wired in, and no process.
     local function client_with(caps, declared)

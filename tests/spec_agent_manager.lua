@@ -1,8 +1,8 @@
 -- Store, lock and registry: the parts of the agent manager that never touch the
 -- network. Everything here runs against a throwaway directory.
 return function(t)
-  local store_mod = require("acp.manager.store")
-  local lock_mod = require("acp.manager.lock")
+  local store_mod = require("ade.manager.store")
+  local lock_mod = require("ade.manager.lock")
 
   ---A pid with no process behind it (pid_max can be 4M, so a fixed number
   ---may belong to a live process).
@@ -15,12 +15,12 @@ return function(t)
     end
     error("no free pid found")
   end
-  local registry = require("acp.manager.registry")
+  local registry = require("ade.manager.registry")
 
   local counter = 0
   local function temp_root()
     counter = counter + 1
-    local dir = string.format("/tmp/opencode/acp-manager-%d-%d", vim.uv.hrtime(), counter)
+    local dir = string.format("/tmp/opencode/ade-manager-%d-%d", vim.uv.hrtime(), counter)
     vim.fn.mkdir(dir, "p")
     return dir
   end
@@ -233,6 +233,46 @@ return function(t)
       local third = locks:acquire("claude")
       t.truthy(third, "the lock must be reusable after release")
       locks:release(third)
+      vim.fn.delete(root, "rf")
+    end)
+
+    t.it("reports a root as in use while a live lease or lock exists", function()
+      -- The migration renames the whole tree, so it must be able to ask the same
+      -- question the manager asks: is anybody still using this root?
+      local root = temp_root()
+      local locks = lock_mod.new({
+        root = function()
+          return root
+        end,
+      })
+      t.eq(false, lock_mod.in_use(root), "an empty root is not in use")
+
+      local lease = locks:lease("pi", "1.0.0")
+      t.truthy(lease)
+      local busy, reason = lock_mod.in_use(root)
+      t.truthy(busy, "a live lease means the root is in use")
+      t.match("in use", reason)
+      locks:unlease(lease)
+      t.eq(false, lock_mod.in_use(root), "a released lease no longer counts")
+
+      local handle = locks:acquire("pi")
+      t.truthy(handle)
+      local locked, lock_reason = lock_mod.in_use(root)
+      t.truthy(locked, "a held install lock means the root is in use")
+      t.match("lock", lock_reason)
+      locks:release(handle)
+      t.eq(false, lock_mod.in_use(root))
+
+      -- A stale record is not a reason to wait.
+      local dir = root .. "/.leases/pi"
+      vim.fn.mkdir(dir, "p")
+      assert(lock_mod.write_json_atomic(dir .. "/lease-" .. dead_pid() .. ".json", {
+        host = lock_mod.hostname(),
+        pid = dead_pid(),
+        installId = "1.0.0",
+        heartbeat = lock_mod.now() - 24 * 60 * 60 * 1000,
+      }))
+      t.eq(false, lock_mod.in_use(root), "an abandoned lease must not block anything")
       vim.fn.delete(root, "rf")
     end)
 

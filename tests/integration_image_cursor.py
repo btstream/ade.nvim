@@ -19,7 +19,7 @@ import pynvim
 logging.disable(logging.CRITICAL)
 ROOT = str(Path(__file__).resolve().parent.parent)
 USE_EDGY = "edgy" in sys.argv[1:]
-state = tempfile.TemporaryDirectory(prefix="acp-image-ui-", dir="/tmp/opencode")
+state = tempfile.TemporaryDirectory(prefix="ade-image-ui-", dir="/tmp/opencode")
 nvim = pynvim.attach("child", argv=["env", "XDG_STATE_HOME=" + state.name, "nvim", "--embed", "-u", "NONE", "-i", "NONE", "--noplugin"])
 
 
@@ -42,7 +42,7 @@ def snapshot():
           lines = vim.api.nvim_buf_get_lines(test_input.buf, 0, -1, false),
           attachments = #test_input.attachments,
           image_marks = vim.api.nvim_buf_get_extmarks(test_input.buf,
-            vim.api.nvim_get_namespaces()['acp.input.images'], 0, -1, {details = true}),
+            vim.api.nvim_get_namespaces()['ade.input.images'], 0, -1, {details = true}),
         }
         """
     )
@@ -51,7 +51,7 @@ def snapshot():
 def attach_image(path_lua="test_shot"):
     nvim.exec_lua(
         """
-        local context = require('acp.context')
+        local context = require('ade.context')
         local att, err = context.image(_G[({ ... })[1]], test_cfg)
         assert(att, err)
         test_input:add_attachment(att)
@@ -68,7 +68,7 @@ try:
         local root, use_edgy = ...
         vim.notify = function() end -- Notifications must not open a hit-enter prompt.
         vim.opt.runtimepath:append(root)
-        local Config = require('acp.config')
+        local Config = require('ade.config')
         if use_edgy then
           local edgy = vim.fn.expand('~/.local/share/nvim/lazy/edgy.nvim')
           assert(vim.fn.isdirectory(edgy) == 1, 'edgy.nvim is required for this test')
@@ -76,21 +76,21 @@ try:
           vim.opt.laststatus = 3
           vim.opt.splitkeep = 'screen'
           local opts = { animate = { enabled = false }, options = { right = { size = 55 } } }
-          require('acp.integrations.edgy').extend(opts)
+          require('ade.integrations.edgy').extend(opts)
           require('edgy').setup(opts)
-          require('acp').setup({
+          require('ade').setup({
             agents = { opencode = { command = 'python3', args = { root .. '/tests/mock_agent.py' } } },
             layout = { backend = 'external', input_height = 6 },
           })
-          require('acp').open()
-          local st = require('acp.controller').state()
+          require('ade').open()
+          local st = require('ade.controller').state()
           assert(vim.wait(10000, function() return st.session ~= nil end, 20), 'no session')
           _G.test_cfg, _G.test_input = st.config, st.input
           test_input:clear()
           vim.api.nvim_set_current_win(test_input.win)
         else
           _G.test_cfg = Config.validate(Config.defaults)
-          _G.test_input = require('acp.ui.input').new({ config = test_cfg })
+          _G.test_input = require('ade.ui.input').new({ config = test_cfg })
         end
 
         local dir = vim.fn.tempname()
@@ -140,7 +140,7 @@ try:
         """
     )
     assert "hello[Image 1] brave world" in screen, f"image is not drawn between the cursor's text: {screen!r}"
-    assert marks[0][3]["hl_group"] == "AcpInputImage", marks
+    assert marks[0][3]["hl_group"] == "AdeInputImage", marks
     print("ok: real screen draws the image chip at the input cursor, not the winbar")
     print("ok: pasting inserts an editable highlighted token and keeps insert mode")
 
@@ -178,7 +178,7 @@ try:
     if USE_EDGY:
         nvim.exec_lua(
             """
-            assert(require('acp.controller').paste_image({ command = { 'cat', test_clip } }))
+            assert(require('ade.controller').paste_image({ command = { 'cat', test_clip } }))
             """
         )
         wait_for("real clipboard callback", "#test_input.attachments == 2")
@@ -186,15 +186,15 @@ try:
         assert any(mark[1:3] == [0, 14] for mark in actual["image_marks"]), actual
         assert actual["mode"] == "i", actual
         assert nvim.exec_lua("return test_input:text()") == "helloX brave world\nsecond line", actual
-        bar = nvim.exec_lua("return require('acp.controller').composer_bar(test_input.win)")
+        bar = nvim.exec_lua("return require('ade.controller').composer_bar(test_input.win)")
         assert "shot.png" not in bar and "clip.png" not in bar, bar
         print("ok: real controller clipboard callback under edgy anchors the image inside input")
         nvim.exec_lua(
             """
-            local reader = require('acp.context.clipboard')
+            local reader = require('ade.context.clipboard')
             local saved = reader.read
             reader.read = function(_, done) _G.pending_image = done end
-            assert(require('acp.controller').paste_image())
+            assert(require('ade.controller').paste_image())
             reader.read = saved
             """
         )
@@ -211,9 +211,9 @@ try:
         """
         local c = test_cfg
         local buf = test_input.buf
-        vim.bo[buf].filetype = 'acp_input'
+        vim.bo[buf].filetype = 'ade_input'
         _G.paste_calls = 0
-        require('acp.ui.keymaps').attach_input(buf, {
+        require('ade.ui.keymaps').attach_input(buf, {
           config = c,
           keymaps = c.keymaps.input,
           get_session = function() return { cwd = '/tmp/opencode', commands = {} } end,

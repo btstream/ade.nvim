@@ -1,8 +1,8 @@
 -- Diff extraction and rendering for file-modifying tool calls.
 return function(t)
-  local diff = require("acp.ui.diff")
-  local state = require("acp.session.state")
-  local blocks = require("acp.ui.blocks")
+  local diff = require("ade.ui.diff")
+  local state = require("ade.session.state")
+  local blocks = require("ade.ui.blocks")
 
   local function tool(over)
     local block = {
@@ -100,7 +100,7 @@ return function(t)
       local lines = diff.lines({ { path = "/proj/f.lua", oldText = "", newText = "a\nb\n", synthetic = true } })
       local added = 0
       for _, line in ipairs(lines) do
-        if line.bg == "AcpDiffAdd" then
+        if line.bg == "AdeDiffAdd" then
           added = added + 1
         end
       end
@@ -139,11 +139,11 @@ return function(t)
         end
       end
       t.truthy(add and remove, "both sides of the change are missing")
-      t.eq("AcpDiffAdd", add.bg)
-      t.eq("AcpDiffDelete", remove.bg)
+      t.eq("AdeDiffAdd", add.bg)
+      t.eq("AdeDiffDelete", remove.bg)
       -- The sign is not part of the body colour so a theme can colour it alone.
-      t.eq("AcpDiffAddSign", add.segments[1].group)
-      t.eq("AcpDiffRemoveSign", remove.segments[1].group)
+      t.eq("AdeDiffAddSign", add.segments[1].group)
+      t.eq("AdeDiffRemoveSign", remove.segments[1].group)
     end)
 
     t.it("hides the hunk header when there is only one hunk", function()
@@ -166,7 +166,7 @@ return function(t)
       for _, line in ipairs(lines) do
         if line.text:find("^@@", 1) then
           hunks = hunks + 1
-          t.eq("AcpDiffHunk", line.segments[1].group)
+          t.eq("AdeDiffHunk", line.segments[1].group)
         end
       end
       t.eq(2, hunks, "both hunks should be separated")
@@ -200,7 +200,7 @@ return function(t)
       for _, line in ipairs(lines) do
         if line.text:find("No newline at end of file", 1, true) then
           found = true
-          t.eq("AcpDiffMeta", line.segments[1].group)
+          t.eq("AdeDiffMeta", line.segments[1].group)
         end
       end
       t.truthy(found, "the missing-newline marker is missing")
@@ -224,7 +224,7 @@ return function(t)
       t.eq(20, visible, "the cap should bound the body")
       t.truthy(summary, "the omitted rows need a summary")
       t.match("48%d more lines", summary.text)
-      t.eq("AcpDiffMeta", summary.segments[1].group)
+      t.eq("AdeDiffMeta", summary.segments[1].group)
     end)
 
     t.it("refuses to diff an oversized payload", function()
@@ -253,18 +253,18 @@ return function(t)
       for i, line in ipairs(lines) do
         if line.text:sub(1, 6) == "──" then
           rules[#rules + 1] = i
-          t.eq("AcpDiffMeta", line.segments[1].group)
+          t.eq("AdeDiffMeta", line.segments[1].group)
         end
       end
       t.eq(1, #rules, "exactly one rule belongs between two files")
       local second_header
       for i, line in ipairs(lines) do
-        if line.segments and line.segments[1].group == "AcpDiffFile" and line.text:find("b%.lua") then
+        if line.segments and line.segments[1].group == "AdeDiffFile" and line.text:find("b%.lua") then
           second_header = i
         end
       end
       t.eq(second_header - 1, rules[1], "the rule must sit right before the second header")
-      t.eq("AcpDiffFile", lines[1].segments[1].group, "the first file must not start with a rule")
+      t.eq("AdeDiffFile", lines[1].segments[1].group, "the first file must not start with a rule")
     end)
 
     t.it("does not add a rule for a single file", function()
@@ -293,8 +293,8 @@ return function(t)
   end)
 
   t.describe("diff syntax highlighting", function()
-    local diff_hl = require("acp.ui.diff_hl")
-    local CodeHL = require("acp.ui.code_hl")
+    local diff_hl = require("ade.ui.diff_hl")
+    local CodeHL = require("ade.ui.code_hl")
 
     local function groups_of(lines)
       local groups = {}
@@ -354,7 +354,7 @@ return function(t)
       local lines = diff.lines({ { path = "/proj/a.lua", oldText = "", newText = "local x = 1\n" } })
       local added
       for _, line in ipairs(lines) do
-        if line.bg == "AcpDiffAdd" then
+        if line.bg == "AdeDiffAdd" then
           added = line
         end
       end
@@ -407,13 +407,13 @@ return function(t)
       })
       local checked = 0
       for _, line in ipairs(lines) do
-        if line.bg == "AcpDiffAdd" or line.bg == "AcpDiffDelete" then
+        if line.bg == "AdeDiffAdd" or line.bg == "AdeDiffDelete" then
           checked = checked + 1
           -- The line-wide background lives in its own namespace; syntax and the
           -- sign are inline segments on top of it, so all three must coexist.
           local sign, syntax = false, false
           for _, seg in ipairs(line.segments or {}) do
-            if seg.group == "AcpDiffAddSign" or seg.group == "AcpDiffRemoveSign" then
+            if seg.group == "AdeDiffAddSign" or seg.group == "AdeDiffRemoveSign" then
               sign = true
             elseif type(seg.group) == "string" and seg.group:sub(1, 1) == "@" then
               syntax = true
@@ -500,7 +500,7 @@ return function(t)
         end
       end
       t.truthy(add, "no added row")
-      t.eq("AcpDiffAdd", add.bg)
+      t.eq("AdeDiffAdd", add.bg)
     end)
 
     t.it("keeps the diff out of a collapsed card", function()
@@ -552,7 +552,7 @@ return function(t)
         end
       end
       t.truthy(rule, "the summary is not separated from the diff")
-      t.eq("AcpDiffMeta", rule.segments[1].group)
+      t.eq("AdeDiffMeta", rule.segments[1].group)
     end)
 
     t.it("renders a live diff from the tool input", function()

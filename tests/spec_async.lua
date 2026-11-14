@@ -1,6 +1,6 @@
 -- Regression tests for coroutine plumbing.
 return function(t)
-  local async = require("acp.async")
+  local async = require("ade.async")
 
   local function run_until(fn, timeout)
     local done = false

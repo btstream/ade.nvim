@@ -1,5 +1,5 @@
 return function(t)
-  local toolbar = require("acp.ui.toolbar")
+  local toolbar = require("ade.ui.toolbar")
 
   ---Strip winbar markup so only the text the user sees remains.
   ---@param text string
@@ -22,7 +22,7 @@ return function(t)
         icons = false,
         chips = { "screenshot.png" },
       }, 70)
-      t.match("^%%#AcpToolbar#", text, "the bar must still start with its own highlight")
+      t.match("^%%#AdeToolbar#", text, "the bar must still start with its own highlight")
       local shown = visible(text)
       local mode_at = shown:find(" B ", 1, true)
       local chip_at = shown:find("[screenshot.png]", 1, true)
@@ -67,7 +67,7 @@ return function(t)
     end)
 
     t.it("shows the running state as a spinner glyph", function()
-      local ic = require("acp.ui.icons").get(true)
+      local ic = require("ade.ui.icons").get(true)
       local text = toolbar.render({ status = "running", icons = true, spinner = "*" }, 80)
       t.match(vim.pesc("*"), text, "the spinner frame should be shown")
       t.falsy(visible(text):find("Running", 1, true), "the status should not be spelled out")
@@ -78,7 +78,7 @@ return function(t)
     end)
 
     t.it("shows the mode as a glyph", function()
-      local ic = require("acp.ui.icons").get(true)
+      local ic = require("ade.ui.icons").get(true)
       local plan = toolbar.render({ mode = "plan", icons = true, status = "idle" }, 80)
       local build = toolbar.render({ mode = "build", icons = true, status = "idle" }, 80)
       t.match(vim.pesc(ic.mode_plan), plan)
@@ -87,37 +87,37 @@ return function(t)
     end)
 
     t.it("pins the mode badge to the left edge", function()
-      local ic = require("acp.ui.icons").get(true)
+      local ic = require("ade.ui.icons").get(true)
       local raw = toolbar.render({ mode = "build", model = "Sonnet", status = "idle", icons = true }, 80)
       -- The bar opens with its own background, then the badge starts at column
       -- 0: no leading space or separator before it.
-      t.truthy(raw:find("^%%#AcpToolbar#%%@v:lua%.AcpPickMode@", 1), "the mode region should start the bar: " .. raw)
-      local group = raw:match("^%%#AcpToolbar#%%@v:lua%.AcpPickMode@%%[$]([%w_]+)[$]")
-      t.eq("AcpToolbarModeBuild", group)
+      t.truthy(raw:find("^%%#AdeToolbar#%%@v:lua%.AdePickMode@", 1), "the mode region should start the bar: " .. raw)
+      local group = raw:match("^%%#AdeToolbar#%%@v:lua%.AdePickMode@%%[$]([%w_]+)[$]")
+      t.eq("AdeToolbarModeBuild", group)
       -- The clickable region must still open on the badge and close after it.
       t.truthy(raw:find("%T", 1, true) ~= nil, "the mode region must be terminated so clicks stop")
     end)
 
     t.it("pads the badge glyph by one cell on each side", function()
-      local ic = require("acp.ui.icons").get(true)
+      local ic = require("ade.ui.icons").get(true)
       local raw = toolbar.render({ mode = "build", status = "idle", icons = true }, 80)
-      local body = raw:match("%%[$]AcpToolbarModeBuild[$](.-)%%[$]AcpToolbar[$]")
+      local body = raw:match("%%[$]AdeToolbarModeBuild[$](.-)%%[$]AdeToolbar[$]")
       t.eq(" " .. ic.mode_build .. " ", body, "the badge should be ' glyph ', not the bare glyph")
     end)
 
     t.it("covers the badge padding with its own background", function()
-      local ic = require("acp.ui.icons").get(true)
+      local ic = require("ade.ui.icons").get(true)
       local raw = toolbar.render({ mode = "plan", status = "idle", icons = true }, 80)
       -- The group is opened before the leading space and closed after the
       -- trailing one, so both cells are painted.
       t.truthy(
-        raw:find("%%[$]AcpToolbarModePlan[$] " .. vim.pesc(ic.mode_plan) .. " %%[$]AcpToolbar[$]", 1),
+        raw:find("%%[$]AdeToolbarModePlan[$] " .. vim.pesc(ic.mode_plan) .. " %%[$]AdeToolbar[$]", 1),
         "the badge background does not cover its padding: " .. raw
       )
     end)
 
     t.it("draws no chevron", function()
-      local ic = require("acp.ui.icons").get(true)
+      local ic = require("ade.ui.icons").get(true)
       local text = visible(toolbar.render({
         mode = "plan",
         model = "Sonnet",
@@ -131,66 +131,66 @@ return function(t)
     t.it("carries its own background instead of relying on WinBar", function()
       -- A layout manager (edgy) may remap `WinBar` to its own group. Every
       -- region therefore inherits the background from an explicit
-      -- `%#AcpToolbar#` opener through `%$...$`, never from the window mapping.
-      local ic = require("acp.ui.icons").get(true)
-      local highlights = require("acp.ui.highlights")
+      -- `%#AdeToolbar#` opener through `%$...$`, never from the window mapping.
+      local ic = require("ade.ui.icons").get(true)
+      local highlights = require("ade.ui.highlights")
       highlights.setup()
 
       local raw = toolbar.render({ mode = "build", model = "Sonnet", status = "idle", icons = true }, 80)
-      t.truthy(raw:find("^%%#AcpToolbar#", 1), "the bar must open with its own background: " .. raw)
+      t.truthy(raw:find("^%%#AdeToolbar#", 1), "the bar must open with its own background: " .. raw)
       -- After the opening run, no other group may be opened with `%#...#`;
-      -- re-opening `AcpToolbar` itself is fine, anything else would restart
+      -- re-opening `AdeToolbar` itself is fine, anything else would restart
       -- from the window's `WinBar` mapping.
-      local body = raw:sub(#"%#AcpToolbar#" + 1)
+      local body = raw:sub(#"%#AdeToolbar#" + 1)
       for group in body:gmatch("%%#([%w_]+)#") do
-        t.eq("AcpToolbar", group, "a region restarted from WinBar instead of inheriting")
+        t.eq("AdeToolbar", group, "a region restarted from WinBar instead of inheriting")
       end
 
       -- The transcript title is a header, not a toolbar: it opens on the
       -- window's own background so it matches the transcript below it.
       local title = toolbar.chat_title({ icons = true, agent = "opencode", title = "work" }, 60)
-      t.truthy(title:find("^%%#AcpNormal#", 1), "the title must open on the transcript background")
-      local rest = title:sub(#"%#AcpNormal#" + 1)
+      t.truthy(title:find("^%%#AdeNormal#", 1), "the title must open on the transcript background")
+      local rest = title:sub(#"%#AdeNormal#" + 1)
       for group in rest:gmatch("%%#([%w_]+)#") do
-        t.eq("AcpNormal", group, "the title restarted from WinBar instead of inheriting")
+        t.eq("AdeNormal", group, "the title restarted from WinBar instead of inheriting")
       end
     end)
 
     t.it("gives the transcript title the same background as the transcript", function()
       -- A header in a different colour reads as a separate strip. The title bar
-      -- must sit on `AcpNormal`'s surface, and the window mapping must agree for
+      -- must sit on `AdeNormal`'s surface, and the window mapping must agree for
       -- the blank remainder past the text.
-      local highlights = require("acp.ui.highlights")
+      local highlights = require("ade.ui.highlights")
       highlights.setup()
-      local layout = require("acp.layout")
-      local config = require("acp.config")
+      local layout = require("ade.layout")
+      local config = require("ade.config")
       layout.setup(config.merge(config.defaults, {}))
       layout.apply_window_options(vim.api.nvim_get_current_win(), "chat")
       local winhl = vim.api.nvim_get_option_value("winhighlight", { win = vim.api.nvim_get_current_win() })
-      t.match("WinBar:AcpNormal", winhl, "the transcript WinBar must map to AcpNormal")
-      t.match("WinBarNC:AcpNormal", winhl, "the transcript WinBarNC must map to AcpNormal")
+      t.match("WinBar:AdeNormal", winhl, "the transcript WinBar must map to AdeNormal")
+      t.match("WinBarNC:AdeNormal", winhl, "the transcript WinBarNC must map to AdeNormal")
 
       -- The composer keeps the statusline colour: it is a toolbar.
       layout.apply_window_options(vim.api.nvim_get_current_win(), "input")
       local input_winhl = vim.api.nvim_get_option_value("winhighlight", { win = vim.api.nvim_get_current_win() })
-      t.match("WinBar:AcpToolbar", input_winhl, "the composer WinBar must keep AcpToolbar")
+      t.match("WinBar:AdeToolbar", input_winhl, "the composer WinBar must keep AdeToolbar")
     end)
 
     t.it("keeps working when a layout manager replaces the WinBar mapping", function()
       -- Reproduces the edgy case: edgy appends `WinBar:EdgyWinBar` after ours,
       -- and the later mapping wins. The toolbar must still not depend on it.
-      local highlights = require("acp.ui.highlights")
+      local highlights = require("ade.ui.highlights")
       highlights.setup()
       vim.api.nvim_set_hl(0, "EdgyWinBar", { fg = "#b2ccd6", bg = "#303030" })
       local win = vim.api.nvim_get_current_win()
       vim.api.nvim_set_option_value(
         "winhighlight",
-        "Normal:AcpNormal,WinBar:AcpToolbar,WinBarNC:AcpToolbar,WinBar:EdgyWinBar,WinBarNC:EdgyWinBar",
+        "Normal:AdeNormal,WinBar:AdeToolbar,WinBarNC:AdeToolbar,WinBar:EdgyWinBar,WinBarNC:EdgyWinBar",
         { win = win }
       )
       local raw = toolbar.render({ mode = "plan", model = "Sonnet", status = "idle", icons = true }, 80)
       local res = vim.api.nvim_eval_statusline(raw, { use_winbar = true, highlights = true })
-      -- Every segment must name AcpToolbar (or a group that inherits it) in its
+      -- Every segment must name AdeToolbar (or a group that inherits it) in its
       -- stacked groups, never EdgyWinBar.
       for _, seg in ipairs(res.highlights or {}) do
         local groups = table.concat(seg.groups or {}, ">")
@@ -199,7 +199,7 @@ return function(t)
     end)
 
     t.it("gives each mode and status its own colour", function()
-      local highlights = require("acp.ui.highlights")
+      local highlights = require("ade.ui.highlights")
       highlights.setup()
       local function fg(name)
         return vim.api.nvim_get_hl(0, { name = name }).fg
@@ -208,14 +208,14 @@ return function(t)
         return vim.api.nvim_get_hl(0, { name = name }).bg
       end
       t.truthy(
-        bg("AcpToolbarModePlan") ~= bg("AcpToolbarModeBuild"),
+        bg("AdeToolbarModePlan") ~= bg("AdeToolbarModeBuild"),
         "modes should be told apart by their badge background"
       )
       local statuses = {
-        fg("AcpToolbarIdle"),
-        fg("AcpToolbarRunning"),
-        fg("AcpToolbarWaiting"),
-        fg("AcpToolbarCancelling"),
+        fg("AdeToolbarIdle"),
+        fg("AdeToolbarRunning"),
+        fg("AdeToolbarWaiting"),
+        fg("AdeToolbarCancelling"),
       }
       for i = 1, #statuses do
         for j = i + 1, #statuses do
@@ -229,16 +229,16 @@ return function(t)
       -- this module must guarantee is that each region actually resolves to a
       -- foreground: a group linked to something the theme never defines would
       -- silently fall back to the bar's own text colour and lose the state.
-      local highlights = require("acp.ui.highlights")
+      local highlights = require("ade.ui.highlights")
       highlights.setup()
       for _, name in ipairs({
-        "AcpToolbarAccent",
-        "AcpToolbarModePlan",
-        "AcpToolbarModeBuild",
-        "AcpToolbarIdle",
-        "AcpToolbarRunning",
-        "AcpToolbarWaiting",
-        "AcpToolbarCancelling",
+        "AdeToolbarAccent",
+        "AdeToolbarModePlan",
+        "AdeToolbarModeBuild",
+        "AdeToolbarIdle",
+        "AdeToolbarRunning",
+        "AdeToolbarWaiting",
+        "AdeToolbarCancelling",
       }) do
         local hl = vim.api.nvim_get_hl(0, { name = name, link = false })
         t.truthy(hl.fg, name .. " resolves to no foreground")
@@ -246,10 +246,10 @@ return function(t)
     end)
 
     t.it("makes the mode badge stand out from the bar", function()
-      local highlights = require("acp.ui.highlights")
+      local highlights = require("ade.ui.highlights")
       highlights.setup()
-      local bar = vim.api.nvim_get_hl(0, { name = "AcpToolbar", link = false })
-      for _, name in ipairs({ "AcpToolbarModePlan", "AcpToolbarModeBuild" }) do
+      local bar = vim.api.nvim_get_hl(0, { name = "AdeToolbar", link = false })
+      for _, name in ipairs({ "AdeToolbarModePlan", "AdeToolbarModeBuild" }) do
         local badge = vim.api.nvim_get_hl(0, { name = name }).bg
         t.truthy(badge, name .. " has no badge background")
         t.truthy(badge ~= bar.bg, name .. " does not stand out from the bar")
@@ -257,20 +257,20 @@ return function(t)
     end)
 
     t.it("maps modes to their highlight group", function()
-      t.eq("AcpToolbarModePlan", toolbar.mode_hl("plan"))
-      t.eq("AcpToolbarModeBuild", toolbar.mode_hl("Build"))
-      t.eq("AcpToolbarAccent", toolbar.mode_hl("ask"))
+      t.eq("AdeToolbarModePlan", toolbar.mode_hl("plan"))
+      t.eq("AdeToolbarModeBuild", toolbar.mode_hl("Build"))
+      t.eq("AdeToolbarAccent", toolbar.mode_hl("ask"))
     end)
 
     t.it("falls back to letter labels without Nerd Font icons", function()
-      local ic = require("acp.ui.icons").get(false)
+      local ic = require("ade.ui.icons").get(false)
       local text = toolbar.render({ mode = "plan", icons = false, status = "idle" }, 80)
       t.match(vim.pesc(ic.mode_plan), text)
       t.match(vim.pesc(ic.status_idle), text)
     end)
 
     t.it("prioritises the waiting glyph when narrow", function()
-      local ic = require("acp.ui.icons").get(true)
+      local ic = require("ade.ui.icons").get(true)
       local text = toolbar.render({
         icons = true,
         mode = "a-very-long-mode-name",
@@ -283,14 +283,14 @@ return function(t)
     end)
 
     t.it("degrades to plain text without Nerd Font icons", function()
-      local blocks = require("acp.ui.blocks")
+      local blocks = require("ade.ui.blocks")
       local ic = blocks.icon_set(false)
       t.eq(">", ic.user)
       t.eq("v", ic.tool_ok)
     end)
 
     t.it("renders an empty transcript hint", function()
-      t.truthy(require("acp.ui.chat"))
+      t.truthy(require("ade.ui.chat"))
     end)
   end)
 end

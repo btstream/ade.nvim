@@ -1,8 +1,8 @@
 return function(t)
-  local work = require("acp.ui.work_scheduler")
-  local metrics = require("acp.ui.render_metrics")
-  local renderer = require("acp.ui.buffer_renderer")
-  local process = require("acp.transport.process")
+  local work = require("ade.ui.work_scheduler")
+  local metrics = require("ade.ui.render_metrics")
+  local renderer = require("ade.ui.buffer_renderer")
+  local process = require("ade.transport.process")
 
   local function manual(clock)
     local pending = {}
@@ -125,7 +125,7 @@ return function(t)
 
     t.it("contains a failing job and keeps the queue moving", function()
       local ran = {}
-      local log = require("acp.log")
+      local log = require("ade.log")
       local original, errors = log.error, {}
       log.error = function(fmt, ...)
         errors[#errors + 1] = string.format(fmt, ...)

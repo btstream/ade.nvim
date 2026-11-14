@@ -1,8 +1,8 @@
 return function(t)
-  local complete = require("acp.ui.complete")
-  local context = require("acp.context")
-  local config = require("acp.config")
-  local state = require("acp.session.state")
+  local complete = require("ade.ui.complete")
+  local context = require("ade.context")
+  local config = require("ade.config")
+  local state = require("ade.session.state")
 
   t.describe("completion", function()
     t.it("completes slash commands", function()
@@ -45,14 +45,14 @@ return function(t)
     end)
 
     t.it("attaches an existing file", function()
-      local path = "/tmp/acp_ctx_test.lua"
+      local path = "/tmp/ade_ctx_test.lua"
       local fh = io.open(path, "wb")
       fh:write("local x = 1\n")
       fh:close()
       local att = context.file(path, cfg)
       t.truthy(att)
       t.eq("file", att.kind)
-      t.eq("acp_ctx_test.lua", att.label)
+      t.eq("ade_ctx_test.lua", att.label)
       -- The block is built at send time, not at attach time.
       t.eq(nil, att.block)
       local blocks = context.to_prompt("", { att }, cfg)
@@ -60,14 +60,14 @@ return function(t)
     end)
 
     t.it("rejects a missing file with a message", function()
-      local att, err = context.file("/tmp/definitely-missing-acp.lua", cfg)
+      local att, err = context.file("/tmp/definitely-missing-ade.lua", cfg)
       t.falsy(att)
       t.match("not a readable file", err)
     end)
 
     t.it("expands @mentions into attachments", function()
-      local path = "/tmp/acp_ctx_test.lua"
-      local attachments = context.mentions("please read @/tmp/acp_ctx_test.lua", cfg, "/tmp")
+      local path = "/tmp/ade_ctx_test.lua"
+      local attachments = context.mentions("please read @/tmp/ade_ctx_test.lua", cfg, "/tmp")
       t.eq(1, #attachments)
       t.eq("file", attachments[1].kind)
     end)
@@ -101,7 +101,7 @@ return function(t)
     end
 
     t.it("sends an unsaved buffer as a link plus text without embeddedContext", function()
-      local path = "/tmp/acp_ctx_unsaved.lua"
+      local path = "/tmp/ade_ctx_unsaved.lua"
       vim.fn.writefile({ "on disk" }, path)
       local bufnr = vim.fn.bufadd(path)
       vim.fn.bufload(bufnr)
@@ -122,7 +122,7 @@ return function(t)
     end)
 
     t.it("embeds an unsaved buffer when the agent advertises embeddedContext", function()
-      local path = "/tmp/acp_ctx_unsaved2.lua"
+      local path = "/tmp/ade_ctx_unsaved2.lua"
       vim.fn.writefile({ "on disk" }, path)
       local bufnr = vim.fn.bufadd(path)
       vim.fn.bufload(bufnr)
@@ -138,7 +138,7 @@ return function(t)
     end)
 
     t.it("sends a selection as a link plus text without embeddedContext", function()
-      local path = "/tmp/acp_ctx_selection.lua"
+      local path = "/tmp/ade_ctx_selection.lua"
       vim.fn.writefile({ "alpha", "beta", "gamma" }, path)
       local bufnr = vim.fn.bufadd(path)
       vim.fn.bufload(bufnr)
@@ -156,7 +156,7 @@ return function(t)
     end)
 
     t.it("embeds a selection when the agent advertises embeddedContext", function()
-      local path = "/tmp/acp_ctx_selection2.lua"
+      local path = "/tmp/ade_ctx_selection2.lua"
       vim.fn.writefile({ "alpha" }, path)
       local bufnr = vim.fn.bufadd(path)
       vim.fn.bufload(bufnr)

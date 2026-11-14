@@ -1,12 +1,12 @@
 return function(t)
-  local acp = require("acp")
-  local controller = require("acp.controller")
-  local state = require("acp.session.state")
+  local ade = require("ade")
+  local controller = require("ade.controller")
+  local state = require("ade.session.state")
 
   local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
 
   local function setup(overrides)
-    acp.setup(vim.tbl_deep_extend("force", {
+    ade.setup(vim.tbl_deep_extend("force", {
       agent = "opencode",
       agents = { opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } } },
       ui = {},
@@ -19,14 +19,14 @@ return function(t)
   -- Snapshot before the explicit Escape: feedkeys("x") itself returns to normal
   -- mode when typeahead runs out, which would make a final mode() check vacuous.
   local function probe(keys)
-    local samples, previous = {}, _G._acp_panel_mode_probe
-    _G._acp_panel_mode_probe = function(name)
+    local samples, previous = {}, _G._ade_panel_mode_probe
+    _G._ade_panel_mode_probe = function(name)
       samples[name] = { mode = vim.fn.mode(), buf = vim.api.nvim_get_current_buf() }
     end
-    local sequence = keys .. "<Cmd>lua _G._acp_panel_mode_probe('after')<CR><Esc>"
+    local sequence = keys .. "<Cmd>lua _G._ade_panel_mode_probe('after')<CR><Esc>"
     local ok, err =
       pcall(vim.api.nvim_feedkeys, vim.api.nvim_replace_termcodes(sequence, true, false, true), "xt", false)
-    _G._acp_panel_mode_probe = previous
+    _G._ade_panel_mode_probe = previous
     if not ok then
       error(err, 0)
     end
@@ -41,8 +41,8 @@ return function(t)
       controller.open()
       t.truthy(S.view.chat and S.view.chat:is_visible(), "chat window missing")
       t.truthy(S.view.input and S.view.input:is_visible(), "composer missing")
-      t.eq("acp_chat", vim.bo[S.view.chat.buf].filetype)
-      t.eq("acp_input", vim.bo[S.view.input.buf].filetype)
+      t.eq("ade_chat", vim.bo[S.view.chat.buf].filetype)
+      t.eq("ade_input", vim.bo[S.view.input.buf].filetype)
       t.eq(before_statusline, vim.o.statusline, "global statusline was modified")
       t.eq(3, vim.o.laststatus, "laststatus was modified")
       controller.hide()
@@ -69,8 +69,8 @@ return function(t)
         t.eq("n", result.mode, key .. " entered insert mode")
         t.eq(S.view.chat.buf, result.buf)
       end
-      t.eq("acp: add diagnostics", vim.fn.maparg("R", "n", false, true).desc)
-      t.eq("acp: add selection", vim.fn.maparg("S", "n", false, true).desc)
+      t.eq("ade: add diagnostics", vim.fn.maparg("R", "n", false, true).desc)
+      t.eq("ade: add selection", vim.fn.maparg("S", "n", false, true).desc)
       -- `i` is deliberately bound to the composer instead.
       local result = probe("i").after
       t.eq(S.view.input.buf, result.buf)
@@ -83,7 +83,7 @@ return function(t)
       controller.open()
       vim.api.nvim_set_current_win(S.view.input.win)
       local samples = probe(
-        "i<Cmd>lua _G._acp_panel_mode_probe('before'); vim.api.nvim_set_current_win(" .. S.view.chat.win .. ")<CR>"
+        "i<Cmd>lua _G._ade_panel_mode_probe('before'); vim.api.nvim_set_current_win(" .. S.view.chat.win .. ")<CR>"
       )
       t.eq("i", samples.before.mode)
       t.eq("n", samples.after.mode)
@@ -98,7 +98,7 @@ return function(t)
       local win =
         vim.api.nvim_open_win(scratch, true, { relative = "editor", row = 0, col = 0, width = 40, height = 5 })
       local samples = probe(
-        "i<Cmd>lua _G._acp_panel_mode_probe('before'); vim.api.nvim_set_current_buf(" .. S.view.chat.buf .. ")<CR>"
+        "i<Cmd>lua _G._ade_panel_mode_probe('before'); vim.api.nvim_set_current_buf(" .. S.view.chat.buf .. ")<CR>"
       )
       vim.api.nvim_win_close(win, true)
       vim.api.nvim_buf_delete(scratch, { force = true })
@@ -133,7 +133,7 @@ return function(t)
         "<Cmd>lua vim.api.nvim_set_current_win("
           .. S.view.input.win
           .. ")<CR>"
-          .. "<Cmd>lua _G._acp_panel_mode_probe('before'); vim.api.nvim_set_current_win("
+          .. "<Cmd>lua _G._ade_panel_mode_probe('before'); vim.api.nvim_set_current_win("
           .. editor
           .. ")<CR>"
       )
@@ -155,7 +155,7 @@ return function(t)
       t.eq(S.view.input.buf, entered.buf)
       t.eq("i", entered.mode)
       local samples =
-        probe("i<Cmd>lua _G._acp_panel_mode_probe('before'); vim.api.nvim_set_current_buf(" .. scratch .. ")<CR>")
+        probe("i<Cmd>lua _G._ade_panel_mode_probe('before'); vim.api.nvim_set_current_buf(" .. scratch .. ")<CR>")
       t.eq("i", samples.before.mode)
       t.eq(scratch, samples.after.buf)
       t.eq("n", samples.after.mode)
@@ -305,18 +305,18 @@ return function(t)
       end, 20)
       -- The winbar is an expression; inspect what it actually renders.
       local rendered = controller.composer_bar(S.view.input.win)
-      t.match("AcpPickModel", rendered)
-      t.match("AcpPickMode", rendered)
-      t.eq("function", type(_G.AcpPickModel))
-      t.eq("function", type(_G.AcpPickMode))
+      t.match("AdePickModel", rendered)
+      t.match("AdePickMode", rendered)
+      t.eq("function", type(_G.AdePickModel))
+      t.eq("function", type(_G.AdePickMode))
       controller.hide()
     end)
 
     t.it("shows idle, running and waiting states in the toolbar", function()
       local S = setup()
       controller.open()
-      local toolbar = require("acp.ui.toolbar")
-      local ic = require("acp.ui.icons").get(true)
+      local toolbar = require("ade.ui.toolbar")
+      local ic = require("ade.ui.icons").get(true)
       local idle = toolbar.render({ status = "idle", icons = true }, 60)
       local running = toolbar.render({ status = "running", icons = true, spinner = "*" }, 60)
       local waiting = toolbar.render({ status = "running", icons = true, waiting = true }, 60)

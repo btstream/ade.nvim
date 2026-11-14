@@ -4,16 +4,16 @@
 -- the service wires it to the config, that listing never installs anything, and
 -- that the window renders state without owning decisions.
 return function(t)
-  local AgentManager = require("acp.app.agent_manager")
-  local AgentManagerUI = require("acp.ui.agent_manager")
-  local Resolve = require("acp.manager.resolve")
-  local Registry = require("acp.manager.registry")
-  local Config = require("acp.config")
+  local AgentManager = require("ade.app.agent_manager")
+  local AgentManagerUI = require("ade.ui.agent_manager")
+  local Resolve = require("ade.manager.resolve")
+  local Registry = require("ade.manager.registry")
+  local Config = require("ade.config")
   local fake = require("tests.fake_npm")
-  local npm_mod = require("acp.manager.npm")
+  local npm_mod = require("ade.manager.npm")
 
   local function temp_root()
-    local dir = string.format("/tmp/opencode/acp-svc-%d", vim.uv.hrtime())
+    local dir = string.format("/tmp/opencode/ade-svc-%d", vim.uv.hrtime())
     vim.fn.mkdir(dir, "p")
     return dir
   end

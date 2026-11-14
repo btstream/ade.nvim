@@ -1,8 +1,8 @@
 return function(t)
-  local Chat = require("acp.ui.chat")
-  local State = require("acp.session.state")
-  local Config = require("acp.config")
-  local work = require("acp.ui.work_scheduler")
+  local Chat = require("ade.ui.chat")
+  local State = require("ade.session.state")
+  local Config = require("ade.config")
+  local work = require("ade.ui.work_scheduler")
 
   local function cfg()
     return Config.validate(Config.merge(Config.defaults, {
@@ -255,7 +255,7 @@ return function(t)
     t.it("does not mutate thought expansion or published caches before yielding", function()
       local chat, win = view()
       local ok, err = pcall(function()
-        local blocks = require("acp.ui.blocks")
+        local blocks = require("ade.ui.blocks")
         local b = { id = "thought", kind = "thought", expanded = false, text = "first\nsecond\nthird\n" }
         local ctx = { icons = chat.icons, width = 60, show_thoughts = true, thoughts = chat.thoughts }
         blocks.render_block(b, ctx)
@@ -280,7 +280,7 @@ return function(t)
 
     t.it("rebuilds a commit invalidated by width and syntax generation", function()
       local chat, win = view()
-      local hl = require("acp.ui.code_hl")
+      local hl = require("ade.ui.code_hl")
       local generation = hl.generation
       local ok, err = pcall(function()
         local s = session(200)

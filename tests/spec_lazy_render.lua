@@ -1,9 +1,9 @@
 return function(t)
-  local config = require("acp.config")
-  local Chat = require("acp.ui.chat")
-  local State = require("acp.session.state")
-  local decoration = require("acp.ui.decoration")
-  local CodeHL = require("acp.ui.code_hl")
+  local config = require("ade.config")
+  local Chat = require("ade.ui.chat")
+  local State = require("ade.session.state")
+  local decoration = require("ade.ui.decoration")
+  local CodeHL = require("ade.ui.code_hl")
 
   local function with_view(options, fn)
     local cfg = config.merge(config.defaults, {
@@ -142,7 +142,7 @@ return function(t)
     end)
 
     t.it("defers diff syntax without changing signs, backgrounds or file rules", function()
-      local diff = require("acp.ui.diff")
+      local diff = require("ade.ui.diff")
       local entries = {
         { path = "/tmp/a.lua", oldText = "local a = 1\n", newText = "local b = 2\n" },
         { path = "/tmp/b.lua", oldText = "local c = 3\n", newText = "local d = 4\n" },
@@ -181,7 +181,7 @@ return function(t)
       with_view({ ui = { render = { profile = false } } }, function(chat)
         local s = session(100)
         chat:set_session(s)
-        local blocks = require("acp.ui.blocks")
+        local blocks = require("ade.ui.blocks")
         local original, calls = blocks.render_block, 0
         blocks.render_block = function(...)
           calls = calls + 1

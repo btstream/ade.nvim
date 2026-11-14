@@ -1,7 +1,7 @@
 return function(t)
-  local Chat = require("acp.ui.chat")
-  local State = require("acp.session.state")
-  local config = require("acp.config")
+  local Chat = require("ade.ui.chat")
+  local State = require("ade.session.state")
+  local config = require("ade.config")
 
   local function fixture(fn)
     local columns, lines = vim.o.columns, vim.o.lines
@@ -10,7 +10,7 @@ return function(t)
     local chat = Chat.new({ config = cfg })
     -- Other specs may leave edgy active. These are isolated view tests; do not
     -- let a third-party filetype rule turn the fixture's float into a split.
-    vim.bo[chat.buf].filetype = "acp_resize_test"
+    vim.bo[chat.buf].filetype = "ade_resize_test"
     chat.win = vim.api.nvim_open_win(chat.buf, false, {
       relative = "editor",
       row = 0,
@@ -60,7 +60,7 @@ return function(t)
   local function marks(chat)
     local out = {}
     for _, mark in
-      ipairs(vim.api.nvim_buf_get_extmarks(chat.buf, vim.api.nvim_get_namespaces().acp_chat, 0, -1, { details = true }))
+      ipairs(vim.api.nvim_buf_get_extmarks(chat.buf, vim.api.nvim_get_namespaces().ade_chat, 0, -1, { details = true }))
     do
       local d = mark[4]
       out[#out + 1] = { mark[2], mark[3], d.end_row, d.end_col, d.hl_group, d.conceal }

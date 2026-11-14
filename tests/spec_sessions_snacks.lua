@@ -1,7 +1,7 @@
 return function(t)
-  local acp = require("acp")
-  local controller = require("acp.controller")
-  local session_snacks = require("acp.ui.session_snacks")
+  local ade = require("ade")
+  local controller = require("ade.controller")
+  local session_snacks = require("ade.ui.session_snacks")
 
   local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
 
@@ -18,7 +18,7 @@ return function(t)
   local has_snacks = find_snacks()
 
   local function setup(over)
-    acp.setup(vim.tbl_deep_extend("force", {
+    ade.setup(vim.tbl_deep_extend("force", {
       agent = "opencode",
       agents = { opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } } },
       ui = {},
@@ -50,7 +50,7 @@ return function(t)
         return true
       end
       for _, win in ipairs(vim.api.nvim_list_wins()) do
-        if vim.bo[vim.api.nvim_win_get_buf(win)].filetype == "acp_sessions" then
+        if vim.bo[vim.api.nvim_win_get_buf(win)].filetype == "ade_sessions" then
           return true
         end
       end
@@ -71,7 +71,7 @@ return function(t)
         t.falsy(picker, "snacks picker used although snacks is unavailable")
         local found = false
         for _, win in ipairs(vim.api.nvim_list_wins()) do
-          if vim.bo[vim.api.nvim_win_get_buf(win)].filetype == "acp_sessions" then
+          if vim.bo[vim.api.nvim_win_get_buf(win)].filetype == "ade_sessions" then
             found = true
             pcall(vim.api.nvim_win_close, win, true)
           end
@@ -109,7 +109,7 @@ return function(t)
       local S = setup()
       local picker = open_browser(S)
       t.truthy(picker)
-      local icons = require("acp.ui.icons").get(true)
+      local icons = require("ade.ui.icons").get(true)
       local found
       for _, item in ipairs(picker:items()) do
         if item.session.sessionId == S.sess.current.id then
@@ -120,7 +120,7 @@ return function(t)
       -- The formatter depends on current_id, so drive it directly.
       local row = picker.opts.format(found, picker)
       t.eq(icons.arrow_right .. " ", row[1][1])
-      t.eq("AcpPickerCurrent", row[1][2])
+      t.eq("AdePickerCurrent", row[1][2])
       picker:close()
       controller.hide()
     end)
@@ -192,7 +192,7 @@ return function(t)
         prompt = opts.prompt
         cb("Delete")
       end
-      picker:action("acp_delete", picker:current())
+      picker:action("ade_delete", picker:current())
       vim.wait(6000, function()
         return S.sess.all["sess_old"] == nil
       end, 20)
@@ -220,7 +220,7 @@ return function(t)
       vim.ui.select = function(_, _, cb)
         cb("Cancel")
       end
-      picker:action("acp_delete", picker:items()[1])
+      picker:action("ade_delete", picker:items()[1])
       vim.wait(1000)
       vim.ui.select = original
       t.eq(2, #picker:items(), "list changed although deletion was declined")
@@ -240,7 +240,7 @@ return function(t)
       vim.ui.select = function()
         prompted = true
       end
-      picker:action("acp_delete", picker:items()[1])
+      picker:action("ade_delete", picker:items()[1])
       vim.wait(500)
       vim.ui.select = original
       t.falsy(prompted, "offered a confirmation it cannot honour")
@@ -254,7 +254,7 @@ return function(t)
       t.falsy(picker, "snacks was used although internal was requested")
       local found = false
       for _, win in ipairs(vim.api.nvim_list_wins()) do
-        if vim.bo[vim.api.nvim_win_get_buf(win)].filetype == "acp_sessions" then
+        if vim.bo[vim.api.nvim_win_get_buf(win)].filetype == "ade_sessions" then
           found = true
           pcall(vim.api.nvim_win_close, win, true)
         end
@@ -277,7 +277,7 @@ return function(t)
       picker.list:set_target(target_idx, nil, { force = true })
       picker:refresh()
       vim.wait(500)
-      picker:action("acp_open", picker:current())
+      picker:action("ade_open", picker:current())
       vim.wait(8000, function()
         return S.sess.current and S.sess.current.id == "sess_old"
       end, 20)

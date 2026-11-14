@@ -3,17 +3,17 @@
 -- Uses the scripted npm from tests/fake_npm.lua, so nothing here touches the
 -- network or a real npm cache.
 return function(t)
-  local store_mod = require("acp.manager.store")
-  local lock_mod = require("acp.manager.lock")
-  local npm_mod = require("acp.manager.npm")
-  local Installer = require("acp.manager.install")
+  local store_mod = require("ade.manager.store")
+  local lock_mod = require("ade.manager.lock")
+  local npm_mod = require("ade.manager.npm")
+  local Installer = require("ade.manager.install")
   local fake = require("tests.fake_npm")
-  local registry = require("acp.manager.registry")
+  local registry = require("ade.manager.registry")
 
   local counter = 0
   local function temp_root()
     counter = counter + 1
-    local dir = string.format("/tmp/opencode/acp-install-%d-%d", vim.uv.hrtime(), counter)
+    local dir = string.format("/tmp/opencode/ade-install-%d-%d", vim.uv.hrtime(), counter)
     vim.fn.mkdir(dir, "p")
     return dir
   end
@@ -258,9 +258,9 @@ return function(t)
 
   t.describe("managed connection lease", function()
     local function connection_harness()
-      local Connection = require("acp.app.connection")
-      local Resolve = require("acp.manager.resolve")
-      local client_mod = require("acp.protocol.client")
+      local Connection = require("ade.app.connection")
+      local Resolve = require("ade.manager.resolve")
+      local client_mod = require("ade.protocol.client")
       local original_resolve, original_new = Resolve.resolve, client_mod.new
       local launch = { source = "managed", agent_id = "claude", install_id = "rel-1", command = "node", args = {} }
       Resolve.resolve = function()

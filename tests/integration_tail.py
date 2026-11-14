@@ -38,7 +38,7 @@ def phase(label, action, marker=None, align="bottom"):
                         text = "".join(grid.get((row, col), " ") for col in range(100))
                         if marker in text:
                             marker_rows.append(row)
-        elif method == "acp_tail_done":
+        elif method == "ade_tail_done":
             result.append(args[0])
             nvim.stop_loop()
 
@@ -54,7 +54,7 @@ def phase(label, action, marker=None, align="bottom"):
           local info = vim.fn.getwininfo(c.win)[1]
           local count = vim.api.nvim_buf_line_count(c.buf)
           local view = vim.api.nvim_win_call(c.win, vim.fn.winsaveview)
-          vim.rpcnotify({nvim.channel_id}, 'acp_tail_done', {{
+          vim.rpcnotify({nvim.channel_id}, 'ade_tail_done', {{
             count = count,
             bottom = info.winrow + info.winbar + info.height - 1,
             top = info.winrow + info.winbar,
@@ -108,8 +108,8 @@ try:
         r"""
         vim.opt.runtimepath:append(...)
         vim.opt.mouse = 'a'
-        local cfg = require('acp.config').defaults
-        local chat = require('acp.ui.chat').new({ config = cfg })
+        local cfg = require('ade.config').defaults
+        local chat = require('ade.ui.chat').new({ config = cfg })
         chat.win = vim.api.nvim_get_current_win()
         vim.api.nvim_win_set_buf(chat.win, chat.buf)
         vim.wo[chat.win].winbar = 'Transcript'
@@ -118,7 +118,7 @@ try:
         vim.wo[chat.win].breakindent = true
         vim.wo[chat.win].statuscolumn = ' '
         _G.tail_test = chat
-        _G.tail_state = require('acp.session.state').new('tail-ui', '/tmp')
+        _G.tail_state = require('ade.session.state').new('tail-ui', '/tmp')
         tail_state:track_changes()
         for i = 1, 40 do
           tail_state:append({ id = 'h' .. i, kind = 'agent', text = 'history ' .. i })
@@ -158,7 +158,7 @@ try:
     phase(
         "short collapsed thought",
         r"""
-        _G.tail_state = require('acp.session.state').new('short-ui', '/tmp')
+        _G.tail_state = require('ade.session.state').new('short-ui', '/tmp')
         tail_state:track_changes()
         tail_state:append_text('thought', string.rep('reasoning\n', 40), 't')
         tail_test:set_session(tail_state)
@@ -177,7 +177,7 @@ try:
     phase(
         "coalesced collapse and oversized wrapped reply",
         r"""
-        _G.tail_state = require('acp.session.state').new('coalesced-ui', '/tmp')
+        _G.tail_state = require('ade.session.state').new('coalesced-ui', '/tmp')
         tail_state:track_changes()
         tail_state:append_text('thought', string.rep('reasoning\n', 40), 't')
         tail_test:set_session(tail_state)

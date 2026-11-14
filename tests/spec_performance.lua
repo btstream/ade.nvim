@@ -1,7 +1,7 @@
 return function(t)
   t.describe("performance regressions", function()
     t.it("reuses syntax analysis across widths and evicts old cache entries", function()
-      local hl = require("acp.ui.code_hl")
+      local hl = require("ade.ui.code_hl")
       local original, calls = vim.treesitter.get_string_parser, 0
       hl.clear_cache()
       vim.treesitter.get_string_parser = function(...)
@@ -9,7 +9,7 @@ return function(t)
         return original(...)
       end
       local ok, err = pcall(function()
-        local blocks = require("acp.ui.blocks")
+        local blocks = require("ade.ui.blocks")
         local block = { id = "syntax-cache", kind = "agent", text = "```lua\nlocal width_cache = 1\n```\n" }
         local icons = blocks.icon_set(false)
         blocks.render_block(block, { width = 80, icons = icons })
@@ -29,11 +29,11 @@ return function(t)
     end)
 
     t.it("falls back safely after the render change journal wraps", function()
-      local s = require("acp.session.state").new("wrap", "/tmp")
+      local s = require("ade.session.state").new("wrap", "/tmp")
       s:track_changes()
       s:add_local_user("question")
       s:append_text("agent", "start", "answer")
-      local chat = require("acp.ui.chat").new({ config = require("acp.config").defaults })
+      local chat = require("ade.ui.chat").new({ config = require("ade.config").defaults })
       chat:set_session(s)
       for _ = 1, 300 do
         s:append_text("agent", " x", "answer")
@@ -56,7 +56,7 @@ return function(t)
         stopped = stopped + 1
       end
       local ok, err = pcall(function()
-        local proc = require("acp.transport.process").spawn({
+        local proc = require("ade.transport.process").spawn({
           command = "mock",
           max_pending_bytes = 1024,
           dispatch_budget_ms = 1,
@@ -100,7 +100,7 @@ return function(t)
       end
       local ok, err = pcall(function()
         local received, sentinel, exited = {}, nil, false
-        require("acp.transport.process").spawn({
+        require("ade.transport.process").spawn({
           command = "mock",
           dispatch_budget_ms = 1,
           on_line = function(line)
@@ -132,11 +132,11 @@ return function(t)
     end)
 
     t.it("rejects a queue overflow without clearing the user's draft", function()
-      local controller = require("acp.controller")
+      local controller = require("ade.controller")
       controller.setup({ memory = { max_queued_messages = 1 } })
       local s = controller.state()
       s.connection, s.client = "ready", {}
-      s.session = require("acp.session.state").new("queue", "/tmp")
+      s.session = require("ade.session.state").new("queue", "/tmp")
       s.session.status = "running"
       s.input:restore("draft")
       t.eq(true, controller.send_now("first", {}))
@@ -147,8 +147,8 @@ return function(t)
     end)
 
     t.it("bounds in-memory drafts while preserving the current composer", function()
-      local cfg = require("acp.config").merge(require("acp.config").defaults, { memory = { max_drafts = 2 } })
-      local input = require("acp.ui.input").new({ config = cfg })
+      local cfg = require("ade.config").merge(require("ade.config").defaults, { memory = { max_drafts = 2 } })
+      local input = require("ade.ui.input").new({ config = cfg })
       for i = 1, 5 do
         input:switch_session(tostring(i))
         input:restore("draft " .. i)
@@ -159,8 +159,8 @@ return function(t)
     end)
 
     t.it("retains tool detail during a status-only update", function()
-      local s = require("acp.session.state").new("tool", "/tmp")
-      local reducer = require("acp.session.reducer")
+      local s = require("ade.session.state").new("tool", "/tmp")
+      local reducer = require("ade.session.reducer")
       reducer.apply(s, {
         sessionUpdate = "tool_call",
         toolCallId = "x",
@@ -173,13 +173,13 @@ return function(t)
     end)
 
     t.it("reuses stable code background marks while following prose grows", function()
-      local s = require("acp.session.state").new("background", "/tmp")
+      local s = require("ade.session.state").new("background", "/tmp")
       s:track_changes()
       s:add_local_user("question")
       s:append_text("agent", "```lua\nlocal x = 1\n```\n", "answer")
-      local chat = require("acp.ui.chat").new({ config = require("acp.config").defaults })
+      local chat = require("ade.ui.chat").new({ config = require("ade.config").defaults })
       chat:set_session(s)
-      local ns = vim.api.nvim_get_namespaces().acp_chat_bg
+      local ns = vim.api.nvim_get_namespaces().ade_chat_bg
       local before = vim.api.nvim_buf_get_extmarks(chat.buf, ns, 0, -1, {})
       t.truthy(#before > 0)
       s:append_text("agent", "prose\n", "answer")
@@ -190,7 +190,7 @@ return function(t)
     end)
 
     t.it("coalesces draft writes and exposes an explicit durable flush", function()
-      local drafts = require("acp.storage.drafts")
+      local drafts = require("ade.storage.drafts")
       local original = drafts.path
       local path = vim.fn.tempname() .. ".json"
       drafts.path = function()
@@ -228,10 +228,10 @@ return function(t)
     t.it("bounds block and session payloads by bytes", function()
       local limits = vim.tbl_extend(
         "force",
-        require("acp.config").defaults.memory,
+        require("ade.config").defaults.memory,
         { max_block_bytes = 2048, max_session_bytes = 4096 }
       )
-      local s = require("acp.session.state").new("budget", "/tmp", limits)
+      local s = require("ade.session.state").new("budget", "/tmp", limits)
       for i = 1, 20 do
         s:append({ id = tostring(i), kind = "agent", text = string.rep("x", 3000) })
       end
@@ -250,7 +250,7 @@ return function(t)
     end)
 
     t.it("evicts idle sessions in LRU order while protecting active work", function()
-      local State = require("acp.session.state")
+      local State = require("ade.session.state")
       local sessions = {}
       for i = 1, 6 do
         local s = State.new(tostring(i), "/tmp")
@@ -259,7 +259,7 @@ return function(t)
       end
       sessions["2"].status = "running"
       sessions["3"].queue = { { text = "pending" } }
-      require("acp.session.memory").prune(sessions, sessions["6"], { permission = { session_id = "4" } }, {
+      require("ade.session.memory").prune(sessions, sessions["6"], { permission = { session_id = "4" } }, {
         max_cached_sessions = 4,
         max_total_bytes = 1024,
       })
@@ -271,43 +271,43 @@ return function(t)
     end)
 
     t.it("updates tracked tails without replacing stable metadata", function()
-      local State, Chat = require("acp.session.state"), require("acp.ui.chat")
+      local State, Chat = require("ade.session.state"), require("ade.ui.chat")
       local s = State.new("tracked", "/tmp")
       s:track_changes()
       for i = 1, 100 do
         s:append({ id = tostring(i), kind = "agent", text = "stable\ntext" })
       end
       local tail = s:append_text("agent", "tail", "tail")
-      local chat = Chat.new({ config = require("acp.config").defaults })
+      local chat = Chat.new({ config = require("ade.config").defaults })
       chat:set_session(s)
       local first = chat.meta[1]
       s:append_text("agent", " grows", "tail")
       chat:render()
       t.truthy(first == chat.meta[1], "stable prefix metadata should be reused")
       t.truthy(chat:transcript():find("tail grows", 1, true))
-      local original, calls = require("acp.ui.blocks").render_block, 0
-      require("acp.ui.blocks").render_block = function(...)
+      local original, calls = require("ade.ui.blocks").render_block, 0
+      require("ade.ui.blocks").render_block = function(...)
         calls = calls + 1
         return original(...)
       end
       chat:render()
-      require("acp.ui.blocks").render_block = original
+      require("ade.ui.blocks").render_block = original
       t.eq(0, calls)
       chat:destroy()
     end)
 
     t.it("matches full rendering through tracked streams, toggles and trimming", function()
-      local State, Chat = require("acp.session.state"), require("acp.ui.chat")
+      local State, Chat = require("ade.session.state"), require("ade.ui.chat")
       local s = State.new(
         "tracked",
         "/tmp",
-        vim.tbl_extend("force", require("acp.config").defaults.memory, {
+        vim.tbl_extend("force", require("ade.config").defaults.memory, {
           max_block_bytes = 1024,
           max_session_bytes = 4096,
         })
       )
       s:track_changes()
-      local cfg = require("acp.config").defaults
+      local cfg = require("ade.config").defaults
       local incremental, full = Chat.new({ config = cfg }), Chat.new({ config = cfg })
       incremental:set_session(s)
       full:set_session(s)
@@ -337,8 +337,8 @@ return function(t)
           end)
           return out
         end
-        t.eq(marks(full, "acp_chat"), marks(incremental, "acp_chat"))
-        t.eq(marks(full, "acp_chat_bg"), marks(incremental, "acp_chat_bg"))
+        t.eq(marks(full, "ade_chat"), marks(incremental, "ade_chat"))
+        t.eq(marks(full, "ade_chat_bg"), marks(incremental, "ade_chat_bg"))
       end
       for i = 1, 25 do
         s:add_local_user("turn " .. i)
@@ -367,7 +367,7 @@ return function(t)
 
     t.it("rejects oversized complete protocol lines before dispatch", function()
       for _, text in ipairs({ string.rep("x", 1025) .. "\n", string.rep("x", 1025) .. "\r\n" }) do
-        local decoder = require("acp.transport.framing").new_decoder(1024)
+        local decoder = require("ade.transport.framing").new_decoder(1024)
         local calls = 0
         t.eq(
           false,
@@ -381,7 +381,7 @@ return function(t)
     end)
 
     t.it("reuses closed fence syntax while prose streams after it", function()
-      local hl = require("acp.ui.code_hl")
+      local hl = require("ade.ui.code_hl")
       local original, calls = hl.highlight, 0
       hl.highlight = function()
         calls = calls + 1
@@ -391,11 +391,11 @@ return function(t)
         local cache, text = {}, "```lua\nlocal x = 1\n```\n"
         for _ = 1, 20 do
           text = text .. "More prose.\n"
-          require("acp.ui.blocks").render_text(text, "AcpAssistant", 80, cache)
+          require("ade.ui.blocks").render_text(text, "AdeAssistant", 80, cache)
         end
         t.eq(1, calls)
         hl.clear_cache()
-        require("acp.ui.blocks").render_text(text, "AcpAssistant", 80, cache)
+        require("ade.ui.blocks").render_text(text, "AdeAssistant", 80, cache)
         t.eq(2, calls, "theme changes invalidate cached capture groups")
       end)
       hl.highlight = original

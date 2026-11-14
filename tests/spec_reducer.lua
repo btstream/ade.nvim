@@ -1,7 +1,7 @@
 return function(t)
-  local state = require("acp.session.state")
-  local reducer = require("acp.session.reducer")
-  local presenter = require("acp.ui.presenter")
+  local state = require("ade.session.state")
+  local reducer = require("ade.session.reducer")
+  local presenter = require("ade.ui.presenter")
 
   t.describe("reducer", function()
     t.it("streams agent chunks into one block", function()
@@ -230,7 +230,7 @@ return function(t)
     end)
 
     t.it("opens new diffs after a history replay is committed", function()
-      local Runtime = require("acp.session.runtime")
+      local Runtime = require("ade.session.runtime")
       local runtime = Runtime.new(state.new("box", "/tmp").limits, {})
       local staged = runtime:stage("s1", "/tmp")
       reducer.apply(staged, {

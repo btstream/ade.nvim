@@ -1,7 +1,7 @@
 -- Integration: reconnect and session restoration.
 local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
-local acp = require("acp")
-local controller = require("acp.controller")
+local ade = require("ade")
+local controller = require("ade.controller")
 
 local failures = {}
 local function check(name, fn)
@@ -14,12 +14,12 @@ local function check(name, fn)
   end
 end
 
-acp.setup({
+ade.setup({
   agent = "opencode",
   agents = { opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } } },
   ui = {},
 })
-acp.open()
+ade.open()
 local st = controller.state()
 
 vim.wait(8000, function()
@@ -75,7 +75,7 @@ check("transcript shows the replayed history", function()
   assert(text:find("old answer", 1, true), "replayed answer missing")
 end)
 
-acp.hide()
+ade.hide()
 
 if #failures > 0 then
   io.write("\n" .. #failures .. " reconnect failures:\n")

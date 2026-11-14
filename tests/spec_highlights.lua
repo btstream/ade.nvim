@@ -1,5 +1,5 @@
 return function(t)
-  local highlights = require("acp.ui.highlights")
+  local highlights = require("ade.ui.highlights")
 
   local function defined(name)
     local hl = vim.api.nvim_get_hl(0, { name = name })
@@ -16,14 +16,14 @@ return function(t)
 
     t.it("survives a colorscheme change", function()
       highlights.setup()
-      t.truthy(defined("AcpUser"), "not defined after setup")
+      t.truthy(defined("AdeUser"), "not defined after setup")
 
       -- Loading any colorscheme clears user groups; the ColorScheme autocmd
       -- must put them back.
       vim.cmd("silent! colorscheme default")
       vim.cmd("doautocmd ColorScheme")
 
-      for _, name in ipairs({ "AcpUser", "AcpAssistant", "AcpToolbar", "AcpToolTitle" }) do
+      for _, name in ipairs({ "AdeUser", "AdeAssistant", "AdeToolbar", "AdeToolTitle" }) do
         t.truthy(defined(name), name .. " lost after a colorscheme change")
       end
     end)
@@ -33,7 +33,7 @@ return function(t)
       for _, scheme in ipairs({ "default", "blue", "default" }) do
         vim.cmd("silent! colorscheme " .. scheme)
         vim.cmd("doautocmd ColorScheme")
-        t.truthy(defined("AcpUser"), "lost after switching to " .. scheme)
+        t.truthy(defined("AdeUser"), "lost after switching to " .. scheme)
       end
     end)
 
@@ -49,8 +49,8 @@ return function(t)
         return vim.api.nvim_get_hl(0, { name = name, link = false }).bg
       end
       local normal = bg("Normal")
-      local card = bg("AcpCardBg")
-      local code = bg("AcpCodeBlockBg")
+      local card = bg("AdeCardBg")
+      local code = bg("AdeCodeBlockBg")
 
       t.truthy(card, "the card surface has no background")
       t.truthy(code, "the code block surface has no background")
@@ -59,7 +59,7 @@ return function(t)
       t.truthy(card ~= code, "the card and the code block look the same")
       -- Inline code deliberately has no surface: a background per word is noisy
       -- in prose and would break up a card.
-      t.eq(nil, bg("AcpMdCode"), "inline code should not paint a background")
+      t.eq(nil, bg("AdeMdCode"), "inline code should not paint a background")
     end)
 
     t.it("links content groups to the same captures a markdown buffer uses", function()
@@ -67,16 +67,16 @@ return function(t)
       -- Markdown file: reuse the treesitter captures instead of inventing
       -- parallel colours.
       local expected = {
-        AcpBold = "@markup.strong",
-        AcpItalic = "@markup.italic",
-        AcpStrike = "@markup.strikethrough",
-        AcpMdCode = "String",
-        AcpMdLink = "@markup.link",
-        AcpH1 = "@markup.heading.1",
-        AcpH2 = "@markup.heading.2",
-        AcpH3 = "@markup.heading.3",
-        AcpH4 = "@markup.heading.4",
-        AcpQuote = "@markup.quote",
+        AdeBold = "@markup.strong",
+        AdeItalic = "@markup.italic",
+        AdeStrike = "@markup.strikethrough",
+        AdeMdCode = "String",
+        AdeMdLink = "@markup.link",
+        AdeH1 = "@markup.heading.1",
+        AdeH2 = "@markup.heading.2",
+        AdeH3 = "@markup.heading.3",
+        AdeH4 = "@markup.heading.4",
+        AdeQuote = "@markup.quote",
       }
       for name, target in pairs(expected) do
         t.eq(target, highlights.groups[name].link, name .. " should link to " .. target)
@@ -84,61 +84,61 @@ return function(t)
       -- Review row groups declare the shared diff role as their fallback (the
       -- effective background is copied from the theme at apply time, without
       -- the theme's foreground or underline).
-      t.eq("AcpDiffAdd", highlights.groups["AcpReviewAdd"].link)
-      t.eq("AcpDiffDelete", highlights.groups["AcpReviewDelete"].link)
-      t.eq("AcpDiffModify", highlights.groups["AcpReviewPending"].link)
-      t.eq("DiffText", highlights.groups["AcpReviewAddText"].link)
-      t.eq("DiffText", highlights.groups["AcpReviewDeleteText"].link)
+      t.eq("AdeDiffAdd", highlights.groups["AdeReviewAdd"].link)
+      t.eq("AdeDiffDelete", highlights.groups["AdeReviewDelete"].link)
+      t.eq("AdeDiffModify", highlights.groups["AdeReviewPending"].link)
+      t.eq("DiffText", highlights.groups["AdeReviewAddText"].link)
+      t.eq("DiffText", highlights.groups["AdeReviewDeleteText"].link)
     end)
 
     t.it("respects a user override made before setup", function()
       vim.cmd("hi clear")
-      vim.api.nvim_set_hl(0, "AcpUser", { fg = "#ff0000" })
-      vim.api.nvim_set_hl(0, "AcpBold", { fg = "#00ff00" })
+      vim.api.nvim_set_hl(0, "AdeUser", { fg = "#ff0000" })
+      vim.api.nvim_set_hl(0, "AdeBold", { fg = "#00ff00" })
       highlights.setup()
 
-      t.eq(0xff0000, vim.api.nvim_get_hl(0, { name = "AcpUser" }).fg, "AcpUser was overwritten")
-      t.eq(0x00ff00, vim.api.nvim_get_hl(0, { name = "AcpBold" }).fg, "AcpBold was overwritten")
+      t.eq(0xff0000, vim.api.nvim_get_hl(0, { name = "AdeUser" }).fg, "AdeUser was overwritten")
+      t.eq(0x00ff00, vim.api.nvim_get_hl(0, { name = "AdeBold" }).fg, "AdeBold was overwritten")
     end)
 
     t.it("respects a user override made after setup", function()
       vim.cmd("hi clear")
       highlights.setup()
-      vim.api.nvim_set_hl(0, "AcpThought", { fg = "#123456" })
+      vim.api.nvim_set_hl(0, "AdeThought", { fg = "#123456" })
 
       -- A colorscheme load re-applies every group; the user's value must survive.
       vim.cmd("doautocmd ColorScheme")
-      t.eq(0x123456, vim.api.nvim_get_hl(0, { name = "AcpThought" }).fg, "AcpThought was overwritten")
+      t.eq(0x123456, vim.api.nvim_get_hl(0, { name = "AdeThought" }).fg, "AdeThought was overwritten")
     end)
 
     t.it("respects a user override of a derived group", function()
       vim.cmd("hi clear")
-      vim.api.nvim_set_hl(0, "AcpCardBg", { bg = "#123456" })
-      vim.api.nvim_set_hl(0, "AcpToolbarModePlan", { fg = "#abcdef", bg = "#111111" })
-      vim.api.nvim_set_hl(0, "AcpToolbarIdle", { fg = "#999999" })
+      vim.api.nvim_set_hl(0, "AdeCardBg", { bg = "#123456" })
+      vim.api.nvim_set_hl(0, "AdeToolbarModePlan", { fg = "#abcdef", bg = "#111111" })
+      vim.api.nvim_set_hl(0, "AdeToolbarIdle", { fg = "#999999" })
       highlights.setup()
 
-      t.eq(0x123456, vim.api.nvim_get_hl(0, { name = "AcpCardBg" }).bg, "derived surface was overwritten")
-      local badge = vim.api.nvim_get_hl(0, { name = "AcpToolbarModePlan" })
+      t.eq(0x123456, vim.api.nvim_get_hl(0, { name = "AdeCardBg" }).bg, "derived surface was overwritten")
+      local badge = vim.api.nvim_get_hl(0, { name = "AdeToolbarModePlan" })
       t.eq(0xabcdef, badge.fg, "badge foreground was overwritten")
       t.eq(0x111111, badge.bg, "badge background was overwritten")
-      t.eq(0x999999, vim.api.nvim_get_hl(0, { name = "AcpToolbarIdle" }).fg, "status glyph was overwritten")
+      t.eq(0x999999, vim.api.nvim_get_hl(0, { name = "AdeToolbarIdle" }).fg, "status glyph was overwritten")
     end)
 
     t.it("still defines groups the user left alone", function()
       vim.cmd("hi clear")
-      vim.api.nvim_set_hl(0, "AcpUser", { fg = "#ff0000" })
+      vim.api.nvim_set_hl(0, "AdeUser", { fg = "#ff0000" })
       highlights.setup()
       -- A group next to the overridden one must still get its default.
-      t.truthy(defined("AcpAssistant"), "a non-overridden group was not defined")
-      t.truthy(defined("AcpToolbarModePlan"), "a derived group was not defined")
+      t.truthy(defined("AdeAssistant"), "a non-overridden group was not defined")
+      t.truthy(defined("AdeToolbarModePlan"), "a derived group was not defined")
     end)
 
     t.it("gives each block header glyph and title their own group", function()
       -- The four groups exist so an icon and its label can be coloured apart.
       -- What each one points at is a styling choice, so only their existence is
       -- asserted here; how the blocks use them is covered in spec_markdown.
-      for _, name in ipairs({ "AcpUserIcon", "AcpUserTitle", "AcpAssistantIcon", "AcpAssistantTitle" }) do
+      for _, name in ipairs({ "AdeUserIcon", "AdeUserTitle", "AdeAssistantIcon", "AdeAssistantTitle" }) do
         t.truthy(highlights.groups[name], name .. " is not in the group table")
         t.truthy(defined(name), name .. " was not defined")
       end
@@ -146,22 +146,22 @@ return function(t)
 
     t.it("does not give card body text a background of its own", function()
       highlights.setup()
-      -- No `AcpToolBody` group exists on purpose; body text inherits the card.
-      t.eq(nil, highlights.groups["AcpToolBody"], "card body must not define a group")
+      -- No `AdeToolBody` group exists on purpose; body text inherits the card.
+      t.eq(nil, highlights.groups["AdeToolBody"], "card body must not define a group")
     end)
 
     t.it("links the diff roles and review surfaces without computing colours", function()
       -- A diff inside a card has to read like a diff in a review window, so the
       -- line colours come from the theme rather than a blended colour.
       local expected = {
-        AcpDiffAdd = "DiffAdd",
-        AcpDiffDelete = "DiffDelete",
-        AcpDiffModify = "DiffChange",
-        AcpDiffAddSign = "DiffAdd",
-        AcpDiffRemoveSign = "DiffDelete",
-        AcpDiffHunk = "@label",
-        AcpDiffMeta = "Comment",
-        AcpDiffFile = "Title",
+        AdeDiffAdd = "DiffAdd",
+        AdeDiffDelete = "DiffDelete",
+        AdeDiffModify = "DiffChange",
+        AdeDiffAddSign = "DiffAdd",
+        AdeDiffRemoveSign = "DiffDelete",
+        AdeDiffHunk = "@label",
+        AdeDiffMeta = "Comment",
+        AdeDiffFile = "Title",
       }
       for name, target in pairs(expected) do
         t.eq(target, highlights.groups[name].link, name .. " should link to " .. target)
@@ -169,38 +169,38 @@ return function(t)
       -- Review row groups declare the shared diff role as their fallback (the
       -- effective background is copied from the theme at apply time, without
       -- the theme's foreground or underline).
-      t.eq("AcpDiffAdd", highlights.groups["AcpReviewAdd"].link)
-      t.eq("AcpDiffDelete", highlights.groups["AcpReviewDelete"].link)
-      t.eq("AcpDiffModify", highlights.groups["AcpReviewPending"].link)
-      t.eq("DiffText", highlights.groups["AcpReviewAddText"].link)
-      t.eq("DiffText", highlights.groups["AcpReviewDeleteText"].link)
+      t.eq("AdeDiffAdd", highlights.groups["AdeReviewAdd"].link)
+      t.eq("AdeDiffDelete", highlights.groups["AdeReviewDelete"].link)
+      t.eq("AdeDiffModify", highlights.groups["AdeReviewPending"].link)
+      t.eq("DiffText", highlights.groups["AdeReviewAddText"].link)
+      t.eq("DiffText", highlights.groups["AdeReviewDeleteText"].link)
     end)
 
     t.it("applies groups passed through the config", function()
       vim.cmd("hi clear")
-      highlights.setup({ AcpUser = { fg = "#abcdef" }, AcpToolbarModePlan = { fg = "#111111", bg = "#222222" } })
+      highlights.setup({ AdeUser = { fg = "#abcdef" }, AdeToolbarModePlan = { fg = "#111111", bg = "#222222" } })
 
-      t.eq(0xabcdef, vim.api.nvim_get_hl(0, { name = "AcpUser" }).fg, "configured group was not applied")
-      local badge = vim.api.nvim_get_hl(0, { name = "AcpToolbarModePlan" })
+      t.eq(0xabcdef, vim.api.nvim_get_hl(0, { name = "AdeUser" }).fg, "configured group was not applied")
+      local badge = vim.api.nvim_get_hl(0, { name = "AdeToolbarModePlan" })
       t.eq(0x222222, badge.bg, "configured badge background was not applied")
       -- Groups not mentioned in the config keep their defaults.
-      t.truthy(defined("AcpAssistant"), "an unconfigured group lost its default")
+      t.truthy(defined("AdeAssistant"), "an unconfigured group lost its default")
     end)
 
     t.it("re-applies configured groups after a colorscheme change", function()
       vim.cmd("hi clear")
-      highlights.setup({ AcpUser = { fg = "#abcdef" } })
+      highlights.setup({ AdeUser = { fg = "#abcdef" } })
       vim.cmd("silent! colorscheme default")
       vim.cmd("doautocmd ColorScheme")
 
-      t.eq(0xabcdef, vim.api.nvim_get_hl(0, { name = "AcpUser" }).fg, "configured colour lost on colorscheme change")
+      t.eq(0xabcdef, vim.api.nvim_get_hl(0, { name = "AdeUser" }).fg, "configured colour lost on colorscheme change")
     end)
 
     t.it("lets a configured group replace a built-in one", function()
       vim.cmd("hi clear")
-      highlights.setup({ AcpCardBg = { bg = "#101010" } })
+      highlights.setup({ AdeCardBg = { bg = "#101010" } })
       -- The definition wins over the link the default table would install.
-      t.eq(0x101010, vim.api.nvim_get_hl(0, { name = "AcpCardBg", link = false }).bg)
+      t.eq(0x101010, vim.api.nvim_get_hl(0, { name = "AdeCardBg", link = false }).bg)
     end)
 
     t.it("does not stack autocmds on repeated setup", function()
@@ -209,7 +209,7 @@ return function(t)
       highlights.setup()
       local count = 0
       for _, autocmd in ipairs(vim.api.nvim_get_autocmds({ event = "ColorScheme" })) do
-        if autocmd.group_name == "AcpHighlights" then
+        if autocmd.group_name == "AdeHighlights" then
           count = count + 1
         end
       end

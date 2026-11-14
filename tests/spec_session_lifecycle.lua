@@ -1,12 +1,12 @@
 return function(t)
-  local acp = require("acp")
-  local controller = require("acp.controller")
+  local ade = require("ade")
+  local controller = require("ade.controller")
 
   local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
   local mock = root .. "tests/mock_agent.py"
 
   local function setup(profile, env)
-    acp.setup({
+    ade.setup({
       agent = profile,
       agents = {
         [profile] = {
@@ -43,7 +43,7 @@ return function(t)
   end
 
   local function tempname(tag)
-    return string.format("/tmp/opencode/acp-%s-%d.log", tag, vim.uv.hrtime())
+    return string.format("/tmp/opencode/ade-%s-%d.log", tag, vim.uv.hrtime())
   end
 
   local function transcript(S)
@@ -60,7 +60,7 @@ return function(t)
     t.it("resumes instead of creating when the agent cannot load history", function()
       local log = tempname("resume")
       local S = setup("resumeonly", { ACP_MOCK_LOG = log })
-      local caps = require("acp.protocol.capabilities").agent(S.conn.client)
+      local caps = require("ade.protocol.capabilities").agent(S.conn.client)
       t.falsy(caps.loadSession, "the resume-only profile must not advertise loadSession")
       t.truthy(caps.sessionCapabilities and caps.sessionCapabilities.resume, "resume must be advertised")
 
@@ -152,7 +152,7 @@ return function(t)
 
       local done
       local catalog = S.sess.catalog
-      local sessions_service = require("acp.app.sessions")
+      local sessions_service = require("ade.app.sessions")
       t.truthy(catalog)
       t.truthy(sessions_service)
 

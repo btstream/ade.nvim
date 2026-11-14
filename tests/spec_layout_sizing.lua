@@ -1,8 +1,8 @@
 return function(t)
-  local acp = require("acp")
-  local controller = require("acp.controller")
-  local toolbar = require("acp.ui.toolbar")
-  local config = require("acp.config")
+  local ade = require("ade")
+  local controller = require("ade.controller")
+  local toolbar = require("ade.ui.toolbar")
+  local config = require("ade.config")
 
   local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
 
@@ -18,8 +18,8 @@ return function(t)
           status = "idle",
           icons = true,
         }, width)
-        t.truthy(bar:find("AcpPickModel", 1, true), string.format("model lost its click region at width %d", width))
-        t.truthy(bar:find("AcpPickMode", 1, true), string.format("mode lost its click region at width %d", width))
+        t.truthy(bar:find("AdePickModel", 1, true), string.format("model lost its click region at width %d", width))
+        t.truthy(bar:find("AdePickMode", 1, true), string.format("mode lost its click region at width %d", width))
       end
     end)
 
@@ -47,10 +47,10 @@ return function(t)
         [[
         vim.opt.runtimepath:append(%q)
         vim.o.swapfile = false
-        local acp = require("acp")
-        local controller = require("acp.controller")
-        local config = require("acp.config")
-        acp.setup({
+        local ade = require("ade")
+        local controller = require("ade.controller")
+        local config = require("ade.config")
+        ade.setup({
           agent = "opencode",
           agents = { opencode = { command = "python3", args = { %q } } },
           ui = {},
@@ -144,15 +144,15 @@ return function(t)
         [[
         vim.opt.runtimepath:append(%q)
         vim.o.swapfile = false
-        local controller = require("acp.controller")
+        local controller = require("ade.controller")
         controller.setup({})
-        local layout = require("acp.layout")
+        local layout = require("ade.layout")
         local S = controller.state()
         S.view.input.win = layout.create_input_win(S.view.input.buf, nil)
         S.view.chat.win = layout.create_chat_win(S.view.chat.buf)
         local n = 0
         for _, win in ipairs(vim.api.nvim_list_wins()) do
-          if vim.bo[vim.api.nvim_win_get_buf(win)].filetype == "acp_chat" then
+          if vim.bo[vim.api.nvim_win_get_buf(win)].filetype == "ade_chat" then
             n = n + 1
           end
         end

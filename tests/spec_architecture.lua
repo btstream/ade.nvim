@@ -1,9 +1,9 @@
 return function(t)
-  local stores = require("acp.app.stores")
+  local stores = require("ade.app.stores")
 
   local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p") .. "lua/"
 
-  ---Every `acp.*` module under lua/, keyed by dotted name.
+  ---Every `ade.*` module under lua/, keyed by dotted name.
   ---@return table<string, string>
   local function modules()
     local out = {}
@@ -27,7 +27,7 @@ return function(t)
     for line in handle:lines() do
       if not line:find("v:lua", 1, true) then
         for dep in line:gmatch("require%s*%(?%s*[\"']([%w%._%-]+)[\"']") do
-          if dep:match("^acp%.") or dep == "acp" then
+          if dep:match("^ade%.") or dep == "ade" then
             out[#out + 1] = dep
           end
         end
@@ -44,7 +44,7 @@ return function(t)
       -- docs/architecture.md explaining what earned the extra room.
       local budget = 700
       local count = 0
-      local handle = io.open(root .. "acp/controller.lua", "r")
+      local handle = io.open(root .. "ade/controller.lua", "r")
       if not handle then
         error("cannot find the controller")
       end
@@ -55,7 +55,7 @@ return function(t)
       t.truthy(
         count <= budget,
         string.format(
-          "acp/controller.lua is %d lines, over the %d-line budget: move the feature into app/* "
+          "ade/controller.lua is %d lines, over the %d-line budget: move the feature into app/* "
             .. "or raise the budget deliberately (and say why in docs/architecture.md)",
           count,
           budget
@@ -107,10 +107,10 @@ return function(t)
     t.it("keeps protocol and session independent of the UI", function()
       local mods = modules()
       for name, path in pairs(mods) do
-        if name:match("^acp%.protocol%.") or name:match("^acp%.session%.") then
+        if name:match("^ade%.protocol%.") or name:match("^ade%.session%.") then
           for _, dep in ipairs(deps(path)) do
             t.falsy(
-              dep:match("^acp%.ui"),
+              dep:match("^ade%.ui"),
               string.format("%s must not require %s: the lower layers cannot depend on the editor UI", name, dep)
             )
           end
@@ -121,12 +121,12 @@ return function(t)
     t.it("keeps app services off a concrete picker", function()
       local mods = modules()
       -- `app/presenter` is the single place allowed to import UI backends.
-      local allowed = { ["acp.app.presenter"] = true, ["acp.app.connection"] = true }
+      local allowed = { ["ade.app.presenter"] = true, ["ade.app.connection"] = true }
       for name, path in pairs(mods) do
-        if name:match("^acp%.app%.") and not allowed[name] then
+        if name:match("^ade%.app%.") and not allowed[name] then
           for _, dep in ipairs(deps(path)) do
             t.falsy(
-              dep:match("^acp%.ui%.(picker|form|permission_details|session_picker|session_snacks|diff|icons)$"),
+              dep:match("^ade%.ui%.(picker|form|permission_details|session_picker|session_snacks|diff|icons)$"),
               string.format("%s must go through app/presenter, not require %s directly", name, dep)
             )
           end
@@ -211,7 +211,7 @@ return function(t)
   end)
 
   t.describe("client events", function()
-    local Events = require("acp.app.events")
+    local Events = require("ade.app.events")
 
     local function harness()
       -- A real partitioned state: the event handlers address the stores.

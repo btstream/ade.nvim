@@ -5,12 +5,12 @@
 -- `pending` describe behaviour that docs/compat-plan.md has not delivered yet;
 -- they turn into normal tests when the phase named in the reason lands.
 return function(t)
-  local client_mod = require("acp.protocol.client")
-  local state = require("acp.session.state")
-  local reducer = require("acp.session.reducer")
-  local async = require("acp.async")
-  local config = require("acp.config")
-  local connection = require("acp.app.connection")
+  local client_mod = require("ade.protocol.client")
+  local state = require("ade.session.state")
+  local reducer = require("ade.session.reducer")
+  local async = require("ade.async")
+  local config = require("ade.config")
+  local connection = require("ade.app.connection")
 
   local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
   local mock = root .. "tests/mock_agent.py"

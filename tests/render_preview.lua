@@ -3,11 +3,11 @@
 --   nvim --headless -u tests/minimal_init.lua -l tests/render_preview.lua
 --
 -- Used to eyeball the layout without a real terminal UI.
-local config = require("acp.config")
-local state = require("acp.session.state")
-local Chat = require("acp.ui.chat")
-local toolbar = require("acp.ui.toolbar")
-local highlights = require("acp.ui.highlights")
+local config = require("ade.config")
+local state = require("ade.session.state")
+local Chat = require("ade.ui.chat")
+local toolbar = require("ade.ui.toolbar")
+local highlights = require("ade.ui.highlights")
 
 local function demo_session()
   local s = state.new("ses_preview", "/home/user/project")
@@ -139,7 +139,7 @@ end
 
 out[#out + 1] = ""
 out[#out + 1] = "=== composer toolbar (width 60) ==="
-local model, mode = require("acp.ui.presenter").toolbar_labels(session)
+local model, mode = require("ade.ui.presenter").toolbar_labels(session)
 local tb = toolbar.render({
   mode = mode,
   model = model,

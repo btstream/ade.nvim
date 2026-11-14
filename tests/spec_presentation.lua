@@ -1,8 +1,8 @@
 return function(t)
-  local state = require("acp.session.state")
-  local reducer = require("acp.session.reducer")
-  local agents = require("acp.agents")
-  local blocks = require("acp.ui.blocks")
+  local state = require("ade.session.state")
+  local reducer = require("ade.session.reducer")
+  local agents = require("ade.agents")
+  local blocks = require("ade.ui.blocks")
 
   local function ctx(overrides)
     return vim.tbl_extend("force", {
@@ -109,7 +109,7 @@ return function(t)
           group = seg.group
         end
       end
-      t.eq("AcpToolError", group)
+      t.eq("AdeToolError", group)
     end)
 
     t.it("does not print a bare terminal id", function()
@@ -357,7 +357,7 @@ return function(t)
     end)
 
     t.it("reconstructs every hunk of a MultiEdit", function()
-      local diff = require("acp.ui.diff")
+      local diff = require("ade.ui.diff")
       local s = tool_session("claude")
       reducer.apply(s, {
         sessionUpdate = "tool_call",
@@ -450,8 +450,8 @@ return function(t)
     end)
 
     t.it("starts a fresh plan after a replay is committed", function()
-      local Runtime = require("acp.session.runtime")
-      local runtime = Runtime.new(require("acp.config").defaults.memory, {}, nil)
+      local Runtime = require("ade.session.runtime")
+      local runtime = Runtime.new(require("ade.config").defaults.memory, {}, nil)
       local staged = runtime:stage("s", "/proj")
       reducer.apply(staged, { sessionUpdate = "plan", entries = { { content = "replayed" } } })
       t.eq(0, staged.blocks[1].turn)

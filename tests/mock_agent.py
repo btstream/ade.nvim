@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal ACP agent used by acp.nvim's test suite.
+"""Minimal ACP agent used by ade.nvim's test suite.
 
 Speaks newline-delimited JSON-RPC 2.0 on stdin/stdout. Behavior is driven by
 the prompt text so tests can request specific flows:
@@ -602,7 +602,7 @@ def run_prompt(msg_id, text):
         # so the client should answer "reject". Handled before the ordinary
         # copy/permission probe below, which would otherwise decide for it.
         if "INLINE_DELETE" in text:
-            copy_path = re.search(r"`([^`]*acp-inline-[^`]*)`", text)
+            copy_path = re.search(r"`([^`]*ade-inline-[^`]*)`", text)
             target = copy_path.group(1) if copy_path else "/tmp"
             pending = PendingPermission(msg_id)
             with permissions_lock:
@@ -640,7 +640,7 @@ def run_prompt(msg_id, text):
                 active_prompts.pop(msg_id, None)
             return
 
-        match = re.search(r"`([^`]*acp-inline-[^`]*)`", text)
+        match = re.search(r"`([^`]*ade-inline-[^`]*)`", text)
         if match and os.path.isfile(match.group(1)):
             path = match.group(1)
             choices = []

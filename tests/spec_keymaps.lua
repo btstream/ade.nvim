@@ -1,9 +1,9 @@
 -- Every binding the plugin installs must be configurable, so these tests walk
 -- the same action table the mapping module uses instead of a hand-written list.
 return function(t)
-  local config = require("acp.config")
-  local keymaps = require("acp.ui.keymaps")
-  local windows = require("acp.ui.windows")
+  local config = require("ade.config")
+  local keymaps = require("ade.ui.keymaps")
+  local windows = require("ade.ui.windows")
 
   ---A resolved configuration, exercising the merge + validate path a user takes.
   ---@param over table|nil
@@ -32,7 +32,7 @@ return function(t)
     local found = {}
     for _, mode in ipairs({ "n", "i" }) do
       for _, map in ipairs(vim.api.nvim_buf_get_keymap(buf, mode)) do
-        if map.desc and map.desc:match("^acp:") then
+        if map.desc and map.desc:match("^ade:") then
           found[mode .. " " .. key_of(map.lhs)] = map.desc
         end
       end
@@ -72,7 +72,7 @@ return function(t)
           end
           for _, pair in ipairs(pairs_) do
             local desc = found[pair.mode .. " " .. key_of(pair.lhs)]
-            t.eq("acp: " .. spec.desc, desc, view .. "." .. spec.action .. " is not bound to " .. pair.lhs)
+            t.eq("ade: " .. spec.desc, desc, view .. "." .. spec.action .. " is not bound to " .. pair.lhs)
           end
         end
       end
@@ -93,11 +93,11 @@ return function(t)
         },
       })
       local found = installed(attach("chat", resolved.keymaps.chat))
-      t.eq("acp: help", found["n H"])
-      t.eq("acp: focus composer", found["n i"])
-      t.eq("acp: focus composer", found["n " .. key_of("<C-s>")])
-      t.eq("acp: focus composer", found["n a"])
-      t.eq("acp: pick model", found["n T"])
+      t.eq("ade: help", found["n H"])
+      t.eq("ade: focus composer", found["n i"])
+      t.eq("ade: focus composer", found["n " .. key_of("<C-s>")])
+      t.eq("ade: focus composer", found["n a"])
+      t.eq("ade: pick model", found["n T"])
       t.eq(nil, found["n M"], "the old default must be gone")
     end)
 
@@ -106,13 +106,13 @@ return function(t)
       -- instead of creating one the transcript cannot use.
       local resolved = cfg({ keymaps = { chat = { pick_model = { n = "T", i = "<M-t>" } } } })
       local found = installed(attach("chat", resolved.keymaps.chat))
-      t.eq("acp: pick model", found["n T"])
+      t.eq("ade: pick model", found["n T"])
       t.eq(nil, found["i <M-t>"])
 
       -- The composer does declare insert mode for the same action.
       local input = cfg({ keymaps = { input = { pick_model = { n = "T", i = "<M-t>" } } } })
       local input_found = installed(attach("input", input.keymaps.input))
-      t.eq("acp: pick model", input_found["i <M-t>"])
+      t.eq("ade: pick model", input_found["i <M-t>"])
     end)
 
     t.it("leaves an action unbound when configured as false", function()
@@ -121,7 +121,7 @@ return function(t)
       t.eq(nil, found["n g?"], "a disabled binding must not be installed")
       t.eq(nil, found["n gg"], "an empty key must not be installed")
       -- Neighbouring actions are untouched.
-      t.eq("acp: hide panel", found["n q"])
+      t.eq("ade: hide panel", found["n q"])
     end)
 
     t.it("rejects a flat key and names the view it belongs to", function()

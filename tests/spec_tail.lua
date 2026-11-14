@@ -1,8 +1,8 @@
 return function(t)
-  local Chat = require("acp.ui.chat")
-  local Config = require("acp.config")
-  local State = require("acp.session.state")
-  local viewport = require("acp.ui.viewport")
+  local Chat = require("ade.ui.chat")
+  local Config = require("ade.config")
+  local State = require("ade.session.state")
+  local viewport = require("ade.ui.viewport")
 
   local function ready(chat)
     t.truthy(
@@ -28,8 +28,8 @@ return function(t)
     vim.o.columns, vim.o.lines = 120, 40
     local cfg = Config.validate(Config.merge(Config.defaults, overrides or {}))
     local chat = Chat.new({ config = cfg })
-    -- Other specs may leave edgy's acp_chat rule active.
-    vim.bo[chat.buf].filetype = "acp_tail_test"
+    -- Other specs may leave edgy's ade_chat rule active.
+    vim.bo[chat.buf].filetype = "ade_tail_test"
     local win = vim.api.nvim_open_win(
       chat.buf,
       true,
