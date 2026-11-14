@@ -41,11 +41,11 @@ transport/process + framing
 Controller 只保留公开入口、会话选择、服务装配和跨模块协调。业务流程由
 `app/*` 承担；展示计算与编辑器交互由 `ui/*` 承担。
 
-- `app/*` 不反向依赖 `acp.controller`，也不直接操作 Chat/Input；激活会话通过回调交给控制器。
-  `acp.inline` 同样不再 require controller：`inline.setup({state, send, is_question})` 注入它需要的
+- `app/*` 不反向依赖 `ade.controller`，也不直接操作 Chat/Input；激活会话通过回调交给控制器。
+  `ade.inline` 同样不再 require controller：`inline.setup({state, send, is_question})` 注入它需要的
   三个钩子。
 - `app/*` 通过 `app/presenter` 使用 picker、表单、权限详情与会话浏览器。这样服务层不绑定某个
-  具体的 UI 后端，测试替换 `acp.ui.picker.select` 之类的入口仍然生效（presenter 在调用时
+  具体的 UI 后端，测试替换 `ade.ui.picker.select` 之类的入口仍然生效（presenter 在调用时
   require，不做缓存绑定）。
 - 状态按所有者存放在 `app/stores` 的三张表里：`connection`（client、连接阶段、登录后重发的
   槽位）、`session`（runtime、当前会话、catalog 缓存）、`view`（panel、chat、input、chrome、

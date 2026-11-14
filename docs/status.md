@@ -1,6 +1,6 @@
 # 当前状态与检查记录
 
-检查日期：2026-11-09。本文是本轮检查的快照，不替代 README 和 `:help acp.nvim`。
+检查日期：2026-11-09。本文是本轮检查的快照，不替代 README 和 `:help ade.nvim`。
 
 后续更新（按时间顺序，见文末）：2026-11-10 运行时一致性、模块拆分、动画与表格修复；
 2026-11-11 历史回放与诊断；2026-11-12 多 agent 兼容阶段 0–5；2026-11-13 阶段 6–9 与
@@ -146,7 +146,7 @@ prompts/连接 → 转录内核」的顺序拆分，未改变公开 API、配置
 | `ui/buffer_renderer.lua` | 行差异写入、内联高亮与背景 extmark |
 | `ui/windows.lua` | 帮助浮窗与日志打开 |
 
-保留的兼容入口：`acp.ui.blocks.render_block`、`render_text`、`indent_lines` 等仍是
+保留的兼容入口：`ade.ui.blocks.render_block`、`render_text`、`indent_lines` 等仍是
 块渲染与文本排版的公开入口。`controller.state()` 继续作为诊断视图，测试写入的
 `titles`、`session_cwds`、`pending_permissions` 由服务通过 getter 读取。
 
@@ -167,7 +167,7 @@ StyLua 全部通过。拆分未在真实 OpenCode 会话上重新验证远端副
 
 验证：456 项单元测试通过（新增 10 项）；界面、edgy、重连、性能脚本、StyLua 与
 `git diff --check` 通过。9 轮同机对照中，200 次可见面板 open 的中位总耗时从修复前
-约 33.7ms 降至约 0.12ms，ACP 映射重复安装次数归零。
+约 33.7ms 降至约 0.12ms，ade.nvim 的映射重复安装次数归零。
 
 边界：本轮不改变同步文本/代码排版机制；主线程处理大块内容时仍可能短暂掉帧。
 自动化使用 mock Agent，未重新发送真实 OpenCode 请求或验证终端实际动画效果。
@@ -177,7 +177,7 @@ StyLua 全部通过。拆分未在真实 OpenCode 会话上重新验证远端副
 - 单元格在测量前剥离 Markdown 标记，按可见文本计算自然列宽；代码、强调和链接高亮
   通过源字节边界映射到可见文本，再按实际换行切片调整坐标。表格不再二次 conceal，
   避免隐藏正常文字/边框以及将单元格高亮错误延伸到边框。
-- 竖向边框使用独立的 `AcpTableBorder` 区间，不再以边框颜色覆盖整行单元格；保持
+- 竖向边框使用独立的 `AdeTableBorder` 区间，不再以边框颜色覆盖整行单元格；保持
   水平边框与竖向边框一致，中文、emoji、行内代码与换行后的列边界对齐。
 - 流式缓存只提交稳定前缀。尚未闭合的表格从首行重新排版，保留表头及已收到的全部
   行；表格闭合后的正文继续复用已有表格，不强制重新排版整条消息。
@@ -215,7 +215,7 @@ extmark 一致性。验证：465 项单元测试、界面、edgy、重连及性�
   仍断开并走既有暂存回滚。
 - 新增低开销诊断：回调/消息/字节计数、最大输入与最大消息、积压高水位、批次与最慢行
   耗时、回放阶段标记。超限摘要不含正文；`log.protocol` 记录逐回调明细。
-  `:AcpDebug` 也暴露传输统计。
+  `:AdeDebug` 也暴露传输统计。
 
 可控测量：24 MiB、60,000 行的单次回调在 16 MiB 预算下完成，积压峰值约 8 MiB、耗时约
 27ms；慢于预算的处理器仍会在硬上限处断开。新增 8 项传输限制测试和 1 项单行上限回归；
@@ -232,9 +232,9 @@ stdout 与死锁风险。
 ## 无总积压上限与 spool（2026-11-10）
 
 - `max_pending_bytes = 0` 表示不因总积压断开；仍按输入行共享分发预算，避免只进不出。
-  16/64/256/1024 MiB 各告警一次，`:AcpDebug` 暴露峰值与落盘状态。
+  16/64/256/1024 MiB 各告警一次，`:AdeDebug` 暴露峰值与落盘状态。
 - 新增 `transport.spill_bytes`（默认 64 MiB）：超过水位把最早的已解码消息写入
-  `stdpath("run")/acp.nvim/acp-spill-*`（0600），内存降到低水位后按原始年龄顺序读回；
+  `stdpath("run")/ade.nvim/ade-spill-*`（0600），内存降到低水位后按原始年龄顺序读回；
   后续新数据继续落盘，保证顺序。上限为正时先落盘、上限作为紧急保护。
 - 打开/写入/读取失败都回退内存并记录；已写记录仍优先读完。停止、断连、退出关闭 fd 并
   删除文件，启动清理超过 24 小时的残留。
@@ -271,7 +271,7 @@ StyLua 与 `git diff --check` 通过。
 - 只处理 `agent_message_chunk` / `agent_thought_chunk` / `user_message_chunk` 和单项
   工具文本；工具文本的分片携带累计内容，因为 reducer 会替换 content 数组。其它形状仍整条处理。
 - 后续分片保留 `messageId`/`toolCallId` 与 `_meta`；切片后再解码不会递归切片。
-  `:AcpDebug` 增加 `chunked_messages`/`chunk_parts`。
+  `:AdeDebug` 增加 `chunked_messages`/`chunk_parts`。
 
 测量（约 8.4 MiB 单条文本、模拟每次归约 0.2ms、64 KiB 片）：不切片 1 次归约、约 13ms；
 切片后 128 片、约 60ms，片间按 4ms 预算让出。开销来自逐片编码/解码，换的是单次阻塞缩短。
@@ -346,7 +346,7 @@ spill_bytes 是工作集目标而非 RSS 上限，输入回调、解码对象和
   源文本 byte offset、同源行内偏移与 block/渲染行回退共同用于恢复阅读锚点，覆盖表格重排。
 - 原生 / 与 Visual 复制仅覆盖已物化内容，不伪装全文搜索；显式 Chat:transcript() 导出仍是
   Session 保留的全文，导出时会临时执行全量文本排版。
-- `profile=true` 启用分层计数，`:AcpDebug` 的 render 包含排版/写入/装饰耗时、行数、缓存
+- `profile=true` 启用分层计数，`:AdeDebug` 的 render 包含排版/写入/装饰耗时、行数、缓存
   块数、语法 extmark、任务状态及页范围。默认不开日志或采样。
 
 新增 20 项回归，642 项单元测试通过。默认模式及开启 A+B 的 native/edgy/reconnect 集成
@@ -372,9 +372,9 @@ extmark 计数不含背景 namespace。A 的全文文本排版/写入仍同步�
   下一次同步重建。窗口/焦点恢复会触发同步，切到其他 tab 暂停，返回后恢复；无需额外 watchdog。
 - 按单调时间选帧，不在主循环恢复后补放积压。animate=false 会释放已有 handle 并显示静态帧。
   参数变化也会安全更换 handle；启动、tick、apply、redraw 错误独立记录，连续错误阶段仅首次日志。
-- 明确定向刷新 ACP winbar，不移动焦点；API 不支持时回退 redrawstatus!，缓存兼容路径，
+- 明确定向刷新 ade.nvim 的 winbar，不移动焦点；API 不支持时回退 redrawstatus!，缓存兼容路径，
   不每帧重复探测失败。输入区 setter 错误可返回给 Chrome，不再被内部 pcall 静默吞掉。
-- :AcpDebug 增加 spinner：timer 状态、tick/帧变化/求值/重绘计数、最大 tick 间隔、scheduled
+- :AdeDebug 增加 spinner：timer 状态、tick/帧变化/求值/重绘计数、最大 tick 间隔、scheduled
   等待、刷新等待、最后求值帧、当前/历史错误。求值和重绘请求并不保证已经发生物理屏幕绘制。
 
 657 项单元测试通过（新增 15 项）；默认及 A+B 的 native/edgy/reconnect 集成、性能与格式检查通过。
@@ -455,8 +455,8 @@ tail/spinner、StyLua 与 git diff --check 均通过。
 
 ## 原生补全 source 与完整项目文件索引（2026-11-11）
 
-- 新增共享 `acp.completion` 核心、blink.cmp provider 与 nvim-cmp 的 `acp` source；只在可编辑
-  `acp_input` 中交付候选，不修改全局 sources/按键，保留 `<C-x><C-u>` 异步原生回退。
+- 新增共享 `ade.completion` 核心、blink.cmp provider 与 nvim-cmp 的 `ade` source；只在可编辑
+  `ade_input` 中交付候选，不修改全局 sources/按键，保留 `<C-x><C-u>` 异步原生回退。
 - `/` 使用当前会话命令、说明和输入提示；`@` 使用完整项目索引。框架自行匹配排序，原生菜单
   在全量匹配后才受 `max_items` 限制，深层/后出现的文件不会被前 200 个候选遮蔽。
 - 文件发现异步选用 rg → fd/fdfind → git → 内置遍历；按批排空 NUL 输出后才完成扫描，
@@ -464,8 +464,8 @@ tail/spinner、StyLua 与 git diff --check 均通过。
   无订阅扫描延后 50ms 停止，避免连续按键的取消/订阅交接反复重启进程。
 - 共享引用语法支持无扩展名、中文和 JSON 引号路径，补全与提交解析一致；显示/插入相对会话
   cwd，必要时使用 `../`。支持字面美元符号、空格、引号、反斜杠和换行文件名，不预读文件正文。
-- `:Acp files` / `pick_file()` 可使用 vim.ui.select、fzf-lua、Snacks、Telescope；仅插入引用并
-  返回输入区，不打开文件或发送。默认不占用按键，`:AcpCompletionRefresh` 清理索引缓存。
+- `:Ade files` / `pick_file()` 可使用 vim.ui.select、fzf-lua、Snacks、Telescope；仅插入引用并
+  返回输入区，不打开文件或发送。默认不占用按键，`:AdeCompletionRefresh` 清理索引缓存。
 - 请求与选择接受检查绑定、会话/cwd、buffer tick、可编辑性及光标；销毁/隐藏取消，picker
   暂时取得焦点不会被普通 BufLeave 误取消。原生确认仅在旧后缀仍匹配且身份未变时删除后缀。
 
@@ -490,7 +490,7 @@ Snacks/Telescope 适配仍需用户环境实测。内置遍历不解释 ignore �
 ACP `image` 块，因此没有引入依赖。
 
 - `context/image`：按魔数识别 PNG/JPEG/GIF/WebP，内容寻址存入
-  `stdpath("state")/acp/images`（临时名 + rename，目录 0700、文件 0600），可按 TTL 与总量回收。
+  `stdpath("state")/ade/images`（临时名 + rename，目录 0700、文件 0600），可按 TTL 与总量回收。
 - `context/init`：`file()` 识别图像后改用图像附件，避免把二进制当 text/plain 读取；
   `image()`/`image_bytes()` 只产出元数据，`to_prompt()` 在发送时才编码。
   `path_mode` 控制 `@shot.png` 是 `resource_link` 还是内嵌 `image`；文件消失时返回错误而非静默省略。
@@ -504,7 +504,7 @@ ACP `image` 块，因此没有引入依赖。
   按占位符在正文中的 UTF-8 字节位置生成交错的 text/image（或 resource_link）内容块；
   聊天记录以同一顺序在正文插回编号，不把图像文件名堆在标题上。排队前深拷贝位置元数据，
   已有完整本地图文消息时不再用 Agent 的碎片回显覆盖正文，避免偏移失效或重复图像标记。
-  标签使用 `[Image 1]`、`[Image 2]` 等紧凑编号；`AcpInputImage` 默认浅黄色底、深色粗体。
+  标签使用 `[Image 1]`、`[Image 2]` 等紧凑编号；`AdeInputImage` 默认浅黄色底、深色粗体。
   先前只调整 winbar 内排序的修复不符合需求，原测试也未断言屏幕位置。
   异步读取用独立 extmark 跟随编辑，以 input/config/草稿代次拦截过期结果；不强制 startinsert。
 - 缓存清理保护草稿（含持久化）、队列与会话块引用；写入时即使用 0600，校验已有摘要文件，
@@ -531,7 +531,7 @@ native/edgy/reconnect、性能 smoke、tail/spinner 附加 UI 回归通过。
 
 - `inline/selection`：在映射内用 `getregionpos()` 捕获；字符/行选择默认扩成整行，块选择逐行；
   精确字符/块范围不扩大权限；普通模式没有选区，按请求修改整个副本。拒绝分割 Tab/宽字符的块范围。
-- `inline/copy`：同目录 `.acp-inline-*` 私有副本（0600），目录不可写时退回 state；行尾符跟随源 buffer。
+- `inline/copy`：同目录 `.ade-inline-*` 私有副本（0600），目录不可写时退回 state；行尾符跟随源 buffer。
 - `inline/result`：行/UTF-8 字符 diff、越界过滤，始终按最初文本、文件名和换行快照检查冲突。
 - `inline/apply`：仅写入真实修改的 hunks，保留其它行的 extmarks，单次撤销。
 - `inline/diff_session`：独立只读 scratch 审查，`ga`/`gr`/`g2`/`g3`/`g1`；全部决定后才写源。
@@ -553,11 +553,11 @@ native/edgy/reconnect、性能 smoke、tail/spinner 附加 UI 回归通过。
   从上到下），行类型（modify/delete/add）、filler 与字符级范围（`result.char_ranges`，超过一半变化的行
   不做字符级标记）都来自同一份配对，modify 行对面必有内容、add/delete 行对面必为 filler。
   块高度与决策无关，决定只替换结果列块内文本。
-- 外观：每栏只显示自己一侧相对结果的变化——原文 pending 为 `AcpReviewDelete`(+DeleteText)、接受后
-  `AcpReviewDimmed`、拒绝后无底色；结果 pending 为 `AcpReviewPending`、接受后 `AcpReviewAdd`(+AddText)；
-  提案为 `AcpReviewAdd`(+AddText)、拒绝后 `AcpReviewDimmed`。状态条 `AcpReviewState*`（三栏同行同色，
+- 外观：每栏只显示自己一侧相对结果的变化——原文 pending 为 `AdeReviewDelete`(+DeleteText)、接受后
+  `AdeReviewDimmed`、拒绝后无底色；结果 pending 为 `AdeReviewPending`、接受后 `AdeReviewAdd`(+AddText)；
+  提案为 `AdeReviewAdd`(+AddText)、拒绝后 `AdeReviewDimmed`。状态条 `AdeReviewState*`（三栏同行同色，
   已决定块首行 ✓/✗）；当前块在结果列行尾提示 ga/gr（`hints`）。winbar 徽章每栏一个，计数只在结果列。
-  `AcpReviewCursorLine` 复制 `CursorLine` 底色去掉下划线。底色在 setup/ColorScheme 时从主题
+  `AdeReviewCursorLine` 复制 `CursorLine` 底色去掉下划线。底色在 setup/ColorScheme 时从主题
   `DiffAdd/DiffDelete/DiffChange/DiffText` 复制（只复制 bg），运行期不算色；filler 为固定灰。
 - `inline/review/card`：`min_split_width` 以下或 `target = "float"` 时回退；复用
   `ui.diff`/`ui.diff_hl` 的 `bg` 与语法 segments，只加 `@@` 头、状态 gutter 与 `row_hunk`。
@@ -656,11 +656,11 @@ native/edgy/reconnect、性能 smoke、tail/spinner 附加 UI 回归通过。
   agent 命令，只采用方法给出的 `args`/`env`（按 ACP 要求，方法不能指定 command；env 覆盖同名
   配置），启动前展示命令与 env。退出码 0 后**强制重启** agent 进程（`Connection:restart`，因为
   `reconnect` 在连接健康时是 no-op），再重发失败的消息；`agent` 类型调用 `authenticate`。
-- 同一登录流程连续成功后 agent 仍拒绝时，最多重试 2 次后停止并提示；`:Acp login` 会重置计数。
+- 同一登录流程连续成功后 agent 仍拒绝时，最多重试 2 次后停止并提示；`:Ade login` 会重置计数。
   登录终端打开失败（例如窗口太小）会报告错误而不是留下 `running` 状态；横向分屏放不下时改用
   新 tab，登录窗口优先落在面板记录的焦点窗口下方，不会替换聊天区或输入框。
 - 重试保留原用户消息，不重复插入；失败的那一轮不再留下错误块。
-- 新增 `:Acp login` 与 `:Acp logout`（后者仅当 agent 声明 `auth.logout`）；未连接时 `:Acp login`
+- 新增 `:Ade login` 与 `:Ade logout`（后者仅当 agent 声明 `auth.logout`）；未连接时 `:Ade login`
   明确提示先连接，logout 成功后提示下次新建会话需要重新登录。
 - 删除 `prompts.lua`、`controller.lua` 里写死的 OpenCode 提示；没有登录方式时提示查看 agent
   文档。`health` 报告当前登录方式。
@@ -678,23 +678,23 @@ agent profile 与规范化 controls：
 
 - 内置 `claude` 与 `pi` 预设；用户配置按字段合并，不会替换掉预设。`profile` 省略时按 agent
   名称推断，未知 agent 用 `generic`。
-- 新增 `lua/acp/agents/init.lua`：`plan_mode`、`unsafe_edit_mode`、`tool_name`、
+- 新增 `lua/ade/agents/init.lua`：`plan_mode`、`unsafe_edit_mode`、`tool_name`、
   `update_meta`、`is_question`、`classify_mode`、`error_hint`、`install_hint`，全部有 generic
   默认值，并且都有实际调用方：工具名落到 tool card，提问识别交给权限模块（保留通用启发式兜底），
   错误提示追加到失败块，`health` 按 agent 给出安装提示并检查每个已配置的 agent。
   OpenCode 的 `retry` / `compaction` / `child-session` 解析从 reducer 移入 profile。
-- 新增 `lua/acp/session/controls.lua`：有 configOptions 时忽略 `modes`（pi 两者重复）；
+- 新增 `lua/ade/session/controls.lua`：有 configOptions 时忽略 `modes`（pi 两者重复）；
   只有 `modes` 时按 profile 分类为工作模式或思考级别；模式语义优先读选项 `_meta.kind`。
   修正 `state.lua` 从 `result.modes.currentModeId` 读取当前模式；`current_mode_update` 同时
   更新 controls 和 configOptions。
 - `app/options` 按 control id 选择，boolean 直接切换，`session/set_mode` 与
-  `session/set_config_option` 各走其源；新增 `:Acp config` 汇总全部 controls。
+  `session/set_config_option` 各走其源；新增 `:Ade config` 汇总全部 controls。
 - 工具栏只读 controls：徽章按 value id 与 `plan` 语义着色（`mode_hl(label, key, plan)`），
   思考级别单独显示小幅标记。
-- 新增 `:Acp agent [name]`：切换 agent 时关闭当前连接、保留各自会话元数据；切换前统计并提示
+- 新增 `:Ade agent [name]`：切换 agent 时关闭当前连接、保留各自会话元数据；切换前统计并提示
   被丢弃的排队消息与被打断的回合。
 - 删除随 controls 失去调用方的死代码：`controls.any`、`Session:option_by_category`、
-  `state.select_values`、`state.option_label`；`:Acp config` 的嵌套标题不再重复。
+  `state.select_values`、`state.option_label`；`:Ade config` 的嵌套标题不再重复。
 - 新增 profile、controls 推导、切换方法、boolean 切换、agent 切换提示、工具名/错误提示/
   安装提示接线的单元与 controller 级测试。
 
@@ -793,10 +793,10 @@ mock 新增 `resumeonly` profile（可 resume、不可 load）、`session/resume
 
 - **事件分发表**：`app/events` 用 `handlers[name]` 代替 controller 里的 if 链，未知事件被忽略，
   服务或测试可以替换单个处理器。
-- **inline 依赖注入**：`acp.inline.setup({ state, send, is_question })`。inline 不再 require
+- **inline 依赖注入**：`ade.inline.setup({ state, send, is_question })`。inline 不再 require
   controller，也不再直接 require `app.permissions`、`ui.picker`、`ui.diff`。
 - **呈现器边界**：新增 `app/presenter`，picker、表单、权限详情、会话浏览器、图标与 diff 都从
-  这里取。它按调用时 require，所以测试替换具体后端（如 `acp.ui.picker.select`）仍然生效。
+  这里取。它按调用时 require，所以测试替换具体后端（如 `ade.ui.picker.select`）仍然生效。
 - **状态真拆**：`app/stores` 把全局 `S` 拆成 `connection` / `session` / `view` 三张真实表，
   字段按语义命名（`session.current`、`connection.phase`），`config` 留在顶层。旧的扁平名是
   metatable 提供的兼容视图，`rawget` 读不到；`controller.stores()` 暴露三张表。controller、
@@ -808,7 +808,7 @@ controller 从 1851 行降到 599 行（后来托管安装又加了入口，现�
 `setup`）、`app/turn`、`app/window`、`app/status`、`app/attachments`、`app/runtime_ops`、
 `app/connection_flow`、`app/events`、`app/presenter`。
 
-分层门禁：模块 require 图无环；`protocol/*` 与 `session/*` 不 require `acp.ui*`；`app/*` 只能
+分层门禁：模块 require 图无环；`protocol/*` 与 `session/*` 不 require `ade.ui*`；`app/*` 只能
 经 `app/presenter` 使用 picker/form/详情/会话浏览器/图标/diff（`app.connection` 的
 `ui.work_scheduler` 例外，它属于调度而非呈现）。
 
@@ -848,7 +848,7 @@ controller 从 1851 行降到 599 行（后来托管安装又加了入口，现�
 按 `docs/agent-manager-plan.md` 实现了阶段 1–5：内置包清单、每 agent 独立安装记录、
 跨进程锁与运行租约、npm 安装事务、启动来源解析、管理界面与文档。
 
-**装的在哪里**：`stdpath("data")/acp/agents/<id>/releases/<install-id>/`。不写插件目录、
+**装的在哪里**：`stdpath("data")/ade/agents/<id>/releases/<install-id>/`。不写插件目录、
 不写项目目录、不做全局 npm 安装。每个 agent 独立的 `current.json` 指针，所以两个 agent
 可以并行更新，同一个 agent 串行。
 
@@ -877,7 +877,7 @@ controller 从 1851 行降到 599 行（后来托管安装又加了入口，现�
 - 经插件自身连接托管 pi：`launch.source == "managed"`，命令为
   `node <release>/node_modules/@geohar/pi-acp/dist/index.js`，不再经过 npx。
 - 租约生命周期：运行中 1 个存活租约，断开后归零。
-- `:checkhealth acp` 按实际启动来源报告（`agent: pi (managed, node)`）。
+- `:checkhealth ade` 按实际启动来源报告（`agent: pi (managed, node)`）。
 - 发现并修正：真实 Claude 0.107 不再在 mode 选项上带 `_meta.kind`，徽章依赖 profile 的
   id 匹配兜底（已补回归测试）。
 

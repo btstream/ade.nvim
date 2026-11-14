@@ -199,7 +199,7 @@ M.supports(agent_caps, "prompt.image" | "prompt.embeddedContext" | "session.list
 
 ### 2.1 `app/interactions.lua`（新增）
 ```lua
----@class AcpInteraction
+---@class AdeInteraction
 ---@field id string              -- 内部 id，例如 "perm:12"、"elicit:3"
 ---@field type "permission"|"elicitation"   -- 后续可加 "terminal"、"fs"
 ---@field session_id string|nil
@@ -217,7 +217,7 @@ Interactions:cancel(id, reason)             -- 按类型回复对应的取消结
 Interactions:cancel_session(session_id)     -- session/cancel 时调用
 Interactions:cancel_all(reason)             -- 断线、退出、shutdown 时调用
 Interactions:on_remote_cancel(rpc_id)       -- agent 发来 $/cancel_request：标为 expired，并关闭对应的 UI
-Interactions:pending(session_id?) -> AcpInteraction[]   -- 按 created 排序
+Interactions:pending(session_id?) -> AdeInteraction[]   -- 按 created 排序
 Interactions:show_next()                    -- 打开最早的一个待回答请求
 ```
 
@@ -329,7 +329,7 @@ tool card 显示等待状态，`<CR>` 可直接重开请求。一致性套件中
     agent 的命令（命令和参数来自方法本身，或者用当前 agent 配置的 `command` 加上方法给的 `args`/`env`）；
     终端退出后自动重连并重试刚才的操作。
   - `type == "agent"`（或没有 type）：调用 `authenticate(methodId)`，成功后重试。
-- **新增 `:Acp login`**：手动触发登录；`:Acp logout` 仅在 agent 声明 `auth.logout` 时可用。
+- **新增 `:Ade login`**：手动触发登录；`:Ade logout` 仅在 agent 声明 `auth.logout` 时可用。
 - 删除 `app/prompts.lua`、控制器中写死的 OpenCode 提示，改为显示 agent 给出的登录方式；
   完全没有提供登录方式时，提示查看 agent 文档。
 
@@ -342,8 +342,8 @@ agent 方式会调用 `authenticate`；登录后重试成功。
 `session/new` / `session/load` / `session/prompt` 失败都会进入登录并在成功后重试。单一方式
 直接执行，多个用 picker；terminal 类型在新 `:terminal` 分屏运行客户端自己配置的 agent 命令
 （只采用方法给的 args/env，启动前展示），退出 0 后强制重启进程、恢复会话并重发失败的消息；
-agent 类型调用 `authenticate`。连续失败最多重试 2 次后停止；`:Acp login` 重置计数。登录终端从
-编辑器窗口切分（面板布局不变），放不下时改用新 tab。新增 `:Acp login` / `:Acp logout`（后者仅
+agent 类型调用 `authenticate`。连续失败最多重试 2 次后停止；`:Ade login` 重置计数。登录终端从
+编辑器窗口切分（面板布局不变），放不下时改用新 tab。新增 `:Ade login` / `:Ade logout`（后者仅
 在 agent 声明 `auth.logout` 时可用）。删除写死的 OpenCode 提示，无登录方式时提示查看 agent
 文档；`health` 列出登录方式。顺带修复创建会话的 `creating`
 守卫在任务被取消后永久卡住的问题，并声明 `session.configOptions.boolean`。mock 增加 `@auth`
@@ -361,12 +361,12 @@ agent 类型调用 `authenticate`。连续失败最多重试 2 次后停止；`:
   pi       = { command = "npx", args = { "-y", "@geohar/pi-acp" }, profile = "pi" },
   ```
   `profile` 省略时按 agent 名称推断，推断不出时使用 `generic`。
-- 新增 `:Acp agent [name]`：切换 agent（关闭当前连接，用新 agent 连接；会话按 agent 分开记录）。
+- 新增 `:Ade agent [name]`：切换 agent（关闭当前连接，用新 agent 连接；会话按 agent 分开记录）。
 - `health.lua` 对每个已配置的 agent 检查可执行文件是否存在，并给出对应的安装提示。
 
-### 5.2 profile 钩子（`lua/acp/agents/{generic,opencode,claude,pi}.lua`）
+### 5.2 profile 钩子（`lua/ade/agents/{generic,opencode,claude,pi}.lua`）
 ```lua
----@class AcpAgentProfile
+---@class AdeAgentProfile
 ---@field name string
 ---@field install_hint string
 ---@field classify_mode fun(control): "work"|"thinking"|nil   -- 模式是工作模式还是思考级别
@@ -401,7 +401,7 @@ agent 类型调用 `authenticate`。连续失败最多重试 2 次后停止；`:
 - `app/options.lua` 按 control id 选择（不再按 category）；boolean 用开关切换；extras 用一个总的 picker。
 - toolbar 只读取 controls：徽章样式由 `plan_mode` 判断（Claude 的 plan 模式也会显示为 plan 样式），
   思考级别单独显示一个小标记。
-- 新增 `:Acp config`：打开 extras 和全部 controls 的 picker。
+- 新增 `:Ade config`：打开 extras 和全部 controls 的 picker。
 
 **测试**：三个 profile 的 controls 推导；切换走正确的方法（`set_config_option` 或 `set_mode`）；
 `current_mode_update` 后徽章更新；boolean 配置项可以切换。
@@ -414,7 +414,7 @@ OpenCode 的 `retry`/`compaction`/`child-session` 从 reducer 移出。新增 `s
 configOptions 优先并忽略重复的 `modes`，只有 `modes` 时按 profile 分出工作模式与思考级别，
 模式语义先读 `_meta.kind`。修正 `modes.currentModeId` 层级与 `current_mode_update` 的 controls
 刷新。`app/options` 按 control id 切换，boolean 直接翻转，`set_mode` 与 `set_config_option`
-各走其源；新增 `:Acp config` 与 `:Acp agent [name]`，后者按 agent 分开保存会话标题与 cwd，
+各走其源；新增 `:Ade config` 与 `:Ade agent [name]`，后者按 agent 分开保存会话标题与 cwd，
 并在丢弃排队消息/打断回合时提示。工具栏按 value id 与 `plan` 语义着色，并显示思考级别。
 
 ---
@@ -556,11 +556,11 @@ protocol 和 session 两层不 require `ui/*`；controller 不超过 700 行（�
 
 - 9.1 已完成：`app/events` 是事件分发表（`handlers[name]`），`dispatch` 忽略未知事件，
   `register` 允许服务或测试替换单个处理器。controller 的 `on_client_event` 只剩一次转发。
-- 9.2 已完成：`protocol/*` 与 `session/*` 都不 require `acp.ui*`；调度器由连接服务注入。
-- 9.3 已完成：`acp.inline.setup({ state, send, is_question })` 注入三个钩子，inline 不再 require
+- 9.2 已完成：`protocol/*` 与 `session/*` 都不 require `ade.ui*`；调度器由连接服务注入。
+- 9.3 已完成：`ade.inline.setup({ state, send, is_question })` 注入三个钩子，inline 不再 require
   controller；`presenter.select` / `presenter.diff_lines` 取代对 `ui.picker`、`ui.diff` 的直接依赖。
 - 9.4 已完成：`app/presenter` 是 `app/*` 访问 UI 的唯一入口（picker、form、权限详情、会话浏览器、
-  图标、diff）。它按调用时 require，因此测试替换 `acp.ui.picker.select` 等仍然生效。
+  图标、diff）。它按调用时 require，因此测试替换 `ade.ui.picker.select` 等仍然生效。
 - 9.5 已完成，按「真拆」执行：`app/stores` 把状态拆成 `connection` / `session` / `view` 三张
   真实表，字段按语义命名（`session.current`、`connection.phase`），`config` 留在顶层。扁平名
   （`state.session`、`state.chat`）只是 metatable 提供的兼容视图，`rawget` 读不到；`controller.stores()`
