@@ -1,0 +1,26 @@
+[package]
+name = "nvim_ade_server"
+version = "0.1.0"
+edition = "2021"
+description = "Background service for ade.nvim (ACP agent manager)"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "nvim_ade_server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }

@@ -1,0 +1,80 @@
+name: service
+
+# Format, lint and test the Rust service (service/).
+#
+# The toolchain is NOT hard-coded: every job reads the channel from
+# service/rust-toolchain.toml, so bumping the nightly only means editing that
+# one file. See service/README.md ("Nightly toolchain").
+#
+# Third-party actions are pinned to a full commit SHA; the version they
+# correspond to is in the trailing comment. `actions/*` stay on their major tag.
+
+on:
+  push:
+    paths:
+      - "service/**"
+      - ".github/workflows/service.yml"
+  pull_request:
+    paths:
+      - "service/**"
+      - ".github/workflows/service.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: service-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: fmt + clippy + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    defaults:
+      run:
+        working-directory: service
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Read toolchain from service/rust-toolchain.toml
+        id: toolchain
+        shell: bash
+        working-directory: .
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' service/rust-toolchain.toml)"
+          if [ -z "$channel" ]; then
+            echo "no channel found in service/rust-toolchain.toml" >&2
+            exit 1
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "Using Rust $channel"
+
+      - name: Install Rust (channel from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (master, 2026-10-16)
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: service -> target
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-targets
