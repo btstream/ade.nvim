@@ -1,0 +1,193 @@
+-- Start the service on demand and connect to it.
+--
+-- The service is started only by a Neovim that needs it (design §4.1): no
+-- systemd/launchd unit, and no automatic restart. `ensure()` therefore does
+-- the minimum: return early when the socket already accepts a connection,
+-- otherwise spawn `nvim_ade_server serve` detached and wait for the one-line
+-- JSON status the contract requires on stdout.
+--
+-- Nothing here downloads or installs anything: a missing binary is an explicit
+-- "not installed" error so the caller can suggest `:Ade service install`.
+local log = require("ade.log")
+local Paths = require("ade.service.paths")
+
+local M = {}
+
+---Default time to wait for the service's ready line.
+M.DEFAULT_START_TIMEOUT = 5000
+
+---Whether something is listening on the service socket right now.
+---
+---Connecting is the only portable probe: a stale socket file survives a crash,
+---and a named pipe has no file at all. The test connection is closed at once;
+---the service treats a connection that sends nothing as a client that left.
+---@param paths table
+---@return boolean reachable
+function M.probe(paths)
+  paths = paths or Paths.paths()
+  if not paths.pipe and vim.fn.isdirectory(paths.dir) == 0 and vim.fn.filereadable(paths.socket) ~= 1 then
+    -- A named pipe has no file; a unix socket does. Without it, skip the
+    -- connect attempt so a missing service never logs an error.
+    return false
+  end
+  local pipe = vim.uv.new_pipe(false)
+  if not pipe then
+    return false
+  end
+  local connected = false
+  local failed = false
+  local ok = pcall(function()
+    pipe:connect(paths.socket, function(err)
+      if err then
+        failed = true
+      else
+        connected = true
+      end
+    end)
+  end)
+  if not ok then
+    pcall(function()
+      pipe:close()
+    end)
+    return false
+  end
+  -- `connect` on a unix socket completes synchronously in libuv, so this wait
+  -- usually returns on the first iteration. The timeout only protects a
+  -- pathologically slow filesystem.
+  vim.wait(500, function()
+    return connected or failed
+  end, 5)
+  pcall(function()
+    pipe:close()
+  end)
+  return connected
+end
+
+---Parse the single status line printed by `nvim_ade_server serve`.
+---@param line string|nil
+---@return table|nil status
+---@return string|nil err
+function M.parse_status(line)
+  if type(line) ~= "string" or vim.trim(line) == "" then
+    return nil, "the service printed no status line"
+  end
+  local ok, decoded = pcall(vim.json.decode, vim.trim(line))
+  if not ok or type(decoded) ~= "table" then
+    return nil, "the service status is not JSON: " .. line:sub(1, 120)
+  end
+  local status = decoded.status
+  if status ~= "ready" and status ~= "already_running" and status ~= "error" then
+    return nil, "unknown service status: " .. tostring(status)
+  end
+  return decoded, nil
+end
+
+---Spawn the service and wait for its status line.
+---
+---`spawn` is injectable: tests replace it with a scripted function so no real
+---process is started.
+---@param opts {bin: string, paths: table, timeout?: integer,
+---  spawn?: fun(argv: string[], on_line: fun(line: string), on_exit: fun(code: integer)): boolean}
+---@return boolean ok
+---@return string|nil err
+---@return table|nil status
+function M.start(opts)
+  local timeout = opts.timeout or M.DEFAULT_START_TIMEOUT
+  local paths = opts.paths or Paths.paths()
+  local spawn = opts.spawn
+    or function(argv, on_line, on_exit)
+      local lines = {}
+      local id = vim.fn.jobstart(argv, {
+        detach = true,
+        stdin = "null",
+        on_stdout = function(_, data)
+          for _, chunk in ipairs(data or {}) do
+            if chunk ~= "" then
+              lines[#lines + 1] = chunk
+              on_line(table.concat(lines, "\n"))
+            end
+          end
+        end,
+        on_exit = function(_, code)
+          on_exit(code or -1)
+        end,
+      })
+      return type(id) == "number" and id > 0
+    end
+
+  local status, failure, exited = nil, nil, nil
+  local started = spawn({ opts.bin, "serve" }, function(line)
+    if status then
+      return
+    end
+    local parsed, err = M.parse_status(line)
+    if parsed then
+      status = parsed
+    elseif err then
+      failure = err
+    end
+  end, function(code)
+    exited = code
+  end)
+  if not started then
+    return false, "unable to start " .. opts.bin, nil
+  end
+  vim.wait(timeout, function()
+    return status ~= nil or exited ~= nil
+  end, 10)
+  if not status then
+    if failure then
+      return false, "the service printed an unusable status: " .. failure, nil
+    end
+    if exited ~= nil then
+      return false, string.format("the service exited with %s before becoming ready", tostring(exited)), nil
+    end
+    return false, string.format("the service did not become ready within %d ms", timeout), nil
+  end
+  if status.status == "error" then
+    return false, "the service failed to start: " .. tostring(status.message or "no message"), status
+  end
+  return true, nil, status
+end
+
+---Make sure a service is running and return the paths to reach it.
+---
+---Returns `false, reason` when there is no installed binary. The reason is
+---written to be shown to the user as-is, since the most likely cause is "the
+---install hook never ran".
+---@param opts {bin?: string, data_dir?: string, timeout?: integer, spawn?: function,
+---  probe?: fun(paths: table): boolean}|nil
+---@return boolean ok
+---@return string|nil err
+---@return table|nil info `{paths, status, bin}`
+function M.ensure(opts)
+  opts = opts or {}
+  local paths = Paths.paths()
+  local probe = opts.probe or M.probe
+  if probe(paths) then
+    log.debug("service already reachable at %s", paths.socket)
+    return true, nil, { paths = paths, status = { status = "already_running", socket = paths.socket } }
+  end
+
+  local bin = opts.bin
+  if not bin then
+    bin = require("ade.service.install").current_binary({ data_dir = opts.data_dir })
+  end
+  if not bin then
+    return false,
+      "nvim_ade_server is not installed; run :Ade service install (or set service.path to a built binary)",
+      nil
+  end
+  if vim.fn.executable(bin) ~= 1 then
+    return false, "the service binary is not executable: " .. bin, nil
+  end
+
+  log.info("starting nvim_ade_server: %s", bin)
+  local ok, err, status = M.start({ bin = bin, paths = paths, timeout = opts.timeout, spawn = opts.spawn })
+  if not ok then
+    return false, err, nil
+  end
+  return true, nil, { paths = paths, status = status, bin = bin }
+end
+
+return M

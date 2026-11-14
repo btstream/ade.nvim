@@ -719,6 +719,69 @@ require("ade").setup({
 托管安装损坏时 `auto` 会报错而不是换一个版本运行；想严格禁止 npx 回退时用
 `source = "managed"`。
 
+## 服务后端（nvim_ade_server）
+
+后续版本会把 agent 的管理搬到 Rust 后台服务 `nvim_ade_server`。**目前服务还没接管聊天**：
+默认仍是 Lua 直连（`backend = "direct"`），这一节只涉及服务的安装与状态查看，不改变现有体验。
+
+### 安装
+
+推荐在插件管理器里挂一个 build 钩子（lazy.nvim）：
+
+```lua
+{
+  "btstream/ade.nvim",
+  build = function()
+    require("ade.service.install").run()
+  end,
+}
+```
+
+其他插件管理器（vim-plug 的 `do`、packer 的 `run` 等）在安装或更新后执行一次
+`:Ade service install` 即可。两者行为相同：
+
+1. 已经装了需要的版本就跳过；
+2. 优先下载对应平台的预编译包，并用发行版里的 `SHA256SUMS` 校验（不一致直接拒绝）；
+3. 下载不可用（无网络、平台不在构建矩阵、该版本还没发布）时用 `cargo` 本地编译。服务使用
+   `service/rust-toolchain.toml` 锁定日期的 nightly 工具链，**建议安装 rustup**，它会自动获取
+   指定的 nightly；编译仍然失败时，提示会写明需要 rustup，或者改用 `service.path` 指向你自己
+   编译的二进制；
+4. 两种方式都失败时给出提示，插件继续以直连模式工作，不会因此不可用。
+
+自己编译了二进制，或者想用别的安装位置，设置 `service.path`：设置后只运行
+`<path> version` 做版本检查，不下载也不编译。
+
+```lua
+require("ade").setup({
+  service = {
+    path = "/opt/ade/bin/nvim_ade_server", -- 可选
+    release_base = "https://github.com/btstream/ade.nvim/releases/download", -- 可选，必须 https
+    install_timeout = 10 * 60 * 1000,      -- 下载或编译的总超时
+    start_timeout = 5000,                  -- 等待服务就绪的超时
+  },
+})
+```
+
+`release_base` 必须是 `https://`：压缩包和 `SHA256SUMS` 来自同一个地址，若允许明文 http，
+中间人可以同时替换两者，校验就失去意义；下载时也会用 `curl --proto =https --proto-redir =https`
+禁止跟随重定向降级。唯一例外是回环地址（`localhost`、`127.0.0.1`、`[::1]`）可以用
+`http://`，方便本地测试服务器。此外，URL 里出现反斜杠、空白或控制字符、或 authority 里带
+`@`（userinfo）都会被直接拒绝——这些写法在不同 URL 解析器里含义不一致（例如浏览器会把
+`http://evil.example\@127.0.0.1/` 的反斜杠当作路径分隔符），不适合用来指定发布源。
+
+### 命令与健康检查
+
+| 命令 | 说明 |
+|---|---|
+| `:Ade service install` | 安装服务（异步，进度用通知显示） |
+| `:Ade service status` | 已安装版本、二进制路径、是否在运行、`api_version` 是否匹配 |
+| `:Ade service start` | 在后台启动服务（已运行则直接复用） |
+| `:Ade service stop` | 让服务退出 |
+
+`:checkhealth ade` 里的 “ade.nvim service” 一节与 `status` 内容一致，只报告不修改。
+服务目录、socket 和令牌路径遵循同一套规则：优先 `$NVIM_ADE_SERVER_DIR`，其次
+`$XDG_RUNTIME_DIR/ade`、`$XDG_STATE_HOME/ade`，最后 `~/.local/state/ade`。
+
 ## 配置
 
 ```lua

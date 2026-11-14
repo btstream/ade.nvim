@@ -134,5 +134,6 @@ require("tests.spec_agent_resolve")(t)
 require("tests.spec_agent_manager_service")(t)
 require("tests.spec_agent_launch")(t)
 require("tests.spec_migrate")(t)
+require("tests.spec_service")(t)
 
 t.run()

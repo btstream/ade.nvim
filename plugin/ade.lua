@@ -35,7 +35,11 @@ local SUBCOMMANDS = {
   "inline-stop",
   "inline-reset",
   "diagnostics",
+  "service",
 }
+
+---Subcommands of `:Ade service`.
+local SERVICE_SUBCOMMANDS = { "install", "status", "start", "stop" }
 
 ---Complete subcommands, and agent ids for the commands that take one.
 local function complete(arglead, cmdline)
@@ -61,6 +65,8 @@ local function complete(arglead, cmdline)
       local current = ok and (config.current or config.defaults) or {}
       candidates = vim.tbl_keys(current.agents or {})
       table.sort(candidates)
+    elseif sub == "service" then
+      candidates = SERVICE_SUBCOMMANDS
     else
       return {}
     end
@@ -174,11 +180,13 @@ local function setup()
         ade.inline_reset()
       elseif sub == "diagnostics" then
         ade.add_diagnostics()
+      elseif sub == "service" then
+        require("ade.service.commands").dispatch(rest ~= "" and rest or nil)
       else
         vim.notify("ade.nvim: unknown subcommand " .. sub, vim.log.levels.WARN)
       end
     end,
-    "open|hide|toggle|new|stop|reconnect|login|logout|agent|agents|install|update|uninstall|config|disconnect|permission|sessions|delete|model|mode|file|files|image|inline|inline-stop|inline-reset|diagnostics",
+    "open|hide|toggle|new|stop|reconnect|login|logout|agent|agents|install|update|uninstall|config|disconnect|permission|sessions|delete|model|mode|file|files|image|inline|inline-stop|inline-reset|diagnostics|service",
     true,
     complete
   )
