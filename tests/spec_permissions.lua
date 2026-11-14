@@ -1,9 +1,9 @@
 return function(t)
-  local controller = require("acp.controller")
-  local config = require("acp.config")
-  local state = require("acp.session.state")
-  local picker = require("acp.ui.picker")
-  local permissions = require("acp.app.permissions")
+  local controller = require("ade.controller")
+  local config = require("ade.config")
+  local state = require("ade.session.state")
+  local picker = require("ade.ui.picker")
+  local permissions = require("ade.app.permissions")
 
   local function with_ui_select(stub, fn)
     local original = vim.ui.select
@@ -67,7 +67,7 @@ return function(t)
     t.it("expires the picker when the agent withdraws the request", function()
       controller.setup({ ui = {}, permissions = { prompt = "select" } })
       local S = controller.state()
-      local picker = require("acp.ui.picker")
+      local picker = require("ade.ui.picker")
       local original = picker.select
       local choices = {}
       picker.select = function(opts)
@@ -151,7 +151,7 @@ return function(t)
     t.it("uses the meta permission title for Claude questions", function()
       controller.setup({ ui = { picker = "vim" }, permissions = { prompt = "select" } })
       local S = controller.state()
-      local picker = require("acp.ui.picker")
+      local picker = require("ade.ui.picker")
       local original, seen = picker.select, nil
       picker.select = function(opts)
         seen = opts
@@ -184,7 +184,7 @@ return function(t)
       local S = controller.state()
       S.conn.phase = "ready"
       S.sess.current = nil
-      local ic = require("acp.ui.icons").get(true)
+      local ic = require("ade.ui.icons").get(true)
       t.eq(ic.assistant, controller.statusline())
       local session = state.new("s1", "/tmp")
       session.status = "running"
@@ -214,7 +214,7 @@ return function(t)
       t.truthy(called)
       t.eq(2, called.count)
       t.eq("Pick", called.prompt)
-      t.eq("acp_select", called.kind)
+      t.eq("ade_select", called.kind)
     end)
 
     t.it("treats a nil choice as cancellation", function()

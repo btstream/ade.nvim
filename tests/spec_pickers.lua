@@ -1,10 +1,10 @@
 -- Highlight coverage for the pickers the plugin draws itself.
 --
--- Both dialogs must colour every region through the `AcpPicker*` groups so a
+-- Both dialogs must colour every region through the `AdePicker*` groups so a
 -- user can restyle them without touching the panel's groups.
 return function(t)
-  local highlights = require("acp.ui.highlights")
-  local picker = require("acp.ui.picker")
+  local highlights = require("ade.ui.highlights")
+  local picker = require("ade.ui.picker")
 
   ---Highlight groups used by the extmarks of `buf` in namespace `name`.
   ---@param buf integer
@@ -35,7 +35,7 @@ return function(t)
       local buf = vim.api.nvim_win_get_buf(win)
       local ft = vim.bo[buf].filetype
       if
-        ft == "acp_sessions" or (vim.bo[buf].buftype == "nofile" and vim.api.nvim_win_get_config(win).relative ~= "")
+        ft == "ade_sessions" or (vim.bo[buf].buftype == "nofile" and vim.api.nvim_win_get_config(win).relative ~= "")
       then
         pcall(vim.api.nvim_win_close, win, true)
       end
@@ -55,10 +55,10 @@ return function(t)
     t.it("maps the floating window chrome onto the picker groups", function()
       local winhl = highlights.picker_winhl()
       for _, pair in ipairs({
-        "Normal:AcpPickerNormal",
-        "NormalNC:AcpPickerNormal",
-        "FloatBorder:AcpPickerBorder",
-        "FloatTitle:AcpPickerTitle",
+        "Normal:AdePickerNormal",
+        "NormalNC:AdePickerNormal",
+        "FloatBorder:AdePickerBorder",
+        "FloatTitle:AdePickerTitle",
       }) do
         t.truthy(winhl:find(pair, 1, true), "winhighlight is missing " .. pair)
       end
@@ -87,8 +87,8 @@ return function(t)
       local win = wins[#wins]
       t.truthy(win and vim.api.nvim_win_is_valid(win), "no window was opened")
       local winhl = vim.api.nvim_get_option_value("winhighlight", { win = win })
-      t.truthy(winhl:find("Normal:AcpPickerNormal", 1, true), "minimal style overrode the picker background")
-      t.truthy(winhl:find("FloatBorder:AcpPickerBorder", 1, true), "minimal style overrode the picker border")
+      t.truthy(winhl:find("Normal:AdePickerNormal", 1, true), "minimal style overrode the picker background")
+      t.truthy(winhl:find("FloatBorder:AdePickerBorder", 1, true), "minimal style overrode the picker border")
       close_all()
     end)
 
@@ -119,15 +119,15 @@ return function(t)
       end
       buf = vim.api.nvim_win_get_buf(wins[#wins])
 
-      local groups = marks(buf, "acp_picker")
-      t.truthy(groups.AcpPickerItem, "rows have no item group")
-      t.eq({ 1, 2 }, groups.AcpPickerItem, "every row should carry the item group")
-      t.eq({ 1 }, groups.AcpPickerSelection, "only the cursor row should be selected")
-      t.eq({ 1 }, groups.AcpPickerDescription, "the description is drawn with its own group")
+      local groups = marks(buf, "ade_picker")
+      t.truthy(groups.AdePickerItem, "rows have no item group")
+      t.eq({ 1, 2 }, groups.AdePickerItem, "every row should carry the item group")
+      t.eq({ 1 }, groups.AdePickerSelection, "only the cursor row should be selected")
+      t.eq({ 1 }, groups.AdePickerDescription, "the description is drawn with its own group")
 
       -- The selected row keeps its item mark *and* gains the selection, so a
       -- foreground-only override still shows the floating background.
-      t.truthy(vim.tbl_contains(groups.AcpPickerItem, 1))
+      t.truthy(vim.tbl_contains(groups.AdePickerItem, 1))
       close_all()
     end)
 
@@ -145,8 +145,8 @@ return function(t)
       picker._internal_select({ title = "Pick", items = items, on_choice = function() end })
       vim.api.nvim_open_win = original
       local buf = vim.api.nvim_win_get_buf(win)
-      local groups = marks(buf, "acp_picker")
-      t.truthy(groups.AcpPickerPrompt, "the filter row has no prompt group")
+      local groups = marks(buf, "ade_picker")
+      t.truthy(groups.AdePickerPrompt, "the filter row has no prompt group")
       close_all()
 
       -- Empty state: the "no match" line uses its own group.
@@ -158,8 +158,8 @@ return function(t)
       picker._internal_select({ title = "Pick", items = {}, filter = false, on_choice = function() end })
       vim.api.nvim_open_win = original
       buf = vim.api.nvim_win_get_buf(win)
-      groups = marks(buf, "acp_picker")
-      t.truthy(groups.AcpPickerEmpty, "the empty state has no group")
+      groups = marks(buf, "ade_picker")
+      t.truthy(groups.AdePickerEmpty, "the empty state has no group")
       close_all()
     end)
 
@@ -175,7 +175,7 @@ return function(t)
   end)
 
   t.describe("session browser highlights", function()
-    local session_picker = require("acp.ui.session_picker")
+    local session_picker = require("ade.ui.session_picker")
 
     t.it("colours the current marker, separator, metadata and footer", function()
       local browser = session_picker.open({
@@ -186,20 +186,20 @@ return function(t)
         current_id = "aaa",
       })
       local buf = browser.buf
-      local groups = marks(buf, "acp_sessions")
+      local groups = marks(buf, "ade_sessions")
 
-      t.truthy(groups.AcpPickerItem, "rows have no item group")
-      t.eq({ 1 }, groups.AcpPickerSelection, "only the cursor row should be selected")
+      t.truthy(groups.AdePickerItem, "rows have no item group")
+      t.eq({ 1 }, groups.AdePickerSelection, "only the cursor row should be selected")
       -- The arrow and the "✓ current" suffix both use the group.
-      t.truthy(vim.tbl_contains(groups.AcpPickerCurrent, 1), "the current session arrow lost its group")
-      t.falsy(vim.tbl_contains(groups.AcpPickerCurrent, 2), "a plain row was marked as current")
-      t.eq({ 1 }, groups.AcpPickerCurrentItem, "the current session title lost its emphasis")
-      t.truthy(groups.AcpPickerMeta, "the timestamp has no group")
-      t.truthy(groups.AcpPickerSeparator, "the rule above the footer has no group")
-      t.truthy(groups.AcpPickerFooter, "the footer hint has no group")
+      t.truthy(vim.tbl_contains(groups.AdePickerCurrent, 1), "the current session arrow lost its group")
+      t.falsy(vim.tbl_contains(groups.AdePickerCurrent, 2), "a plain row was marked as current")
+      t.eq({ 1 }, groups.AdePickerCurrentItem, "the current session title lost its emphasis")
+      t.truthy(groups.AdePickerMeta, "the timestamp has no group")
+      t.truthy(groups.AdePickerSeparator, "the rule above the footer has no group")
+      t.truthy(groups.AdePickerFooter, "the footer hint has no group")
 
       -- Rows are items, the rule and footer are not.
-      t.falsy(vim.tbl_contains(groups.AcpPickerItem, 3), "the separator must not be painted as a row")
+      t.falsy(vim.tbl_contains(groups.AdePickerItem, 3), "the separator must not be painted as a row")
       pcall(vim.api.nvim_win_close, browser.win, true)
     end)
 
@@ -213,10 +213,10 @@ return function(t)
         maps[map.lhs] = map
       end
       maps.F.callback()
-      local groups = marks(browser.buf, "acp_sessions")
-      t.truthy(groups.AcpPickerPrompt, "the live query has no group")
+      local groups = marks(browser.buf, "ade_sessions")
+      t.truthy(groups.AdePickerPrompt, "the live query has no group")
       -- "First" matched F: the match is marked inside the title, after the marker.
-      t.truthy(groups.AcpPickerMatch, "the filter match has no group")
+      t.truthy(groups.AdePickerMatch, "the filter match has no group")
       pcall(vim.api.nvim_win_close, browser.win, true)
     end)
 
@@ -229,8 +229,8 @@ return function(t)
         maps[map.lhs] = map
       end
       maps.Z.callback()
-      local groups = marks(browser.buf, "acp_sessions")
-      t.truthy(groups.AcpPickerEmpty, "the empty state has no group")
+      local groups = marks(browser.buf, "ade_sessions")
+      t.truthy(groups.AdePickerEmpty, "the empty state has no group")
       pcall(vim.api.nvim_win_close, browser.win, true)
     end)
   end)

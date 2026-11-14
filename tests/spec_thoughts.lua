@@ -1,7 +1,7 @@
 -- Tests for collapsing agent reasoning (phase 4).
 return function(t)
-  local blocks = require("acp.ui.blocks")
-  local state = require("acp.session.state")
+  local blocks = require("ade.ui.blocks")
+  local state = require("ade.session.state")
 
   local function ctx(overrides)
     return vim.tbl_extend("force", {
@@ -115,7 +115,7 @@ return function(t)
       for _, line in ipairs(lines) do
         if line.bg then
           bg_lines = bg_lines + 1
-          t.eq("AcpCardBg", line.bg, "thoughts and tool cards must share a surface")
+          t.eq("AdeCardBg", line.bg, "thoughts and tool cards must share a surface")
         end
       end
       t.truthy(bg_lines >= 2, "expanded reasoning should have a padded surface")
@@ -127,23 +127,23 @@ return function(t)
     end)
 
     t.it("keeps the thought label background-free", function()
-      local highlights = require("acp.ui.highlights")
+      local highlights = require("ade.ui.highlights")
       highlights.setup()
 
       -- A background here would paint a solid block behind the label, and the
       -- collapsed header deliberately sits directly on the transcript.
-      local hl = vim.api.nvim_get_hl(0, { name = "AcpThought", link = false })
-      t.truthy(hl.fg ~= nil, "AcpThought should resolve to a foreground")
-      t.eq(nil, hl.bg, "AcpThought must not paint a background")
+      local hl = vim.api.nvim_get_hl(0, { name = "AdeThought", link = false })
+      t.truthy(hl.fg ~= nil, "AdeThought should resolve to a foreground")
+      t.eq(nil, hl.bg, "AdeThought must not paint a background")
 
       local ic = blocks.icon_set(true)
       local lines = blocks.render_block(thought("x"), ctx())
       local header = lines[1]
       local caret_end = #ic.chevron_right
-      t.eq("AcpSeparator", header.segments[1].group, "the caret must keep its own colour")
+      t.eq("AdeSeparator", header.segments[1].group, "the caret must keep its own colour")
       t.eq(0, header.segments[1].s)
       t.eq(caret_end, header.segments[1].e)
-      t.eq("AcpThought", header.segments[2].group, "icon and label take the thought colour")
+      t.eq("AdeThought", header.segments[2].group, "icon and label take the thought colour")
       t.eq(caret_end + 1, header.segments[2].s)
     end)
 
@@ -162,8 +162,8 @@ return function(t)
         end
       end
       t.truthy(concealed > 0, "markup should be concealed inside a thought")
-      t.truthy(groups["AcpMdCode"], "inline code missing inside a thought")
-      t.truthy(groups["AcpBold"], "bold missing inside a thought")
+      t.truthy(groups["AdeMdCode"], "inline code missing inside a thought")
+      t.truthy(groups["AdeBold"], "bold missing inside a thought")
     end)
 
     t.it("keeps every rendered row a single line", function()
@@ -177,7 +177,7 @@ return function(t)
 
   t.describe("streaming thoughts", function()
     t.it("finishes thoughts on updates to existing tools and plans", function()
-      local reducer = require("acp.session.reducer")
+      local reducer = require("ade.session.reducer")
       for _, kind in ipairs({ "tool", "plan" }) do
         local s = state.new("s", "/proj")
         s:begin_turn()
@@ -336,8 +336,8 @@ return function(t)
   end)
 
   t.describe("thought toggling", function()
-    local Chat = require("acp.ui.chat")
-    local config = require("acp.config")
+    local Chat = require("ade.ui.chat")
+    local config = require("ade.config")
 
     t.it("is handled by toggle_current", function()
       local cfg = config.validate(config.merge(config.defaults, {}))

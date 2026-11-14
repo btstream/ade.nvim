@@ -1,6 +1,6 @@
 return function(t)
-  local form = require("acp.ui.form")
-  local picker = require("acp.ui.picker")
+  local form = require("ade.ui.form")
+  local picker = require("ade.ui.picker")
 
   local function with_picker(stub, fn)
     local original = picker.select
@@ -105,7 +105,7 @@ return function(t)
         })
         local win
         for _, candidate in ipairs(vim.api.nvim_list_wins()) do
-          if vim.b[vim.api.nvim_win_get_buf(candidate)].acp_form then
+          if vim.b[vim.api.nvim_win_get_buf(candidate)].ade_form then
             win = candidate
           end
         end
@@ -144,7 +144,7 @@ return function(t)
       })
       local win
       for _, candidate in ipairs(vim.api.nvim_list_wins()) do
-        if vim.b[vim.api.nvim_win_get_buf(candidate)].acp_form then
+        if vim.b[vim.api.nvim_win_get_buf(candidate)].ade_form then
           win = candidate
         end
       end
@@ -178,7 +178,7 @@ return function(t)
         })
         local win
         for _, candidate in ipairs(vim.api.nvim_list_wins()) do
-          if vim.b[vim.api.nvim_win_get_buf(candidate)].acp_form then
+          if vim.b[vim.api.nvim_win_get_buf(candidate)].ade_form then
             win = candidate
           end
         end

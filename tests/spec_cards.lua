@@ -1,7 +1,7 @@
 -- Tests for the tool card rendering (phase 3).
 return function(t)
-  local blocks = require("acp.ui.blocks")
-  local state = require("acp.session.state")
+  local blocks = require("ade.ui.blocks")
+  local state = require("ade.session.state")
 
   local function ctx(overrides)
     return vim.tbl_extend("force", {
@@ -156,7 +156,7 @@ return function(t)
       end
       t.truthy(#body >= 4, "card should have a top pad, content and a bottom pad")
       for _, line in ipairs(body) do
-        t.eq("AcpCardBg", line.bg)
+        t.eq("AdeCardBg", line.bg)
         t.match("^  ", line.text, "card rows need a left margin")
       end
       t.match("compiling", joined(lines):find("compiling") and "compiling" or "")
@@ -214,7 +214,7 @@ return function(t)
         end
       end
       t.truthy(found, "location missing from the card")
-      t.eq("AcpCardBg", found.bg)
+      t.eq("AdeCardBg", found.bg)
       t.truthy(found.location, "location metadata must survive for jumping")
     end)
 
@@ -391,10 +391,10 @@ return function(t)
   end)
 
   t.describe("card toggling", function()
-    local config = require("acp.config")
-    local Chat = require("acp.ui.chat")
-    local ns = vim.api.nvim_create_namespace("acp_chat")
-    local ns_bg = vim.api.nvim_create_namespace("acp_chat_bg")
+    local config = require("ade.config")
+    local Chat = require("ade.ui.chat")
+    local ns = vim.api.nvim_create_namespace("ade_chat")
+    local ns_bg = vim.api.nvim_create_namespace("ade_chat_bg")
 
     ---Snapshot every extmark so two renders can be compared exactly.
     local function snapshot(chat)

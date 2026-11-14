@@ -4,13 +4,13 @@
 -- recorded there; otherwise the login would fall back to the configured command
 -- and could talk to a different version.
 return function(t)
-  local Client = require("acp.protocol.client")
+  local Client = require("ade.protocol.client")
 
   t.describe("client launch spec", function()
     t.it("keeps the launch spec it was started with", function()
       local launch = {
         command = "node",
-        args = { "/data/acp/agents/pi/releases/v1/index.js" },
+        args = { "/data/ade/agents/pi/releases/v1/index.js" },
         source = "managed",
         install_id = "v1",
         version = "0.4.0",

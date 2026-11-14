@@ -1,7 +1,7 @@
 return function(t)
-  local agents = require("acp.agents")
-  local controls = require("acp.session.controls")
-  local state = require("acp.session.state")
+  local agents = require("ade.agents")
+  local controls = require("ade.session.controls")
+  local state = require("ade.session.state")
 
   local function session_with(result, profile_name)
     local s = state.new("s", "/tmp")
@@ -44,8 +44,8 @@ return function(t)
     end)
 
     t.it("stores the agent tool name and shows it on the card", function()
-      local reducer = require("acp.session.reducer")
-      local blocks = require("acp.ui.blocks")
+      local reducer = require("ade.session.reducer")
+      local blocks = require("ade.ui.blocks")
       local s = state.new("s", "/proj")
       s.profile = agents.get({}, "claude")
       reducer.apply(s, {
@@ -69,7 +69,7 @@ return function(t)
     end)
 
     t.it("never reads another agent's _meta", function()
-      local reducer = require("acp.session.reducer")
+      local reducer = require("ade.session.reducer")
       local s = state.new("s", "/proj")
       s.profile = agents.get({}, "unknown")
       reducer.apply(s, {
@@ -247,8 +247,8 @@ return function(t)
     end)
 
     t.it("lets the profile decide what a question is", function()
-      local state_mod = require("acp.session.state")
-      local permissions = require("acp.app.permissions")
+      local state_mod = require("ade.session.state")
+      local permissions = require("ade.app.permissions")
       local pi_session = state_mod.new("s", "/tmp")
       pi_session.profile = agents.get({}, "pi")
       local p = permissions.new({
@@ -288,7 +288,7 @@ return function(t)
     end)
 
     t.it("updates controls on current_mode_update", function()
-      local reducer = require("acp.session.reducer")
+      local reducer = require("ade.session.reducer")
       local s = session_with({
         configOptions = {
           {
@@ -314,8 +314,8 @@ return function(t)
     end)
 
     t.it("styles the mode badge from the value id, not the label", function()
-      local toolbar = require("acp.ui.toolbar")
-      local presenter = require("acp.ui.presenter")
+      local toolbar = require("ade.ui.toolbar")
+      local presenter = require("ade.ui.presenter")
       local s = session_with({
         configOptions = {
           {
@@ -334,15 +334,15 @@ return function(t)
       t.eq("Plan mode", label)
       t.eq("plan", key)
       t.truthy(plan)
-      t.eq("AcpToolbarModePlan", toolbar.mode_hl(label, key, plan))
-      t.truthy(toolbar.mode_text(label, require("acp.ui.icons").get(true), key) ~= "Plan mode")
+      t.eq("AdeToolbarModePlan", toolbar.mode_hl(label, key, plan))
+      t.truthy(toolbar.mode_text(label, require("ade.ui.icons").get(true), key) ~= "Plan mode")
     end)
 
     t.it("keeps the label glyph fallback when no id is available", function()
-      local toolbar = require("acp.ui.toolbar")
-      t.eq("AcpToolbarModePlan", toolbar.mode_hl("plan"))
-      t.eq("AcpToolbarModeBuild", toolbar.mode_hl("Build"))
-      t.eq("AcpToolbarAccent", toolbar.mode_hl("ask"))
+      local toolbar = require("ade.ui.toolbar")
+      t.eq("AdeToolbarModePlan", toolbar.mode_hl("plan"))
+      t.eq("AdeToolbarModeBuild", toolbar.mode_hl("Build"))
+      t.eq("AdeToolbarAccent", toolbar.mode_hl("ask"))
     end)
   end)
 end

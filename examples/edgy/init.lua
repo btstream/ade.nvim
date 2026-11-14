@@ -2,7 +2,7 @@
 --
 --   nvim -u examples/edgy/init.lua
 --
--- Shows how edgy owns the panel position while acp.nvim owns the content.
+-- Shows how edgy owns the panel position while ade.nvim owns the content.
 
 local root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h:h:h")
 vim.opt.runtimepath:append(root)
@@ -22,7 +22,7 @@ vim.opt.splitkeep = "screen"
 require("edgy").setup({
   right = (function()
     local opts = { right = {} }
-    require("acp.integrations.edgy").extend(opts)
+    require("ade.integrations.edgy").extend(opts)
     return opts.right
   end)(),
   options = {
@@ -32,10 +32,10 @@ require("edgy").setup({
   animate = { enabled = true },
 })
 
-require("acp").setup({
+require("ade").setup({
   layout = { backend = "external" },
 })
 
 vim.keymap.set("n", "<leader>a", function()
-  require("acp").toggle()
-end, { desc = "ACP panel" })
+  require("ade").toggle()
+end, { desc = "ADE panel" })

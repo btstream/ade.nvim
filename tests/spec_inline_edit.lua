@@ -1,11 +1,11 @@
 return function(t)
-  local Config = require("acp.config")
-  local selection = require("acp.inline.selection")
-  local result = require("acp.inline.result")
-  local copy = require("acp.inline.copy")
-  local apply = require("acp.inline.apply")
-  local review = require("acp.inline.review")
-  local diff_session = require("acp.inline.diff_session")
+  local Config = require("ade.config")
+  local selection = require("ade.inline.selection")
+  local result = require("ade.inline.result")
+  local copy = require("ade.inline.copy")
+  local apply = require("ade.inline.apply")
+  local review = require("ade.inline.review")
+  local diff_session = require("ade.inline.diff_session")
 
   local function cfg(over)
     return Config.validate(Config.merge(Config.defaults, over or {}))
@@ -27,7 +27,7 @@ return function(t)
 
   local function wait_close(buf)
     vim.wait(500, function()
-      return not require("acp.inline.diff_session").active(buf)
+      return not require("ade.inline.diff_session").active(buf)
     end, 10)
   end
 
@@ -133,17 +133,47 @@ return function(t)
       vim.api.nvim_buf_set_name(buf, path)
       local sel = assert(selection.capture(win, cfg(), { mode = "v", pos1 = pos(0, 1), pos2 = pos(0, 1) }))
       local made = assert(copy.create(sel, cfg()))
-      t.truthy(vim.startswith(vim.fs.basename(made), ".acp-inline-"))
+      t.truthy(vim.startswith(vim.fs.basename(made), ".ade-inline-"))
       t.eq(vim.fs.dirname(made), dir)
       t.eq({ "one", "two" }, copy.read(made))
       t.truthy(copy.is_copy_path(made, made))
       t.falsy(copy.is_copy_path(path, made))
-      t.falsy(copy.is_copy_path(dir .. "/.acp-inline-unrelated.lua", made))
+      t.falsy(copy.is_copy_path(dir .. "/.ade-inline-unrelated.lua", made))
       local stat = vim.uv.fs_stat(made)
       t.eq(384, stat.mode % 512)
       copy.remove(made)
       t.eq(nil, vim.uv.fs_stat(made))
       vim.fn.delete(dir, "rf")
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end)
+
+    t.it("reclaims stale pre-rename copies in the state directory", function()
+      -- After the data/state migration, `acp-inline-*` copies sit in the new
+      -- `ade/inline` directory. They belong to a process that is long gone (pid
+      -- 1 is never us here: the name records a pid that is dead or reused), and
+      -- must still be swept, or the directory grows forever.
+      local state_dir = vim.fn.stdpath("state") .. "/ade/inline"
+      vim.fn.mkdir(state_dir, "p", 448)
+      local dead = state_dir .. "/.acp-inline-999999-1-1-file.lua"
+      local fh = assert(io.open(dead, "wb"))
+      fh:write("stale\n")
+      fh:close()
+      local old = os.time() - 48 * 3600
+      vim.uv.fs_utime(dead, old, old)
+      t.truthy(vim.uv.fs_stat(dead), "the fixture did not create the stale copy")
+
+      local win, buf = win_with({ "one", "two" }, "lua")
+      local sel = assert(
+        selection.capture(
+          win,
+          cfg({ inline = { copy_dir = "state" } }),
+          { mode = "v", pos1 = pos(0, 1), pos2 = pos(0, 1) }
+        )
+      )
+      local made = assert(copy.create(sel, cfg({ inline = { copy_dir = "state" } })))
+      t.eq(nil, vim.uv.fs_stat(dead), "a stale pre-rename copy must be pruned")
+      t.truthy(vim.startswith(vim.fs.basename(made), "ade-inline-"))
+      copy.remove(made)
       vim.api.nvim_buf_delete(buf, { force = true })
     end)
   end)
@@ -162,7 +192,7 @@ return function(t)
 
   t.describe("chat selection attachments", function()
     t.it("links to the line range and keeps its place in the prompt", function()
-      local context = require("acp.context")
+      local context = require("ade.context")
       local dir = vim.fn.tempname()
       vim.fn.mkdir(dir, "p")
       local path = dir .. "/file.lua"
@@ -180,7 +210,7 @@ return function(t)
       t.eq("beta", att.text)
       -- The block is decided at send time, so a draft can survive a reconnect.
       t.eq(nil, att.block)
-      local input = require("acp.ui.input").new({ config = cfg() })
+      local input = require("ade.ui.input").new({ config = cfg() })
       input:restore("before after")
       vim.api.nvim_win_set_cursor(win, { 1, 6 })
       input:add_attachment(att, { 0, 6 })
@@ -205,7 +235,7 @@ return function(t)
     end)
 
     t.it("uses the current line when there is no visual marks", function()
-      local context = require("acp.context")
+      local context = require("ade.context")
       local dir = vim.fn.tempname()
       vim.fn.mkdir(dir, "p")
       local path = dir .. "/file.lua"
@@ -227,7 +257,7 @@ return function(t)
     end)
 
     t.it("embeds the selection when the agent advertises it", function()
-      local context = require("acp.context")
+      local context = require("ade.context")
       local dir = vim.fn.tempname()
       vim.fn.mkdir(dir, "p")
       local path = dir .. "/file.lua"
@@ -272,8 +302,8 @@ return function(t)
 
   t.describe("inline permissions", function()
     t.it("allows reads and only edits to the copy", function()
-      local inline = require("acp.inline")
-      local S = require("acp.controller").state()
+      local inline = require("ade.inline")
+      local S = require("ade.controller").state()
       local saved_cfg, saved_client = S.config, S.conn.client
       local chosen
       S.config = cfg()
@@ -301,7 +331,7 @@ return function(t)
       t.eq("r", chosen)
       inline.on_permission(invocation, {
         options = options,
-        tool_call = { kind = "edit", locations = { { path = "/tmp/.acp-inline-somebody-else.lua" } } },
+        tool_call = { kind = "edit", locations = { { path = "/tmp/.ade-inline-somebody-else.lua" } } },
       })
       t.eq("r", chosen)
       inline.on_permission(
@@ -455,7 +485,7 @@ return function(t)
   end)
 
   t.describe("inline prompt text", function()
-    local prompt = require("acp.inline.prompt")
+    local prompt = require("ade.inline.prompt")
     local function selection(over)
       return vim.tbl_extend("force", {
         original = { "local a = 1", "local b = 2", "local c = 3" },
@@ -471,7 +501,7 @@ return function(t)
       return prompt.build({
         selection = sel,
         config = cfg(),
-        copy = "/tmp/.acp-inline-test.lua",
+        copy = "/tmp/.ade-inline-test.lua",
         prompt = "rename this variable",
       })
     end
@@ -509,7 +539,7 @@ return function(t)
   end)
 
   t.describe("inline prompt placement", function()
-    local anchor = require("acp.inline.anchor")
+    local anchor = require("ade.inline.anchor")
     t.it("keeps the float inside the screen at every edge", function()
       local config = anchor.config(-5, -5, 10000, 10000)
       t.eq(0, config.row)
@@ -555,7 +585,7 @@ return function(t)
   end)
 
   t.describe("inline review card rendering", function()
-    local card = require("acp.inline.review.card")
+    local card = require("ade.inline.review.card")
     local original = { "a", "b", "c", "d" }
     local edited = { "A", "b", "c", "D" }
     local hunks = result.hunks(original, edited)
@@ -620,7 +650,7 @@ return function(t)
           groups[span.group] = true
         end
       end
-      t.truthy(groups.AcpDiffAdd or groups.AcpDiffDelete, vim.inspect(vim.tbl_keys(groups)))
+      t.truthy(groups.AdeDiffAdd or groups.AdeDiffDelete, vim.inspect(vim.tbl_keys(groups)))
     end)
 
     t.it("uses byte offsets after accepted and rejected UTF-8 markers", function()
@@ -630,7 +660,7 @@ return function(t)
         local view = build({ hunks = h, original = { "local a = 1" }, edited = { "local a = 2" } })
         local found = false
         for _, span in ipairs(view.spans) do
-          if span.group == "AcpDiffAddSign" or span.group == "AcpDiffRemoveSign" then
+          if span.group == "AdeDiffAddSign" or span.group == "AdeDiffRemoveSign" then
             found = true
             t.eq(4, span.start)
             t.eq(6, span.stop)
@@ -656,7 +686,7 @@ return function(t)
     end)
 
     t.it("keeps configured review highlights ahead of the static defaults", function()
-      local hl = require("acp.ui.highlights")
+      local hl = require("ade.ui.highlights")
       local saved = {
         DiffAdd = vim.api.nvim_get_hl(0, { name = "DiffAdd" }),
         DiffDelete = vim.api.nvim_get_hl(0, { name = "DiffDelete" }),
@@ -666,18 +696,18 @@ return function(t)
       vim.api.nvim_set_hl(0, "DiffDelete", { bg = "#550000" })
       vim.api.nvim_set_hl(0, "DiffChange", { bg = "#000055" })
       hl.setup({
-        AcpDiffModify = { bg = "#123456" },
-        AcpReviewAdd = { bg = "#abcdef" },
-        AcpReviewDelete = { bg = "#fedcba" },
-        AcpReviewPending = { bg = "#456789" },
-        AcpReviewFiller = { fg = "#334455" },
+        AdeDiffModify = { bg = "#123456" },
+        AdeReviewAdd = { bg = "#abcdef" },
+        AdeReviewDelete = { bg = "#fedcba" },
+        AdeReviewPending = { bg = "#456789" },
+        AdeReviewFiller = { fg = "#334455" },
       })
       for _ = 1, 2 do
-        t.eq(0x123456, vim.api.nvim_get_hl(0, { name = "AcpDiffModify", link = false }).bg)
-        t.eq(0xabcdef, vim.api.nvim_get_hl(0, { name = "AcpReviewAdd", link = false }).bg)
-        t.eq(0xfedcba, vim.api.nvim_get_hl(0, { name = "AcpReviewDelete", link = false }).bg)
-        t.eq(0x456789, vim.api.nvim_get_hl(0, { name = "AcpReviewPending", link = false }).bg)
-        t.eq(0x334455, vim.api.nvim_get_hl(0, { name = "AcpReviewFiller", link = false }).fg)
+        t.eq(0x123456, vim.api.nvim_get_hl(0, { name = "AdeDiffModify", link = false }).bg)
+        t.eq(0xabcdef, vim.api.nvim_get_hl(0, { name = "AdeReviewAdd", link = false }).bg)
+        t.eq(0xfedcba, vim.api.nvim_get_hl(0, { name = "AdeReviewDelete", link = false }).bg)
+        t.eq(0x456789, vim.api.nvim_get_hl(0, { name = "AdeReviewPending", link = false }).bg)
+        t.eq(0x334455, vim.api.nvim_get_hl(0, { name = "AdeReviewFiller", link = false }).fg)
         vim.api.nvim_exec_autocmds("ColorScheme", {})
       end
       for name, spec in pairs(saved) do
@@ -687,7 +717,7 @@ return function(t)
     end)
 
     t.it("copies the theme diff surfaces onto the review rows", function()
-      local hl = require("acp.ui.highlights")
+      local hl = require("ade.ui.highlights")
       local saved = {}
       for _, name in ipairs({ "DiffAdd", "DiffDelete", "DiffChange", "DiffText", "CursorLine" }) do
         saved[name] = vim.api.nvim_get_hl(0, { name = name })
@@ -699,12 +729,12 @@ return function(t)
       vim.api.nvim_set_hl(0, "CursorLine", { bg = "#202020", underline = true })
       hl.setup({})
       for group, expected in pairs({
-        AcpReviewAdd = 0x103010,
-        AcpReviewDelete = 0x301010,
-        AcpReviewPending = 0x101030,
-        AcpReviewAddText = 0x404070,
-        AcpReviewDeleteText = 0x404070,
-        AcpReviewCursorLine = 0x202020,
+        AdeReviewAdd = 0x103010,
+        AdeReviewDelete = 0x301010,
+        AdeReviewPending = 0x101030,
+        AdeReviewAddText = 0x404070,
+        AdeReviewDeleteText = 0x404070,
+        AdeReviewCursorLine = 0x202020,
       }) do
         local def = vim.api.nvim_get_hl(0, { name = group, link = false })
         t.eq(expected, def.bg, group)
@@ -716,10 +746,10 @@ return function(t)
       -- The copy follows the theme.
       vim.api.nvim_set_hl(0, "DiffAdd", { bg = "#105510" })
       vim.api.nvim_exec_autocmds("ColorScheme", {})
-      t.eq(0x105510, vim.api.nvim_get_hl(0, { name = "AcpReviewAdd", link = false }).bg)
+      t.eq(0x105510, vim.api.nvim_get_hl(0, { name = "AdeReviewAdd", link = false }).bg)
       -- An explicit override wins.
-      hl.setup({ AcpReviewAdd = { bg = "#224422" } })
-      t.eq(0x224422, vim.api.nvim_get_hl(0, { name = "AcpReviewAdd", link = false }).bg)
+      hl.setup({ AdeReviewAdd = { bg = "#224422" } })
+      t.eq(0x224422, vim.api.nvim_get_hl(0, { name = "AdeReviewAdd", link = false }).bg)
       for name, spec in pairs(saved) do
         vim.api.nvim_set_hl(0, name, spec)
       end
@@ -744,7 +774,7 @@ return function(t)
     end)
 
     t.it("uses fixed subdued filler foregrounds on every theme", function()
-      local hl = require("acp.ui.highlights")
+      local hl = require("ade.ui.highlights")
       local saved = {}
       for _, name in ipairs({ "Normal", "NormalFloat", "DiffDelete" }) do
         saved[name] = vim.api.nvim_get_hl(0, { name = name })
@@ -754,11 +784,11 @@ return function(t)
         vim.api.nvim_set_hl(0, "NormalFloat", { bg = bg })
         vim.api.nvim_set_hl(0, "DiffDelete", { bg = "#602020", fg = "#ffffff" })
         hl.setup({})
-        t.eq(0x5c6370, vim.api.nvim_get_hl(0, { name = "AcpReviewFiller", link = false }).fg)
+        t.eq(0x5c6370, vim.api.nvim_get_hl(0, { name = "AdeReviewFiller", link = false }).fg)
         -- No background: the row/Normal background shows through.
-        t.falsy(vim.api.nvim_get_hl(0, { name = "AcpReviewFiller", link = false }).bg)
+        t.falsy(vim.api.nvim_get_hl(0, { name = "AdeReviewFiller", link = false }).bg)
         vim.api.nvim_exec_autocmds("ColorScheme", {})
-        t.eq(0x5c6370, vim.api.nvim_get_hl(0, { name = "AcpReviewFiller", link = false }).fg)
+        t.eq(0x5c6370, vim.api.nvim_get_hl(0, { name = "AdeReviewFiller", link = false }).fg)
       end
       for name, spec in pairs(saved) do
         vim.api.nvim_set_hl(0, name, spec)
@@ -768,7 +798,7 @@ return function(t)
   end)
 
   t.describe("inline review session", function()
-    local session_mod = require("acp.inline.diff_session")
+    local session_mod = require("ade.inline.diff_session")
     local original = { "a", "b", "c", "d", "e" }
     local edited = { "A", "b", "c", "D", "e" }
 
@@ -816,7 +846,7 @@ return function(t)
     ---expands the format string: this is where a fold column would still show up
     ---as `%C`.
     local function gutter_cell(win, row)
-      local layout = require("acp.inline.review.layout")
+      local layout = require("ade.inline.review.layout")
       local saved_winid, saved_lnum = vim.g.statusline_winid, vim.v.lnum
       vim.g.statusline_winid = win
       vim.v.lnum = row
@@ -840,7 +870,7 @@ return function(t)
     ---Row decorations of a review buffer: `row -> group` (filler rows by their
     ---line highlight, changed rows by their row surface).
     local function row_groups(buf)
-      local ns = vim.api.nvim_get_namespaces()["acp.inline.review"]
+      local ns = vim.api.nvim_get_namespaces()["ade.inline.review"]
       local out = {}
       for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, ns, 0, -1, { details = true })) do
         local d = mark[4]
@@ -901,7 +931,7 @@ return function(t)
     end)
 
     t.it("aligns rows so modified rows face content and added rows face filler", function()
-      local align = require("acp.inline.review.align")
+      local align = require("ade.inline.review.align")
       local cases = {
         { { "a", "b", "c" }, { "a", "B", "x", "c" } },
         { { "a", "b" }, { "z", "a", "b", "y" } },
@@ -974,11 +1004,11 @@ return function(t)
       t.eq({ "a", "old", "", "z" }, lines[2])
       t.eq({ "a", "new", "added", "z" }, lines[3])
       -- Original: what goes away. Result: still undecided. Proposal: what comes in.
-      t.eq({ [2] = "AcpReviewDelete", [3] = "AcpReviewFiller" }, row_groups(panes[1].buf))
-      t.eq({ [2] = "AcpReviewPending", [3] = "AcpReviewFiller" }, row_groups(panes[2].buf))
-      t.eq({ [2] = "AcpReviewAdd", [3] = "AcpReviewAdd" }, row_groups(panes[3].buf))
+      t.eq({ [2] = "AdeReviewDelete", [3] = "AdeReviewFiller" }, row_groups(panes[1].buf))
+      t.eq({ [2] = "AdeReviewPending", [3] = "AdeReviewFiller" }, row_groups(panes[2].buf))
+      t.eq({ [2] = "AdeReviewAdd", [3] = "AdeReviewAdd" }, row_groups(panes[3].buf))
       -- Real line numbers: filler rows have none, the proposal keeps its own.
-      local layout = require("acp.inline.review.layout")
+      local layout = require("ade.inline.review.layout")
       local lnums = layout.gutter(panes[1].buf).lnums
       t.eq({ 1, 2, nil, 3 }, { lnums[1], lnums[2], lnums[3], lnums[4] })
       t.eq(4, layout.gutter(panes[3].buf).lnums[4])
@@ -1006,16 +1036,16 @@ return function(t)
       vim.api.nvim_feedkeys("ga", "x", false)
       -- Accepted: the result shows the proposal, the replaced original dims.
       t.eq({ "a", "new", "z", "q" }, vim.api.nvim_buf_get_lines(panes[2].buf, 0, -1, false))
-      t.eq("AcpReviewDimmed", row_groups(panes[1].buf)[2])
-      t.eq("AcpReviewAdd", row_groups(panes[2].buf)[2])
-      t.eq("AcpReviewAdd", row_groups(panes[3].buf)[2])
-      local layout = require("acp.inline.review.layout")
-      t.eq("AcpReviewStateAccepted", layout.gutter(panes[1].buf).bars[2].group)
+      t.eq("AdeReviewDimmed", row_groups(panes[1].buf)[2])
+      t.eq("AdeReviewAdd", row_groups(panes[2].buf)[2])
+      t.eq("AdeReviewAdd", row_groups(panes[3].buf)[2])
+      local layout = require("ade.inline.review.layout")
+      t.eq("AdeReviewStateAccepted", layout.gutter(panes[1].buf).bars[2].group)
       t.eq("✓", layout.gutter(panes[3].buf).bars[2].glyph)
       -- Rejected: the original is kept as is, the dropped proposal dims.
       vim.api.nvim_win_set_cursor(result_win, { 4, 0 })
       vim.api.nvim_feedkeys("u", "x", false)
-      t.eq("AcpReviewStateCurrent", layout.gutter(panes[2].buf).bars[4].group)
+      t.eq("AdeReviewStateCurrent", layout.gutter(panes[2].buf).bars[4].group)
       session_mod.close_all()
       vim.api.nvim_buf_delete(buf, { force = true })
 
@@ -1027,14 +1057,14 @@ return function(t)
       vim.api.nvim_feedkeys("gr", "x", false)
       t.eq(nil, row_groups(panes[1].buf)[2])
       t.eq(nil, row_groups(panes[2].buf)[2])
-      t.eq("AcpReviewDimmed", row_groups(panes[3].buf)[2])
-      t.eq("AcpReviewStateRejected", layout.gutter(panes[2].buf).bars[2].group)
+      t.eq("AdeReviewDimmed", row_groups(panes[3].buf)[2])
+      t.eq("AdeReviewStateRejected", layout.gutter(panes[2].buf).bars[2].group)
       session_mod.close_all()
       vim.api.nvim_buf_delete(buf, { force = true })
     end)
 
     t.it("starts Tree-sitter for languages Neovim does not cover by default", function()
-      local layout = require("acp.inline.review.layout")
+      local layout = require("ade.inline.review.layout")
       local sources = {
         python = { "def f(x):", "    return x + 1" },
         javascript = { "function f(x) {", "  return x + 1", "}" },
@@ -1059,7 +1089,7 @@ return function(t)
       for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
         t.truthy(vim.api.nvim_get_option_value("winfixbuf", { win = win }), "unpinned window " .. win)
         local before = vim.api.nvim_win_get_buf(win)
-        for _, command in ipairs({ "enew", "bnext", "edit /tmp/acp-review-should-not-open.lua" }) do
+        for _, command in ipairs({ "enew", "bnext", "edit /tmp/ade-review-should-not-open.lua" }) do
           local changed, failure = pcall(function()
             vim.api.nvim_win_call(win, function()
               vim.cmd(command)
@@ -1100,7 +1130,7 @@ return function(t)
       })
       t.falsy(vim.api.nvim_get_option_value("diff", { win = float }), "float joined the diff")
       t.falsy(
-        vim.api.nvim_get_option_value("winhighlight", { win = float }):find("AcpReview", 1, true),
+        vim.api.nvim_get_option_value("winhighlight", { win = float }):find("AdeReview", 1, true),
         "float inherited the review winhighlight"
       )
       t.eq(saved.diff, global("diff"))
@@ -1197,17 +1227,17 @@ return function(t)
         -- (now ignored) config value says.
         t.eq("0", vim.wo[win].foldcolumn)
         t.eq("manual", vim.wo[win].foldmethod)
-        t.truthy(vim.wo[win].statuscolumn:find("acp.inline.review.layout", 1, true))
+        t.truthy(vim.wo[win].statuscolumn:find("ade.inline.review.layout", 1, true))
         local fcs = vim.api.nvim_get_option_value("fillchars", { win = win, scope = "local" })
         t.truthy(fcs:find("vert:│", 1, true), fcs)
-        t.truthy(vim.wo[win].winhl:find("CursorLine:AcpReviewCursorLine", 1, true))
+        t.truthy(vim.wo[win].winhl:find("CursorLine:AdeReviewCursorLine", 1, true))
       end
       -- The gutter shows the bar cell and the real line number.
       local win = vim.api.nvim_get_current_win()
       local text = vim.api.nvim_eval_statusline(vim.wo[win].statuscolumn, { winid = win, use_statuscol_lnum = 1 }).str
       t.match("1 $", text)
       -- The global option must not be touched by the window-local assignment.
-      t.falsy(vim.api.nvim_get_option_value("statuscolumn", { scope = "global" }):find("acp", 1, true))
+      t.falsy(vim.api.nvim_get_option_value("statuscolumn", { scope = "global" }):find("ade", 1, true))
       session_mod.close_all()
       vim.api.nvim_buf_delete(buf, { force = true })
     end)
@@ -1311,7 +1341,7 @@ return function(t)
       -- A hunk row keeps its bar, and the real line numbers are still there.
       local win = vim.api.nvim_get_current_win()
       local lnum_row = nil
-      local layout = require("acp.inline.review.layout")
+      local layout = require("ade.inline.review.layout")
       local gutter = layout.gutter(vim.api.nvim_win_get_buf(win))
       for row = 1, vim.api.nvim_buf_line_count(vim.api.nvim_win_get_buf(win)) do
         if gutter.lnums[row] then
@@ -1345,7 +1375,7 @@ return function(t)
       c.inline.window.review.min_split_width = 20
       assert(session_mod.open({ bufnr = buf, lines = { "a", "b", "NEW", "c" }, config = c }))
       local panes = sorted_panes()
-      local layout = require("acp.inline.review.layout")
+      local layout = require("ade.inline.review.layout")
       local gutter = layout.gutter(panes[1].buf)
       local filler_row
       for row = 1, vim.api.nvim_buf_line_count(panes[1].buf) do
@@ -1397,9 +1427,9 @@ return function(t)
       -- A pure insertion has no row on the old side: the original and the
       -- (still unmodified) result columns show filler there, the proposal the
       -- inserted line. Neighbouring unchanged lines stay unpainted.
-      t.eq({ [3] = "AcpReviewFiller" }, row_groups(panes[1].buf))
-      t.eq({ [3] = "AcpReviewFiller" }, row_groups(panes[2].buf))
-      t.eq({ [3] = "AcpReviewAdd" }, row_groups(panes[3].buf))
+      t.eq({ [3] = "AdeReviewFiller" }, row_groups(panes[1].buf))
+      t.eq({ [3] = "AdeReviewFiller" }, row_groups(panes[2].buf))
+      t.eq({ [3] = "AdeReviewAdd" }, row_groups(panes[3].buf))
       for _, pane in ipairs(panes) do
         t.eq(6, vim.api.nvim_buf_line_count(pane.buf))
       end
@@ -1412,7 +1442,7 @@ return function(t)
       local c = cfg()
       c.inline.window.review.min_split_width = 20
       assert(session_mod.open({ bufnr = buf, lines = { "a", "", "NEW", "c", "d", "e" }, config = c }))
-      local ns = vim.api.nvim_get_namespaces()["acp.inline.review"]
+      local ns = vim.api.nvim_get_namespaces()["ade.inline.review"]
       local panes = sorted_panes()
       for _, pane in ipairs(panes) do
         -- The empty anchor line above the insertion is untouched everywhere.
@@ -1420,7 +1450,7 @@ return function(t)
       end
       local marks = vim.api.nvim_buf_get_extmarks(panes[3].buf, ns, { 2, 0 }, { 2, -1 }, { details = true })
       t.eq(1, #marks)
-      t.eq("AcpReviewAdd", marks[1][4].hl_group)
+      t.eq("AdeReviewAdd", marks[1][4].hl_group)
       t.eq(3, marks[1][4].end_row)
       t.eq(0, marks[1][4].end_col)
       t.truthy(marks[1][4].hl_eol)
@@ -1459,13 +1489,13 @@ return function(t)
     t.it("updates the current hunk bar when the cursor moves", function()
       local ok, err, buf = open({ fold = false })
       t.truthy(ok, err)
-      local layout = require("acp.inline.review.layout")
+      local layout = require("ade.inline.review.layout")
       local mid = vim.api.nvim_get_current_buf()
       local function bar(row)
         local entry = layout.gutter(mid).bars[row]
         return entry and entry.group
       end
-      local ns = vim.api.nvim_get_namespaces()["acp.inline.review"]
+      local ns = vim.api.nvim_get_namespaces()["ade.inline.review"]
       local function hint_row()
         for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(mid, ns, 0, -1, { details = true })) do
           if mark[4].virt_text_pos == "eol" then
@@ -1475,12 +1505,12 @@ return function(t)
       end
       vim.api.nvim_win_set_cursor(0, { 4, 0 })
       vim.api.nvim_exec_autocmds("CursorMoved", { buffer = mid })
-      t.eq("AcpReviewStateCurrent", bar(4))
-      t.eq("AcpReviewStatePending", bar(1))
+      t.eq("AdeReviewStateCurrent", bar(4))
+      t.eq("AdeReviewStatePending", bar(1))
       t.eq(4, hint_row())
       vim.api.nvim_win_set_cursor(0, { 2, 0 })
       vim.api.nvim_exec_autocmds("CursorMoved", { buffer = mid })
-      t.eq("AcpReviewStatePending", bar(4))
+      t.eq("AdeReviewStatePending", bar(4))
       t.eq(nil, hint_row())
       session_mod.close_all()
       vim.api.nvim_buf_delete(buf, { force = true })
@@ -1524,7 +1554,7 @@ return function(t)
       t.eq(before_tabs, #vim.api.nvim_list_tabpages())
       t.eq(before_buffers, vim.api.nvim_list_bufs())
       t.falsy(session_mod.active(buf))
-      t.falsy(pcall(vim.api.nvim_get_autocmds, { group = "AcpInlineReview" .. buf }))
+      t.falsy(pcall(vim.api.nvim_get_autocmds, { group = "AdeInlineReview" .. buf }))
       assert(session_mod.open({ bufnr = buf, lines = edited, config = c }))
       session_mod.close_all()
       vim.api.nvim_buf_delete(buf, { force = true })
@@ -1963,7 +1993,7 @@ return function(t)
       local ok, err = session_mod.open({ bufnr = buf, lines = edited, config = c })
       t.truthy(ok, err)
       local current = vim.api.nvim_get_current_buf()
-      t.eq("acp_inline_review", vim.bo[current].filetype)
+      t.eq("ade_inline_review", vim.bo[current].filetype)
       t.truthy(table.concat(vim.api.nvim_buf_get_lines(current, 0, -1, false), "\n"):find("@@ Hunk", 1, true))
       session_mod.close_all()
       vim.api.nvim_buf_delete(buf, { force = true })

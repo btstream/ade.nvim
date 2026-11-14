@@ -1,8 +1,8 @@
 -- nvim --headless -i NONE -u tests/minimal_init.lua -l tests/perf_completion.lua
 -- No optional completion framework is needed. Measures discovery + full-item
 -- materialisation, not just the first 200 paths or an empty hidden buffer.
-local core = require("acp.completion")
-local Config = require("acp.config")
+local core = require("ade.completion")
+local Config = require("ade.config")
 local root = "/tmp/opencode"
 local config = Config.validate(Config.merge(Config.defaults, {
   completion = {
@@ -18,7 +18,7 @@ local config = Config.validate(Config.merge(Config.defaults, {
 }))
 local buf = vim.api.nvim_create_buf(false, true)
 local win = vim.api.nvim_open_win(buf, true, { relative = "editor", row = 0, col = 0, width = 60, height = 8 })
-vim.bo[buf].filetype = "acp_input"
+vim.bo[buf].filetype = "ade_input"
 vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "@z " })
 vim.api.nvim_win_set_cursor(win, { 1, 2 })
 local session = { cwd = root }

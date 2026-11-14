@@ -1,6 +1,6 @@
 return function(t)
-  local Config = require("acp.config")
-  local review = require("acp.inline.review")
+  local Config = require("ade.config")
+  local review = require("ade.inline.review")
 
   local function cfg(over)
     return Config.validate(Config.merge(Config.defaults, over or {}))

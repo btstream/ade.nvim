@@ -28,7 +28,7 @@ def wait_for(label, expression):
     expired = threading.Event()
 
     def notification(method, args):
-        if method == "acp_completion_test":
+        if method == "ade_completion_test":
             result.append(args[0])
             nvim.stop_loop()
 
@@ -45,7 +45,7 @@ def wait_for(label, expression):
           attempts = attempts + 1
           local ok, value = pcall(predicate)
           if not ok or value or attempts > 150 then
-            vim.rpcnotify(channel, 'acp_completion_test', {
+            vim.rpcnotify(channel, 'ade_completion_test', {
               ok = ok, value = value or false,
               messages = vim.fn.execute('messages'), line = vim.api.nvim_get_current_line(),
             })
@@ -151,17 +151,17 @@ try:
                 fuzzy = { implementation = 'lua' },
                 keymap = { preset = 'none', ['<CR>'] = { 'accept', 'fallback' } },
                 completion = { list = { selection = { preselect = false, auto_insert = false } } },
-                sources = { per_filetype = { acp_input = { 'acp' } }, providers = { acp = { name = 'ACP', module = 'acp.completion.blink' } } },
+                sources = { per_filetype = { ade_input = { 'ade' } }, providers = { ade = { name = 'ADE', module = 'ade.completion.blink' } } },
               })
               _G.test_items = function() return require('blink.cmp').get_items() end
             elseif engine == 'cmp' then
               vim.cmd('runtime plugin/cmp.lua')
               local cmp = require('cmp')
-              require('acp.completion.cmp').setup()
+              require('ade.completion.cmp').setup()
               cmp.setup({
                 snippet = { expand = function() error('unexpected snippet') end },
                 preselect = cmp.PreselectMode.None,
-                sources = { { name = 'acp', keyword_length = 0 } },
+                sources = { { name = 'ade', keyword_length = 0 } },
                 matching = { disallow_symbol_nonprefix_matching = false },
                 mapping = { ['<CR>'] = cmp.mapping.confirm({ select = false }) },
               })
@@ -177,13 +177,13 @@ try:
                 return items
               end
             end
-            local config = require('acp.config')
+            local config = require('ade.config')
             _G.test_cfg = config.validate(config.merge(config.defaults, { completion = { files = { root = project } } }))
             _G.test_session = { cwd = project, commands = { {name = 'compact', description = 'Compact history'}, {name = 'init'} } }
-            local input = require('acp.ui.input').new({ config = test_cfg })
+            local input = require('ade.ui.input').new({ config = test_cfg })
             _G.test_buf = input.buf
             _G.test_sent = 0
-            require('acp.ui.keymaps').attach_input(test_buf, { config = test_cfg, keymaps = test_cfg.keymaps.input,
+            require('ade.ui.keymaps').attach_input(test_buf, { config = test_cfg, keymaps = test_cfg.keymaps.input,
               get_session = function() return test_session end, on_send = function() test_sent = test_sent + 1 end })
             vim.api.nvim_win_set_buf(0, test_buf)
             vim.cmd('startinsert')
@@ -199,7 +199,7 @@ try:
         complete("read @中文", "docs/中文 file.txt", 'read @"docs/中文 file.txt"')
         complete("你好 @lu/old.lua tail", "lua/测试.lua", "你好 @lua/测试.lua tail", len("你好 @lu".encode()))
         complete("@Make", "Makefile", "@Makefile")
-        attached = nvim.exec_lua("return #require('acp.context').mentions(vim.api.nvim_get_current_line(), test_cfg, test_session.cwd)")
+        attached = nvim.exec_lua("return #require('ade.context').mentions(vim.api.nvim_get_current_line(), test_cfg, test_session.cwd)")
         assert attached == 1, "accepted extensionless file did not become an attachment"
         if ENGINE != "native":
             reset("/com")
@@ -210,7 +210,7 @@ try:
             wait_for("Enter confirms without sending", "return vim.api.nvim_get_current_line() == '/compact' and test_sent == 0")
             assert len(nvim.current.buffer[:]) == 1
         nvim.input("<C-s>")
-        wait_for("ACP send key remains available", "return test_sent == 1")
+        wait_for("ADE send key remains available", "return test_sent == 1")
         print(f"all {ENGINE} attached-UI completion checks passed")
 finally:
     try:

@@ -1,12 +1,12 @@
 return function(t)
-  local acp = require("acp")
-  local controller = require("acp.controller")
-  local marker = "/tmp/opencode/acp-auth-retry-marker"
+  local ade = require("ade")
+  local controller = require("ade.controller")
+  local marker = "/tmp/opencode/ade-auth-retry-marker"
 
   local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
 
   local function setup()
-    acp.setup({
+    ade.setup({
       agent = "opencode",
       agents = {
         opencode = {
@@ -230,7 +230,7 @@ return function(t)
       vim.notify = function(message)
         notes[#notes + 1] = tostring(message)
       end
-      local ops = require("acp.app.runtime_ops").new({
+      local ops = require("ade.app.runtime_ops").new({
         state = function()
           return S
         end,

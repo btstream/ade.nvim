@@ -1,9 +1,9 @@
 return function(t)
-  local guard = require("acp.inline.guard")
-  local state = require("acp.session.state")
-  local agents = require("acp.agents")
+  local guard = require("ade.inline.guard")
+  local state = require("ade.session.state")
+  local agents = require("ade.agents")
 
-  local dir = "/tmp/opencode/acp-inline-guard"
+  local dir = "/tmp/opencode/ade-inline-guard"
   vim.fn.mkdir(dir, "p")
 
   local function write(name, text)
@@ -75,7 +75,7 @@ return function(t)
   end)
 
   t.describe("inline source lock", function()
-    local lock = require("acp.inline.lock")
+    local lock = require("ade.inline.lock")
 
     local function named_buf(name)
       local path = dir .. "/" .. name
@@ -133,7 +133,7 @@ return function(t)
   end)
 
   t.describe("inline mode guard", function()
-    local inline = require("acp.inline")
+    local inline = require("ade.inline")
 
     local function session_with_mode(profile_name, mode, options)
       local s = state.new("s", "/tmp")
@@ -278,7 +278,7 @@ return function(t)
   end)
 
   t.describe("inline transcript folding", function()
-    local blocks = require("acp.ui.blocks")
+    local blocks = require("ade.ui.blocks")
     local ctx = {
       icons = blocks.icon_set(true),
       width = 80,
@@ -333,8 +333,8 @@ return function(t)
   end)
 
   t.describe("inline tool kinds", function()
-    local inline = require("acp.inline")
-    local permissions = require("acp.app.permissions")
+    local inline = require("ade.inline")
+    local permissions = require("ade.app.permissions")
 
     local function decide_allows(kind, inline_config)
       local s = state.new("s", "/tmp")
@@ -342,7 +342,7 @@ return function(t)
       local inv = {
         session = s,
         config = { inline = inline_config },
-        copy = "/tmp/opencode/acp-inline-guard/copy.txt",
+        copy = "/tmp/opencode/ade-inline-guard/copy.txt",
       }
       -- `decide` is private; the policy is the public path.
       local interaction = {

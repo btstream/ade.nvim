@@ -1,13 +1,13 @@
 return function(t)
-  local acp = require("acp")
-  local controller = require("acp.controller")
-  local Runtime = require("acp.session.runtime")
-  local config = require("acp.config")
+  local ade = require("ade")
+  local controller = require("ade.controller")
+  local Runtime = require("ade.session.runtime")
+  local config = require("ade.config")
 
   local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
 
   local function setup(env, overrides)
-    acp.setup(vim.tbl_deep_extend("force", {
+    ade.setup(vim.tbl_deep_extend("force", {
       agent = "opencode",
       agents = {
         opencode = {

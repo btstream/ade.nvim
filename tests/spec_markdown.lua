@@ -2,7 +2,7 @@
 -- deleted, so every assertion also checks that the returned ranges stay within
 -- the untouched text.
 return function(t)
-  local markdown = require("acp.ui.markdown")
+  local markdown = require("ade.ui.markdown")
 
   ---Collect the visible text of a line: concealed ranges removed.
   ---@param line string
@@ -46,104 +46,104 @@ return function(t)
   t.describe("inline markdown", function()
     t.it("leaves plain text alone", function()
       local line = find("just some words")
-      local segs = markdown.parse_inline(line, "AcpAssistant")
+      local segs = markdown.parse_inline(line, "AdeAssistant")
       t.eq(line, visible(line, segs))
-      t.eq("AcpAssistant", group_at(segs, 0))
+      t.eq("AdeAssistant", group_at(segs, 0))
     end)
 
     t.it("handles empty input", function()
-      t.eq(1, #markdown.parse_inline("", "AcpAssistant"))
+      t.eq(1, #markdown.parse_inline("", "AdeAssistant"))
     end)
 
     t.it("conceals bold delimiters and styles the body", function()
       local line = "a **bold** word"
-      local segs = markdown.parse_inline(line, "AcpAssistant")
+      local segs = markdown.parse_inline(line, "AdeAssistant")
       t.eq("a bold word", visible(line, segs))
-      t.eq("AcpBold", group_at(segs, line:find("bold") - 1))
+      t.eq("AdeBold", group_at(segs, line:find("bold") - 1))
     end)
 
     t.it("conceals italic delimiters", function()
       local line = "an *italic* word"
-      local segs = markdown.parse_inline(line, "AcpAssistant")
+      local segs = markdown.parse_inline(line, "AdeAssistant")
       t.eq("an italic word", visible(line, segs))
-      t.eq("AcpItalic", group_at(segs, line:find("italic") - 1))
+      t.eq("AdeItalic", group_at(segs, line:find("italic") - 1))
     end)
 
     t.it("prefers ** over * when both are possible", function()
       local line = "**strong**"
-      local segs = markdown.parse_inline(line, "AcpAssistant")
+      local segs = markdown.parse_inline(line, "AdeAssistant")
       t.eq("strong", visible(line, segs))
-      t.eq("AcpBold", group_at(segs, 2))
+      t.eq("AdeBold", group_at(segs, 2))
     end)
 
     t.it("handles strikethrough", function()
       local line = "~~gone~~"
-      local segs = markdown.parse_inline(line, "AcpAssistant")
+      local segs = markdown.parse_inline(line, "AdeAssistant")
       t.eq("gone", visible(line, segs))
-      t.eq("AcpStrike", group_at(segs, 2))
+      t.eq("AdeStrike", group_at(segs, 2))
     end)
 
     t.it("conceals backticks and styles inline code", function()
       local line = "run `ls -la` now"
-      local segs = markdown.parse_inline(line, "AcpAssistant")
+      local segs = markdown.parse_inline(line, "AdeAssistant")
       t.eq("run ls -la now", visible(line, segs))
-      t.eq("AcpMdCode", group_at(segs, line:find("ls") - 1))
+      t.eq("AdeMdCode", group_at(segs, line:find("ls") - 1))
     end)
 
     t.it("does not parse markup inside inline code", function()
       local line = "`a **b** c`"
-      local segs = markdown.parse_inline(line, "AcpAssistant")
+      local segs = markdown.parse_inline(line, "AdeAssistant")
       t.eq("a **b** c", visible(line, segs))
       -- The whole code span keeps the code group.
-      t.eq("AcpMdCode", group_at(segs, 2))
+      t.eq("AdeMdCode", group_at(segs, 2))
       for _, seg in ipairs(segs) do
-        t.falsy(seg.group == "AcpBold", "bold inside code must not be applied")
+        t.falsy(seg.group == "AdeBold", "bold inside code must not be applied")
       end
     end)
 
     t.it("renders a link as its label", function()
       local line = "see [docs](https://example.com) here"
-      local segs = markdown.parse_inline(line, "AcpAssistant")
+      local segs = markdown.parse_inline(line, "AdeAssistant")
       t.eq("see docs here", visible(line, segs))
-      t.eq("AcpMdLink", group_at(segs, line:find("docs") - 1))
+      t.eq("AdeMdLink", group_at(segs, line:find("docs") - 1))
     end)
 
     t.it("leaves an unclosed delimiter as text", function()
       local line = "a **b"
-      local segs = markdown.parse_inline(line, "AcpAssistant")
+      local segs = markdown.parse_inline(line, "AdeAssistant")
       t.eq("a **b", visible(line, segs))
     end)
 
     t.it("leaves an unclosed backtick as text", function()
       local line = "run `ls"
-      local segs = markdown.parse_inline(line, "AcpAssistant")
+      local segs = markdown.parse_inline(line, "AdeAssistant")
       t.eq("run `ls", visible(line, segs))
     end)
 
     t.it("does not italicise snake_case identifiers", function()
       local line = "call some_function_name now"
-      local segs = markdown.parse_inline(line, "AcpAssistant")
+      local segs = markdown.parse_inline(line, "AdeAssistant")
       t.eq("call some_function_name now", visible(line, segs))
-      t.eq("AcpAssistant", group_at(segs, line:find("some_function") - 1))
+      t.eq("AdeAssistant", group_at(segs, line:find("some_function") - 1))
     end)
 
     t.it("does not italicise arithmetic", function()
       local line = "2*3*4 equals 24"
-      local segs = markdown.parse_inline(line, "AcpAssistant")
+      local segs = markdown.parse_inline(line, "AdeAssistant")
       t.eq("2*3*4 equals 24", visible(line, segs))
     end)
 
     t.it("keeps offsets correct around multibyte text", function()
       local line = "中文 **粗体** 结束"
-      local segs = markdown.parse_inline(line, "AcpAssistant")
+      local segs = markdown.parse_inline(line, "AdeAssistant")
       t.eq("中文 粗体 结束", visible(line, segs))
       local byte = line:find("粗")
-      t.eq("AcpBold", group_at(segs, byte - 1))
+      t.eq("AdeBold", group_at(segs, byte - 1))
     end)
 
     t.it("finds segments in source order", function()
       local line = "**a** and `b`"
-      local segs = markdown.parse_inline(line, "AcpAssistant")
+      local segs = markdown.parse_inline(line, "AdeAssistant")
       local last_conceal = -1
       for _, seg in ipairs(segs) do
         if seg.conceal then
@@ -181,8 +181,8 @@ return function(t)
   end)
 
   t.describe("rendered blocks", function()
-    local blocks = require("acp.ui.blocks")
-    local state = require("acp.session.state")
+    local blocks = require("ade.ui.blocks")
+    local state = require("ade.session.state")
 
     local function render(text)
       local s = state.new("s", "/tmp")
@@ -226,16 +226,16 @@ return function(t)
         end
       end
       t.eq(2, concealed, "backticks should be concealed inside a thought")
-      t.truthy(groups["AcpMdCode"], "inline code lost its style inside a thought")
+      t.truthy(groups["AdeMdCode"], "inline code lost its style inside a thought")
     end)
   end)
 
   t.describe("headings", function()
-    local blocks = require("acp.ui.blocks")
-    local state = require("acp.session.state")
+    local blocks = require("ade.ui.blocks")
+    local state = require("ade.session.state")
 
     t.it("gives a heading in the body its level group", function()
-      local expected = { "AcpH1", "AcpH2", "AcpH3", "AcpH4" }
+      local expected = { "AdeH1", "AdeH2", "AdeH3", "AdeH4" }
       for level = 1, 4 do
         local s = state.new("s", "/tmp")
         -- A leading paragraph keeps the heading off the first line, so it stays
@@ -276,9 +276,9 @@ return function(t)
       for _, seg in ipairs(lines[1].segments or {}) do
         groups[seg.group] = true
       end
-      t.truthy(groups["AcpAssistantIcon"], "the glyph keeps its own group")
-      t.truthy(groups["AcpAssistantTitle"], "the opening heading should be the block title")
-      t.falsy(groups["AcpH2"], "the opening heading should not keep its body group")
+      t.truthy(groups["AdeAssistantIcon"], "the glyph keeps its own group")
+      t.truthy(groups["AdeAssistantTitle"], "the opening heading should be the block title")
+      t.falsy(groups["AdeH2"], "the opening heading should not keep its body group")
     end)
 
     t.it("separates the user glyph from the user label", function()
@@ -294,8 +294,8 @@ return function(t)
       for _, seg in ipairs(lines[1].segments or {}) do
         groups[seg.group] = true
       end
-      t.truthy(groups["AcpUserIcon"], "the user glyph needs its own group")
-      t.truthy(groups["AcpUserTitle"], "the user label needs its own group")
+      t.truthy(groups["AdeUserIcon"], "the user glyph needs its own group")
+      t.truthy(groups["AdeUserTitle"], "the user label needs its own group")
     end)
   end)
 end

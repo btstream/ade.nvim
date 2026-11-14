@@ -1,12 +1,12 @@
 return function(t)
-  local acp = require("acp")
-  local controller = require("acp.controller")
-  local picker = require("acp.ui.picker")
+  local ade = require("ade")
+  local controller = require("ade.controller")
+  local picker = require("ade.ui.picker")
 
   local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
 
   local function setup()
-    acp.setup({
+    ade.setup({
       agent = "opencode",
       agents = { opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } } },
       ui = { session_picker = "internal" },
@@ -98,7 +98,7 @@ return function(t)
       vim.wait(6000, function()
         for _, win in ipairs(vim.api.nvim_list_wins()) do
           local buf = vim.api.nvim_win_get_buf(win)
-          if vim.bo[buf].filetype == "acp_sessions" then
+          if vim.bo[buf].filetype == "ade_sessions" then
             found = { win = win, buf = buf }
             return true
           end
@@ -125,7 +125,7 @@ return function(t)
       local S = setup()
       local browser = open_browser(S)
       t.truthy(browser, "session browser did not open")
-      t.eq("acp_sessions", vim.bo[browser.buf].filetype)
+      t.eq("ade_sessions", vim.bo[browser.buf].filetype)
       local lines = browser_lines(browser)
       local joined = table.concat(lines, "\n")
       t.match("sess_old", joined .. "sess_old")
@@ -141,7 +141,7 @@ return function(t)
       local browser = open_browser(S)
       t.truthy(browser)
       -- The active session starts with the arrow marker.
-      local icons = require("acp.ui.icons").get(true)
+      local icons = require("ade.ui.icons").get(true)
       local marked = false
       for _, line in ipairs(browser_lines(browser)) do
         if vim.startswith(line, icons.arrow_right .. " ") or vim.startswith(line, "> ") then

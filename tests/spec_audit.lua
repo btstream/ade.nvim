@@ -1,10 +1,10 @@
 return function(t)
-  local toolbar = require("acp.ui.toolbar")
-  local config = require("acp.config")
+  local toolbar = require("ade.ui.toolbar")
+  local config = require("ade.config")
 
   t.describe("audit regressions", function()
     t.it("keeps internal session navigation ahead of text mappings", function()
-      local browser = require("acp.ui.session_picker").open({
+      local browser = require("ade.ui.session_picker").open({
         sessions = { { sessionId = "aaa", title = "First" }, { sessionId = "bbb", title = "Old" } },
       })
       local maps = {}
@@ -37,7 +37,7 @@ return function(t)
       end
       local browser
       local ok, err = pcall(function()
-        browser = require("acp.ui.session_picker").open({
+        browser = require("ade.ui.session_picker").open({
           sessions = { { sessionId = "one", title = "First" } },
           can_delete = true,
         })
@@ -69,13 +69,13 @@ return function(t)
     t.it("keeps the log rotation counter out of the global namespace", function()
       local original = _G.lines_since_check
       _G.lines_since_check = nil
-      require("acp.log").setup({})
+      require("ade.log").setup({})
       local leaked = _G.lines_since_check
       _G.lines_since_check = original
       t.eq(nil, leaked)
     end)
     t.it("honours the configured close key in both panel buffers", function()
-      local controller = require("acp.controller")
+      local controller = require("ade.controller")
       -- `close_panel` exists in both views, so it has to be set in both.
       controller.setup({ keymaps = { input = { close_panel = "Q" }, chat = { close_panel = "Q" } } })
       local state = controller.state()
@@ -99,8 +99,8 @@ return function(t)
       local script = string.format(
         [[
         vim.opt.runtimepath:append(%q)
-        local controller = require("acp.controller")
-        local config = require("acp.config")
+        local controller = require("ade.controller")
+        local config = require("ade.config")
         controller.setup({})
         local state = controller.state()
         state.connection = "starting"
@@ -128,7 +128,7 @@ return function(t)
     end)
 
     t.it("replaces cached history when loading the same session again", function()
-      local controller = require("acp.controller")
+      local controller = require("ade.controller")
       controller.setup({})
       local state = controller.state()
       state.connection = "ready"
@@ -154,7 +154,7 @@ return function(t)
     end)
 
     t.it("disables ordinary request timeouts when configured as zero", function()
-      local client = require("acp.protocol.client").new({
+      local client = require("ade.protocol.client").new({
         agent = {},
         cwd = vim.fn.getcwd(),
         limits = { request_timeout = 0 },
@@ -208,7 +208,7 @@ return function(t)
       for _, bounds in ipairs({ { min_width = "bad" }, { max_width = "bad" } }) do
         local ok, err = pcall(config.validate, config.merge(config.defaults, { layout = bounds }))
         t.eq(false, ok)
-        t.truthy(tostring(err):find("acp.nvim: layout.", 1, true))
+        t.truthy(tostring(err):find("ade.nvim: layout.", 1, true))
       end
     end)
 
@@ -220,7 +220,7 @@ return function(t)
         return 123
       end
       local ok, err = pcall(function()
-        local process = require("acp.transport.process").spawn({
+        local process = require("ade.transport.process").spawn({
           command = "mock",
           stderr_keep_bytes = 0,
           on_line = function() end,
@@ -236,7 +236,7 @@ return function(t)
     end)
 
     t.it("rolls back the first split when the second split fails", function()
-      local layout = require("acp.layout")
+      local layout = require("ade.layout")
       layout.setup(config.merge(config.defaults, {}))
       local before = #vim.api.nvim_list_wins()
       local equalalways = vim.o.equalalways
@@ -263,7 +263,7 @@ return function(t)
     end)
 
     t.it("does not warn for the default nvi mouse setting", function()
-      local controller = require("acp.controller")
+      local controller = require("ade.controller")
       local mouse, notify = vim.o.mouse, vim.notify
       local state = controller.state()
       local hint = state.click_hint_shown

@@ -3,10 +3,10 @@ return {
   "hrsh7th/nvim-cmp",
   opts = function(_, opts)
     local cmp = require("cmp")
-    require("acp.completion.cmp").setup()
-    cmp.setup.filetype("acp_input", {
+    require("ade.completion.cmp").setup()
+    cmp.setup.filetype("ade_input", {
       enabled = true, -- allow nofile buffers even if your global config excludes them
-      sources = { { name = "acp", keyword_length = 0 } },
+      sources = { { name = "ade", keyword_length = 0 } },
       matching = { disallow_symbol_nonprefix_matching = false },
       mapping = {
         ["<CR>"] = cmp.mapping(function(fallback)

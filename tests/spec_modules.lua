@@ -1,8 +1,8 @@
 return function(t)
-  local state = require("acp.session.state")
-  local presenter = require("acp.ui.presenter")
-  local text = require("acp.ui.text")
-  local permissions = require("acp.app.permissions")
+  local state = require("ade.session.state")
+  local presenter = require("ade.ui.presenter")
+  local text = require("ade.ui.text")
+  local permissions = require("ade.app.permissions")
 
   local function config(overrides)
     return function()
@@ -44,7 +44,7 @@ return function(t)
 
   t.describe("text layout", function()
     t.it("renders fenced code with a language row", function()
-      local lines = text.render_text("```lua\nlocal a = 1\n```", "AcpAssistant", 80)
+      local lines = text.render_text("```lua\nlocal a = 1\n```", "AdeAssistant", 80)
       t.eq("lua", lines[1].text)
       t.match("local a = 1", lines[2].text)
     end)
@@ -53,10 +53,10 @@ return function(t)
       local full = "one\n" .. "two\n" .. "three"
       local cache = {}
       for i = 1, #full do
-        text.render_text(full:sub(1, i), "AcpAssistant", 80, cache)
+        text.render_text(full:sub(1, i), "AdeAssistant", 80, cache)
       end
-      local streamed = text.render_text(full, "AcpAssistant", 80, cache)
-      local fresh = text.render_text(full, "AcpAssistant", 80)
+      local streamed = text.render_text(full, "AdeAssistant", 80, cache)
+      local fresh = text.render_text(full, "AdeAssistant", 80)
       t.eq(#fresh, #streamed)
       for i = 1, #fresh do
         t.eq(fresh[i].text, streamed[i].text)
@@ -78,7 +78,7 @@ return function(t)
   end)
 
   t.describe("permissions policy", function()
-    local Interactions = require("acp.app.interactions")
+    local Interactions = require("ade.app.interactions")
 
     local function harness(overrides)
       local answered, shown = {}, 0
@@ -145,7 +145,7 @@ return function(t)
       t.eq(1, #interactions:pending())
       t.truthy(interactions:waiting("s"))
       t.falsy(interactions:waiting("other"))
-      -- nil means "any session", which is what the toolbar and :Acp use.
+      -- nil means "any session", which is what the toolbar and :Ade use.
       t.truthy(interactions:waiting(nil))
     end)
 

@@ -1,16 +1,16 @@
 return function(t)
-  local acp = require("acp")
-  local controller = require("acp.controller")
-  local picker = require("acp.ui.picker")
+  local ade = require("ade")
+  local controller = require("ade.controller")
+  local picker = require("ade.ui.picker")
 
   local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
-  local marker = "/tmp/opencode/acp-auth-marker"
+  local marker = "/tmp/opencode/ade-auth-marker"
 
   local function setup(overrides, opts)
     if not (opts and opts.logged_in) then
       vim.fn.delete(marker)
     end
-    acp.setup(vim.tbl_deep_extend("force", {
+    ade.setup(vim.tbl_deep_extend("force", {
       agent = "opencode",
       agents = {
         opencode = {

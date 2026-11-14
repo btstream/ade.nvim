@@ -1,12 +1,12 @@
 return function(t)
-  local config = require("acp.config")
-  local state = require("acp.session.state")
-  local Chat = require("acp.ui.chat")
-  local blocks = require("acp.ui.blocks")
+  local config = require("ade.config")
+  local state = require("ade.session.state")
+  local Chat = require("ade.ui.chat")
+  local blocks = require("ade.ui.blocks")
 
   local function chat_with(cfg, width)
     local merged = config.validate(config.merge(config.defaults, cfg or {}))
-    require("acp.ui.highlights").setup()
+    require("ade.ui.highlights").setup()
     local chat = Chat.new({ config = merged })
     chat.width = width or 50
     return chat
@@ -73,7 +73,7 @@ return function(t)
     t.it("puts the turn glyph in the turn form", function()
       local chat = chat_with({ ui = { separator = { form = "turn" } } })
       chat:set_session(session_with_turns(2))
-      local ic = require("acp.ui.icons").get(true)
+      local ic = require("ade.ui.icons").get(true)
       t.truthy(separators(chat)[1].text:find(ic.history, 1, true), "the turn glyph is missing")
     end)
 
@@ -121,8 +121,8 @@ return function(t)
       for _, seg in ipairs(row.segments) do
         groups[seg.group] = true
       end
-      t.truthy(groups["AcpSeparator"], "the rule should use the separator group")
-      t.truthy(groups["AcpMuted"] or groups["AcpSeparator"], "the marker needs a colour")
+      t.truthy(groups["AdeSeparator"], "the rule should use the separator group")
+      t.truthy(groups["AdeMuted"] or groups["AdeSeparator"], "the marker needs a colour")
     end)
 
     t.it("survives an incremental render", function()
@@ -143,7 +143,7 @@ return function(t)
     t.it("renders a rule that fits the requested width", function()
       -- `render_separator` is the unit under the integration above: check the
       -- width handling directly, including the odd-width case.
-      local ic = require("acp.ui.icons").get(true)
+      local ic = require("ade.ui.icons").get(true)
       for _, width in ipairs({ 40, 41, 60, 79 }) do
         local out = blocks.render_separator({ width = width, icons = ic }, { form = "turn", turn = 5 })
         t.eq(1, #out)

@@ -1,5 +1,5 @@
 return function(t)
-  local details = require("acp.ui.permission_details")
+  local details = require("ade.ui.permission_details")
 
   t.describe("permission details", function()
     t.it("shows the command an execute call ran", function()

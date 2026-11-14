@@ -1,12 +1,12 @@
 -- Regression tests for the line background painter (phase 0 of the render
 -- upgrade). Code blocks and tool cards both draw through this path.
 return function(t)
-  local config = require("acp.config")
-  local state = require("acp.session.state")
-  local Chat = require("acp.ui.chat")
-  local blocks = require("acp.ui.blocks")
+  local config = require("ade.config")
+  local state = require("ade.session.state")
+  local Chat = require("ade.ui.chat")
+  local blocks = require("ade.ui.blocks")
 
-  local ns_bg = vim.api.nvim_create_namespace("acp_chat_bg")
+  local ns_bg = vim.api.nvim_create_namespace("ade_chat_bg")
 
   local function cfg()
     return config.validate(config.merge(config.defaults, {}))
@@ -89,9 +89,9 @@ return function(t)
       blocks.render_block = function(block)
         if block.id == "card" then
           return {
-            { text = "padding", bg = "AcpCardBg" },
-            { text = "content", bg = "AcpCardBg" },
-            { text = "padding", bg = "AcpCardBg" },
+            { text = "padding", bg = "AdeCardBg" },
+            { text = "content", bg = "AdeCardBg" },
+            { text = "padding", bg = "AdeCardBg" },
           }
         end
         return {
@@ -110,7 +110,7 @@ return function(t)
         t.eq(1, #marks, "the three card lines should share one extmark")
         t.eq(0, marks[1][2], "background starts at the first card line")
         t.eq(3, marks[1][4].end_row, "background covers exactly the card lines")
-        t.eq("AcpCardBg", marks[1][4].hl_group)
+        t.eq("AdeCardBg", marks[1][4].hl_group)
         t.truthy(marks[1][4].hl_eol, "background must reach the window edge")
         -- A lower priority than the inline segments (100) is what lets text
         -- colours show through; `hl_mode` itself is not reported by
@@ -139,8 +139,8 @@ return function(t)
       blocks.render_block = function(block)
         if block.id == "target" then
           return {
-            { text = "line one", bg = with_bg and "AcpCardBg" or nil },
-            { text = "line two", bg = with_bg and "AcpCardBg" or nil },
+            { text = "line one", bg = with_bg and "AdeCardBg" or nil },
+            { text = "line two", bg = with_bg and "AdeCardBg" or nil },
           }
         end
         return { { text = "plain" } }
@@ -171,7 +171,7 @@ return function(t)
       local chat = Chat.new({ config = cfg() })
       local original = blocks.render_block
       blocks.render_block = function()
-        return { { text = "card", bg = "AcpCardBg" } }
+        return { { text = "card", bg = "AdeCardBg" } }
       end
       local ok, err = pcall(function()
         local s = state.new("s", "/tmp")
@@ -194,15 +194,15 @@ return function(t)
   t.describe("diff backgrounds", function()
     t.it("keeps a removed run separate from an added run", function()
       local runs = Chat._background_runs({
-        { bg = "AcpCardBg" },
-        { bg = "AcpDiffDelete", block_id = "t" },
-        { bg = "AcpDiffAdd", block_id = "t" },
-        { bg = "AcpDiffAdd", block_id = "t" },
-        { bg = "AcpCardBg" },
+        { bg = "AdeCardBg" },
+        { bg = "AdeDiffDelete", block_id = "t" },
+        { bg = "AdeDiffAdd", block_id = "t" },
+        { bg = "AdeDiffAdd", block_id = "t" },
+        { bg = "AdeCardBg" },
       })
       t.eq(4, #runs)
-      t.eq({ s = 1, e = 2, group = "AcpDiffDelete" }, runs[2])
-      t.eq({ s = 2, e = 4, group = "AcpDiffAdd" }, runs[3])
+      t.eq({ s = 1, e = 2, group = "AdeDiffDelete" }, runs[2])
+      t.eq({ s = 2, e = 4, group = "AdeDiffAdd" }, runs[3])
     end)
 
     t.it("paints diff rows through the transcript", function()
@@ -223,9 +223,9 @@ return function(t)
       for _, run in ipairs(runs) do
         groups[run.group] = true
       end
-      t.truthy(groups.AcpDiffAdd, "no added row was painted")
-      t.truthy(groups.AcpDiffDelete, "no removed row was painted")
-      t.truthy(groups.AcpCardBg, "the card surface was dropped")
+      t.truthy(groups.AdeDiffAdd, "no added row was painted")
+      t.truthy(groups.AdeDiffDelete, "no removed row was painted")
+      t.truthy(groups.AdeCardBg, "the card surface was dropped")
     end)
 
     t.it("does not paint a diff while the card is collapsed", function()
@@ -242,7 +242,7 @@ return function(t)
       })
       chat:set_session(s)
       for _, run in ipairs(chat.bg_runs or {}) do
-        t.truthy(run.group ~= "AcpDiffAdd" and run.group ~= "AcpDiffDelete", "a collapsed card painted a diff")
+        t.truthy(run.group ~= "AdeDiffAdd" and run.group ~= "AdeDiffDelete", "a collapsed card painted a diff")
       end
     end)
   end)
@@ -263,8 +263,8 @@ return function(t)
 
   t.describe("indentation", function()
     t.it("carries the background through indentation", function()
-      local lines = blocks.indent_lines({ { text = "x", bg = "AcpCardBg", segments = {} } }, "  ")
-      t.eq("AcpCardBg", lines[1].bg)
+      local lines = blocks.indent_lines({ { text = "x", bg = "AdeCardBg", segments = {} } }, "  ")
+      t.eq("AdeCardBg", lines[1].bg)
       t.eq("  x", lines[1].text)
     end)
 
@@ -279,13 +279,13 @@ return function(t)
           text = "**x**",
           segments = {
             { s = 0, e = 2, conceal = true },
-            { s = 2, e = 3, group = "AcpBold" },
+            { s = 2, e = 3, group = "AdeBold" },
             { s = 3, e = 5, conceal = true },
           },
         },
       }, "  ")
       t.truthy(lines[1].segments[1].conceal, "conceal was dropped by indentation")
-      t.eq("AcpBold", lines[1].segments[2].group)
+      t.eq("AdeBold", lines[1].segments[2].group)
       t.eq(4, lines[1].segments[2].s, "segments must shift by the prefix")
       t.truthy(lines[1].segments[3].conceal, "trailing conceal was dropped")
     end)

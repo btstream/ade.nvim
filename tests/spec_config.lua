@@ -1,5 +1,5 @@
 return function(t)
-  local config = require("acp.config")
+  local config = require("ade.config")
 
   t.describe("config", function()
     t.it("merges nested defaults", function()

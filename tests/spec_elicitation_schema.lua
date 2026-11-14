@@ -1,5 +1,5 @@
 return function(t)
-  local schema = require("acp.elicitation_schema")
+  local schema = require("ade.elicitation_schema")
 
   local function field_by_key(parsed, key)
     for _, item in ipairs(parsed.fields) do

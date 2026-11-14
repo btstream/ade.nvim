@@ -1,8 +1,8 @@
 return function(t)
-  local client_mod = require("acp.protocol.client")
-  local state = require("acp.session.state")
-  local reducer = require("acp.session.reducer")
-  local async = require("acp.async")
+  local client_mod = require("ade.protocol.client")
+  local state = require("ade.session.state")
+  local reducer = require("ade.session.reducer")
+  local async = require("ade.async")
 
   local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
   local mock = root .. "tests/mock_agent.py"
@@ -45,7 +45,7 @@ return function(t)
     t.it("sends session/cancel before withdrawing the prompt RPC", function()
       local sent = {}
       local client = new_client({})
-      client.rpc = require("acp.transport.jsonrpc").new({
+      client.rpc = require("ade.transport.jsonrpc").new({
         send = function(payload)
           sent[#sent + 1] = vim.json.decode(payload)
           return true
@@ -64,7 +64,7 @@ return function(t)
     t.it("withdraws only the prompt of the cancelled session", function()
       local sent = {}
       local client = new_client({})
-      local jsonrpc = require("acp.transport.jsonrpc")
+      local jsonrpc = require("ade.transport.jsonrpc")
       client.rpc = jsonrpc.new({
         send = function(payload)
           sent[#sent + 1] = vim.json.decode(payload)
@@ -114,7 +114,7 @@ return function(t)
       -- next turn's policy.
       local sent = {}
       local client = new_client({})
-      client.rpc = require("acp.transport.jsonrpc").new({
+      client.rpc = require("ade.transport.jsonrpc").new({
         send = function(payload)
           sent[#sent + 1] = vim.json.decode(payload)
           return true
@@ -154,7 +154,7 @@ return function(t)
 
     t.it("extends an extendable timeout while updates keep arriving", function()
       local client = new_client({})
-      local rpc = require("acp.transport.jsonrpc").new({
+      local rpc = require("ade.transport.jsonrpc").new({
         send = function()
           return true
         end,
@@ -182,7 +182,7 @@ return function(t)
 
     t.it("times out an extendable request that stops being touched", function()
       local client = new_client({})
-      client.rpc = require("acp.transport.jsonrpc").new({
+      client.rpc = require("ade.transport.jsonrpc").new({
         send = function()
           return true
         end,
@@ -195,12 +195,12 @@ return function(t)
         return done ~= nil
       end, 2000)
       t.falsy(done[1])
-      t.eq(require("acp.transport.jsonrpc").LOCAL_ERROR, done[2].code)
+      t.eq(require("ade.transport.jsonrpc").LOCAL_ERROR, done[2].code)
     end)
 
     t.it("clears the settle entry when a request coroutine is cancelled", function()
       local client = new_client({})
-      local rpc = require("acp.transport.jsonrpc").new({
+      local rpc = require("ade.transport.jsonrpc").new({
         send = function()
           return true
         end,
@@ -222,7 +222,7 @@ return function(t)
       local sent = {}
       local client = new_client({})
       client.limits = { prompt_timeout = 30 }
-      client.rpc = require("acp.transport.jsonrpc").new({
+      client.rpc = require("ade.transport.jsonrpc").new({
         send = function(payload)
           sent[#sent + 1] = vim.json.decode(payload)
           return true
@@ -236,7 +236,7 @@ return function(t)
         return done ~= nil
       end, 2000)
       t.falsy(done[1])
-      t.eq(require("acp.transport.jsonrpc").LOCAL_ERROR, done[2].code)
+      t.eq(require("ade.transport.jsonrpc").LOCAL_ERROR, done[2].code)
       local methods = {}
       for _, message in ipairs(sent) do
         methods[#methods + 1] = message.method
@@ -247,7 +247,7 @@ return function(t)
     end)
 
     t.it("extends the load timeout through the real event path", function()
-      local events_mod = require("acp.app.events")
+      local events_mod = require("ade.app.events")
       local touched = {}
       local S = {
         conn = {
@@ -279,7 +279,7 @@ return function(t)
     t.it("routes only registered agent requests through the registry", function()
       local sent = {}
       local client = new_client({})
-      client.rpc = require("acp.transport.jsonrpc").new({
+      client.rpc = require("ade.transport.jsonrpc").new({
         send = function(payload)
           sent[#sent + 1] = vim.json.decode(payload)
           return true

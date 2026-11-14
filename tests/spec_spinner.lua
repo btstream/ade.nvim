@@ -1,7 +1,7 @@
 return function(t)
-  local Chrome = require("acp.ui.chrome")
-  local Config = require("acp.config")
-  local State = require("acp.session.state")
+  local Chrome = require("ade.ui.chrome")
+  local Config = require("ade.config")
+  local State = require("ade.session.state")
 
   local function fixture(fn, clock)
     local cfg = vim.deepcopy(Config.defaults)
@@ -40,7 +40,7 @@ return function(t)
       end,
       clock = clock,
     })
-    local log = require("acp.log")
+    local log = require("ade.log")
     local original_warn, warnings = log.warn, {}
     log.warn = function(fmt, ...)
       warnings[#warnings + 1] = string.format(fmt, ...)
@@ -127,7 +127,7 @@ return function(t)
       end)
     end)
 
-    t.it("targets inactive ACP winbars without changing focus", function()
+    t.it("targets inactive ADE winbars without changing focus", function()
       fixture(function(c, _, input)
         local original, calls = vim.api.nvim__redraw, {}
         vim.api.nvim__redraw = function(opts)
@@ -385,7 +385,7 @@ return function(t)
       fixture(function(c, cfg, input)
         local original = vim.api.nvim_set_option_value
         input.config = cfg
-        local temp = require("acp.ui.input").new({ config = cfg })
+        local temp = require("ade.ui.input").new({ config = cfg })
         input.apply_winbar = temp.apply_winbar
         temp:destroy()
         vim.api.nvim_set_option_value = function(name, value, ...)

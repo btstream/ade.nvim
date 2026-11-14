@@ -1,5 +1,5 @@
 return function(t)
-  local auth = require("acp.app.auth")
+  local auth = require("ade.app.auth")
 
   local function config(overrides)
     return function()
@@ -157,7 +157,7 @@ return function(t)
       -- MAX_LOGIN_ATTEMPTS is 2: further successes stop instead of restarting.
       t.eq(2, h.terminals.reconnects, "restarted more than the attempt limit")
       t.match("gave up", h.notices[#h.notices].message)
-      -- A deliberate :Acp login resets the counter.
+      -- A deliberate :Ade login resets the counter.
       h.auth:reset()
       h.auth:login()
       h.terminals[#h.terminals].opts.on_exit(0)
@@ -288,7 +288,7 @@ return function(t)
         { id = "a", name = "claude.ai" },
         { id = "b", name = "Console", type = "terminal", args = { "login" } },
       }
-      local picker = require("acp.ui.picker")
+      local picker = require("ade.ui.picker")
       local original, seen = picker.select, nil
       picker.select = function(opts)
         seen = opts

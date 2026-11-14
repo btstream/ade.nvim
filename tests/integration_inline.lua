@@ -21,11 +21,11 @@ local function wait(cond, timeout, label)
   end
 end
 
-local acp = require("acp")
-local controller = require("acp.controller")
-require("acp.inline.review").reset(vim.api.nvim_get_current_buf())
+local ade = require("ade")
+local controller = require("ade.controller")
+require("ade.inline.review").reset(vim.api.nvim_get_current_buf())
 
-acp.setup({
+ade.setup({
   agent = "opencode",
   agents = { opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } } },
   ui = {},
@@ -37,7 +37,7 @@ vim.notify = function(m, l)
     io.write("N:" .. tostring(m) .. "\n")
   end
 end
-acp.open()
+ade.open()
 
 local failures = {}
 local function check(name, fn)
@@ -75,7 +75,7 @@ end
 local function start(review, text)
   vim.api.nvim_set_current_win(source_win)
   pcall(vim.cmd, "stopinsert")
-  require("acp.inline").open({
+  require("ade.inline").open({
     review = review,
     mode = "V",
     pos1 = select_line(2),
@@ -83,7 +83,7 @@ local function start(review, text)
   })
   wait(function()
     local buf = vim.api.nvim_get_current_buf()
-    return vim.bo[buf].filetype == "acp_inline"
+    return vim.bo[buf].filetype == "ade_inline"
   end, 3000, "inline prompt")
   vim.api.nvim_buf_set_lines(vim.api.nvim_get_current_buf(), 0, -1, false, { text or "replace the marker" })
   vim.api.nvim_feedkeys(vim.keycode("<CR>"), "x", false)
@@ -94,10 +94,10 @@ end
 local function start_cursor(line, text)
   vim.api.nvim_set_current_win(source_win)
   vim.api.nvim_win_set_cursor(source_win, { line, 0 })
-  require("acp.inline").open({ review = "write" })
+  require("ade.inline").open({ review = "write" })
   wait(function()
     local buf = vim.api.nvim_get_current_buf()
-    return vim.bo[buf].filetype == "acp_inline"
+    return vim.bo[buf].filetype == "ade_inline"
   end, 3000, "inline prompt")
   vim.api.nvim_buf_set_lines(vim.api.nvim_get_current_buf(), 0, -1, false, { text or "replace the marker" })
   vim.api.nvim_feedkeys(vim.keycode("<CR>"), "x", false)
@@ -116,7 +116,7 @@ local function assert_writable()
 end
 
 check("direct mode rewrites only the selected line", function()
-  require("acp.inline.review").reset(vim.api.nvim_get_current_buf())
+  require("ade.inline.review").reset(vim.api.nvim_get_current_buf())
   start("write")
   wait(function()
     return lines()[2] == "local INLINE_NEW = 2"
@@ -131,7 +131,7 @@ check("direct mode rewrites only the selected line", function()
 end)
 
 check("normal mode follows the request instead of an insert-only point", function()
-  require("acp.inline.review").reset(source_buf)
+  require("ade.inline.review").reset(source_buf)
   -- The cursor is on line 3 but the request edits line 2: no range filtering.
   start_cursor(3, "INLINE_NORMAL replace the marker")
   wait(function()
@@ -145,7 +145,7 @@ check("normal mode follows the request instead of an insert-only point", functio
 end)
 
 check("visual mode drops edits outside the selected range", function()
-  require("acp.inline.review").reset(source_buf)
+  require("ade.inline.review").reset(source_buf)
   start("write", "INLINE_VISUAL replace the marker INLINE_OUTSIDE")
   wait(function()
     return lines()[2] == "local INLINE_NEW = 2"
@@ -159,15 +159,15 @@ check("visual mode drops edits outside the selected range", function()
 end)
 
 check("diff mode applies only after accepting the hunk", function()
-  require("acp.inline.review").reset(vim.api.nvim_get_current_buf())
+  require("ade.inline.review").reset(vim.api.nvim_get_current_buf())
   start("diff", "EXPLICIT")
   wait(function()
-    return require("acp.inline.diff_session").active(source_buf)
+    return require("ade.inline.diff_session").active(source_buf)
   end, 10000, "inline diff")
   assert(lines()[2] == "local INLINE_OLD = 2", "review changed the source before acceptance")
   vim.api.nvim_feedkeys(vim.keycode("ga"), "x", false)
   wait(function()
-    return not require("acp.inline.diff_session").active(source_buf)
+    return not require("ade.inline.diff_session").active(source_buf)
   end, 3000, "review finish")
   assert(lines()[2] == "local INLINE_NEW = 2", "accepted hunk was reverted")
   vim.cmd("silent undo")
@@ -177,14 +177,14 @@ check("diff mode applies only after accepting the hunk", function()
 end)
 
 check("rejecting the hunk restores the original", function()
-  require("acp.inline.review").reset(vim.api.nvim_get_current_buf())
+  require("ade.inline.review").reset(vim.api.nvim_get_current_buf())
   start("diff", "EXPLICIT")
   wait(function()
-    return require("acp.inline.diff_session").active(source_buf)
+    return require("ade.inline.diff_session").active(source_buf)
   end, 10000, "inline diff")
   vim.api.nvim_feedkeys(vim.keycode("gr"), "x", false)
   wait(function()
-    return not require("acp.inline.diff_session").active(source_buf)
+    return not require("ade.inline.diff_session").active(source_buf)
   end, 3000, "review finish")
   local snapshot = lines()
   assert(snapshot[2] == "local INLINE_OLD = 2", "rejected hunk stayed applied")
@@ -192,14 +192,14 @@ check("rejecting the hunk restores the original", function()
 end)
 
 check("always-accept makes the next change direct", function()
-  local review = require("acp.inline.review")
+  local review = require("ade.inline.review")
   review.always_accept(vim.api.nvim_get_current_buf())
   start(nil)
   wait(function()
     return lines()[2] == "local INLINE_NEW = 2"
   end, 10000, "always accept")
   wait(function()
-    return not require("acp.inline.diff_session").active(source_buf)
+    return not require("ade.inline.diff_session").active(source_buf)
   end, 3000, "no review")
   review.reset(vim.api.nvim_get_current_buf())
   vim.cmd("silent undo")
@@ -225,7 +225,7 @@ check("a running inline turn locks edits and writes until it finishes", function
   assert(vim.deep_equal(before, vim.fn.readfile(file)), "the write changed the disk mid-turn")
   assert(table.concat(notes, "\n"):find("locked until it finishes", 1, true), "no lock notification")
   wait(function()
-    return not require("acp.inline").is_active() and st.session.status == "idle"
+    return not require("ade.inline").is_active() and st.session.status == "idle"
   end, 10000, "late result")
   assert(lines()[1] == "user edit", "an unsaved edit was lost: " .. vim.inspect(lines()))
   assert(lines()[2] == "local INLINE_NEW = 2", "the inline result was not applied")
@@ -239,9 +239,9 @@ end)
 
 check("cancelled inline settles before the next turn", function()
   start("write", "INLINE_SLOW")
-  assert(require("acp.inline").stop())
+  assert(require("ade.inline").stop())
   wait(function()
-    return not require("acp.inline").is_active()
+    return not require("ade.inline").is_active()
   end, 10000, "cancel settlement")
   assert(lines()[2] == "local INLINE_OLD = 2", "cancelled result applied")
   assert(st.session.status == "idle", "cancel left session busy")
@@ -252,20 +252,20 @@ end)
 check("a failed inline turn unlocks the source", function()
   start("write", "INLINE_DELETE replace the marker")
   wait(function()
-    return not require("acp.inline").is_active() and st.session.status == "idle"
+    return not require("ade.inline").is_active() and st.session.status == "idle"
   end, 10000, "failed turn settlement")
   assert(vim.bo[source_buf].modifiable, "the failure path left the source locked")
   assert_writable()
 end)
 
 check("explicit diff overrides always accept", function()
-  require("acp.inline.review").always_accept(source_buf)
+  require("ade.inline.review").always_accept(source_buf)
   start("diff", "EXPLICIT")
   wait(function()
-    return require("acp.inline.diff_session").active(source_buf)
+    return require("ade.inline.diff_session").active(source_buf)
   end, 10000, "one-off diff")
   vim.api.nvim_feedkeys("g3", "x", false)
-  require("acp.inline.review").reset(source_buf)
+  require("ade.inline.review").reset(source_buf)
   assert(lines()[2] == "local INLINE_OLD = 2")
 end)
 
@@ -275,7 +275,7 @@ check("review mode uses the filetype at result time", function()
   start(nil, "INLINE_DELAY")
   vim.bo[source_buf].filetype = "markdown"
   wait(function()
-    return require("acp.inline.diff_session").active(source_buf)
+    return require("ade.inline.diff_session").active(source_buf)
   end, 10000, "changed filetype")
   vim.api.nvim_feedkeys("g3", "x", false)
   vim.bo[source_buf].filetype = "lua"
@@ -286,11 +286,11 @@ check("busy session rejects inline without sending another prompt", function()
   start("write", "INLINE_SLOW")
   local turn = st.session.turn
   vim.api.nvim_set_current_win(source_win)
-  assert(require("acp.inline").open() == false, "overlapping inline opened")
+  assert(require("ade.inline").open() == false, "overlapping inline opened")
   assert(st.session.turn == turn)
-  require("acp.inline").stop()
+  require("ade.inline").stop()
   wait(function()
-    return not require("acp.inline").is_active()
+    return not require("ade.inline").is_active()
   end, 10000, "busy cancel")
 end)
 
@@ -300,7 +300,7 @@ check("ordinary chat remains queued behind cancelled inline", function()
   assert(#st.session.queue == 1, "ordinary chat was not queued")
   controller.cancel()
   wait(function()
-    return not require("acp.inline").is_active() and st.session.status == "idle" and #st.session.queue == 0
+    return not require("ade.inline").is_active() and st.session.status == "idle" and #st.session.queue == 0
   end, 15000, "queued chat settlement")
   assert(lines()[2] == "local INLINE_OLD = 2", "cancelled inline applied")
 end)
@@ -309,9 +309,9 @@ check("ordinary busy turn rejects inline submission without consuming it", funct
   assert(controller.send_now("slow", nil, st.session))
   local turn = st.session.turn
   start("write")
-  assert(require("acp.inline.ui").is_open(), "busy inline input was lost")
+  assert(require("ade.inline.ui").is_open(), "busy inline input was lost")
   assert(st.session.turn == turn, "inline submitted an overlapping turn")
-  require("acp.inline.ui").close()
+  require("ade.inline.ui").close()
   controller.cancel()
   wait(function()
     return st.session.status == "idle"
@@ -319,9 +319,9 @@ check("ordinary busy turn rejects inline submission without consuming it", funct
 end)
 
 check("a private copy is removed after the request", function()
-  local copy = require("acp.inline.copy")
+  local copy = require("ade.inline.copy")
   local dir = vim.fs.dirname(file)
-  local leftovers = vim.fn.glob(dir .. "/.acp-inline-*", false, true)
+  local leftovers = vim.fn.glob(dir .. "/.ade-inline-*", false, true)
   assert(#leftovers == 0, "inline copy left behind: " .. vim.inspect(leftovers))
   assert(copy)
 end)
@@ -334,12 +334,12 @@ end)
 check("disconnect invalidates an in-flight inline result", function()
   start("write", "INLINE_DELAY")
   controller.disconnect()
-  assert(not require("acp.inline").is_active(), "disconnect retained inline ownership")
+  assert(not require("ade.inline").is_active(), "disconnect retained inline ownership")
   vim.wait(300)
   assert(lines()[2] == "local INLINE_OLD = 2", "late disconnected result applied")
   assert(vim.bo[source_buf].modifiable, "disconnect left the source locked")
   assert_writable()
-  assert(#vim.fn.glob(tmp .. "/.acp-inline-*", false, true) == 0, "disconnect leaked copy")
+  assert(#vim.fn.glob(tmp .. "/.ade-inline-*", false, true) == 0, "disconnect leaked copy")
 end)
 
 vim.fn.delete(tmp, "rf")

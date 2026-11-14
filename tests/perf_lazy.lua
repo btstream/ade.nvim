@@ -1,11 +1,11 @@
 -- Comparative baseline, A, and B. Timing is reported, not a brittle CI limit.
 -- nvim --headless -u tests/minimal_init.lua -l tests/perf_lazy.lua
-local config = require("acp.config")
-local Chat = require("acp.ui.chat")
-local State = require("acp.session.state")
-local CodeHL = require("acp.ui.code_hl")
-local renderer = require("acp.ui.buffer_renderer")
-local decoration = require("acp.ui.decoration")
+local config = require("ade.config")
+local Chat = require("ade.ui.chat")
+local State = require("ade.session.state")
+local CodeHL = require("ade.ui.code_hl")
+local renderer = require("ade.ui.buffer_renderer")
+local decoration = require("ade.ui.decoration")
 
 local function history()
   local s = State.new("benchmark", "/tmp")

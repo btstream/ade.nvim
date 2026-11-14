@@ -1,12 +1,12 @@
 return function(t)
-  local controller = require("acp.controller")
-  local async = require("acp.async")
-  local drafts = require("acp.storage.drafts")
+  local controller = require("ade.controller")
+  local async = require("ade.async")
+  local drafts = require("ade.storage.drafts")
 
   local function fixture(fn)
     drafts.flush()
     local original = drafts.path
-    local path = "/tmp/opencode/acp-lifecycle-" .. vim.uv.os_getpid() .. ".json"
+    local path = "/tmp/opencode/ade-lifecycle-" .. vim.uv.os_getpid() .. ".json"
     drafts.path = function()
       return path
     end
@@ -45,7 +45,7 @@ return function(t)
   end
 
   local function with_browser(s, client, fn)
-    local browser = require("acp.ui.session_picker")
+    local browser = require("ade.ui.session_picker")
     local original, options = browser.open, nil
     browser.open = function(opts)
       options = opts
@@ -93,7 +93,7 @@ return function(t)
         client.is_ready = function()
           return false
         end
-        local mod, event = require("acp.protocol.client"), nil
+        local mod, event = require("ade.protocol.client"), nil
         local original = mod.new
         local fresh = {
           shutdown = function() end,
@@ -260,7 +260,7 @@ return function(t)
 
     t.it("keeps a staged replay's cards closed", function()
       fixture(function(s)
-        local runtime, reducer = s.runtime, require("acp.session.reducer")
+        local runtime, reducer = s.runtime, require("ade.session.reducer")
         local staged = runtime:stage("a", "/tmp/project-a")
         reducer.apply(staged, {
           sessionUpdate = "tool_call",
@@ -306,7 +306,7 @@ return function(t)
 
     t.it("rejects a late model picker from an earlier connection", function()
       fixture(function(s, client)
-        local picker = require("acp.ui.picker")
+        local picker = require("ade.ui.picker")
         local original, choice = picker.select, nil
         picker.select = function(opts)
           choice = opts
@@ -343,7 +343,7 @@ return function(t)
 
     t.it("reduces protocol notifications inside the transport dispatch budget", function()
       fixture(function(s, client)
-        local mod = require("acp.protocol.client")
+        local mod = require("ade.protocol.client")
         local original_new, original_event = mod.new, controller.on_client_event
         local opts, count = nil, 0
         mod.new = function(value)
@@ -583,7 +583,7 @@ return function(t)
 
     t.it("does not resolve a new permission through an old picker", function()
       fixture(function(s, client)
-        local picker = require("acp.ui.picker")
+        local picker = require("ade.ui.picker")
         local original, choices = picker.select, {}
         picker.select = function(opts)
           choices[#choices + 1] = opts
@@ -635,7 +635,7 @@ return function(t)
         error("broken pipe")
       end
       local ok, err = pcall(function()
-        local proc = require("acp.transport.process").spawn({
+        local proc = require("ade.transport.process").spawn({
           command = "mock",
           on_line = function() end,
           on_exit = function() end,
@@ -672,8 +672,8 @@ return function(t)
     end)
 
     t.it("settles failed client writes even with request timeouts disabled", function()
-      local client = require("acp.protocol.client").new({ agent = {}, cwd = "/tmp", limits = { request_timeout = 0 } })
-      client.rpc = require("acp.transport.jsonrpc").new({
+      local client = require("ade.protocol.client").new({ agent = {}, cwd = "/tmp", limits = { request_timeout = 0 } })
+      client.rpc = require("ade.transport.jsonrpc").new({
         send = function()
           return false
         end,
@@ -689,7 +689,7 @@ return function(t)
     end)
 
     t.it("propagates initialization errors after suspension to every waiter", function()
-      local client = require("acp.protocol.client").new({ agent = {}, cwd = "/tmp" })
+      local client = require("ade.protocol.client").new({ agent = {}, cwd = "/tmp" })
       local done, errors = nil, {}
       client.do_start = function()
         async.await(function(cb)
@@ -713,14 +713,14 @@ return function(t)
     end)
 
     t.it("cancels a task's pending RPC and ignores its late result", function()
-      local client = require("acp.protocol.client").new({ agent = {}, cwd = "/tmp", limits = { request_timeout = 0 } })
-      client.rpc = require("acp.transport.jsonrpc").new({
+      local client = require("ade.protocol.client").new({ agent = {}, cwd = "/tmp", limits = { request_timeout = 0 } })
+      client.rpc = require("ade.transport.jsonrpc").new({
         send = function()
           return true
         end,
       })
       local state = { client = client, sessions = {} }
-      local scope = require("acp.tasks").new(function()
+      local scope = require("ade.tasks").new(function()
         return state
       end)
       local resumed, finalized = false, 0
@@ -765,7 +765,7 @@ return function(t)
     end)
 
     t.it("joins initialization callers instead of reporting premature success", function()
-      local client = require("acp.protocol.client").new({ agent = {}, cwd = "/tmp" })
+      local client = require("ade.protocol.client").new({ agent = {}, cwd = "/tmp" })
       local done, callbacks = nil, 0
       client.do_start = function()
         return async.await(function(cb)
@@ -787,7 +787,7 @@ return function(t)
     end)
 
     t.it("cancels initialization and settles all waiters once", function()
-      local client = require("acp.protocol.client").new({ agent = {}, cwd = "/tmp" })
+      local client = require("ade.protocol.client").new({ agent = {}, cwd = "/tmp" })
       local done, results = nil, {}
       client.do_start = function()
         return async.await(function(cb)
@@ -827,7 +827,7 @@ return function(t)
     end)
 
     t.it("settles failed RPC writes immediately without a pending leak", function()
-      local rpc = require("acp.transport.jsonrpc").new({
+      local rpc = require("ade.transport.jsonrpc").new({
         send = function()
           return false
         end,
@@ -845,7 +845,7 @@ return function(t)
 
   t.describe("manager leases across setup", function()
     t.it("releases the previous connection's lease when reconfiguring", function()
-      local root = string.format("/tmp/opencode/acp-lifecycle-lease-%d", vim.uv.hrtime())
+      local root = string.format("/tmp/opencode/ade-lifecycle-lease-%d", vim.uv.hrtime())
       vim.fn.mkdir(root, "p")
       controller.setup({ agent = "opencode", manager = { root = root } })
       local S = controller.state()

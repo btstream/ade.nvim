@@ -1,14 +1,14 @@
 return function(t)
-  local Config = require("acp.config")
-  local core = require("acp.completion")
-  local files = require("acp.completion.files")
-  local mentions = require("acp.completion.mentions")
-  local context = require("acp.context")
+  local Config = require("ade.config")
+  local core = require("ade.completion")
+  local files = require("ade.completion.files")
+  local mentions = require("ade.completion.mentions")
+  local context = require("ade.context")
   local counter = 0
 
   local function fixture(fn, overrides)
     counter = counter + 1
-    local root = "/tmp/opencode/acp-completion-" .. vim.uv.hrtime() .. "-" .. counter
+    local root = "/tmp/opencode/ade-completion-" .. vim.uv.hrtime() .. "-" .. counter
     vim.fn.mkdir(root, "p")
     local config = Config.validate(Config.merge(Config.defaults, {
       completion = { files = { backend = "builtin", root = root } },
@@ -19,10 +19,10 @@ return function(t)
     local buf = vim.api.nvim_create_buf(false, true)
     local previous = vim.api.nvim_get_current_win()
     local win = vim.api.nvim_open_win(buf, true, { relative = "editor", row = 0, col = 0, width = 60, height = 6 })
-    vim.bo[buf].filetype = "acp_input"
+    vim.bo[buf].filetype = "ade_input"
     local session =
       { cwd = root, commands = { { name = "compact", description = "Compact history" }, { name = "init" } } }
-    require("acp.ui.complete").attach(buf, function()
+    require("ade.ui.complete").attach(buf, function()
       return session
     end, config)
     local function write(path, text)
@@ -303,7 +303,7 @@ return function(t)
           end, 1))
           t.eq(0, #result)
           vim.bo[f.buf].modifiable = true
-          vim.bo[f.buf].filetype = "acp_input"
+          vim.bo[f.buf].filetype = "ade_input"
         end
       end)
     end)
@@ -454,7 +454,7 @@ return function(t)
       fixture(function(f)
         for _, command in ipairs({
           { "python3", "-c", "print('not NUL delimited')" },
-          { "acp-no-such-file-enumerator" },
+          { "ade-no-such-file-enumerator" },
         }) do
           f.config.completion.files.command = command
           local result, err
@@ -490,7 +490,7 @@ return function(t)
     t.it("adapts identical candidates to both frameworks without requiring either plugin", function()
       fixture(function(f)
         f.cursor("/co")
-        local blink = require("acp.completion.blink").new()
+        local blink = require("ade.completion.blink").new()
         t.truthy(blink:enabled())
         local a
         blink:get_completions({ bufnr = f.buf, cursor = { 1, 3 } }, function(value)
@@ -499,7 +499,7 @@ return function(t)
         t.truthy(vim.wait(2000, function()
           return a ~= nil
         end, 1))
-        local cmp = require("acp.completion.cmp").new()
+        local cmp = require("ade.completion.cmp").new()
         t.truthy(cmp:is_available())
         t.eq("utf-8", cmp:get_position_encoding_kind())
         local b
@@ -523,7 +523,7 @@ return function(t)
         f.write("dir/file with spaces.txt")
         f.cursor("read @old tail", #"read @old")
         local chosen = false
-        require("acp.completion.picker").open(f.buf, f.win, {
+        require("ade.completion.picker").open(f.buf, f.win, {
           select = function(paths, accept)
             t.eq(1, #paths)
             chosen = true
@@ -544,7 +544,7 @@ return function(t)
         f.write("chosen.txt")
         f.cursor("read @old")
         local other
-        require("acp.completion.picker").open(f.buf, f.win, {
+        require("ade.completion.picker").open(f.buf, f.win, {
           select = function(paths, accept)
             local buf = vim.api.nvim_create_buf(false, true)
             vim.bo[buf].bufhidden = "wipe"
@@ -578,7 +578,7 @@ return function(t)
               opts.actions.default({ labels[1] })
             end,
           }
-          require("acp.completion.picker").open(f.buf, f.win, { backend = "fzf-lua" })
+          require("ade.completion.picker").open(f.buf, f.win, { backend = "fzf-lua" })
           t.truthy(vim.wait(2000, function()
             return vim.api.nvim_get_current_line() == mentions.encode(name) .. " "
           end, 1))
@@ -598,7 +598,7 @@ return function(t)
         f.write("file.txt")
         f.cursor("read @old")
         local accept
-        require("acp.completion.picker").open(f.buf, f.win, {
+        require("ade.completion.picker").open(f.buf, f.win, {
           select = function(_, callback)
             accept = callback
           end,

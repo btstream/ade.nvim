@@ -31,7 +31,7 @@ def phase(label, setup):
                     for line in event[1:]:
                         for cell in line[3]:
                             seen.update(FRAMES.intersection(cell[0]))
-        elif method == "acp_spinner_done":
+        elif method == "ade_spinner_done":
             result.append(args[0])
             nvim.stop_loop()
 
@@ -48,7 +48,7 @@ def phase(label, setup):
           stats.stress_complete = _G.stress_complete
           stats.stress_frames = _G.stress_frames and vim.tbl_count(_G.stress_frames)
           stats.stress_readonly = _G.stress_readonly
-          vim.rpcnotify({nvim.channel_id}, 'acp_spinner_done', stats)
+          vim.rpcnotify({nvim.channel_id}, 'ade_spinner_done', stats)
         end, 500)
         """,
     )
@@ -74,14 +74,14 @@ try:
     nvim.exec_lua(
         """
         vim.opt.runtimepath:append(...)
-        local cfg = vim.deepcopy(require('acp.config').defaults)
+        local cfg = vim.deepcopy(require('ade.config').defaults)
         cfg.ui.toolbar.animation_interval = 30
-        local state = require('acp.session.state').new('spinner', '/tmp')
+        local state = require('ade.session.state').new('spinner', '/tmp')
         state.status = 'running'
-        local input = require('acp.ui.input').new({ config = cfg })
+        local input = require('ade.ui.input').new({ config = cfg })
         input.win = vim.api.nvim_get_current_win()
         vim.api.nvim_win_set_buf(input.win, input.buf)
-        _G.spinner_test = require('acp.ui.chrome').new({
+        _G.spinner_test = require('ade.ui.chrome').new({
           config = function() return cfg end,
           current = function() return state end,
           waiting = function() return false end,
@@ -89,7 +89,7 @@ try:
           input = function() return input end,
           chat = function() return nil end,
         })
-        _G.AcpComposerBar = function() return spinner_test:composer_bar() end
+        _G.AdeComposerBar = function() return spinner_test:composer_bar() end
         vim.cmd('vsplit')
         vim.api.nvim_win_set_buf(0, vim.api.nvim_create_buf(false, true))
         spinner_test:apply()
@@ -110,13 +110,13 @@ try:
     stress = phase(
         "chunked transcript commit with live spinner",
         r"""
-        local cfg = vim.deepcopy(require('acp.config').defaults)
+        local cfg = vim.deepcopy(require('ade.config').defaults)
         cfg.ui.render.commit_rows = 20
-        local chat = require('acp.ui.chat').new({ config = cfg })
+        local chat = require('ade.ui.chat').new({ config = cfg })
         _G.stress_chat = chat
         chat.win = vim.api.nvim_get_current_win()
         vim.api.nvim_win_set_buf(chat.win, chat.buf)
-        local renderer = require('acp.ui.buffer_renderer')
+        local renderer = require('ade.ui.buffer_renderer')
         local highlight = renderer.highlight_line
         -- Controlled expensive row highlighting ensures actual overlap rather
         -- than merely observing idle animation after a very fast commit.
@@ -125,16 +125,16 @@ try:
           while vim.uv.hrtime() < deadline do end
           return highlight(...)
         end
-        local bar = _G.AcpComposerBar
+        local bar = _G.AdeComposerBar
         _G.stress_frames, _G.stress_readonly = {}, true
-        _G.AcpComposerBar = function(...)
+        _G.AdeComposerBar = function(...)
           if chat.commit_job then
             stress_frames[spinner_test.frame or 'none'] = true
             stress_readonly = stress_readonly and not vim.bo[chat.buf].modifiable
           end
           return bar(...)
         end
-        local state = require('acp.session.state').new('stress', '/tmp')
+        local state = require('ade.session.state').new('stress', '/tmp')
         state:track_changes()
         state:append({ id = 'large', kind = 'agent', text = string.rep('stress row\n', 6000) })
         chat:set_session(state)
@@ -146,7 +146,7 @@ try:
           _G.stress_complete = chat.render_version == state.version
             and vim.deep_equal(chat.lines_cache, vim.api.nvim_buf_get_lines(chat.buf, 0, -1, false))
           renderer.highlight_line = highlight
-          _G.AcpComposerBar = bar
+          _G.AdeComposerBar = bar
         end
         finish()
         """,

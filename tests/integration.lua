@@ -7,10 +7,10 @@ local function wait(cond, timeout, label)
   end
 end
 
-local acp = require("acp")
-local controller = require("acp.controller")
+local ade = require("ade")
+local controller = require("ade.controller")
 
-acp.setup({
+ade.setup({
   agent = "opencode",
   agents = {
     opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } },
@@ -34,13 +34,13 @@ for _, laststatus in ipairs({ 0, 2, 3 }) do
   vim.o.laststatus = laststatus
   local before_statusline = vim.o.statusline
   local before_laststatus = vim.o.laststatus
-  acp.setup({
+  ade.setup({
     agent = "opencode",
     agents = { opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } } },
     ui = {},
     layout = { input_height = 6 },
   })
-  acp.open()
+  ade.open()
 
   local st = controller.state()
   wait(function()
@@ -51,8 +51,8 @@ for _, laststatus in ipairs({ 0, 2, 3 }) do
     assert(st.input and st.input:is_visible(), "composer window missing")
   end)
 
-  check("laststatus=" .. laststatus .. " chat buffer is acp_chat", function()
-    assert(vim.bo[st.chat.buf].filetype == "acp_chat", "wrong filetype")
+  check("laststatus=" .. laststatus .. " chat buffer is ade_chat", function()
+    assert(vim.bo[st.chat.buf].filetype == "ade_chat", "wrong filetype")
   end)
 
   check("laststatus=" .. laststatus .. " composer winbar is set", function()
@@ -67,7 +67,7 @@ for _, laststatus in ipairs({ 0, 2, 3 }) do
     assert(vim.o.laststatus == before_laststatus, "laststatus was modified")
   end)
 
-  acp.hide()
+  ade.hide()
   check("laststatus=" .. laststatus .. " hide keeps the session", function()
     assert(st.session ~= nil, "session was discarded on hide")
   end)
@@ -75,20 +75,20 @@ end
 
 -- Full conversation through the UI.
 vim.o.laststatus = 3
-acp.setup({
+ade.setup({
   agent = "opencode",
   agents = { opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } } },
   ui = {},
   layout = { input_height = 6 },
 })
-acp.open()
+ade.open()
 
 local st = controller.state()
 wait(function()
   return st.session ~= nil
 end, 8000, "session creation")
-acp.hide()
-acp.open()
+ade.hide()
+ade.open()
 
 controller.submit("hello there", {})
 
@@ -116,7 +116,7 @@ check("toolbar reflects an idle session after the turn", function()
     use_winbar = true,
   })
   -- The status is a glyph, not the word "Idle".
-  local ic = require("acp.ui.icons").get(true)
+  local ic = require("ade.ui.icons").get(true)
   assert(res.str:find(ic.status_idle, 1, true), "toolbar did not return to idle: " .. tostring(res.str))
 end)
 
@@ -147,7 +147,7 @@ check("messages submitted during a turn are queued", function()
   assert(st.session.status == "running", "session should be running")
   assert(#st.session.queue >= 1, "nothing queued")
 end)
-acp.cancel()
+ade.cancel()
 wait(function()
   return st.session.status == "idle"
 end, 10000, "cancellation")
@@ -158,7 +158,7 @@ check("selections can be attached", function()
   local main
   for _, win in ipairs(vim.api.nvim_list_wins()) do
     local ft = vim.bo[vim.api.nvim_win_get_buf(win)].filetype
-    if ft ~= "acp_chat" and ft ~= "acp_input" then
+    if ft ~= "ade_chat" and ft ~= "ade_input" then
       main = win
       break
     end
@@ -168,12 +168,12 @@ check("selections can be attached", function()
   vim.cmd("enew")
   vim.api.nvim_buf_set_lines(0, 0, -1, false, { "line one", "line two" })
   vim.bo.buftype = ""
-  vim.cmd("write! /tmp/acp_sel_test.lua")
+  vim.cmd("write! /tmp/ade_sel_test.lua")
   vim.cmd("normal! ggVj")
   vim.cmd("normal! \27")
   vim.fn.setpos("'<", { 0, 1, 1, 0 })
   vim.fn.setpos("'>", { 0, 2, 8, 0 })
-  acp.add_selection()
+  ade.add_selection()
   assert(#st.input.attachments == 1, "attachment missing")
   assert(st.input.attachments[1].kind == "selection", "wrong attachment kind")
 end)
@@ -238,7 +238,7 @@ check("no prompt outlived the queue", function()
   assert(#st.session.queue == 0, "queue not empty")
 end)
 
-acp.hide()
+ade.hide()
 
 if #failures > 0 then
   io.write("\n" .. #failures .. " integration failures:\n")

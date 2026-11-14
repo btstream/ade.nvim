@@ -1,8 +1,8 @@
 return function(t)
-  local clients = require("acp.protocol.client")
-  local reducer = require("acp.session.reducer")
-  local state = require("acp.session.state")
-  local rpcmod = require("acp.transport.jsonrpc")
+  local clients = require("ade.protocol.client")
+  local reducer = require("ade.session.reducer")
+  local state = require("ade.session.state")
+  local rpcmod = require("ade.transport.jsonrpc")
 
   local function client(size)
     local c = clients.new({

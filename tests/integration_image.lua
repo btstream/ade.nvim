@@ -13,17 +13,17 @@ local function wait(cond, timeout, label)
   end
 end
 
-local acp = require("acp")
-local controller = require("acp.controller")
-local context = require("acp.context")
-local image = require("acp.context.image")
+local ade = require("ade")
+local controller = require("ade.controller")
+local context = require("ade.context")
+local image = require("ade.context.image")
 
-local tmp = "/tmp/opencode/acp-image-integration-" .. tostring(vim.uv.hrtime())
+local tmp = "/tmp/opencode/ade-image-integration-" .. tostring(vim.uv.hrtime())
 vim.fn.mkdir(tmp, "p")
 image.dir = function()
   return tmp .. "/images"
 end
-require("acp.storage.drafts").path = function()
+require("ade.storage.drafts").path = function()
   return tmp .. "/drafts.json"
 end
 local png = "\137PNG\r\n\26\n" .. string.rep("\0\1\2\3", 400)
@@ -34,13 +34,13 @@ do
   fh:close()
 end
 
-acp.setup({
+ade.setup({
   agent = "opencode",
   agents = { opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } } },
   ui = {},
   layout = { input_height = 6 },
 })
-acp.open()
+ade.open()
 
 local failures = {}
 local function check(name, fn)
@@ -68,7 +68,7 @@ end)
 check("attaching an image file adds one image chip and no base64", function()
   -- A restored draft can already hold attachments from an earlier run.
   st.input:clear_attachments()
-  assert(acp.add_image(shot), "add_image refused a valid PNG")
+  assert(ade.add_image(shot), "add_image refused a valid PNG")
   local atts = st.input.attachments
   assert(#atts == 1, "expected one attachment, got " .. #atts)
   assert(atts[1].kind == "image", "wrong attachment kind: " .. tostring(atts[1].kind))
@@ -84,12 +84,12 @@ check("the composer chip is rendered", function()
   assert(ok, tostring(err))
   local marks = vim.api.nvim_buf_get_extmarks(
     st.input.buf,
-    vim.api.nvim_get_namespaces()["acp.input.images"],
+    vim.api.nvim_get_namespaces()["ade.input.images"],
     0,
     -1,
     { details = true }
   )
-  assert(#marks == 1 and marks[1][4].hl_group == "AcpInputImage", "image token must be highlighted in the input buffer")
+  assert(#marks == 1 and marks[1][4].hl_group == "AdeInputImage", "image token must be highlighted in the input buffer")
   assert(not controller.composer_bar(win):find("shot.png", 1, true), "image leaked into the winbar")
 end)
 
@@ -107,7 +107,7 @@ check("attaching inserts a token at the cursor without changing prompt text", fu
   local lines = vim.api.nvim_buf_get_lines(st.input.buf, 0, -1, false)
 
   st.input:clear_attachments()
-  assert(acp.add_image(shot), "add_image refused a valid PNG")
+  assert(ade.add_image(shot), "add_image refused a valid PNG")
 
   assert(vim.api.nvim_win_get_cursor(win)[2] >= cursor[2], "cursor must stay next to the inserted token")
   assert(st.input:text() == table.concat(lines, "\n"), "attachment token leaked into prompt text")
@@ -150,7 +150,7 @@ check("clipboard paste does not drag focus back from another window", function()
 end)
 
 check("a cleared draft rejects an old clipboard result", function()
-  local reader = require("acp.context.clipboard")
+  local reader = require("ade.context.clipboard")
   local saved, done = reader.read
   reader.read = function(_, callback)
     done = callback
@@ -203,7 +203,7 @@ else
     assert(att and att.inline == true, "clipboard attachment was not embedded")
     local blocks = context.to_prompt("look here", { att }, cfg, {
       supports = function(name)
-        return require("acp.protocol.capabilities").prompt(st.client, name)
+        return require("ade.protocol.capabilities").prompt(st.client, name)
       end,
     })
     local kinds = {}

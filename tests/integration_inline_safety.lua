@@ -15,15 +15,15 @@ local function wait(cond, timeout, label)
   end
 end
 
-local acp = require("acp")
-local controller = require("acp.controller")
-local picker = require("acp.ui.picker")
+local ade = require("ade")
+local controller = require("ade.controller")
+local picker = require("ade.ui.picker")
 
 -- No check here drives a permission dialog by hand.
 local real_select = picker.select
 picker.select = function() end
 
-acp.setup({
+ade.setup({
   agent = "opencode",
   agents = { opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } } },
   ui = {},
@@ -55,7 +55,7 @@ vim.fn.writefile({ "local a = 1", "local INLINE_OLD = 2", "local c = 3" }, file)
 vim.cmd("edit " .. vim.fn.fnameescape(file))
 local source_win = vim.api.nvim_get_current_win()
 
-acp.open()
+ade.open()
 local st = controller.state()
 wait(function()
   return st.session ~= nil and st.client ~= nil and st.connection == "ready"
@@ -65,7 +65,7 @@ local function reset_file()
   vim.fn.writefile({ "local a = 1", "local INLINE_OLD = 2", "local c = 3" }, file)
   vim.api.nvim_set_current_win(source_win)
   vim.cmd("edit! " .. vim.fn.fnameescape(file))
-  require("acp.inline.review").reset(vim.api.nvim_get_current_buf())
+  require("ade.inline.review").reset(vim.api.nvim_get_current_buf())
 end
 reset_file()
 
@@ -76,7 +76,7 @@ end
 ---Start an inline edit on line 2 and submit `text`.
 local function start(text)
   vim.api.nvim_set_current_win(source_win)
-  require("acp.inline").open({
+  require("ade.inline").open({
     review = "write",
     mode = "V",
     pos1 = select_line(2),
@@ -84,7 +84,7 @@ local function start(text)
   })
   wait(function()
     local buf = vim.api.nvim_get_current_buf()
-    return vim.bo[buf].filetype == "acp_inline"
+    return vim.bo[buf].filetype == "ade_inline"
   end, 5000, "inline prompt window")
   vim.api.nvim_buf_set_lines(vim.api.nvim_get_current_buf(), 0, -1, false, { text })
   vim.api.nvim_feedkeys(vim.keycode("<CR>"), "x", false)
@@ -95,9 +95,9 @@ local function lines()
 end
 
 local function settle()
-  require("acp.inline").stop()
+  require("ade.inline").stop()
   vim.wait(2000, function()
-    return st.session == nil or (st.session.status == "idle" and not require("acp.inline").is_active())
+    return st.session == nil or (st.session.status == "idle" and not require("ade.inline").is_active())
   end, 20)
 end
 

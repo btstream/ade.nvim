@@ -1,8 +1,8 @@
 return function(t)
-  local state = require("acp.session.state")
-  local blocks = require("acp.ui.blocks")
-  local Chat = require("acp.ui.chat")
-  local config = require("acp.config")
+  local state = require("ade.session.state")
+  local blocks = require("ade.ui.blocks")
+  local Chat = require("ade.ui.chat")
+  local config = require("ade.config")
 
   local ctx = {
     icons = blocks.icon_set(true),

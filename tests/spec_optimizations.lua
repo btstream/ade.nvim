@@ -1,14 +1,14 @@
 -- Regression tests for the performance and robustness optimisations.
 return function(t)
-  local state = require("acp.session.state")
-  local reducer = require("acp.session.reducer")
-  local blocks = require("acp.ui.blocks")
-  local icons = require("acp.ui.icons")
-  local toolbar = require("acp.ui.toolbar")
-  local framing = require("acp.transport.framing")
-  local jsonrpc = require("acp.transport.jsonrpc")
-  local config = require("acp.config")
-  local log = require("acp.log")
+  local state = require("ade.session.state")
+  local reducer = require("ade.session.reducer")
+  local blocks = require("ade.ui.blocks")
+  local icons = require("ade.ui.icons")
+  local toolbar = require("ade.ui.toolbar")
+  local framing = require("ade.transport.framing")
+  local jsonrpc = require("ade.transport.jsonrpc")
+  local config = require("ade.config")
+  local log = require("ade.log")
 
   t.describe("streaming text buffer", function()
     t.it("joins chunks transparently through block.text", function()
@@ -40,18 +40,18 @@ return function(t)
     t.it("matches a full re-render while text grows", function()
       local full = "line one\nline two\n`code` here\nline four"
       local cache = {}
-      local expected = blocks.render_text(full, "AcpX", 80)
+      local expected = blocks.render_text(full, "AdeX", 80)
       for i = 1, #full do
-        local got = blocks.render_text(full:sub(1, i), "AcpX", 80, cache)
-        local ref = blocks.render_text(full:sub(1, i), "AcpX", 80)
+        local got = blocks.render_text(full:sub(1, i), "AdeX", 80, cache)
+        local ref = blocks.render_text(full:sub(1, i), "AdeX", 80)
         t.eq(vim.inspect(ref), vim.inspect(got), "mismatch at byte " .. i)
       end
-      local final = blocks.render_text(full, "AcpX", 80, cache)
+      local final = blocks.render_text(full, "AdeX", 80, cache)
       t.eq(vim.inspect(expected), vim.inspect(final))
     end)
 
     t.it("never mutates cached lines through indentation", function()
-      local lines = blocks.render_text("a\nb", "AcpX", 80)
+      local lines = blocks.render_text("a\nb", "AdeX", 80)
       local indented = blocks.indent_lines(lines, "  ")
       t.eq("a", lines[1].text, "source line was mutated")
       t.eq("  a", indented[1].text)
@@ -63,7 +63,7 @@ return function(t)
     t.it("re-renders a plan when only entry content changes", function()
       local s = state.new("s", "/tmp")
       reducer.apply(s, { sessionUpdate = "plan", entries = { { content = "one", status = "pending" } } })
-      local chat = require("acp.ui.chat").new({ config = config.validate(config.merge(config.defaults, {})) })
+      local chat = require("ade.ui.chat").new({ config = config.validate(config.merge(config.defaults, {})) })
       chat:set_session(s)
       local first = table.concat(vim.api.nvim_buf_get_lines(chat.buf, 0, -1, false), "\n")
       reducer.apply(s, { sessionUpdate = "plan", entries = { { content = "two", status = "pending" } } })
@@ -241,7 +241,7 @@ return function(t)
     -- The renderer writes only the changed range of the buffer. It must stay
     -- byte-identical to a full re-render no matter which block changed.
     local cfg = config.validate(config.merge(config.defaults, {}))
-    local Chat = require("acp.ui.chat")
+    local Chat = require("ade.ui.chat")
 
     local function full_render(s)
       local ref = Chat.new({ config = cfg })
@@ -299,7 +299,7 @@ return function(t)
     -- `vim.schedule`), so without a turn check it marked the *new* turn idle.
     -- The next prompt then reached the agent while it still had one active and
     -- failed with "Session already has an active ACP prompt".
-    local controller = require("acp.controller")
+    local controller = require("ade.controller")
 
     t.it("ignores a prompt_finished event for an earlier turn", function()
       local s = state.new("s", "/tmp")
@@ -354,7 +354,7 @@ return function(t)
 
   t.describe("session switching", function()
     local cfg = config.validate(config.merge(config.defaults, {}))
-    local Chat = require("acp.ui.chat")
+    local Chat = require("ade.ui.chat")
 
     local function lines(chat)
       return vim.api.nvim_buf_get_lines(chat.buf, 0, -1, false)

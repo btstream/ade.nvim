@@ -29,8 +29,8 @@ local t = require("tests.harness")
 -- Baseline cleanup for every case. Specs replace globals, open windows, start
 -- processes and call setup; a failed assertion skips their hand-written
 -- teardown, so the harness restores all of it here.
-local controller = require("acp.controller")
-local drafts = require("acp.storage.drafts")
+local controller = require("ade.controller")
+local drafts = require("ade.storage.drafts")
 local drafts_path = drafts.path
 local setup_calls, torn_down = 0, 0
 local raw_setup = controller.setup
@@ -41,7 +41,7 @@ end
 t.after_each(function()
   -- Let callbacks scheduled by the test run before their state disappears.
   vim.wait(1)
-  local inline = package.loaded["acp.inline"]
+  local inline = package.loaded["ade.inline"]
   if inline then
     pcall(inline.invalidate)
   end
@@ -133,5 +133,6 @@ require("tests.spec_agent_install")(t)
 require("tests.spec_agent_resolve")(t)
 require("tests.spec_agent_manager_service")(t)
 require("tests.spec_agent_launch")(t)
+require("tests.spec_migrate")(t)
 
 t.run()

@@ -1,9 +1,9 @@
 return function(t)
-  local Config = require("acp.config")
-  local context = require("acp.context")
-  local image = require("acp.context.image")
-  local clipboard = require("acp.context.clipboard")
-  local paste = require("acp.ui.paste_image")
+  local Config = require("ade.config")
+  local context = require("ade.context")
+  local image = require("ade.context.image")
+  local clipboard = require("ade.context.clipboard")
+  local paste = require("ade.ui.paste_image")
 
   local counter = 0
   local PNG = "\137PNG\r\n\26\n"
@@ -15,7 +15,7 @@ return function(t)
 
   local function tempdir()
     counter = counter + 1
-    local dir = "/tmp/opencode/acp-image-" .. vim.uv.hrtime() .. "-" .. counter
+    local dir = "/tmp/opencode/ade-image-" .. vim.uv.hrtime() .. "-" .. counter
     vim.fn.mkdir(dir, "p")
     return dir
   end
@@ -44,7 +44,7 @@ return function(t)
     it = function(name, fn)
       suite.it(name, function()
         local original = image.dir
-        local dir = tempdir() .. "/acp/images"
+        local dir = tempdir() .. "/ade/images"
         image.dir = function()
           return dir
         end
@@ -66,12 +66,12 @@ return function(t)
     end)
 
     t.it("tracks image positions through edits, draft switches and removal", function()
-      local input = require("acp.ui.input").new({ config = cfg() })
+      local input = require("ade.ui.input").new({ config = cfg() })
       input:switch_session("first")
       input:restore("hello world")
       local att = { kind = "image", label = "shot.png", path = "/shot.png" }
       input:add_attachment(att, { 0, 5 })
-      local ns = vim.api.nvim_get_namespaces()["acp.input.images"]
+      local ns = vim.api.nvim_get_namespaces()["ade.input.images"]
       local function marks()
         return vim.api.nvim_buf_get_extmarks(input.buf, ns, 0, -1, { details = true })
       end
@@ -91,11 +91,11 @@ return function(t)
     end)
 
     t.it("renders editable numbered image tokens and preserves remaining identifiers", function()
-      local input = require("acp.ui.input").new({ config = cfg() })
+      local input = require("ade.ui.input").new({ config = cfg() })
       input:add_attachment({ kind = "file", label = "main.lua", path = "/main.lua" })
       input:add_attachment({ kind = "image", label = "long-screenshot-name.png", path = "/one.png" })
       input:add_attachment({ kind = "image", label = "other.png", path = "/two.png" })
-      local ns = vim.api.nvim_get_namespaces()["acp.input.images"]
+      local ns = vim.api.nvim_get_namespaces()["ade.input.images"]
       local function labels()
         local result = {}
         for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(input.buf, ns, 0, -1, { details = true })) do
@@ -108,15 +108,15 @@ return function(t)
         end)
         return result
       end
-      t.eq({ { "[Image 1]", "AcpInputImage" }, { "[Image 2]", "AcpInputImage" } }, labels())
+      t.eq({ { "[Image 1]", "AdeInputImage" }, { "[Image 2]", "AdeInputImage" } }, labels())
       input:remove_attachment(2)
-      t.eq({ { "[Image 2]", "AcpInputImage" } }, labels())
+      t.eq({ { "[Image 2]", "AdeInputImage" } }, labels())
       t.eq("", input:text())
       input:destroy()
     end)
 
     t.it("removes edited image tokens from attachments without stripping literal lookalikes", function()
-      local input = require("acp.ui.input").new({ config = cfg() })
+      local input = require("ade.ui.input").new({ config = cfg() })
       local prefix = "literal [Image 1]: "
       input:restore(prefix)
       input:add_attachment({ kind = "image", path = "/one.png" }, { 0, #prefix })
@@ -131,9 +131,9 @@ return function(t)
 
     t.it("keeps images out of the composer winbar even when the toolbar is disabled", function()
       local c = cfg()
-      local input = require("acp.ui.input").new({ config = c })
+      local input = require("ade.ui.input").new({ config = c })
       local win = vim.api.nvim_get_current_win()
-      local chrome = require("acp.ui.chrome").new({
+      local chrome = require("ade.ui.chrome").new({
         config = function()
           return c
         end,
@@ -151,12 +151,12 @@ return function(t)
       t.falsy(chrome:composer_bar(win):find("cursor-only.png", 1, true))
       c.ui.toolbar.placement = "off"
       t.eq("", chrome:composer_bar(win))
-      t.eq(1, #vim.api.nvim_buf_get_extmarks(input.buf, vim.api.nvim_get_namespaces()["acp.input.images"], 0, -1, {}))
+      t.eq(1, #vim.api.nvim_buf_get_extmarks(input.buf, vim.api.nvim_get_namespaces()["ade.input.images"], 0, -1, {}))
       input:destroy()
     end)
 
     t.it("anchors pending clipboard reads to their original draft and edit position", function()
-      local input = require("acp.ui.input").new({ config = cfg() })
+      local input = require("ade.ui.input").new({ config = cfg() })
       input:switch_session("first")
       input:restore("hello")
       local anchor = input:image_anchor()
@@ -221,7 +221,7 @@ return function(t)
       local c = cfg()
       local first, err = context.image_bytes(png(), "image/png", c)
       t.eq(nil, err)
-      t.truthy(first.path:find("/acp/images/", 1, true))
+      t.truthy(first.path:find("/ade/images/", 1, true))
       t.truthy(first.path:find(vim.fn.sha256(png()), 1, true))
       local second = context.image_bytes(png(), "image/png", c)
       t.eq(first.path, second.path)
@@ -433,7 +433,7 @@ return function(t)
     end)
 
     t.it("keeps image bytes out of protocol logs", function()
-      local Log = require("acp.log")
+      local Log = require("ade.log")
       local payload = vim.json.encode({
         params = {
           prompt = { { type = "image", mimeType = "image/png", data = vim.base64.encode(string.rep("pixel!", 200)) } },
@@ -461,7 +461,7 @@ return function(t)
     end)
 
     t.it("escapes terminal backslash quoting for paths with spaces", function()
-      local dir = "/tmp/opencode/acp-image space-" .. tostring(vim.uv.hrtime())
+      local dir = "/tmp/opencode/ade-image space-" .. tostring(vim.uv.hrtime())
       vim.fn.mkdir(dir, "p")
       local path = dir .. "/my shot.png"
       local fh = assert(io.open(path, "wb"))
@@ -488,7 +488,7 @@ return function(t)
       local c = cfg()
       local received = {}
       local buf = vim.api.nvim_create_buf(false, true)
-      vim.bo[buf].filetype = "acp_input"
+      vim.bo[buf].filetype = "ade_input"
       local original = vim.paste
       vim.paste = function(lines, phase)
         received[#received + 1] = { lines = lines, phase = phase }
@@ -521,7 +521,7 @@ return function(t)
       local path, dir = tempfile(png())
       local c = cfg()
       local buf = vim.api.nvim_create_buf(false, true)
-      vim.bo[buf].filetype = "acp_input"
+      vim.bo[buf].filetype = "ade_input"
       local base = function()
         return true
       end
@@ -559,7 +559,7 @@ return function(t)
       local path, dir = tempfile(png())
       local c = cfg()
       local buf = vim.api.nvim_create_buf(false, true)
-      vim.bo[buf].filetype = "acp_input"
+      vim.bo[buf].filetype = "ade_input"
       local original = vim.paste
       local forwarded = {}
       vim.paste = function(lines, phase)
@@ -594,7 +594,7 @@ return function(t)
       local path, dir = tempfile(png())
       local c = cfg()
       local buf = vim.api.nvim_create_buf(false, true)
-      vim.bo[buf].filetype = "acp_input"
+      vim.bo[buf].filetype = "ade_input"
       local original = vim.paste
       local passthrough = 0
       vim.paste = function()
@@ -628,7 +628,7 @@ return function(t)
   t.describe("image prompt encoding", function()
     t.it("preserves the input's image positions across Unicode, newlines and adjacent tokens", function()
       local c = cfg()
-      local input = require("acp.ui.input").new({ config = c })
+      local input = require("ade.ui.input").new({ config = c })
       input:switch_session("positioned")
       input:restore("前\n中后")
       local function add(name, position)
@@ -676,7 +676,7 @@ return function(t)
       local c = cfg()
       local captured
       local session = { id = "queued", cwd = "/tmp", status = "running" }
-      local prompts = require("acp.app.prompts").new({
+      local prompts = require("ade.app.prompts").new({
         config = function()
           return c
         end,
@@ -712,8 +712,8 @@ return function(t)
     end)
 
     t.it("degrades an image to a resource link when the agent lacks image support", function()
-      local Prompts = require("acp.app.prompts")
-      local state = require("acp.session.state")
+      local Prompts = require("ade.app.prompts")
+      local state = require("ade.session.state")
       local c = cfg()
       local session = state.new("s", "/tmp")
       local blocks
@@ -790,8 +790,8 @@ return function(t)
     end)
 
     t.it("still refuses too many images for one message", function()
-      local Prompts = require("acp.app.prompts")
-      local state = require("acp.session.state")
+      local Prompts = require("ade.app.prompts")
+      local state = require("ade.session.state")
       local c = cfg()
       local notified
       local session = state.new("s", "/tmp")
@@ -845,8 +845,8 @@ return function(t)
     end)
 
     t.it("sends a resource_link when the image is not embedded", function()
-      local Prompts = require("acp.app.prompts")
-      local state = require("acp.session.state")
+      local Prompts = require("ade.app.prompts")
+      local state = require("ade.session.state")
       local c = cfg()
       local session = state.new("s", "/tmp")
       local blocks
@@ -957,7 +957,7 @@ return function(t)
     end)
 
     t.it("routes an image through M.file as an image, not as text", function()
-      -- `:Acp file` and the drag-and-drop path both go through `M.file`; a PNG
+      -- `:Ade file` and the drag-and-drop path both go through `M.file`; a PNG
       -- there must not be read as a 500 KiB "text" file with binary content.
       local path, dir = tempfile(png())
       local c = cfg()
@@ -988,7 +988,7 @@ return function(t)
       -- instead of sending a block that points at nothing.
       local c = cfg()
       local att = context.image_bytes(png(), "image/png", c)
-      local Input = require("acp.ui.input")
+      local Input = require("ade.ui.input")
       local input = Input.new({ config = c })
       input:add_attachment({
         kind = att.kind,
@@ -1029,7 +1029,7 @@ return function(t)
       end
       h.start, h.ok, h.warn, h.error, h.info =
         capture("START"), capture("OK"), capture("WARN"), capture("ERROR"), capture("INFO")
-      local ok, problem = pcall(require("acp.health").check)
+      local ok, problem = pcall(require("ade.health").check)
       h.start, h.ok, h.warn, h.error, h.info = saved.start, saved.ok, saved.warn, saved.error, saved.info
       t.truthy(ok, tostring(problem))
       local joined = table.concat(lines, "\n")

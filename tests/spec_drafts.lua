@@ -1,6 +1,6 @@
 return function(t)
-  local drafts = require("acp.storage.drafts")
-  local context = require("acp.context")
+  local drafts = require("ade.storage.drafts")
+  local context = require("ade.context")
 
   local function to_blocks(text, attachments)
     return context.to_prompt(text, attachments, { context = { images = {} } }, {
@@ -11,7 +11,7 @@ return function(t)
   end
 
   t.describe("drafts", function()
-    local cwd = "/tmp/acp-draft-test"
+    local cwd = "/tmp/ade-draft-test"
 
     t.it("round-trips a draft", function()
       drafts.clear()
@@ -95,8 +95,8 @@ return function(t)
     end)
 
     t.it("prefers the full in-memory draft over a truncated restored copy", function()
-      local Config = require("acp.config")
-      local Input = require("acp.ui.input")
+      local Config = require("ade.config")
+      local Input = require("ade.ui.input")
       drafts.clear()
       local config = Config.validate(Config.merge(Config.defaults, {}))
       local input = Input.new({ config = config })

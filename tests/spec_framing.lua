@@ -1,5 +1,5 @@
 return function(t)
-  local framing = require("acp.transport.framing")
+  local framing = require("ade.transport.framing")
 
   t.describe("framing", function()
     t.it("splits multiple messages in one chunk", function()

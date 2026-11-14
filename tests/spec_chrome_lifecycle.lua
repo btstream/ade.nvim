@@ -1,13 +1,13 @@
 return function(t)
-  local controller = require("acp.controller")
-  local async = require("acp.async")
-  local drafts = require("acp.storage.drafts")
+  local controller = require("ade.controller")
+  local async = require("ade.async")
+  local drafts = require("ade.storage.drafts")
 
   local function fixture(fn)
     drafts.flush()
     local original_path, original_notify = drafts.path, vim.notify
     drafts.path = function()
-      return "/tmp/opencode/acp-chrome-" .. vim.uv.os_getpid() .. ".json"
+      return "/tmp/opencode/ade-chrome-" .. vim.uv.os_getpid() .. ".json"
     end
     drafts.clear()
     vim.notify = function() end
@@ -181,14 +181,14 @@ return function(t)
 
     t.it("does not reinstall keymaps or completion when windows reopen", function()
       fixture(function(s)
-        local complete = require("acp.ui.complete")
+        local complete = require("ade.ui.complete")
         local calls, attaches, original, original_attach = 0, 0, vim.keymap.set, complete.attach
         vim.keymap.set = function(mode, lhs, rhs, opts)
           if
             opts
             and (opts.buffer == s.input.buf or opts.buffer == s.chat.buf)
             and opts.desc
-            and opts.desc:match("^acp:")
+            and opts.desc:match("^ade:")
           then
             calls = calls + 1
           end
@@ -225,7 +225,7 @@ return function(t)
         local mapping = vim.api.nvim_buf_call(s.input.buf, function()
           return vim.fn.maparg("<C-]>", "n", false, true)
         end)
-        t.eq("acp: add selection", mapping.desc)
+        t.eq("ade: add selection", mapping.desc)
         t.eq(1, mapping.buffer)
         t.eq("function", type(mapping.callback))
       end)

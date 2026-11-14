@@ -191,7 +191,7 @@ def main():
             {
                 "protocolVersion": 1,
                 "clientCapabilities": CLIENT_CAPABILITIES,
-                "clientInfo": {"name": "acp.nvim-probe", "version": "0"},
+                "clientInfo": {"name": "ade.nvim-probe", "version": "0"},
             },
         )
         print("== initialize ==")

@@ -1,11 +1,11 @@
 return function(t)
-  local acp = require("acp")
-  local controller = require("acp.controller")
+  local ade = require("ade")
+  local controller = require("ade.controller")
 
   local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
 
   local function setup(cwd)
-    acp.setup({
+    ade.setup({
       agent = "opencode",
       agents = { opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } } },
       ui = { session_picker = "internal" },
@@ -25,8 +25,8 @@ return function(t)
   ---Replace the picker backends with recorders.
   local function capture_pickers()
     local calls = {}
-    local snacks = require("acp.ui.session_snacks")
-    local internal = require("acp.ui.session_picker")
+    local snacks = require("ade.ui.session_snacks")
+    local internal = require("ade.ui.session_picker")
     local orig_snacks = snacks.open
     local orig_internal = internal.open
     snacks.open = function(opts)
@@ -135,7 +135,7 @@ return function(t)
     end)
 
     t.it("sends an object, not an array, for an unscoped request", function()
-      local client_mod = require("acp.protocol.client")
+      local client_mod = require("ade.protocol.client")
       local inst = client_mod.new({
         agent = { command = "true" },
         cwd = "/tmp",
@@ -150,7 +150,7 @@ return function(t)
         end,
       }
       -- list_sessions yields, so drive it through a coroutine.
-      local async = require("acp.async")
+      local async = require("ade.async")
       local finished = false
       async.run(function()
         inst:list_sessions(nil)
