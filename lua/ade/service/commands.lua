@@ -49,16 +49,28 @@ function M.install(opts)
   opts = opts or {}
   local show = opts.notify or notify
   local service = (opts.config and opts.config.service) or service_config()
+  local install = opts.install or require("ade.service.install")
   if type(service.path) == "string" and service.path ~= "" then
-    local ok, err = require("ade.service.install").check_configured({ path = service.path })
+    -- `run` handles `service.path` itself (version check only), so the command
+    -- and the build hook cannot drift apart.
+    local ok, err = install.run({
+      path = service.path,
+      config = opts.config,
+      timeout = service.install_timeout,
+      on_notify = function(message)
+        show(message)
+      end,
+      on_progress = function(message)
+        log.info("service: %s", message)
+      end,
+    })
     if ok then
-      show("service.path is usable (version " .. tostring(ok.version) .. ")")
-    else
+      show("service.path is usable")
+    elseif err then
       show(tostring(err), vim.log.levels.WARN)
     end
     return
   end
-  local install = opts.install or require("ade.service.install")
   install.install_async({
     release_base = service.release_base,
     timeout = service.install_timeout,
@@ -78,16 +90,27 @@ function M.start(opts)
   local show = opts.notify or notify
   local launcher = opts.launcher or require("ade.service.launcher")
   local service = (opts.config and opts.config.service) or service_config()
-  local ok, err, info = launcher.ensure({ timeout = service.start_timeout })
+  -- The launcher resolves `service.path` itself through
+  -- `install.resolve_binary`, so start, status and health always agree about
+  -- which binary runs.
+  local ok, err, info = launcher.ensure({
+    config = opts.config,
+    path = service.path,
+    timeout = service.start_timeout,
+  })
   if not ok then
     show(tostring(err), vim.log.levels.WARN)
     return false
+  end
+  if info and info.warning then
+    show(tostring(info.warning), vim.log.levels.WARN)
   end
   local status = info and info.status
   if status and status.status == "already_running" then
     show("service is already running at " .. tostring(status.socket))
   else
-    show("service is ready (version " .. Version.VERSION .. ")")
+    local where = info and info.bin and (" at " .. info.bin) or ""
+    show("service is ready (version " .. tostring(info and info.version or Version.VERSION) .. ")" .. where)
   end
   return true
 end

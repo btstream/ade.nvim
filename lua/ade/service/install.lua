@@ -211,32 +211,127 @@ function M.verify_binary(path, opts)
 end
 
 ---Resolve the configured `service.path`, verifying it runs and matches.
+---
+---Thin wrapper over `resolve_binary` kept for the install command's version
+---probe: same rules, same entry point, so `service.path` is never interpreted
+---two different ways.
 ---@param opts {path: string, run?: function, timeout?: integer}
----@return table|nil info
----@return string|nil err
+---@return table|nil info `{version, api_version}`
+---@return string|nil warning_or_err
 function M.check_configured(opts)
-  local path = opts.path
-  if type(path) ~= "string" or path == "" then
-    return nil, "service.path is empty"
+  local resolved, err = M.resolve_binary({ path = opts.path, run = opts.run, timeout = opts.timeout })
+  if not resolved then
+    return nil, err
   end
-  local expanded = vim.fs.normalize(vim.fn.expand(path))
-  local info, err = M.probe_version({ expanded, "version" }, opts)
-  if not info then
-    return nil, "service.path is not runnable: " .. tostring(err)
+  return { version = resolved.version, api_version = resolved.api_version }, resolved.warning
+end
+
+---Resolve the binary to run, from one place.
+---
+---Sources, in order:
+---
+---  1. `service.path` (or `opts.path`): a user-built binary. It must run and
+---     speak the same `api_version`; a different `version` is allowed with a
+---     warning, because the wire protocol is what actually has to match.
+---  2. the managed install's `current` pointer.
+---
+---A missing install is an explicit "not installed" error, never a silent
+---fallback: the caller decides whether to suggest `:Ade service install` or
+---fall back to the direct backend.
+---
+---This is the only place that answers "which binary runs". Status, start,
+---health and (from S1) the backend connection all call it, so they cannot
+---disagree about whether `service.path` is in effect.
+---@param opts {path?: string, config?: table, data_dir?: string, target?: string,
+---  run?: function, timeout?: integer, probe?: boolean}|nil
+---@return table|nil resolved `{path, source, version, api_version, warning}`
+---@return string|nil err
+function M.resolve_binary(opts)
+  opts = opts or {}
+  local configured = opts.path
+  if configured == nil and type(opts.config) == "table" and type(opts.config.service) == "table" then
+    configured = opts.config.service.path
   end
-  if info.version ~= Version.VERSION then
-    return info,
-      string.format("service.path is version %s, the plugin needs %s", tostring(info.version), Version.VERSION)
-  end
-  if info.api_version ~= Version.API_VERSION then
-    return info,
-      string.format(
-        "service.path speaks api_version %s, the plugin needs %d",
-        tostring(info.api_version),
+
+  if type(configured) == "string" and configured ~= "" then
+    local expanded = vim.fs.normalize(vim.fn.expand(configured))
+    local stat = vim.uv.fs_stat(expanded)
+    if not stat or stat.type ~= "file" then
+      return nil, "service.path does not exist or is not a file: " .. expanded
+    end
+    if vim.fn.executable(expanded) ~= 1 then
+      return nil, "service.path is not executable: " .. expanded
+    end
+    local info, err = M.probe_version({ expanded, "version" }, opts)
+    if not info then
+      return nil, "service.path is not runnable: " .. tostring(err)
+    end
+    if info.api_version ~= Version.API_VERSION then
+      return nil,
+        string.format(
+          "service.path speaks api_version %s, but this plugin needs %d; rebuild it against the current service",
+          tostring(info.api_version),
+          Version.API_VERSION
+        )
+    end
+    local warning
+    if info.version ~= Version.VERSION then
+      warning = string.format(
+        "service.path is version %s, but the plugin was written for %s; api_version %d matches, so it will be used",
+        tostring(info.version),
+        Version.VERSION,
         Version.API_VERSION
       )
+    end
+    return {
+      path = expanded,
+      source = "configured",
+      configured_path = configured,
+      version = info.version,
+      api_version = info.api_version,
+      warning = warning,
+    },
+      nil
   end
-  return info, nil
+
+  local binary, pointer_version = M.current_binary({ data_dir = opts.data_dir, target = opts.target })
+  if not binary then
+    if pointer_version then
+      return nil, "the installed service binary is missing; run :Ade service install"
+    end
+    return nil, "nvim_ade_server is not installed; run :Ade service install (or set service.path to a built binary)"
+  end
+  if vim.fn.executable(binary) ~= 1 then
+    return nil, "the service binary is not executable: " .. binary
+  end
+
+  local resolved = { path = binary, source = "managed", version = pointer_version, api_version = nil }
+  if opts.probe ~= false then
+    -- A managed install was verified when it was written, but a hand-edited
+    -- tree or a partially removed release would only fail later, mid-turn.
+    local info, err = M.probe_version({ binary, "version" }, opts)
+    if not info then
+      return nil, "the installed service does not run: " .. tostring(err)
+    end
+    if info.api_version ~= Version.API_VERSION then
+      return nil,
+        string.format(
+          "the installed service speaks api_version %s, but this plugin needs %d; run :Ade service install",
+          tostring(info.api_version),
+          Version.API_VERSION
+        )
+    end
+    resolved.version = info.version
+    resolved.api_version = info.api_version
+    if pointer_version and info.version ~= pointer_version then
+      resolved.warning = string.format(
+        "the installed service reports version %s but the pointer says %s",
+        tostring(info.version),
+        tostring(pointer_version)
+      )
+    end
+  end
+  return resolved, nil
 end
 
 ---Parse a SHA256SUMS file and return the digest for one file name.
@@ -601,7 +696,7 @@ end
 ---@return boolean ok
 ---@return string|nil err
 local function install_compiled(opts)
-  local service_dir = opts.service_dir
+  local service_dir = opts.source_dir
   local manifest = service_dir .. "/Cargo.toml"
   if vim.fn.filereadable(manifest) ~= 1 then
     return false, "the service sources are missing: " .. manifest
@@ -700,8 +795,11 @@ local function with_defaults(opts)
   if opts.target == nil then
     opts.target = Platform.detect(opts.uname)
   end
-  if opts.service_dir == nil then
-    opts.service_dir = vim.fs.normalize(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h:h:h:h"))
+  -- `source_dir` is the injected spelling of the plugin's `service/` tree.
+  -- Tests must never depend on whether the real crate is checked out on this
+  -- branch: they inject a temporary or non-existent directory instead.
+  if opts.source_dir == nil then
+    opts.source_dir = vim.fs.normalize(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h:h:h:h"))
       .. "/service"
   end
   if opts.cargo_available == nil then
@@ -721,13 +819,40 @@ end
 ---@param opts {data_dir?: string, release_base?: string, timeout?: integer,
 ---  target?: string|nil, uname?: table, path?: string, download?: function,
 ---  extract?: function, sha256?: function, run?: function, cargo?: string,
----  cargo_available?: function, service_dir?: string,
+---  cargo_available?: function, source_dir?: string,
 ---  on_progress?: fun(message: string)}|nil
 ---@return boolean ok
 ---@return string|nil err
 function M.run(opts)
   opts = with_defaults(opts)
   progress(opts, "checking for nvim_ade_server " .. Version.VERSION)
+
+  -- A configured `service.path` is the user's own build: the only useful check
+  -- is that it runs and speaks a compatible api_version. Nothing is downloaded
+  -- or compiled over it.
+  local configured = opts.path
+  if configured == nil and type(opts.config) == "table" and type(opts.config.service) == "table" then
+    configured = opts.config.service.path
+  end
+  if type(configured) == "string" and configured ~= "" then
+    local resolved, err = M.resolve_binary({ path = configured, run = opts.run, timeout = opts.timeout })
+    if not resolved then
+      local hint = "ade.nvim: " .. tostring(err)
+      log.warn("%s", hint)
+      if type(opts.on_notify) == "function" then
+        pcall(opts.on_notify, hint)
+      end
+      return false, hint
+    end
+    if resolved.warning then
+      log.warn("%s", resolved.warning)
+      if type(opts.on_notify) == "function" then
+        pcall(opts.on_notify, resolved.warning)
+      end
+    end
+    progress(opts, "service.path is usable: " .. resolved.path)
+    return true, nil
+  end
 
   local installed, version = M.current_binary({ data_dir = opts.data_dir, target = opts.target })
   if installed then

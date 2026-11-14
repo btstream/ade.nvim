@@ -152,14 +152,17 @@ end
 
 ---Make sure a service is running and return the paths to reach it.
 ---
----Returns `false, reason` when there is no installed binary. The reason is
----written to be shown to the user as-is, since the most likely cause is "the
----install hook never ran".
----@param opts {bin?: string, data_dir?: string, timeout?: integer, spawn?: function,
----  probe?: fun(paths: table): boolean}|nil
+---The binary comes from `install.resolve_binary`, the single place that knows
+---about `service.path` versus the managed install, unless the caller passes an
+---explicit `bin` (tests, and a future "run exactly this" path). Returns
+---`false, reason` when there is no usable binary; the reason is written to be
+---shown to the user as-is.
+---@param opts {bin?: string, config?: table, path?: string, data_dir?: string,
+---  timeout?: integer, spawn?: function, probe?: fun(paths: table): boolean,
+---  run?: function}|nil
 ---@return boolean ok
 ---@return string|nil err
----@return table|nil info `{paths, status, bin}`
+---@return table|nil info `{paths, status, bin, version, source, warning}`
 function M.ensure(opts)
   opts = opts or {}
   local paths = Paths.paths()
@@ -169,15 +172,30 @@ function M.ensure(opts)
     return true, nil, { paths = paths, status = { status = "already_running", socket = paths.socket } }
   end
 
-  local bin = opts.bin
+  local install = require("ade.service.install")
+  local bin, resolved = opts.bin, nil
   if not bin then
-    bin = require("ade.service.install").current_binary({ data_dir = opts.data_dir })
+    local resolve_opts = {
+      config = opts.config,
+      path = opts.path,
+      data_dir = opts.data_dir,
+      target = opts.target,
+      run = opts.run,
+      timeout = opts.timeout or M.DEFAULT_START_TIMEOUT,
+    }
+    local resolve_err
+    resolved, resolve_err = install.resolve_binary(resolve_opts)
+    if not resolved then
+      return false, resolve_err, nil
+    end
+    bin = resolved.path
+    if resolved.warning then
+      log.warn("%s", resolved.warning)
+    end
   end
-  if not bin then
-    return false,
-      "nvim_ade_server is not installed; run :Ade service install (or set service.path to a built binary)",
-      nil
-  end
+
+  -- `resolve_binary` already refused a non-executable file; an explicit `bin`
+  -- has not been checked yet.
   if vim.fn.executable(bin) ~= 1 then
     return false, "the service binary is not executable: " .. bin, nil
   end
@@ -187,7 +205,16 @@ function M.ensure(opts)
   if not ok then
     return false, err, nil
   end
-  return true, nil, { paths = paths, status = status, bin = bin }
+  return true,
+    nil,
+    {
+      paths = paths,
+      status = status,
+      bin = bin,
+      version = resolved and resolved.version or nil,
+      source = resolved and resolved.source or nil,
+      warning = resolved and resolved.warning or nil,
+    }
 end
 
 return M

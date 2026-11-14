@@ -45,6 +45,15 @@ return function(t)
     return { sysname = sysname, machine = machine, release = "x", version = "x", nodename = "x" }
   end
 
+  ---A `source_dir` that never exists, so the compile fallback can never pick up
+  ---the real `service/` tree that may or may not be checked out on this branch.
+  ---Every install test injects this unless the case is specifically about
+  ---compiling, where it injects a temporary fixture instead.
+  local function missing_sources(tag)
+    local dir = tmpdir(tag or "no-sources")
+    return dir .. "/service-does-not-exist"
+  end
+
   t.describe("service platform mapping", function()
     t.it("maps every target in the release matrix", function()
       t.eq("x86_64-unknown-linux-musl", Platform.detect(uname("Linux", "x86_64")))
@@ -220,6 +229,7 @@ return function(t)
         data_dir = data,
         target = target,
         uname = uname("Linux", "x86_64"),
+        source_dir = missing_sources("prebuilt-src"),
         download = harness.download,
         extract = function(archive, dest, _)
           extracted = { archive = archive, dest = dest }
@@ -262,6 +272,7 @@ return function(t)
       local ok, err = Install.run({
         data_dir = data,
         target = target,
+        source_dir = missing_sources("skip-src"),
         download = harness.download,
         run = harness.run,
       })
@@ -269,14 +280,17 @@ return function(t)
       t.eq(0, #harness.calls, "an installed service must not be downloaded again")
     end)
 
-    t.it("refuses an archive whose sha256 does not match, and cleans up", function()
+    t.it("never activates a download with a bad sha256, and cleans up", function()
       local data = tmpdir("badsha")
       local target = "x86_64-unknown-linux-musl"
       local harness = installers({ files = release_files(target, "TARBALL") })
       local extracted = false
-      local ok, err = Install.run({
+      Install.run({
         data_dir = data,
         target = target,
+        -- Injected so a real `service/` tree (which exists after merging the
+        -- Rust branch) cannot turn this into a compile attempt.
+        source_dir = missing_sources("badsha-src"),
         download = harness.download,
         extract = function()
           extracted = true
@@ -286,13 +300,42 @@ return function(t)
           return "0000000000000000000000000000000000000000000000000000000000000000"
         end,
         run = harness.run,
+        cargo_available = function()
+          return false
+        end,
       })
-      t.falsy(ok)
-      t.match("checksum mismatch", err)
       t.eq(false, extracted, "a bad checksum must not be extracted")
       t.falsy(Install.current_version({ data_dir = data }), "a bad checksum must not be activated")
       local downloads = Install.root({ data_dir = data }) .. "/downloads"
       t.eq({}, vim.fn.isdirectory(downloads) == 1 and vim.fn.readdir(downloads) or {})
+    end)
+
+    t.it("reports a bad-checksum download failure when the compiler also fails", function()
+      local data = tmpdir("badsha-compile")
+      local target = "x86_64-unknown-linux-musl"
+      local harness = installers({ files = release_files(target, "TARBALL"), compile_fails = true })
+      local notified = {}
+      local ok, err = Install.run({
+        data_dir = data,
+        target = target,
+        source_dir = missing_sources("badsha-compile-src"),
+        download = harness.download,
+        extract = function()
+          error("a bad checksum must not be extracted")
+        end,
+        sha256 = function()
+          return "0000000000000000000000000000000000000000000000000000000000000000"
+        end,
+        run = harness.run,
+        on_notify = function(message)
+          notified[#notified + 1] = message
+        end,
+      })
+      t.falsy(ok)
+      t.match("checksum mismatch", err)
+      t.match("could not be installed", err)
+      t.falsy(Install.current_version({ data_dir = data }), "nothing may be activated")
+      t.truthy(#notified >= 1, "the failure must be reported")
     end)
 
     t.it("falls back to compiling when the download fails", function()
@@ -306,7 +349,7 @@ return function(t)
       local ok, err = Install.run({
         data_dir = data,
         target = target,
-        service_dir = service_dir,
+        source_dir = service_dir,
         download = harness.download, -- every URL 404s
         extract = function()
           error("extraction must not run when the download failed")
@@ -346,7 +389,7 @@ return function(t)
       local ok, err = Install.run({
         data_dir = data,
         target = target,
-        service_dir = tmpdir("missing-sources"),
+        source_dir = tmpdir("missing-sources"),
         download = harness.download,
         sha256 = function()
           return nil
@@ -376,12 +419,17 @@ return function(t)
       local info, err = Install.check_configured({ path = binary, run = harness.run })
       t.truthy(info, tostring(err))
       t.eq(Version.VERSION, info.version)
+      t.eq(nil, err)
       t.eq(0, #harness.downloaded, "service.path must never download")
 
+      -- A different version with a matching api_version is allowed, with a
+      -- warning; an incompatible api_version is refused. Both come from the
+      -- same resolver that start/status/health use.
       local wrong = fake_binary(tmpdir("configured-wrong") .. "/nvim_ade_server", "9.9.9")
-      local bad, bad_err = Install.check_configured({ path = wrong, run = harness.run })
-      t.truthy(bad)
-      t.match("9%.9%.9", bad_err)
+      local older, warning = Install.check_configured({ path = wrong, run = harness.run })
+      t.truthy(older)
+      t.eq("9.9.9", older.version)
+      t.match("9%.9%.9", warning)
     end)
 
     t.it("switches the pointer atomically, leaving no temporary file", function()
@@ -748,23 +796,28 @@ return function(t)
 
     t.it("install with service.path only checks the version", function()
       local list, notify = messages()
-      local checked = 0
-      local real = require("ade.service.install")
-      local original = real.check_configured
-      real.check_configured = function(opts)
-        checked = checked + 1
-        return { version = Version.VERSION, api_version = Version.API_VERSION }, nil
-      end
-      local ok, err = pcall(function()
-        Commands.install({
-          config = config_with({ service = { path = "/opt/ade/nvim_ade_server" } }),
-          notify = notify,
-        })
-      end)
-      real.check_configured = original
-      assert(ok, err)
-      t.eq(1, checked, "service.path must be checked exactly once")
-      t.match("usable", table.concat(list, "\n"))
+      local binary = fake_binary(tmpdir("cmd-install-path") .. "/nvim_ade_server", Version.VERSION)
+      Commands.install({
+        config = config_with({ service = { path = binary } }),
+        notify = notify,
+      })
+      local joined = table.concat(list, "\n")
+      t.match("usable", joined)
+      -- Nothing was downloaded or compiled over a user-provided binary.
+      t.falsy(joined:find("downloading", 1, true))
+      t.falsy(joined:find("building", 1, true))
+    end)
+
+    t.it("install reports an unusable service.path instead of installing", function()
+      local list, notify = messages()
+      local binary = tmpdir("cmd-install-missing") .. "/does-not-exist"
+      Commands.install({
+        config = config_with({ service = { path = binary } }),
+        notify = notify,
+      })
+      local joined = table.concat(list, "\n")
+      t.match("service%.path", joined)
+      t.falsy(joined:find("installed", 1, true))
     end)
 
     t.it("install without service.path runs the download/compile installer", function()
@@ -1009,6 +1062,7 @@ return function(t)
         data_dir = data,
         target = target,
         release_base = base,
+        source_dir = missing_sources("transport-src"),
         download_run = run,
         extract = function(_, dest)
           write(dest .. "/nvim_ade_server", "#!/bin/sh\n")
@@ -1047,6 +1101,7 @@ return function(t)
         data_dir = data,
         target = "x86_64-unknown-linux-musl",
         release_base = "http://example.com/releases",
+        source_dir = missing_sources("direct-http-src"),
         download = function()
           fetched = true
           return true, nil
@@ -1083,6 +1138,7 @@ return function(t)
         data_dir = data,
         target = target,
         release_base = "http://127.0.0.1:8080/releases",
+        source_dir = missing_sources("loopback-src"),
         download_run = run,
         extract = function(_, dest)
           write(dest .. "/nvim_ade_server", "#!/bin/sh\n")
@@ -1106,6 +1162,325 @@ return function(t)
       end
       t.eq("=http,https", options["--proto"], "a loopback http base may speak plain http")
       t.eq("=https", options["--proto-redir"])
+    end)
+  end)
+
+  t.describe("service binary resolution (one entry point)", function()
+    ---Run `resolve_binary` with a scripted `version` reply.
+    local function resolve(opts, reply)
+      return Install.resolve_binary(vim.tbl_extend("force", {
+        run = function()
+          return {
+            code = 0,
+            stdout = '{"version":"' .. reply.version .. '","api_version":' .. reply.api_version .. "}",
+            stderr = "",
+          }
+        end,
+      }, opts or {}))
+    end
+
+    t.it("uses service.path when it is configured and compatible", function()
+      local binary = fake_binary(tmpdir("resolve-path") .. "/nvim_ade_server", Version.VERSION)
+      local resolved, err = resolve({ path = binary }, { version = Version.VERSION, api_version = Version.API_VERSION })
+      t.truthy(resolved, tostring(err))
+      t.eq(binary, resolved.path)
+      t.eq("configured", resolved.source)
+      t.eq(Version.API_VERSION, resolved.api_version)
+      t.eq(nil, resolved.warning)
+    end)
+
+    t.it("reads service.path from a config table too", function()
+      local binary = fake_binary(tmpdir("resolve-config") .. "/nvim_ade_server", Version.VERSION)
+      local resolved = resolve({
+        config = { service = { path = binary } },
+      }, { version = Version.VERSION, api_version = Version.API_VERSION })
+      t.truthy(resolved)
+      t.eq("configured", resolved.source)
+      t.eq(binary, resolved.path)
+    end)
+
+    t.it("allows a different version with a warning when api_version matches", function()
+      local binary = fake_binary(tmpdir("resolve-older") .. "/nvim_ade_server", "9.9.9")
+      local resolved, err = resolve({ path = binary }, { version = "9.9.9", api_version = Version.API_VERSION })
+      t.truthy(resolved, tostring(err))
+      t.eq("9.9.9", resolved.version)
+      t.truthy(resolved.warning)
+      t.match("9%.9%.9", resolved.warning)
+      t.match("api_version", resolved.warning)
+    end)
+
+    t.it("rejects service.path with an incompatible api_version", function()
+      local binary = fake_binary(tmpdir("resolve-api") .. "/nvim_ade_server", Version.VERSION)
+      local resolved, err = resolve({ path = binary }, { version = Version.VERSION, api_version = 99 })
+      t.falsy(resolved)
+      t.match("api_version", err)
+      t.match("99", err)
+      -- An older api_version is refused too, not just a newer one.
+      local old, old_err = resolve({ path = binary }, { version = Version.VERSION, api_version = 0 })
+      t.falsy(old)
+      t.match("api_version", old_err)
+    end)
+
+    t.it("rejects a service.path that is missing or not executable", function()
+      local missing, err = resolve({ path = tmpdir("resolve-missing") .. "/nope" }, {})
+      t.falsy(missing)
+      t.match("service%.path", err)
+
+      local path = tmpdir("resolve-noexec") .. "/nvim_ade_server"
+      write(path, "not a program")
+      vim.uv.fs_chmod(path, 384)
+      local noexec, noexec_err = resolve({ path = path }, {})
+      t.falsy(noexec)
+      t.match("not executable", noexec_err)
+    end)
+
+    t.it("falls back to the managed install when service.path is unset", function()
+      local data = tmpdir("resolve-managed")
+      local target = "x86_64-unknown-linux-musl"
+      fake_binary(Install.binary(Version.VERSION, { data_dir = data, target = target }), Version.VERSION)
+      assert(Install.activate(Version.VERSION, {
+        data_dir = data,
+        target = target,
+        run = function()
+          return { code = 0, stdout = '{"version":"' .. Version.VERSION .. '","api_version":1}', stderr = "" }
+        end,
+      }))
+      local resolved, err = resolve({ data_dir = data, target = target }, {
+        version = Version.VERSION,
+        api_version = Version.API_VERSION,
+      })
+      t.truthy(resolved, tostring(err))
+      t.eq("managed", resolved.source)
+      t.eq(Install.binary(Version.VERSION, { data_dir = data, target = target }), resolved.path)
+    end)
+
+    t.it("reports not installed when neither source exists", function()
+      local resolved, err = resolve({ data_dir = tmpdir("resolve-none") }, {})
+      t.falsy(resolved)
+      t.match("not installed", err)
+      t.match("Ade service install", err)
+    end)
+  end)
+
+  t.describe("service start honours service.path", function()
+    -- These cases go through `commands` with a real config table, which is the
+    -- path the bug lived in: `status` honoured service.path but `start` did not.
+    local Commands = require("ade.service.commands")
+    local target = "x86_64-unknown-linux-musl"
+
+    local function config_with(overrides)
+      return Config.validate(Config.merge(Config.defaults, overrides or {}))
+    end
+
+    ---A private server directory so a stray service from another test cannot
+    ---answer the probe.
+    local function server_dir(tag)
+      local dir = tmpdir(tag)
+      local saved = vim.env.NVIM_ADE_SERVER_DIR
+      vim.env.NVIM_ADE_SERVER_DIR = dir
+      t.cleanup(function()
+        vim.env.NVIM_ADE_SERVER_DIR = saved
+      end)
+      return dir
+    end
+
+    ---A binary that answers `version` and can act as a real service when spawned:
+    ---the spawn itself is scripted, so the binary only has to exist and be
+    ---executable.
+    local function service_binary(tag, opts)
+      opts = opts or {}
+      local path = tmpdir(tag) .. "/nvim_ade_server"
+      local reply = string.format(
+        '{"version":"%s","api_version":%s}',
+        opts.version or Version.VERSION,
+        opts.api_version or Version.API_VERSION
+      )
+      write(
+        path,
+        "#!/bin/sh\n"
+          .. 'if [ "$1" = "version" ]; then\n'
+          .. "  echo '"
+          .. reply
+          .. "'\n"
+          .. "  exit 0\n"
+          .. "fi\n"
+          .. "exit 0\n"
+      )
+      vim.uv.fs_chmod(path, 448)
+      return path
+    end
+
+    ---Replace the launcher's spawn so `start` really resolves the binary but
+    ---never runs it.
+    local function fake_spawn(record)
+      local real = Launcher.start
+      Launcher.start = function(start_opts)
+        record.bin = start_opts.bin
+        record.started = true
+        return true, nil, { status = "ready", socket = Paths.paths().socket, pid = 1 }
+      end
+      t.cleanup(function()
+        Launcher.start = real
+      end)
+    end
+
+    t.it("starts from service.path, then stops", function()
+      server_dir("start-path")
+      local binary = service_binary("start-binary")
+      local record = {}
+      fake_spawn(record)
+      local messages = {}
+      local started = Commands.start({
+        config = config_with({ service = { path = binary } }),
+        notify = function(message)
+          messages[#messages + 1] = tostring(message)
+        end,
+      })
+      t.truthy(started, table.concat(messages, "\n"))
+      t.eq(binary, record.bin, "start did not use service.path")
+
+      -- stop goes through a client; inject one that reports a clean shutdown so
+      -- the test covers the command path without needing a real socket.
+      local stopped = Commands.stop({
+        notify = function(message)
+          messages[#messages + 1] = tostring(message)
+        end,
+        client = {
+          new = function()
+            return {
+              connect = function(_, cb)
+                cb(true, { server_version = Version.VERSION, api_version = Version.API_VERSION })
+              end,
+              shutdown = function(_, cb)
+                cb(true, {})
+              end,
+              close = function() end,
+            }
+          end,
+        },
+      })
+      t.truthy(stopped)
+      t.match("stopped", table.concat(messages, "\n"))
+    end)
+
+    t.it("start and status report the same binary for a service.path config", function()
+      server_dir("start-status")
+      local binary = service_binary("agree-binary")
+      local record = {}
+      fake_spawn(record)
+      local config = config_with({ service = { path = binary } })
+      Commands.start({ config = config, notify = function() end })
+      t.eq(binary, record.bin)
+
+      local status = Status.collect({
+        config = config,
+        launcher = {
+          probe = function()
+            return false
+          end,
+        },
+      })
+      t.eq(binary, status.binary, "status and start must agree about the binary")
+      t.eq(Version.VERSION, status.installed_version)
+      t.eq(true, status.api_ok)
+    end)
+
+    t.it("start refuses a service.path with an incompatible api_version", function()
+      server_dir("start-api")
+      local binary = service_binary("api-binary", { api_version = 2 })
+      local record = {}
+      fake_spawn(record)
+      local messages = {}
+      local started = Commands.start({
+        config = config_with({ service = { path = binary } }),
+        notify = function(message)
+          messages[#messages + 1] = tostring(message)
+        end,
+      })
+      t.falsy(started)
+      t.eq(nil, record.started)
+      t.match("api_version", table.concat(messages, "\n"))
+    end)
+
+    t.it("start allows a different version with matching api_version and warns", function()
+      server_dir("start-older")
+      local binary = service_binary("older-binary", { version = "0.0.1" })
+      local record = {}
+      fake_spawn(record)
+      local messages = {}
+      local levels = {}
+      local started = Commands.start({
+        config = config_with({ service = { path = binary } }),
+        notify = function(message, level)
+          messages[#messages + 1] = tostring(message)
+          levels[#levels + 1] = level
+        end,
+      })
+      t.truthy(started, table.concat(messages, "\n"))
+      t.eq(binary, record.bin)
+      local joined = table.concat(messages, "\n")
+      t.match("0%.0%.1", joined)
+      local warned = false
+      for _, level in ipairs(levels) do
+        if level == vim.log.levels.WARN then
+          warned = true
+        end
+      end
+      t.truthy(warned, "a version mismatch must be reported as a warning")
+    end)
+
+    t.it("start reports not installed when nothing is configured or installed", function()
+      server_dir("start-none")
+      local messages = {}
+      local data = tmpdir("start-none-data")
+      local started = Commands.start({
+        config = config_with({}),
+        notify = function(message)
+          messages[#messages + 1] = tostring(message)
+        end,
+        launcher = {
+          ensure = function()
+            return require("ade.service.launcher").ensure({
+              data_dir = data,
+              probe = function()
+                return false
+              end,
+              spawn = function()
+                error("must not spawn without a binary")
+              end,
+            })
+          end,
+        },
+      })
+      t.falsy(started)
+      local joined = table.concat(messages, "\n")
+      t.match("not installed", joined)
+      t.match("Ade service install", joined)
+    end)
+
+    t.it("checkhealth's section reports the same binary as status", function()
+      server_dir("health-agree")
+      local binary = service_binary("health-binary")
+      local config = config_with({ service = { path = binary } })
+      local status = Status.collect({
+        config = config,
+        launcher = {
+          probe = function()
+            return false
+          end,
+        },
+      })
+      -- The health section is `Status.collect` + `Status.lines`, so comparing
+      -- the collected table is the same comparison `:checkhealth` makes.
+      local lines = Status.lines(status)
+      local text = {}
+      for _, line in ipairs(lines) do
+        text[#text + 1] = line.text
+      end
+      local joined = table.concat(text, "\n")
+      t.match("binary: " .. binary:gsub("%-", "%%-"), joined)
+      t.match("service%.path: " .. binary:gsub("%-", "%%-"), joined)
+      t.truthy(status.installed_version == Version.VERSION, "the health section must report the version")
     end)
   end)
 

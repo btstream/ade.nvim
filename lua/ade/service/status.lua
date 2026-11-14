@@ -36,25 +36,33 @@ function M.collect(opts)
     api_version = nil,
     api_ok = nil,
     server_version = nil,
+    warning = nil,
     error = nil,
   }
 
   if type(service_cfg.path) == "string" and service_cfg.path ~= "" then
-    local info, err = install.check_configured({ path = service_cfg.path, run = opts.run })
+    local resolved, err = install.resolve_binary({ path = service_cfg.path, run = opts.run })
     status.binary = vim.fs.normalize(vim.fn.expand(service_cfg.path))
-    if info then
-      status.server_version = info.version
-      status.api_version = info.api_version
-      status.api_ok = info.api_version == Version.API_VERSION
-      status.installed_version = info.version
+    if resolved then
+      status.server_version = resolved.version
+      status.api_version = resolved.api_version
+      status.api_ok = resolved.api_version == Version.API_VERSION
+      status.installed_version = resolved.version
+      status.warning = resolved.warning
     end
     status.error = err
   else
-    local binary, version = install.current_binary({ data_dir = data_dir })
-    status.binary = binary
-    status.installed_version = version
-    if not binary then
-      status.error = version and "the installed service binary is missing" or "the service is not installed"
+    local resolved, err = install.resolve_binary({ data_dir = data_dir, run = opts.run })
+    if resolved then
+      status.binary = resolved.path
+      status.installed_version = resolved.version
+      status.api_version = resolved.api_version
+      status.api_ok = resolved.api_version == Version.API_VERSION
+      status.warning = resolved.warning
+    else
+      status.binary = nil
+      status.installed_version = nil
+      status.error = err
     end
   end
 
@@ -111,6 +119,9 @@ function M.lines(status)
     else
       add("warn", "binary is not executable: " .. status.binary)
     end
+  end
+  if status.warning then
+    add("warn", tostring(status.warning))
   end
   add("info", "directory: " .. status.dir)
   add("info", "socket: " .. status.socket)
