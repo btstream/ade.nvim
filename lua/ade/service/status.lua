@@ -39,6 +39,8 @@ function M.collect(opts)
     instances = nil,
     warning = nil,
     error = nil,
+    ping_error = nil,
+    instances_error = nil,
   }
 
   if type(service_cfg.path) == "string" and service_cfg.path ~= "" then
@@ -83,19 +85,24 @@ function M.collect(opts)
       status.server_version = info.server_version or status.server_version
       status.api_version = info.api_version or status.api_version
       status.api_ok = info.api_version == Version.API_VERSION
-      client:ping(function() end)
-      -- Instance count is part of status (`:Ade service status` asks for it),
-      -- and it must not turn a working service into an error when the count is
-      -- unavailable: `agent.list` only exists from api_version 2.
-      local listed = false
-      client:request("agent.list", {}, function(ok, value)
-        if ok and type(value) == "table" and type(value.instances) == "table" then
-          status.instances = #value.instances
-          listed = true
-        end
-      end)
-      if not listed then
-        status.instances = nil
+      -- Both calls must produce a value before this function returns: status is
+      -- a synchronous report. The bounded wait lives in
+      -- `Connection.await_request` — the one implementation shared with the
+      -- command helpers.
+      local ServiceConnection = require("ade.service.connection")
+      local ok_ping, ping_value = ServiceConnection.await_request(client, "ping", {}, opts.timeout)
+      if not ok_ping then
+        status.ping_error = require("ade.service.transport").describe(ping_value)
+      end
+      local list_ok, list_value = ServiceConnection.await_request(client, "agent.list", {}, opts.timeout)
+      if list_ok and type(list_value) == "table" and type(list_value.instances) == "table" then
+        status.instances = #list_value.instances
+      else
+        -- The count is optional (`agent.list` only exists from api_version 2),
+        -- so a failure here is reported but does not make the service "not
+        -- running". It must still carry a reason, and it must not be swallowed
+        -- by an unrelated earlier error.
+        status.instances_error = require("ade.service.transport").describe(list_value)
       end
     else
       status.error = status.error or tostring(info)
@@ -190,6 +197,12 @@ function M.lines(status)
       "error",
       "api_version " .. tostring(status.api_version) .. " does not match the required " .. status.required_api_version
     )
+  end
+  if status.ping_error then
+    add("warn", "ping failed: " .. tostring(status.ping_error))
+  end
+  if status.instances_error then
+    add("warn", tostring(status.instances_error))
   end
   -- "not installed" is already reported above; repeating it only adds noise.
   if status.error and status.installed_version then

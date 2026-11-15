@@ -26,6 +26,63 @@ local function notify(message, level)
   vim.notify("ade.nvim: " .. message, level or vim.log.levels.INFO)
 end
 
+---Default ceiling for one command request, in milliseconds.
+M.DEFAULT_TIMEOUT = 5000
+
+---Send one request and report the outcome through `cb`, at most once.
+---
+---Every `:Ade service` command is asynchronous: the reply arrives after the
+---command returns. A missing reply (a wedged service) and a dropped connection
+---both have to end as a failure, or the UI silently does nothing — which is
+---exactly the "unable to list agents: nil" the bug report showed.
+---@param connection table
+---@param method string
+---@param params any
+---@param opts {timeout?: integer, on_done: fun(ok: boolean, value: any)}|nil
+function M.request(connection, method, params, opts)
+  opts = opts or {}
+  local on_done = opts.on_done or function() end
+  local timeout = opts.timeout or M.DEFAULT_TIMEOUT
+  local settled = false
+  local timer
+  local function finish(ok, value)
+    if settled then
+      return
+    end
+    settled = true
+    if timer then
+      timer:stop()
+      timer:close()
+      timer = nil
+    end
+    pcall(on_done, ok, value)
+  end
+  -- The connection reports a drop through its own fan-out; subscribe so an
+  -- in-flight request fails instead of hanging.
+  local channel = "command-" .. tostring(vim.uv.hrtime())
+  connection:subscribe(channel, "__disconnected", function(payload)
+    local reason = type(payload) == "table" and tostring(payload.reason or "connection lost") or "connection lost"
+    finish(false, { code = -32000, message = reason })
+  end)
+  connection:request(method, params, function(ok, value)
+    finish(ok, value)
+  end)
+  if timeout and timeout > 0 then
+    timer = vim.uv.new_timer()
+    timer:start(timeout, 0, function()
+      vim.schedule(function()
+        finish(false, {
+          code = -32000,
+          message = string.format("the service did not answer %s within %.1f seconds", method, timeout / 1000),
+        })
+      end)
+    end)
+  end
+  return function()
+    finish(false, { code = -32000, message = "command cancelled" })
+  end
+end
+
 ---Print the status lines through `vim.notify`, worst level last.
 ---@param opts {config?: table, notify?: fun(message: string, level: integer|nil)}|nil
 ---@return table status
@@ -116,19 +173,29 @@ function M.start(opts)
 end
 
 ---`:Ade service stop`: ask a running service to exit.
----@param opts {config?: table, client?: table, notify?: fun(message: string, level: integer|nil)}|nil
+---
+---`connect` and `shutdown` are both blocking on the client, so this command
+---completes synchronously like before; the timeout reasons are now explicit
+---instead of a bare `nil`.
+---@param opts {config?: table, client?: table, timeout?: integer,
+---  notify?: fun(message: string, level: integer|nil), on_done?: fun(ok: boolean)}|nil
 function M.stop(opts)
   opts = opts or {}
   local show = opts.notify or notify
+  local timeout = opts.timeout or M.DEFAULT_TIMEOUT
   local Client = opts.client or require("ade.service.client")
-  local client = Client.new({ timeout = 5000 })
+  local client = Client.new({ timeout = timeout })
   local connected, info = false, nil
   client:connect(function(ok, value)
     connected, info = ok, value
   end)
   if not connected then
     client:close()
-    show("the service is not running: " .. tostring(info))
+    local reason = type(info) == "table" and (info.message or vim.inspect(info)) or tostring(info)
+    show("the service is not running: " .. reason)
+    if opts.on_done then
+      pcall(opts.on_done, false)
+    end
     return false
   end
   local answered, err = false, nil
@@ -137,70 +204,102 @@ function M.stop(opts)
     if not ok then
       err = value
     end
-  end)
+  end, timeout)
   client:close()
   if answered then
     show("service stopped")
+    if opts.on_done then
+      pcall(opts.on_done, true)
+    end
     return true
   end
-  show("unable to stop the service: " .. tostring(err), vim.log.levels.WARN)
+  local reason = type(err) == "table" and (err.message or vim.inspect(err)) or tostring(err)
+  show("unable to stop the service: " .. reason, vim.log.levels.WARN)
+  if opts.on_done then
+    pcall(opts.on_done, false)
+  end
   return false
 end
 
 ---`:Ade service agents`: list the agent instances the service is holding.
----@param opts {config?: table, connection?: table, notify?: fun(message: string, level: integer|nil)}|nil
----@return table|nil instances
+---
+---Asynchronous: the reply is printed from the callback. The command returns
+---nothing; reading a result here would be the very bug this replaced.
+---@param opts {config?: table, connection?: table, timeout?: integer,
+---  notify?: fun(message: string, level: integer|nil),
+---  on_done?: fun(instances: table|nil)}|nil
 function M.agents(opts)
   opts = opts or {}
   local show = opts.notify or notify
   local connection = opts.connection or require("ade.service.connection").shared()
-  local instances, failure = nil, nil
-  connection:request("agent.list", {}, function(ok, value)
-    if ok and type(value) == "table" then
-      instances = value.instances or {}
-    else
-      failure = require("ade.service.transport").describe(value)
-    end
-  end)
-  if not instances then
-    show("unable to list agents: " .. tostring(failure), vim.log.levels.WARN)
-    return nil
-  end
-  if #instances == 0 then
-    show("no agent instances")
-    return instances
-  end
-  local now = os.time()
-  for _, instance in ipairs(instances) do
-    show(require("ade.service.status").instance_line(instance, now))
-  end
-  return instances
+  return M.request(connection, "agent.list", {}, {
+    timeout = opts.timeout,
+    on_done = function(ok, value)
+      if not ok then
+        show("unable to list agents: " .. require("ade.service.transport").describe(value), vim.log.levels.WARN)
+        if opts.on_done then
+          pcall(opts.on_done, nil)
+        end
+        return
+      end
+      local instances = type(value) == "table" and value.instances or nil
+      if type(instances) ~= "table" then
+        show("unable to list agents: the service returned no instance list", vim.log.levels.WARN)
+        if opts.on_done then
+          pcall(opts.on_done, nil)
+        end
+        return
+      end
+      if #instances == 0 then
+        show("no agent instances")
+      else
+        local now = os.time()
+        for _, instance in ipairs(instances) do
+          show(require("ade.service.status").instance_line(instance, now))
+        end
+      end
+      if opts.on_done then
+        pcall(opts.on_done, instances)
+      end
+    end,
+  })
 end
 
 ---`:Ade service kill <instance>`: stop one agent instance.
+---
+---Asynchronous like `agents`. A missing id is the one local error, and it is
+---reported immediately because no request is sent.
 ---@param instance string|nil
----@param opts {config?: table, connection?: table, notify?: fun(message: string, level: integer|nil)}|nil
+---@param opts {config?: table, connection?: table, timeout?: integer,
+---  notify?: fun(message: string, level: integer|nil),
+---  on_done?: fun(ok: boolean)}|nil
 function M.kill(instance, opts)
   opts = opts or {}
   local show = opts.notify or notify
   if type(instance) ~= "string" or instance == "" then
     show(":Ade service kill needs an instance id (see :Ade service agents)", vim.log.levels.WARN)
-    return false
+    if opts.on_done then
+      pcall(opts.on_done, false)
+    end
+    return
   end
   local connection = opts.connection or require("ade.service.connection").shared()
-  local done, failure = false, nil
-  connection:request("agent.stop", { instance = instance }, function(ok, value)
-    done = ok
-    if not ok then
-      failure = require("ade.service.transport").describe(value)
-    end
-  end)
-  if done then
-    show("stopped agent " .. instance)
-    return true
-  end
-  show("unable to stop " .. instance .. ": " .. tostring(failure), vim.log.levels.WARN)
-  return false
+  return M.request(connection, "agent.stop", { instance = instance }, {
+    timeout = opts.timeout,
+    on_done = function(ok, value)
+      if ok then
+        show("stopped agent " .. instance)
+      else
+        show(
+          "unable to stop " .. instance .. ": " .. require("ade.service.transport").describe(value),
+          vim.log.levels.WARN
+        )
+      end
+      if opts.on_done then
+        pcall(opts.on_done, ok)
+      end
+    end,
+  })
 end
 
 ---Dispatch one `:Ade service <sub>` invocation.

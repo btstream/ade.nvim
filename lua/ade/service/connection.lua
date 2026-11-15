@@ -167,7 +167,19 @@ function Connection:resolve()
   -- `opts.config` may be the live config function (the plugin) or a table
   -- (tests). Both are accepted here so `service.path` is read from the same
   -- place the rest of the plugin reads it.
+  --
+  -- When nothing was injected, read the effective config directly. Commands
+  -- (`:Ade service agents` and friends) use `shared()` without going through
+  -- the chat path, and used to get an unconfigured object: `service.path` was
+  -- then ignored and the command reported "not installed" even though `start`
+  -- had just used that binary.
   local config = self.opts.config
+  if config == nil then
+    local ok, value = pcall(function()
+      return require("ade.config").effective()
+    end)
+    config = ok and value or nil
+  end
   if type(config) == "function" then
     local ok, value = pcall(config)
     config = ok and value or nil
@@ -329,6 +341,75 @@ function Connection:request(method, params, cb)
     end
     self.client:request(method, params, cb)
   end)
+end
+
+---Wait for one reply from an already-connected client.
+---
+---The single implementation of "bounded wait for a request" in the service
+---layer: `Connection:request_sync` and `Status.collect` both go through it, so
+---there is one timeout behaviour and one error wording. `vim.wait` appears here
+---and nowhere else for requests.
+---
+---`Status.collect` keeps its own client because its probe must stay read-only
+---(calling `ensure()` would start a service the health check is only supposed
+---to describe).
+---@param client table an `ade.service.client`
+---@param method string
+---@param params any
+---@param timeout_ms integer|nil
+---@return boolean ok
+---@return any value result, or `{code, message}` on failure/timeout
+function M.await_request(client, method, params, timeout_ms)
+  local wait_ms = timeout_ms or 2000
+  local done, ok, value = false, false, nil
+  client:request(method, params, function(result_ok, result_value)
+    done, ok, value = true, result_ok, result_value
+  end)
+  if not done then
+    vim.wait(wait_ms, function()
+      return done
+    end, 10)
+  end
+  if not done then
+    return false,
+      {
+        code = -32000,
+        message = string.format("the service did not answer %s within %.1f seconds", method, wait_ms / 1000),
+      }
+  end
+  return ok, value
+end
+
+---Send one request and **wait** for the reply.
+---
+---For the few callers that must produce a result synchronously: the health
+---check and `:Ade service status` (they build a text report) and `commands`
+---helpers that already ran asynchronously elsewhere. Waiting is bounded, and a
+---missing reply is reported as an error with a reason — never as a silent nil,
+---which is what made `agent.list` look empty.
+---
+---The request itself is still the normal asynchronous one: this only adds the
+---wait, so the ordering is unchanged.
+---@param method string
+---@param params any
+---@param timeout_ms integer|nil
+---@return boolean ok
+---@return any value result, or `{code, message}` on failure/timeout
+function Connection:request_sync(method, params, timeout_ms)
+  local wait_ms = timeout_ms or 2000
+  -- Connect first (this is the caller that may start a service), then use the
+  -- one bounded-wait implementation.
+  local ready, connect_err = false, nil
+  self:ensure(function(ok, err)
+    ready, connect_err = ok, err
+  end)
+  if not ready then
+    return false, { code = -32000, message = connect_err or "the service is unavailable" }
+  end
+  if not self.client then
+    return false, { code = -32000, message = "the service connection is gone" }
+  end
+  return M.await_request(self.client, method, params, wait_ms)
 end
 
 ---Send one notification, connecting first when needed.

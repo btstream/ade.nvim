@@ -1524,21 +1524,35 @@ return function(t)
 
   t.describe("service agents and kill commands", function()
     local Commands = require("ade.service.commands")
+    local fake_connection = require("tests.fake_connection")
 
-    local function listing(instances)
-      return {
-        request = function(_, method, _, cb)
-          if method == "agent.list" then
-            cb(true, { instances = instances })
-          elseif method == "agent.stop" then
-            cb(true, { exited = true, code = 0 })
-          end
-        end,
-      }
+    ---A connection that answers `agent.list` with `instances` and `agent.stop`
+    ---with success. **Asynchronous by default**: the command's tests must not be
+    ---able to pass by reading a result the callback has not produced yet.
+    local function listing(instances, opts)
+      opts = opts or {}
+      return fake_connection.new({
+        sync = opts.sync,
+        delay_ms = opts.delay_ms,
+        responders = {
+          ["agent.list"] = function()
+            return true, { instances = instances }
+          end,
+          ["agent.stop"] = function()
+            return true, { exited = true, code = 0 }
+          end,
+        },
+      })
+    end
+
+    ---Run `fn`, then wait for the connection's pending replies to arrive.
+    local function settle(connection, timeout)
+      vim.wait(timeout or 2000, function()
+        return connection.pending == 0
+      end, 5)
     end
 
     t.it("lists every instance with its runtime facts", function()
-      local messages = {}
       local instances = {
         {
           instance = "inst-1",
@@ -1559,14 +1573,13 @@ return function(t)
           attached = 0,
         },
       }
-      local got = Commands.agents({
-        connection = listing(instances),
-        notify = function(message)
-          messages[#messages + 1] = tostring(message)
-        end,
-      })
-      t.eq(2, #got)
-      local joined = table.concat(messages, "\n")
+      local connection = listing(instances)
+      Commands.agents({ connection = connection, notify = connection:notify() })
+      -- The bug: the command used to read the result immediately. Nothing may be
+      -- printed before the reply arrives.
+      t.eq({}, connection.notes, "the command reported before the reply arrived")
+      settle(connection)
+      local joined = table.concat(connection.notes, "\n")
       t.match("inst%-1", joined)
       t.match("opencode", joined)
       t.match("pid 42", joined)
@@ -1575,63 +1588,123 @@ return function(t)
       t.match("pending 3", joined)
       t.match("1m0", joined)
       t.match("inst%-2", joined)
+      t.falsy(joined:find("unable to list", 1, true), joined)
     end)
 
-    t.it("says so when no instance is running", function()
-      local messages = {}
-      Commands.agents({
-        connection = listing({}),
-        notify = function(message)
-          messages[#messages + 1] = tostring(message)
-        end,
-      })
-      t.match("no agent instances", table.concat(messages, "\n"))
+    t.it("never says unable-to-list before the reply arrives", function()
+      -- The exact user-visible symptom: `unable to list agents: nil`.
+      local connection = listing({}, { delay_ms = 60 })
+      Commands.agents({ connection = connection, notify = connection:notify() })
+      t.eq({}, connection.notes, "an empty result was reported as a failure")
+      settle(connection)
+      local joined = table.concat(connection.notes, "\n")
+      t.match("no agent instances", joined)
+      t.falsy(joined:find("unable to list", 1, true), joined)
+      t.falsy(joined:find("nil", 1, true), joined)
     end)
 
     t.it("reports an unreachable service instead of raising", function()
-      local messages = {}
-      Commands.agents({
-        connection = {
-          request = function(_, _, _, cb)
-            cb(false, { code = -32000, message = "not connected to the service" })
+      local connection = fake_connection.new({
+        responders = {
+          ["agent.list"] = function()
+            return false, { code = -32000, message = "not connected to the service" }
           end,
         },
-        notify = function(message)
-          messages[#messages + 1] = tostring(message)
-        end,
       })
-      t.match("unable to list", table.concat(messages, "\n"))
+      Commands.agents({ connection = connection, notify = connection:notify() })
+      settle(connection)
+      t.match("unable to list", table.concat(connection.notes, "\n"))
+      t.match("not connected", table.concat(connection.notes, "\n"))
+    end)
+
+    t.it("times out with a clear message when the service never answers", function()
+      -- A wedged service: the request is sent and never answered.
+      local connection = fake_connection.new({})
+      connection.request = function(self, _method, _params, _cb)
+        self.pending = self.pending + 1
+        return 1
+      end
+      Commands.agents({
+        connection = connection,
+        notify = connection:notify(),
+        timeout = 120,
+      })
+      vim.wait(1500, function()
+        return #connection.notes > 0
+      end, 10)
+      local joined = table.concat(connection.notes, "\n")
+      t.match("did not answer agent%.list", joined)
+      t.match("within", joined)
+      t.falsy(joined:find("unable to list agents: nil", 1, true), "the old nil message came back")
+    end)
+
+    t.it("answers only once even when the callback fires twice", function()
+      local connection = fake_connection.new({})
+      connection.request = function(self, _method, _params, cb)
+        self.pending = self.pending + 1
+        vim.defer_fn(function()
+          self.pending = self.pending - 1
+          cb(true, { instances = {} })
+          cb(true, { instances = {} })
+        end, 1)
+        return 1
+      end
+      Commands.agents({ connection = connection, notify = connection:notify() })
+      vim.wait(1000, function()
+        return #connection.notes > 0
+      end, 10)
+      vim.wait(200)
+      t.eq(1, #connection.notes, "a duplicate reply must not print twice")
+    end)
+
+    t.it("fails the request when the connection drops", function()
+      local connection = fake_connection.new({})
+      connection.request = function(self, _method, _params, cb)
+        self.pending = self.pending + 1
+        self.pending_cb = cb
+        return 1
+      end
+      Commands.agents({ connection = connection, notify = connection:notify() })
+      -- The drop arrives after the request is in flight.
+      connection:drop("socket closed")
+      vim.wait(1500, function()
+        return #connection.notes > 0
+      end, 10)
+      local joined = table.concat(connection.notes, "\n")
+      t.match("unable to list", joined)
+      t.match("socket closed", joined)
     end)
 
     t.it("kills one instance and refuses without an id", function()
-      local seen = nil
-      local connection = {
-        request = function(_, method, params, cb)
-          seen = { method = method, params = params }
-          cb(true, { exited = true })
-        end,
-      }
-      local messages = {}
-      local ok = Commands.kill("inst-7", {
-        connection = connection,
-        notify = function(message)
-          messages[#messages + 1] = tostring(message)
-        end,
-      })
-      t.truthy(ok)
-      t.eq("agent.stop", seen.method)
-      t.eq("inst-7", seen.params.instance)
-      t.match("stopped agent inst%-7", table.concat(messages, "\n"))
+      local connection = listing({})
+      Commands.kill("inst-7", { connection = connection, notify = connection:notify() })
+      t.eq({}, connection.notes, "kill reported before the reply arrived")
+      settle(connection)
+      t.eq("agent.stop", connection.calls[1].method)
+      t.eq("inst-7", connection.calls[1].params.instance)
+      t.match("stopped agent inst%-7", table.concat(connection.notes, "\n"))
 
-      local refused, refused_notify = nil, {}
-      refused = Commands.kill(nil, {
-        connection = connection,
-        notify = function(message)
-          refused_notify[#refused_notify + 1] = tostring(message)
-        end,
+      local refused = listing({})
+      Commands.kill(nil, { connection = refused, notify = refused:notify() })
+      -- No id is a local error: it is reported immediately and never asks the
+      -- service.
+      t.eq(0, #refused.calls)
+      t.match("needs an instance id", table.concat(refused.notes, "\n"))
+    end)
+
+    t.it("reports a rejected kill after the reply, not before", function()
+      local connection = fake_connection.new({
+        responders = {
+          ["agent.stop"] = function()
+            return false, { code = -32020, message = "unknown instance" }
+          end,
+        },
       })
-      t.falsy(refused)
-      t.match("needs an instance id", table.concat(refused_notify, "\n"))
+      Commands.kill("gone", { connection = connection, notify = connection:notify() })
+      t.eq({}, connection.notes)
+      settle(connection)
+      t.match("unable to stop gone", table.concat(connection.notes, "\n"))
+      t.match("unknown instance", table.concat(connection.notes, "\n"))
     end)
 
     t.it("dispatches agents and kill from the service subcommand", function()
@@ -1650,6 +1723,55 @@ return function(t)
       Commands.agents, Commands.kill = saved[1], saved[2]
       assert(ok, err)
       t.eq({ "agents", "kill:inst-9" }, seen)
+    end)
+  end)
+
+  t.describe("shared connection reads the config", function()
+    local Connection = require("ade.service.connection")
+    local Config = require("ade.config")
+
+    t.it("resolves service.path without going through the chat path", function()
+      -- Defect B: commands use `Connection.shared()`, which used to have no
+      -- config at all, so `service.path` was ignored and the command reported
+      -- "not installed" even though start had just used the path.
+      local binary = fake_binary(tmpdir("shared-path") .. "/nvim_ade_server", Version.VERSION)
+      local original = Config.current
+      t.cleanup(function()
+        Config.current = original
+      end)
+      -- Configure the plugin exactly like a user would.
+      Config.remember(Config.validate(Config.merge(Config.defaults, { service = { path = binary } })))
+
+      local shared = Connection.new({})
+      local resolved, err = shared:resolve()
+      t.truthy(resolved, tostring(err))
+      t.eq("configured", resolved.source)
+      t.eq(binary, resolved.path)
+    end)
+
+    t.it("still honours an explicitly injected config", function()
+      local shared = Connection.new({
+        config = function()
+          return { service = { path = "/explicit/path" } }
+        end,
+        resolve_binary = function()
+          return { path = "/explicit/path", source = "configured" }
+        end,
+      })
+      local resolved = shared:resolve()
+      t.eq("/explicit/path", resolved.path)
+    end)
+
+    t.it("falls back to the managed install when no service.path is set", function()
+      local original = Config.current
+      t.cleanup(function()
+        Config.current = original
+      end)
+      Config.remember(Config.validate(Config.merge(Config.defaults, {})))
+      local shared = Connection.new({ data_dir = tmpdir("shared-managed") })
+      local resolved, err = shared:resolve()
+      t.falsy(resolved)
+      t.match("not installed", err)
     end)
   end)
 
@@ -1745,12 +1867,104 @@ return function(t)
       t.eq(true, status.running)
       t.eq(true, status.api_ok)
       t.eq(Version.API_VERSION, status.api_version)
+      -- The stand-in answers `agent.list` with an empty list, and the count must
+      -- come from that reply — not from a value read before it arrived.
+      t.eq(0, status.instances, "the instance count was not read from the reply")
       local lines = Status.lines(status)
       local text = {}
       for _, line in ipairs(lines) do
         text[#text + 1] = line.text
       end
       t.match("service is running", table.concat(text, "\n"))
+      t.match("agent instances: 0", table.concat(text, "\n"))
+    end)
+
+    t.it("reports the instance count a real reply carries", function()
+      -- Defect: `local listed = false; request(...); if not listed then ...`
+      -- always read false, so the count never showed. The stand-in really has an
+      -- instance here, so a nil/absent count is visible as a wrong answer.
+      local dir = tmpdir("status-instances")
+      local saved = vim.env.NVIM_ADE_SERVER_DIR
+      vim.env.NVIM_ADE_SERVER_DIR = dir
+      t.cleanup(function()
+        vim.env.NVIM_ADE_SERVER_DIR = saved
+      end)
+      local service = fake.new({ dir = dir })
+      t.truthy(service:listen())
+      t.cleanup(function()
+        service:close()
+      end)
+      -- One attached instance, created through the real attach path.
+      local connection = require("ade.service.connection").new({
+        resolve_binary = function()
+          return { path = "/fake", version = Version.VERSION, api_version = Version.API_VERSION }
+        end,
+        ensure_service = function()
+          return true
+        end,
+      })
+      t.cleanup(function()
+        connection:close()
+      end)
+      local ok, err = connection:request_sync("agent.attach", {
+        key = { agent = "opencode", command = "python3", args = {}, cwd = "/tmp" },
+        client_capabilities = {},
+      })
+      t.truthy(ok, require("ade.service.transport").describe(err))
+
+      local status = Status.collect({ config = config_with({}) })
+      t.eq(1, status.instances, "status must report the instance the service has")
+      local lines = Status.lines(status)
+      local text = {}
+      for _, line in ipairs(lines) do
+        text[#text + 1] = line.text
+      end
+      t.match("agent instances: 1", table.concat(text, "\n"))
+    end)
+
+    t.it("says why the instance count is missing instead of showing nothing", function()
+      local dir = tmpdir("status-nolist")
+      local saved = vim.env.NVIM_ADE_SERVER_DIR
+      vim.env.NVIM_ADE_SERVER_DIR = dir
+      t.cleanup(function()
+        vim.env.NVIM_ADE_SERVER_DIR = saved
+      end)
+      local service = fake.new({ dir = dir })
+      t.truthy(service:listen())
+      t.cleanup(function()
+        service:close()
+      end)
+      -- A client that answers hello but never `agent.list`: the timeout must be
+      -- reported, not silently dropped.
+      local real = require("ade.service.client")
+      local status = Status.collect({
+        config = config_with({}),
+        timeout = 120,
+        client = {
+          new = function()
+            local client = real.new({ timeout = 500 })
+            local original = client.request
+            client.request = function(self, method, params, cb)
+              if method == "agent.list" then
+                -- Never answer: the service is wedged.
+                return 1
+              end
+              return original(self, method, params, cb)
+            end
+            return client
+          end,
+        },
+      })
+      t.eq(true, status.running)
+      t.eq(nil, status.instances)
+      -- `status.error` also carries "not installed" for a stand-in with no
+      -- managed install; the line that matters is the count's own reason.
+      local text = {}
+      for _, line in ipairs(Status.lines(status)) do
+        text[#text + 1] = line.text
+      end
+      local joined = table.concat(text, "\n")
+      t.match("did not answer agent%.list", joined)
     end)
   end)
 end

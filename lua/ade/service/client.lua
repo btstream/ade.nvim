@@ -409,10 +409,15 @@ function Client:on_disconnect(reason)
 end
 
 ---Send `ping` and wait for the reply.
+---
+---This is a *blocking* helper on purpose: it exists for synchronous callers
+---(the health check, `:Ade service status`). It reports a timeout with a reason
+---so a caller that inspects the result cannot mistake "no answer" for success.
 ---@param cb fun(ok: boolean, value: any)
-function Client:ping(cb)
+---@param timeout integer|nil
+function Client:ping(cb, timeout)
   if not self.ready then
-    cb(false, "not connected")
+    cb(false, { code = -32000, message = "not connected to the service" })
     return
   end
   local answered = false
@@ -420,20 +425,27 @@ function Client:ping(cb)
     answered = true
     cb(ok, value)
   end)
-  vim.wait(self.timeout, function()
+  local wait_ms = timeout or self.timeout
+  vim.wait(wait_ms, function()
     return answered
   end, 5)
   if not answered then
-    cb(false, "ping timed out")
+    cb(false, {
+      code = -32000,
+      message = string.format("the service did not answer ping within %.1f seconds", wait_ms / 1000),
+    })
   end
 end
 
 ---Ask the service to exit.
+---
+---Blocking like `ping`, with the same explicit timeout reason.
 ---@param cb fun(ok: boolean, value: any)|nil
-function Client:shutdown(cb)
+---@param timeout integer|nil
+function Client:shutdown(cb, timeout)
   cb = cb or function() end
   if not self.ready then
-    cb(false, "not connected")
+    cb(false, { code = -32000, message = "not connected to the service" })
     return
   end
   local answered = false
@@ -442,11 +454,15 @@ function Client:shutdown(cb)
     cb(ok, value)
     self:close()
   end)
-  vim.wait(self.timeout, function()
+  local wait_ms = timeout or self.timeout
+  vim.wait(wait_ms, function()
     return answered
   end, 5)
   if not answered then
-    cb(false, "shutdown timed out")
+    cb(false, {
+      code = -32000,
+      message = string.format("the service did not answer shutdown within %.1f seconds", wait_ms / 1000),
+    })
   end
 end
 
