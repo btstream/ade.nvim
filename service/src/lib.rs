@@ -17,6 +17,7 @@ pub mod hub;
 pub mod output;
 pub mod paths;
 pub mod protocol;
+pub mod recorder;
 pub mod relay;
 pub mod runtime;
 pub mod server;

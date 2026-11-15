@@ -307,6 +307,122 @@ impl Store {
         Ok(seqs)
     }
 
+    /// Append one event with a sequence number chosen by the caller.
+    ///
+    /// The relay is the authority for `seq`: it shares one counter per instance
+    /// between the events it records and those it does not, so the log holds a
+    /// subset of the numbers and gaps are normal. The store only enforces that
+    /// the numbers of one instance **strictly increase**: a `seq` at or below the
+    /// highest already stored is rejected and nothing is written.
+    ///
+    /// `instances.next_seq` is updated to `max(seq) + 1`, so a later
+    /// [`Store::append`] (which allocates its own number) continues after it.
+    pub fn append_at(&self, seq: u64, event: NewEvent) -> Result<()> {
+        self.append_batch_at(vec![(seq, event)])
+    }
+
+    /// A batch of caller-numbered events in one transaction.
+    ///
+    /// Either every event is stored or none is: a stale `seq` anywhere rolls the
+    /// whole batch back, including events for other instances. The numbers must
+    /// increase per instance in the order given.
+    pub fn append_batch_at(&self, events: Vec<(u64, NewEvent)>) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("starting an append transaction")?;
+        for (seq, event) in &events {
+            insert_event_at(&tx, *seq, event).context("appending an event")?;
+        }
+        tx.commit().context("committing an event batch")?;
+        Ok(())
+    }
+
+    /// Mark every session of one instance incomplete.
+    ///
+    /// Used when the log lost events without pruning them (a dropped event under
+    /// back pressure, or a failed write): the sessions are still known but their
+    /// history has a hole, so they must not be replayed. Unknown instances and
+    /// repeated calls are not errors.
+    pub fn mark_instance_incomplete(&self, instance_key: &str) -> Result<()> {
+        let mut conn = self.lock()?;
+        let Some(instance_id) = find_instance(&conn, instance_key)? else {
+            return Ok(());
+        };
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("starting a mark transaction")?;
+        tx.execute(
+            "UPDATE sessions SET incomplete = 1 WHERE instance_id = ?1",
+            params![instance_id],
+        )
+        .context("marking the sessions incomplete")?;
+        tx.commit().context("committing a mark")?;
+        Ok(())
+    }
+
+    /// Total payload size of one instance's stored messages, in bytes.
+    pub fn instance_bytes(&self, instance_key: &str) -> Result<u64> {
+        let conn = self.lock()?;
+        let Some(instance_id) = find_instance(&conn, instance_key)? else {
+            return Ok(0);
+        };
+        let bytes: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(length(CAST(message AS BLOB))), 0) \
+                 FROM events WHERE instance_id = ?1",
+                params![instance_id],
+                |row| row.get(0),
+            )
+            .context("measuring the stored events")?;
+        from_i64(bytes, "stored bytes")
+    }
+
+    /// Every event of one session with `seq <= up_to_seq`, oldest first.
+    ///
+    /// Synthetic events are included: a replay needs the prompts the front end
+    /// sent, not only what the agent said. A session-less event never matches.
+    pub fn read_session_upto(
+        &self,
+        instance_key: &str,
+        session_id: &str,
+        up_to_seq: u64,
+    ) -> Result<Vec<Event>> {
+        let conn = self.lock()?;
+        let Some(instance_id) = find_instance(&conn, instance_key)? else {
+            return Ok(Vec::new());
+        };
+        // `u64::MAX` (and anything above i64::MAX) means "no upper bound"; SQLite
+        // stores seq as an i64, so clamping is exact rather than lossy.
+        let up_to_seq = i64::try_from(up_to_seq).unwrap_or(i64::MAX);
+        let mut statement = conn
+            .prepare_cached(
+                "SELECT seq, kind, message, ts_ms FROM events \
+                 WHERE instance_id = ?1 AND session_id = ?2 AND seq <= ?3 \
+                 ORDER BY seq ASC",
+            )
+            .context("preparing a session read")?;
+        let mut rows = statement
+            .query(params![instance_id, session_id, up_to_seq])
+            .context("reading the session")?;
+        let mut events = Vec::new();
+        while let Some(row) = rows.next().context("reading a session row")? {
+            let seq: i64 = row.get(0).context("reading seq")?;
+            events.push(Event {
+                seq: from_i64(seq, "seq")?,
+                instance_key: instance_key.to_string(),
+                session_id: Some(session_id.to_string()),
+                kind: EventKind::from_i64(row.get(1).context("reading kind")?)?,
+                message: row.get(2).context("reading message")?,
+                ts_ms: row.get(3).context("reading ts_ms")?,
+            });
+        }
+        Ok(events)
+    }
+
     /// Read events of one instance, oldest first.
     pub fn read(&self, query: &Query) -> Result<Vec<Event>> {
         let conn = self.lock()?;
@@ -886,6 +1002,78 @@ fn instance_counter(conn: &Connection, instance_key: &str) -> Result<Option<(i64
         .query_row(params![instance_key], |row| Ok((row.get(0)?, row.get(1)?)))
         .optional()
         .context("reading the instance counter")
+}
+
+/// Insert one event with a caller-chosen sequence number.
+///
+/// Rejects a number that does not strictly increase for the instance, and
+/// advances `next_seq` to `max(seq) + 1` so the store's own allocator (used by
+/// [`Store::append`]) cannot hand out a number that is already taken.
+fn insert_event_at(conn: &Connection, seq: u64, event: &NewEvent) -> Result<()> {
+    if event.instance_key.is_empty() {
+        bail!("instance_key must not be empty");
+    }
+    if seq == 0 {
+        bail!("seq must be at least 1 (the relay's counter starts at 1)");
+    }
+    let seq = to_i64(seq, "seq")?;
+
+    let counter = instance_counter(conn, &event.instance_key)?;
+    let instance_id = match counter {
+        Some((instance_id, next_seq)) => {
+            let highest = next_seq - 1;
+            if seq <= highest {
+                bail!(
+                    "seq {seq} for instance {:?} is not greater than the stored maximum {highest}; \
+                     sequence numbers must strictly increase",
+                    event.instance_key
+                );
+            }
+            instance_id
+        }
+        None => {
+            conn.prepare_cached("INSERT INTO instances (instance_key, next_seq) VALUES (?1, 1)")
+                .context("preparing the instance insert")?
+                .execute(params![event.instance_key])
+                .context("recording an instance")?;
+            instance_counter(conn, &event.instance_key)
+                .context("re-reading a just-created instance")?
+                .context("a just-created instance is missing")?
+                .0
+        }
+    };
+
+    conn.prepare_cached("UPDATE instances SET next_seq = ?2 WHERE id = ?1")
+        .context("preparing the counter update")?
+        .execute(params![instance_id, seq + 1])
+        .context("advancing the instance counter")?;
+    conn.prepare_cached(
+        "INSERT INTO events (instance_id, seq, session_id, kind, message, ts_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )
+    .context("preparing the event insert")?
+    .execute(params![
+        instance_id,
+        seq,
+        event.session_id,
+        event.kind.as_i64(),
+        event.message,
+        event.ts_ms,
+    ])
+    .context("inserting the event")?;
+
+    if let Some(session_id) = &event.session_id {
+        // First sighting of a session registers it as complete; only pruning or
+        // an explicit mark makes it incomplete.
+        conn.prepare_cached(
+            "INSERT INTO sessions (instance_id, session_id, incomplete) VALUES (?1, ?2, 0) \
+             ON CONFLICT (instance_id, session_id) DO NOTHING",
+        )
+        .context("preparing the session insert")?
+        .execute(params![instance_id, session_id])
+        .context("recording the session")?;
+    }
+    Ok(())
 }
 
 /// Move a corrupt database aside and drop its WAL sidecars.

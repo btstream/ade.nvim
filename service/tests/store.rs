@@ -865,3 +865,305 @@ fn collect_quarantine(dir: &Path, found: &mut Vec<PathBuf>, depth: usize) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Caller-assigned sequence numbers (`append_at`) and the recorder's extensions
+// ---------------------------------------------------------------------------
+
+/// A `NewEvent` with an explicit kind, for the synthetic half of the log.
+fn synthetic(instance: &str, session: Option<&str>, body: &str) -> NewEvent {
+    NewEvent {
+        kind: EventKind::Synthetic,
+        ..event(instance, session, body)
+    }
+}
+
+#[test]
+fn append_at_uses_the_callers_sequence_numbers() {
+    let store = Store::open_in_memory().expect("open");
+
+    store
+        .append_at(1, event("a", Some("s"), "first"))
+        .expect("append at 1");
+    // A gap is allowed: the relay shares one counter with the events it does not
+    // record (responses, requests, other notifications).
+    store
+        .append_at(7, synthetic("a", Some("s"), "prompt"))
+        .expect("append at 7");
+    store
+        .append_at(8, event("a", Some("s"), "second"))
+        .expect("append at 8");
+
+    let events = store
+        .read(&Query {
+            include_synthetic: true,
+            ..Query::new("a")
+        })
+        .expect("read");
+    let seqs: Vec<u64> = events.iter().map(|event| event.seq).collect();
+    assert_eq!(seqs, vec![1, 7, 8]);
+    assert_eq!(events[1].kind, EventKind::Synthetic);
+    assert_eq!(store.last_seq("a").expect("last_seq"), 8);
+}
+
+#[test]
+fn append_at_updates_the_counter_the_plain_append_uses() {
+    let store = Store::open_in_memory().expect("open");
+    store
+        .append_at(5, event("a", Some("s"), "relay"))
+        .expect("append at 5");
+    // `next_seq` must become max(seq) + 1, so the old API keeps working and
+    // never reuses a number.
+    assert_eq!(store.last_seq("a").expect("last_seq"), 5);
+    assert_eq!(
+        store.append(event("a", Some("s"), "next")).expect("append"),
+        6
+    );
+}
+
+#[test]
+fn append_at_rejects_a_non_increasing_seq_and_rolls_back() {
+    let store = Store::open_in_memory().expect("open");
+    store
+        .append_at(4, event("a", Some("s"), "four"))
+        .expect("append at 4");
+    store
+        .append_at(6, event("a", Some("s"), "six"))
+        .expect("append at 6");
+
+    for repeated in [6, 5, 1] {
+        let error = store
+            .append_at(repeated, event("a", Some("s"), "rejected"))
+            .expect_err("a non-increasing seq must be rejected");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("seq") && message.contains('6'),
+            "the error must name the seq and the current maximum: {message}"
+        );
+    }
+
+    let events = store.read(&Query::new("a")).expect("read");
+    let messages: Vec<&str> = events.iter().map(|e| e.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        vec!["four", "six"],
+        "rejected writes leave no trace"
+    );
+
+    // The counter is unchanged too: the next caller-assigned number is still
+    // whatever the relay decides, and the store accepts it.
+    assert_eq!(store.last_seq("a").expect("last_seq"), 6);
+    store
+        .append_at(7, event("a", Some("s"), "seven"))
+        .expect("append at 7");
+}
+
+#[test]
+fn append_at_is_per_instance() {
+    let store = Store::open_in_memory().expect("open");
+    store
+        .append_at(9, event("a", Some("s"), "a-nine"))
+        .expect("a at 9");
+    // Another instance has its own counter; 1 is not "decreasing" for it.
+    store
+        .append_at(1, event("b", Some("s"), "b-one"))
+        .expect("b at 1");
+    assert_eq!(store.last_seq("a").expect("last a"), 9);
+    assert_eq!(store.last_seq("b").expect("last b"), 1);
+}
+
+#[test]
+fn append_batch_at_is_atomic_and_covers_several_instances() {
+    let store = Store::open_in_memory().expect("open");
+    store
+        // Per-instance numbers increase in the order given; the instances are
+        // interleaved freely.
+        .append_batch_at(vec![
+            (1, event("a", Some("s"), "a1")),
+            (1, event("b", Some("s"), "b1")),
+            (2, event("a", Some("s"), "a2")),
+            (2, event("b", Some("s"), "b2")),
+            (5, synthetic("a", Some("s"), "pa")),
+        ])
+        .expect("append batch at");
+    assert_eq!(store.last_seq("a").expect("last a"), 5);
+    assert_eq!(store.last_seq("b").expect("last b"), 2);
+
+    // One bad entry rejects the whole batch, including the entries for the
+    // other instance that came before it.
+    let error = store
+        .append_batch_at(vec![
+            (6, event("a", Some("s"), "ok")),
+            (3, event("b", Some("s"), "ok too")),
+            (4, event("a", Some("s"), "stale")),
+        ])
+        .expect_err("a stale seq must be rejected");
+    assert!(format!("{error:#}").contains("seq"));
+
+    let a = store
+        .read(&Query {
+            include_synthetic: true,
+            ..Query::new("a")
+        })
+        .expect("read a");
+    let messages: Vec<&str> = a.iter().map(|e| e.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        vec!["a1", "a2", "pa"],
+        "the rejected batch left nothing"
+    );
+    let b = store.read(&Query::new("b")).expect("read b");
+    assert_eq!(b.len(), 2, "the other instance was rolled back too");
+    assert_eq!(store.last_seq("a").expect("last a"), 5);
+    assert_eq!(store.last_seq("b").expect("last b"), 2);
+}
+
+#[test]
+fn append_batch_at_accepts_an_empty_batch() {
+    let store = Store::open_in_memory().expect("open");
+    store.append_batch_at(Vec::new()).expect("empty batch");
+    assert_eq!(store.last_seq("a").expect("last_seq"), 0);
+}
+
+#[test]
+fn append_at_rejects_an_empty_instance_key() {
+    let store = Store::open_in_memory().expect("open");
+    let error = store
+        .append_at(1, event("", Some("s"), "{}"))
+        .expect_err("empty instance key");
+    assert!(format!("{error:#}").contains("instance_key"));
+}
+
+#[test]
+fn mark_instance_incomplete_marks_every_known_session() {
+    let store = Store::open_in_memory().expect("open");
+    store
+        .append_at(1, event("a", Some("s1"), "{}"))
+        .expect("append");
+    store
+        .append_at(2, event("a", Some("s2"), "{}"))
+        .expect("append");
+    store
+        .append_at(1, event("b", Some("s1"), "{}"))
+        .expect("append");
+    assert!(store.session_complete("a", "s1").expect("s1"));
+
+    store.mark_instance_incomplete("a").expect("mark");
+
+    assert!(!store.session_complete("a", "s1").expect("s1"));
+    assert!(!store.session_complete("a", "s2").expect("s2"));
+    assert!(
+        store.session_complete("b", "s1").expect("b s1"),
+        "another instance is untouched"
+    );
+    // Marking again is not an error, and a session that appears afterwards
+    // starts complete (a new session's log is fresh).
+    store.mark_instance_incomplete("a").expect("mark again");
+    store
+        .append_at(3, event("a", Some("s3"), "{}"))
+        .expect("append");
+    assert!(store.session_complete("a", "s3").expect("s3"));
+
+    // An unknown instance is a no-op.
+    store
+        .mark_instance_incomplete("nope")
+        .expect("unknown instance");
+}
+
+#[test]
+fn instance_bytes_counts_the_stored_messages() {
+    let store = Store::open_in_memory().expect("open");
+    assert_eq!(store.instance_bytes("a").expect("bytes"), 0);
+    store.append(event("a", Some("s"), "abc")).expect("append");
+    store.append(event("a", Some("s"), "中文")).expect("append");
+    store
+        .append(event("b", Some("s"), "other"))
+        .expect("append");
+
+    assert_eq!(
+        store.instance_bytes("a").expect("bytes"),
+        3 + "中文".len() as u64
+    );
+    assert_eq!(store.instance_bytes("b").expect("bytes"), 5);
+    assert_eq!(store.instance_bytes("nope").expect("bytes"), 0);
+
+    // Pruning lowers it: with a 6-byte budget only the 3-byte event goes.
+    let report = store.prune("a", 6).expect("prune");
+    assert_eq!(report.removed_events, 1);
+    assert_eq!(
+        store.instance_bytes("a").expect("bytes"),
+        "中文".len() as u64
+    );
+}
+
+#[test]
+fn read_session_upto_returns_one_session_including_synthetic() {
+    let store = Store::open_in_memory().expect("open");
+    store
+        .append_at(1, event("a", Some("s1"), "s1-agent"))
+        .expect("append");
+    store
+        .append_at(2, synthetic("a", Some("s1"), "s1-prompt"))
+        .expect("append");
+    store
+        .append_at(3, event("a", Some("s2"), "s2-agent"))
+        .expect("append");
+    store
+        .append_at(4, event("a", Some("s1"), "s1-later"))
+        .expect("append");
+    store
+        .append_at(5, event("a", None, "no session"))
+        .expect("append");
+
+    let up_to_2 = store.read_session_upto("a", "s1", 2).expect("read");
+    let messages: Vec<&str> = up_to_2.iter().map(|e| e.message.as_str()).collect();
+    assert_eq!(messages, vec!["s1-agent", "s1-prompt"]);
+    assert_eq!(up_to_2[1].kind, EventKind::Synthetic);
+
+    let all = store.read_session_upto("a", "s1", 100).expect("read");
+    let messages: Vec<&str> = all.iter().map(|e| e.message.as_str()).collect();
+    assert_eq!(messages, vec!["s1-agent", "s1-prompt", "s1-later"]);
+
+    // Other sessions, session-less events and other instances are excluded.
+    let other = store.read_session_upto("a", "s2", 100).expect("read");
+    assert_eq!(other.len(), 1);
+    assert_eq!(other[0].message, "s2-agent");
+    assert!(store
+        .read_session_upto("a", "unknown", 100)
+        .expect("read")
+        .is_empty());
+    assert!(store
+        .read_session_upto("nope", "s1", 100)
+        .expect("read")
+        .is_empty());
+}
+
+#[test]
+fn a_new_session_starts_complete_and_only_pruning_makes_it_incomplete() {
+    let store = Store::open_in_memory().expect("open");
+    store
+        .append_at(1, event("a", Some("old"), &"x".repeat(100)))
+        .expect("append");
+    assert!(store.session_complete("a", "old").expect("old"));
+    // A second session registered after the first is complete from its start.
+    store
+        .append_at(2, event("a", Some("new"), &"y".repeat(100)))
+        .expect("append");
+    assert!(store.session_complete("a", "new").expect("new"));
+
+    let report = store.prune("a", 100).expect("prune");
+    assert_eq!(report.removed_events, 1);
+    assert_eq!(report.sessions_marked_incomplete, 1);
+    assert!(!store.session_complete("a", "old").expect("old"));
+    assert!(
+        store.session_complete("a", "new").expect("new"),
+        "the session whose events survived is still complete"
+    );
+
+    // A session first seen after a prune is complete again: nothing of it was
+    // ever dropped.
+    store
+        .append_at(3, event("a", Some("fresh"), "{}"))
+        .expect("append");
+    assert!(store.session_complete("a", "fresh").expect("fresh"));
+}
