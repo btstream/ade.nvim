@@ -1,4 +1,4 @@
-# nvim_ade_server protocol (api_version 2)
+# nvim_ade_server protocol (api_version 2, service 0.3.0)
 
 This is the contract between the Neovim front end (`lua/ade/service/`) and the
 service (`service/src/`). Both sides implement it as written; a deviation is a
@@ -39,7 +39,8 @@ they do not change what is written here.
 `-> {token, client, client_version, api_version}`
 `<- {server_version, api_version, features}`
 
-`api_version` is `2`. `features` contains `"tunnel"`. Errors are unchanged:
+`api_version` is `2`. `features` contains `"tunnel"`, and `"log"` when the event
+log is enabled (section 10). Errors are unchanged:
 `-32001` bad token (connection closed), `-32002` incompatible api_version with
 `data = {server_api_version}`, `-32003` hello required.
 
@@ -79,6 +80,10 @@ The **instance identity** is the canonical JSON of
 - `instance`: opaque string id, valid until the instance exits.
 - `initialized`: whether the instance already has a cached `initialize` result.
 - `attached`: number of connections attached after this call.
+- `sessions`: the sessions the service knows to be live in this instance
+  (section 11), newest activity first:
+  `[{sessionId, cwd, running, updated_at /* unix ms */}]`. Empty for a
+  freshly created instance and whenever the event log is disabled.
 
 Errors: `-32022` spawn failed (`message` carries the OS error).
 
@@ -113,7 +118,8 @@ sent after the process exited. All attached connections receive
 
 ```
 { instance, agent, command, args, cwd, pid, started_at /* unix ms */,
-  initialized, attached, turns_running, pending_requests, stopping }
+  initialized, attached, turns_running, pending_requests, stopping,
+  sessions /* count */, log_bytes }
 ```
 
 - `turns_running`: pending `session/prompt` requests (sent by a front end,
@@ -137,10 +143,12 @@ must be attached to `instance`, otherwise `tunnel.error` with `-32024`.
 `<- {instance, seq, message}` where `message` is one ACP JSON-RPC object
 received from the agent (after id mapping, section 5).
 
-`seq` is a per-instance counter starting at 1, incremented for **every**
-message the agent writes (response, notification or request), in stdout
-order. Delivery to one connection preserves that order. It is not used for
-anything in api_version 2 except tracing; a later version replays by `seq`.
+`seq` is a per-instance counter starting at 1. Every message the agent writes
+(response, notification or request) takes the next number, in stdout order, and
+so does every event the service records itself (section 10). Numbers therefore
+increase strictly but may skip. Delivery to one connection preserves that
+order. It is the key of the event log (section 10) and is otherwise used only
+for tracing.
 
 ### 3.8 `agent.exited` (notification, `<-`)
 
@@ -286,3 +294,129 @@ indefinitely.
    socket before the process ends.
 5. Reconnecting later: `agent.attach` with the same key finds the running
    instance (`created = false`); pending permission requests arrive again.
+
+## 10. Event log (feature `"log"`)
+
+The service records what a later front end needs to rebuild a conversation: the
+agent's `session/update` notifications, and **synthetic** events for what only
+the front end said. Nothing else is recorded (no responses, no requests, no
+other notifications).
+
+| Recorded event | When | Replayed as |
+|---|---|---|
+| agent `session/update` | the agent writes it | itself, unchanged |
+| synthetic `user_prompt` | a front end sends `session/prompt` | one `user_message_chunk` update per prompt content block |
+| synthetic `config` | a `session/set_config_option` response carries `configOptions`, or an update replaces them | a `config_option_update` update with the full list |
+| synthetic `mode` | a `session/set_mode` succeeds | a `current_mode_update` update |
+
+Rules:
+
+- The log belongs to **one instance** and lives exactly as long as it: it is
+  deleted when the instance stops or exits, and the whole log file is deleted
+  when the service starts (no instance survives a service restart, so a stale
+  log would describe nothing). It is never read after that.
+- File: `<dir>/nvim_ade_server.events.sqlite3`, mode 0600, in the service
+  directory (the runtime directory when there is one, so it normally never
+  reaches persistent storage).
+- Every event carries the instance's next `seq` (section 3.7), allocated by the
+  relay, not by the database, so that live `tunnel.recv` and the log agree.
+- Cap: `--event-log-max-mb` per instance (default 256). When exceeded, the oldest
+  events are dropped; every session that lost an event becomes **incomplete**
+  (section 12 declines to replay it).
+- A synthetic `user_prompt` event is limited to 8 MiB: a content block larger than
+  1 MiB is replaced by a text block `[content omitted from the replay log]`.
+- `--event-log off` disables recording entirely: `features` has no `"log"`,
+  `attach` returns no sessions, and section 12 never applies.
+- Writing the log never blocks the relay. A read for replay first waits until
+  everything recorded before it is readable.
+
+## 11. Session tracking
+
+The relay watches ACP traffic just enough to know which sessions live in the
+agent process:
+
+- `session/new` response: the session id is `result.sessionId`, its `cwd` is the
+  request's `params.cwd`, its **state** is the whole `result`.
+- `session/load` and `session/resume` responses (success): the session id and
+  `cwd` come from the request, the state is the response `result` (it may be
+  empty).
+- `session/close` and `session/delete` responses (success): the session is
+  forgotten.
+
+The **state** is kept current: a `config_option_update` replaces
+`state.configOptions`; a `current_mode_update` sets `state.modes.currentModeId`;
+a successful `session/set_config_option` replaces `state.configOptions` with the
+response's `configOptions`.
+
+`running` is true while a `session/prompt` for that session is unanswered.
+`updated_at` is the time of the last recorded event for the session.
+
+A session is **complete** when the log holds every event since the service first
+saw it and none was pruned. A session the service first saw through
+`session/load` is complete from that load on (the agent's replay is itself
+logged).
+
+## 12. Emulated `session/load`
+
+When a front end sends `session/load` and **all** of these hold:
+
+- the instance has the `"log"` feature enabled;
+- the session id is one the instance tracks (section 11) and is complete;
+- the agent advertised `loadSession` in its `initialize` result;
+
+the service does **not** forward the request. It answers it itself:
+
+1. it relays, in `seq` order and as ordinary `tunnel.recv` messages to the
+   requesting connection only, the replay form (section 10) of every recorded
+   event of that session;
+2. it sends the response: the tracked **state** (section 11) as `result`, with
+   the request's id;
+3. it switches the connection to live delivery with **no gap and no
+   duplicate**: events recorded while the replay was being read are delivered
+   after it, in order.
+
+In every other case (`session/load` of an unknown or incomplete session, log
+disabled, no `loadSession`) the request is forwarded to the agent as before.
+
+Replay messages carry `seq` equal to the event they replay; synthetic events
+use their own numbers.
+
+## 13. Turn adoption
+
+If the session has a `session/prompt` in flight whose requesting connection is
+gone (its front end left, crashed or was killed), the front end that just
+loaded the session (section 12) can take that turn over:
+
+- after the load response, the service sends `tunnel.recv` with the ACP
+  notification `_ade/turn_adopted` and `params = {sessionId}`;
+- the connection becomes an **adopter** of that session;
+- when the agent answers the in-flight `session/prompt`, the service sends
+  every adopter the notification `_ade/turn_finished` with
+  `params = {sessionId, stopReason}` (`stopReason` from the response, or
+  `"error"` with `error` set to the JSON-RPC error object);
+- the prompt is then finished for the service too (`turns_running` drops).
+
+If nobody adopted the session, the response is discarded as before.
+Notifications whose method starts with `_` are ACP extension methods; a front
+end that does not know them ignores them.
+
+## 14. Retracting a request
+
+A pending agent request (section 5.4) can have been **delivered** to more than
+one connection (a new primary receives the whole set again). When one
+connection answers it, or the agent withdraws it, the service sends every
+**other** connection that was delivered it the standard notification
+`$/cancel_request` with `params = {id}` (the agent's id of that request), so
+its front end can close the question. That front end replies with a
+`-32800` error response to the request; the service ignores it because the
+request is no longer pending.
+
+## 15. Service flags and files
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--event-log <on\|off>` | `on` | section 10 |
+| `--event-log-max-mb <n>` | `256` | per-instance cap, 16 to 4096 |
+
+The flags apply when the service starts; a front end that finds a service
+already running does not change them.
