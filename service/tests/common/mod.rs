@@ -247,10 +247,21 @@ pub fn test_socket_path(dir: &Path, label: &str) -> PathBuf {
     }
 }
 
+/// Result of a non-blocking-ish read with a timeout.
+enum ReadOutcome {
+    Frame(Value),
+    Timeout,
+    Closed,
+}
+
 /// A front-end client: line-delimited JSON-RPC over the service socket.
 pub struct Client {
     reader: BufReader<Box<dyn Read + Send>>,
     writer: Box<dyn Write + Send>,
+    /// Notifications read while waiting for a response, so no test loses one.
+    pending: Vec<Value>,
+    #[cfg(unix)]
+    stream: Option<std::os::unix::net::UnixStream>,
 }
 
 impl Client {
@@ -262,7 +273,9 @@ impl Client {
             let reader = stream.try_clone()?;
             Ok(Self {
                 reader: BufReader::new(Box::new(reader)),
-                writer: Box::new(stream),
+                writer: Box::new(stream.try_clone()?),
+                pending: Vec::new(),
+                stream: Some(stream),
             })
         }
         #[cfg(windows)]
@@ -275,6 +288,7 @@ impl Client {
             Ok(Self {
                 reader: BufReader::new(Box::new(reader)),
                 writer: Box::new(pipe),
+                pending: Vec::new(),
             })
         }
     }
@@ -349,6 +363,125 @@ impl Client {
         }));
         self.recv().expect("method response")
     }
+
+    /// Send a request with params and read its response, skipping any
+    /// notification that arrives in between.
+    pub fn request(&mut self, id: impl Into<Value>, method: &str, params: Value) -> Value {
+        self.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id.into(),
+            "method": method,
+            "params": params,
+        }));
+        loop {
+            let frame = self.recv().expect("method response");
+            if frame.get("method").is_none() {
+                return frame;
+            }
+            // Keep notifications for `next_notification`.
+            self.pending.push(frame);
+        }
+    }
+
+    /// Send a notification.
+    pub fn notify(&mut self, method: &str, params: Value) {
+        self.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }));
+    }
+
+    /// Read frames until one is a notification, then return it.
+    pub fn next_notification(&mut self, timeout: Duration) -> Value {
+        if !self.pending.is_empty() {
+            return self.pending.remove(0);
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO);
+            if remaining.is_zero() {
+                panic!("timed out waiting for a notification");
+            }
+            match self.recv_with_timeout(remaining) {
+                ReadOutcome::Frame(frame) if frame.get("method").is_some() => return frame,
+                ReadOutcome::Frame(_) => continue,
+                ReadOutcome::Timeout => {
+                    panic!("timed out waiting for a notification")
+                }
+                ReadOutcome::Closed => panic!("the server closed the connection"),
+            }
+        }
+    }
+
+    /// Like [`Self::next_notification`], but returns `None` instead of
+    /// panicking when nothing arrives within `timeout`.
+    pub fn try_next_notification(&mut self, timeout: Duration) -> Option<Value> {
+        if !self.pending.is_empty() {
+            return self.pending.pop();
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO);
+            if remaining.is_zero() {
+                return None;
+            }
+            match self.recv_with_timeout(remaining) {
+                ReadOutcome::Frame(frame) if frame.get("method").is_some() => return Some(frame),
+                ReadOutcome::Frame(frame) => self.pending.push(frame),
+                ReadOutcome::Timeout | ReadOutcome::Closed => return None,
+            }
+        }
+    }
+
+    /// Read the next `tunnel.recv` notification's params.
+    pub fn next_tunnel_recv(&mut self, timeout: Duration) -> Value {
+        loop {
+            let notification = self.next_notification(timeout);
+            if notification["method"] == "tunnel.recv" {
+                return notification["params"].clone();
+            }
+        }
+    }
+
+    fn recv_with_timeout(&mut self, timeout: Duration) -> ReadOutcome {
+        self.set_read_timeout(timeout);
+        let mut line = String::new();
+        match self.reader.read_line(&mut line) {
+            Ok(0) => ReadOutcome::Closed,
+            Ok(_) => ReadOutcome::Frame(
+                serde_json::from_str(line.trim())
+                    .unwrap_or_else(|error| panic!("invalid JSON response {line:?}: {error}")),
+            ),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                ReadOutcome::Timeout
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::BrokenPipe
+                    || error.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                ReadOutcome::Closed
+            }
+            Err(error) => panic!("read response: {error}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn set_read_timeout(&mut self, timeout: Duration) {
+        if let Some(stream) = self.stream.as_ref() {
+            let _ = stream.set_read_timeout(Some(timeout));
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn set_read_timeout(&mut self, _timeout: Duration) {}
 }
 
 /// Start a second `serve` process against an existing server's directory and

@@ -115,6 +115,7 @@ fn serve(socket: Option<PathBuf>, idle_timeout: Option<f64>) -> ExitCode {
                 0.0
             })
         }),
+        stop_timeouts: None,
     };
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()

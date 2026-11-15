@@ -1,13 +1,12 @@
-//! JSON-RPC 2.0 with one message per line.
+//! JSON-RPC 2.0 with one message per line, plus the small set of service
+//! methods that do not need the hub (`hello`, `ping`, `shutdown`).
 //!
-//! Only the small subset needed by S0 is implemented: `hello`, `ping` and
-//! `shutdown`, plus the standard JSON-RPC error codes for everything else.
-//! Connection state (has this client said hello?) lives in [`Handshake`], so
-//! the whole dispatch can be unit tested without sockets.
+//! Everything else (`agent.*`, `tunnel.send`) is dispatched by
+//! [`crate::server`] into [`crate::hub`]. The relay rules themselves live in
+//! [`crate::relay`].
 
 use std::io;
 
-use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -18,48 +17,76 @@ pub const METHOD_NOT_FOUND: i64 = -32601;
 pub const INVALID_PARAMS: i64 = -32602;
 pub const INTERNAL_ERROR: i64 = -32603;
 
-/// Service-specific errors, fixed by `.acp-work/contract.md`.
+/// Service errors, fixed by `service/PROTOCOL.md` section 4.
 pub const INVALID_TOKEN: i64 = -32001;
 pub const INCOMPATIBLE_API_VERSION: i64 = -32002;
 pub const HELLO_REQUIRED: i64 = -32003;
+pub const UNKNOWN_INSTANCE: i64 = -32020;
+pub const SPAWN_FAILED: i64 = -32022;
+pub const CAPABILITIES_DIFFER: i64 = -32023;
+pub const NOT_ATTACHED: i64 = -32024;
+pub const FRAME_REJECTED: i64 = -32025;
 
-/// Upper bound for a single line, so a broken client cannot exhaust memory.
-pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+/// Maximum length of one line in either direction (PROTOCOL.md section 2).
+pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Read one `\n`-terminated line, enforcing [`MAX_MESSAGE_BYTES`].
+/// Features advertised by `hello`.
+pub const FEATURES: &[&str] = &["tunnel"];
+
+/// One line read from a peer.
+#[derive(Debug, PartialEq)]
+pub enum Line {
+    /// End of stream.
+    Eof,
+    /// A line, without its terminating newline.
+    Text(String),
+    /// A line longer than the limit; it has been consumed and must be
+    /// discarded. The value is the number of bytes read (at least the limit).
+    TooLong(usize),
+}
+
+/// Read one `\n`-terminated line, consuming at most `max` bytes of content.
 ///
-/// Returns `Ok(None)` on a clean end of stream.
-pub async fn read_message<R>(reader: &mut R) -> io::Result<Option<String>>
+/// An over-long line is consumed up to and including its newline, so the
+/// stream can be read again afterwards.
+pub async fn read_line_limited<R>(reader: &mut R, max: usize) -> io::Result<Line>
 where
     R: AsyncBufRead + Unpin,
 {
     let mut line = Vec::new();
+    let mut overflow_total = 0usize;
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
-            if line.is_empty() {
-                return Ok(None);
-            }
-            break;
+            return if overflow_total > 0 {
+                Ok(Line::TooLong(overflow_total))
+            } else if line.is_empty() {
+                Ok(Line::Eof)
+            } else {
+                strip_carriage_return(&mut line);
+                Ok(Line::Text(to_text(line)?))
+            };
         }
+
         match available.iter().position(|byte| *byte == b'\n') {
             Some(position) => {
-                if line.len() + position > MAX_MESSAGE_BYTES {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "message exceeds the maximum size",
-                    ));
+                if overflow_total > 0 || line.len() + position > max {
+                    let total = overflow_total + line.len() + position;
+                    reader.consume(position + 1);
+                    return Ok(Line::TooLong(total));
                 }
                 line.extend_from_slice(&available[..position]);
                 reader.consume(position + 1);
-                break;
+                strip_carriage_return(&mut line);
+                return Ok(Line::Text(to_text(line)?));
             }
             None => {
-                if line.len() + available.len() > MAX_MESSAGE_BYTES {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "message exceeds the maximum size",
-                    ));
+                if overflow_total > 0 || line.len() + available.len() > max {
+                    overflow_total += line.len() + available.len();
+                    line.clear();
+                    let length = available.len();
+                    reader.consume(length);
+                    continue;
                 }
                 line.extend_from_slice(available);
                 let length = available.len();
@@ -67,13 +94,36 @@ where
             }
         }
     }
-    // Tolerate CRLF from clients that add it.
+}
+
+fn strip_carriage_return(line: &mut Vec<u8>) {
     if line.last() == Some(&b'\r') {
         line.pop();
     }
-    let text = String::from_utf8(line)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "message is not UTF-8"))?;
-    Ok(Some(text))
+}
+
+fn to_text(line: Vec<u8>) -> io::Result<String> {
+    String::from_utf8(line)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "message is not UTF-8"))
+}
+
+/// Read one message line for the front-end connection.
+///
+/// `Ok(None)` is a clean end of stream; an over-long or non-UTF-8 line is an
+/// [`io::ErrorKind::InvalidData`] error, because the stream cannot be
+/// resynchronised with the peer's expectations.
+pub async fn read_message<R>(reader: &mut R, max: usize) -> io::Result<Option<String>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    match read_line_limited(reader, max).await? {
+        Line::Eof => Ok(None),
+        Line::Text(text) => Ok(Some(text)),
+        Line::TooLong(bytes) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("message exceeds {max} bytes (read {bytes})"),
+        )),
+    }
 }
 
 /// Write a value as one line and flush it.
@@ -88,15 +138,18 @@ where
     writer.flush().await
 }
 
-/// What the connection loop should do after one request.
-#[derive(Debug, Default, PartialEq)]
-pub struct Outcome {
-    /// Response to send, if the request was not a notification.
-    pub response: Option<Value>,
-    /// Close this connection after sending the response.
-    pub close: bool,
-    /// Stop the whole service after sending the response.
-    pub shutdown: bool,
+/// A JSON-RPC success response.
+pub fn success(id: &Value, result: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
+
+/// A JSON-RPC error response.
+pub fn failure(id: &Value, code: i64, message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message },
+    })
 }
 
 /// Per-connection state: whether `hello` succeeded yet.
@@ -121,184 +174,127 @@ impl Handshake {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct Request {
-    #[serde(default)]
-    jsonrpc: Option<String>,
-    #[serde(default)]
-    id: Option<Value>,
-    #[serde(default)]
-    method: Option<String>,
-    #[serde(default)]
-    params: Option<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HelloParams {
-    #[serde(default)]
-    token: Option<String>,
-    #[serde(default)]
-    client: Option<String>,
-    #[serde(default)]
-    client_version: Option<String>,
-    #[serde(default)]
-    api_version: Option<Value>,
-}
-
-/// How to react to one incoming line.
+/// What to do with one front-end frame.
 #[derive(Debug, PartialEq)]
-enum Dispatch {
+pub enum Local {
+    /// Send this response, keep the connection open.
     Reply(Value),
-    CloseAfter(Value),
+    /// Send this response, then close the connection.
+    Close(Value),
+    /// Send this response, then shut the service down.
     Shutdown(Value),
+    /// Not a local method: hand it to the hub.
+    Route,
 }
 
-impl Dispatch {
-    fn into_outcome(self) -> Outcome {
-        match self {
-            Self::Reply(response) => Outcome {
-                response: Some(response),
-                ..Outcome::default()
-            },
-            Self::CloseAfter(response) => Outcome {
-                response: Some(response),
-                close: true,
-                ..Outcome::default()
-            },
-            Self::Shutdown(response) => Outcome {
-                response: Some(response),
-                shutdown: true,
-                ..Outcome::default()
-            },
-        }
-    }
-}
-
-fn success(id: &Option<Value>, result: Value) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id.clone().unwrap_or(Value::Null), "result": result })
-}
-
-fn failure(id: &Option<Value>, code: i64, message: &str, data: Option<Value>) -> Value {
-    let mut error = json!({ "code": code, "message": message });
-    if let Some(data) = data {
-        error["data"] = data;
-    }
-    json!({ "jsonrpc": "2.0", "id": id.clone().unwrap_or(Value::Null), "error": error })
-}
-
-/// Handle one line of input. `expected_token` is the token of this service
-/// instance; `api_version` is the protocol version the service speaks.
-pub fn handle_line(
-    handshake: &mut Handshake,
-    expected_token: &str,
-    api_version: i64,
-    line: &str,
-) -> Outcome {
-    let request: Request = match serde_json::from_str(line) {
-        Ok(request) => request,
-        Err(_) => {
-            return Outcome {
-                response: Some(failure(
-                    &None,
-                    PARSE_ERROR,
-                    "parse error",
-                    Some(json!({ "detail": "invalid JSON" })),
-                )),
-                ..Outcome::default()
-            }
-        }
+/// Handle the methods that do not need the hub.
+///
+/// `frame` must be a JSON object. Anything without a `method`, or with an
+/// unknown method, is routed so the caller reports the right error.
+pub fn handle_local(handshake: &mut Handshake, token: &str, frame: &Value) -> Local {
+    let Some(object) = frame.as_object() else {
+        return Local::Reply(failure(&Value::Null, PARSE_ERROR, "parse error"));
     };
+    let id = object.get("id").cloned().unwrap_or(Value::Null);
+    let is_notification = !object.contains_key("id");
 
-    let id = request.id.clone();
-    let is_notification = id.is_none();
-    let dispatch = match route(handshake, expected_token, api_version, request) {
-        Ok(dispatch) => dispatch,
-        // A bad token closes the connection right after the error response.
-        Err((INVALID_TOKEN, message, data)) => {
-            Dispatch::CloseAfter(failure(&id, INVALID_TOKEN, message, data))
-        }
-        Err((code, message, data)) => Dispatch::Reply(failure(&id, code, message, data)),
-    };
-    let mut outcome = dispatch.into_outcome();
-    // A notification never gets a response, not even an error one.
-    if is_notification {
-        outcome.response = None;
-    }
-    outcome
-}
-
-type RouteError = (i64, &'static str, Option<Value>);
-
-fn route(
-    handshake: &mut Handshake,
-    expected_token: &str,
-    api_version: i64,
-    request: Request,
-) -> Result<Dispatch, RouteError> {
-    let id = request.id.clone();
-    let method = match request.method {
-        Some(method) => method,
-        None => {
-            return Err((INVALID_REQUEST, "invalid request", None));
-        }
-    };
-    if let Some(version) = &request.jsonrpc {
+    if let Some(version) = object.get("jsonrpc") {
         if version != "2.0" {
-            return Err((INVALID_REQUEST, "invalid request", None));
+            return reject(is_notification, &id, INVALID_REQUEST, "invalid request");
         }
     }
+
+    let Some(method) = object.get("method").and_then(Value::as_str) else {
+        return reject(is_notification, &id, INVALID_REQUEST, "invalid request");
+    };
 
     if method != "hello" && !handshake.authenticated {
-        return Err((
-            HELLO_REQUIRED,
-            "hello required",
-            Some(json!({ "hint": "send hello before any other method" })),
-        ));
+        return reject(is_notification, &id, HELLO_REQUIRED, "hello required");
     }
 
-    match method.as_str() {
-        "hello" => {
-            let params = request
-                .params
-                .ok_or((INVALID_PARAMS, "invalid params", None))?;
-            let params: HelloParams = serde_json::from_value(params)
-                .map_err(|_| (INVALID_PARAMS, "invalid params", None))?;
-            let token = params.token.unwrap_or_default();
-            if !crate::token::tokens_match(expected_token, &token) {
-                return Err((INVALID_TOKEN, "invalid token", None));
+    match method {
+        "hello" => hello(handshake, token, object, &id, is_notification),
+        "ping" => Local::Reply(success(&id, json!({}))),
+        "shutdown" => {
+            if is_notification {
+                // A notification shutdown still stops the service; it just has
+                // no reply.
+                Local::Shutdown(Value::Null)
+            } else {
+                Local::Shutdown(success(&id, json!({})))
             }
-            let requested = match params.api_version {
-                Some(Value::Number(number)) => number.as_i64(),
-                Some(_) => None,
-                None => None,
-            };
-            let requested = match requested {
-                Some(version) => version,
-                None => return Err((INVALID_PARAMS, "invalid params", None)),
-            };
-            if requested != api_version {
-                return Err((
-                    INCOMPATIBLE_API_VERSION,
-                    "incompatible api_version",
-                    Some(json!({ "server_api_version": api_version })),
-                ));
-            }
-            handshake.authenticated = true;
-            handshake.client = params.client;
-            handshake.client_version = params.client_version;
-            Ok(Dispatch::Reply(success(
-                &id,
-                json!({
-                    "server_version": crate::SERVER_VERSION,
-                    "api_version": api_version,
-                    "features": [],
-                }),
-            )))
         }
-        "ping" => Ok(Dispatch::Reply(success(&id, json!({})))),
-        "shutdown" => Ok(Dispatch::Shutdown(success(&id, json!({})))),
-        _ => Err((METHOD_NOT_FOUND, "method not found", None)),
+        _ => Local::Route,
     }
+}
+
+/// An error frame, or nothing at all when the frame was a notification
+/// (JSON-RPC: a notification is never answered).
+fn reject(is_notification: bool, id: &Value, code: i64, message: &str) -> Local {
+    if is_notification {
+        Local::Reply(Value::Null)
+    } else {
+        Local::Reply(failure(id, code, message))
+    }
+}
+
+fn hello(
+    handshake: &mut Handshake,
+    token: &str,
+    object: &serde_json::Map<String, Value>,
+    id: &Value,
+    is_notification: bool,
+) -> Local {
+    let Some(params) = object.get("params").and_then(Value::as_object) else {
+        return reject(is_notification, id, INVALID_PARAMS, "invalid params");
+    };
+    let Some(candidate) = params.get("token").and_then(Value::as_str) else {
+        // A missing token is as bad as a wrong one: the contract closes the
+        // connection in both cases.
+        return Local::Close(failure(id, INVALID_TOKEN, "invalid token"));
+    };
+    if !crate::token::tokens_match(token, candidate) {
+        return Local::Close(failure(id, INVALID_TOKEN, "invalid token"));
+    }
+    let Some(requested) = params.get("api_version").and_then(Value::as_i64) else {
+        return reject(is_notification, id, INVALID_PARAMS, "invalid params");
+    };
+    if requested != crate::API_VERSION {
+        if is_notification {
+            return Local::Reply(Value::Null);
+        }
+        return Local::Reply(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": INCOMPATIBLE_API_VERSION,
+                "message": "incompatible api_version",
+                "data": { "server_api_version": crate::API_VERSION },
+            },
+        }));
+    }
+
+    handshake.authenticated = true;
+    handshake.client = params
+        .get("client")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    handshake.client_version = params
+        .get("client_version")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    if is_notification {
+        return Local::Reply(Value::Null);
+    }
+    Local::Reply(success(
+        id,
+        json!({
+            "server_version": crate::SERVER_VERSION,
+            "api_version": crate::API_VERSION,
+            "features": FEATURES,
+        }),
+    ))
 }
 
 /// The JSON-RPC error code of a failing response, if it is one.
@@ -315,7 +311,7 @@ mod tests {
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-    fn hello(token: &str, api_version: i64) -> String {
+    fn hello_frame(token: &str, api_version: i64) -> Value {
         json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -327,60 +323,81 @@ mod tests {
                 "api_version": api_version,
             }
         })
-        .to_string()
     }
 
-    fn reply(outcome: &Outcome) -> &Value {
-        outcome.response.as_ref().expect("has a response")
+    fn reply(local: &Local) -> &Value {
+        match local {
+            Local::Reply(value) | Local::Close(value) | Local::Shutdown(value) => value,
+            Local::Route => panic!("expected a response, got Route"),
+        }
     }
 
     #[tokio::test]
     async fn framing_splits_on_newlines() {
-        let input = b"{\"a\":1}\n{\"b\":2}\n";
-        let mut reader = input.as_slice();
+        let mut reader = b"{\"a\":1}\n{\"b\":2}\n".as_slice();
         assert_eq!(
-            read_message(&mut reader).await.unwrap().as_deref(),
+            read_message(&mut reader, 1024).await.unwrap().as_deref(),
             Some("{\"a\":1}")
         );
         assert_eq!(
-            read_message(&mut reader).await.unwrap().as_deref(),
+            read_message(&mut reader, 1024).await.unwrap().as_deref(),
             Some("{\"b\":2}")
         );
-        assert_eq!(read_message(&mut reader).await.unwrap(), None);
+        assert_eq!(read_message(&mut reader, 1024).await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn framing_accepts_a_final_line_without_newline() {
         let mut reader = b"{\"a\":1}".as_slice();
         assert_eq!(
-            read_message(&mut reader).await.unwrap().as_deref(),
+            read_message(&mut reader, 1024).await.unwrap().as_deref(),
             Some("{\"a\":1}")
         );
-        assert_eq!(read_message(&mut reader).await.unwrap(), None);
+        assert_eq!(read_message(&mut reader, 1024).await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn framing_strips_carriage_returns() {
         let mut reader = b"{\"a\":1}\r\n".as_slice();
         assert_eq!(
-            read_message(&mut reader).await.unwrap().as_deref(),
+            read_message(&mut reader, 1024).await.unwrap().as_deref(),
             Some("{\"a\":1}")
         );
     }
 
     #[tokio::test]
-    async fn framing_rejects_oversized_lines() {
-        let mut input = vec![b'x'; MAX_MESSAGE_BYTES + 2];
+    async fn framing_reports_oversized_lines_and_recovers() {
+        let big = vec![b'x'; 20];
+        let mut input = big;
         input.push(b'\n');
+        input.extend_from_slice(b"ok\n");
         let mut reader = input.as_slice();
-        let error = read_message(&mut reader).await.unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_line_limited(&mut reader, 10).await.unwrap(),
+            Line::TooLong(20)
+        );
+        assert_eq!(
+            read_line_limited(&mut reader, 10).await.unwrap(),
+            Line::Text("ok".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn framing_reports_oversized_lines_without_a_trailing_newline() {
+        let mut input = vec![b'x'; 20];
+        let mut reader = input.as_slice();
+        assert_eq!(
+            read_line_limited(&mut reader, 10).await.unwrap(),
+            Line::TooLong(20)
+        );
+        assert_eq!(read_line_limited(&mut reader, 10).await.unwrap(), Line::Eof);
+        input.clear();
     }
 
     #[tokio::test]
     async fn framing_rejects_invalid_utf8() {
         let mut reader = &b"\xff\xfe\n"[..];
-        let error = read_message(&mut reader).await.unwrap_err();
+        let error = read_message(&mut reader, 1024).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
@@ -394,129 +411,191 @@ mod tests {
     }
 
     #[test]
-    fn hello_succeeds_and_reports_versions() {
+    fn hello_succeeds_and_reports_the_protocol() {
         let mut handshake = Handshake::default();
-        let outcome = handle_line(&mut handshake, TOKEN, 1, &hello(TOKEN, 1));
+        let local = handle_local(
+            &mut handshake,
+            TOKEN,
+            &hello_frame(TOKEN, crate::API_VERSION),
+        );
         assert!(handshake.is_authenticated());
-        assert!(!outcome.close);
-        let response = reply(&outcome);
+        let response = reply(&local);
         assert_eq!(response["result"]["server_version"], crate::SERVER_VERSION);
-        assert_eq!(response["result"]["api_version"], 1);
-        assert_eq!(response["result"]["features"], json!([]));
+        assert_eq!(response["result"]["api_version"], crate::API_VERSION);
+        assert_eq!(response["result"]["features"], json!(["tunnel"]));
         assert_eq!(handshake.client(), Some("ade.nvim"));
     }
 
     #[test]
     fn hello_with_a_bad_token_is_rejected_and_closes() {
         let mut handshake = Handshake::default();
-        let bad = "f".repeat(64);
-        let outcome = handle_line(&mut handshake, TOKEN, 1, &hello(&bad, 1));
+        let local = handle_local(&mut handshake, TOKEN, &hello_frame(&"f".repeat(64), 2));
         assert!(!handshake.is_authenticated());
-        assert!(outcome.close);
-        let response = reply(&outcome);
+        assert!(matches!(local, Local::Close(_)));
+        let response = reply(&local);
         assert_eq!(error_code(response), Some(INVALID_TOKEN));
         assert_eq!(response["error"]["message"], "invalid token");
     }
 
     #[test]
+    fn hello_without_a_token_is_rejected_and_closes() {
+        let mut handshake = Handshake::default();
+        let frame = json!({"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {}});
+        let local = handle_local(&mut handshake, TOKEN, &frame);
+        assert!(matches!(local, Local::Close(_)));
+        assert_eq!(error_code(reply(&local)), Some(INVALID_TOKEN));
+    }
+
+    #[test]
     fn hello_with_an_incompatible_api_version_reports_the_server_version() {
         let mut handshake = Handshake::default();
-        let outcome = handle_line(&mut handshake, TOKEN, 1, &hello(TOKEN, 2));
+        let local = handle_local(&mut handshake, TOKEN, &hello_frame(TOKEN, 1));
         assert!(!handshake.is_authenticated());
-        assert!(!outcome.close);
-        let response = reply(&outcome);
+        assert!(matches!(local, Local::Reply(_)));
+        let response = reply(&local);
         assert_eq!(error_code(response), Some(INCOMPATIBLE_API_VERSION));
-        assert_eq!(response["error"]["data"]["server_api_version"], 1);
+        assert_eq!(
+            response["error"]["data"]["server_api_version"],
+            crate::API_VERSION
+        );
     }
 
     #[test]
     fn hello_without_api_version_is_an_invalid_params_error() {
         let mut handshake = Handshake::default();
-        let line = json!({
+        let frame = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "hello",
             "params": { "token": TOKEN }
-        })
-        .to_string();
-        let outcome = handle_line(&mut handshake, TOKEN, 1, &line);
-        assert_eq!(error_code(reply(&outcome)), Some(INVALID_PARAMS));
+        });
+        let local = handle_local(&mut handshake, TOKEN, &frame);
+        assert_eq!(error_code(reply(&local)), Some(INVALID_PARAMS));
         assert!(!handshake.is_authenticated());
     }
 
     #[test]
     fn methods_before_hello_are_rejected() {
         let mut handshake = Handshake::default();
-        let line = json!({"jsonrpc": "2.0", "id": 7, "method": "ping"}).to_string();
-        let outcome = handle_line(&mut handshake, TOKEN, 1, &line);
-        let response = reply(&outcome);
-        assert_eq!(error_code(response), Some(HELLO_REQUIRED));
+        let frame = json!({"jsonrpc": "2.0", "id": 7, "method": "agent.list"});
+        let response = reply(&handle_local(&mut handshake, TOKEN, &frame)).clone();
+        assert_eq!(error_code(&response), Some(HELLO_REQUIRED));
         assert_eq!(response["error"]["message"], "hello required");
         assert_eq!(response["id"], 7);
     }
 
     #[test]
-    fn ping_after_hello_returns_an_empty_object() {
+    fn notifications_before_hello_get_no_response() {
         let mut handshake = Handshake::default();
-        handle_line(&mut handshake, TOKEN, 1, &hello(TOKEN, 1));
-        let line = json!({"jsonrpc": "2.0", "id": "abc", "method": "ping"}).to_string();
-        let outcome = handle_line(&mut handshake, TOKEN, 1, &line);
-        assert_eq!(reply(&outcome)["result"], json!({}));
-        assert_eq!(reply(&outcome)["id"], "abc");
+        let frame = json!({"jsonrpc": "2.0", "method": "tunnel.send", "params": {}});
+        // Notifications are never answered, errors included.
+        assert_eq!(
+            handle_local(&mut handshake, TOKEN, &frame),
+            Local::Reply(Value::Null)
+        );
+        assert!(!handshake.is_authenticated());
     }
 
     #[test]
-    fn shutdown_after_hello_sets_the_shutdown_flag() {
+    fn ping_after_hello_returns_an_empty_object() {
         let mut handshake = Handshake::default();
-        handle_line(&mut handshake, TOKEN, 1, &hello(TOKEN, 1));
-        let line = json!({"jsonrpc": "2.0", "id": 9, "method": "shutdown"}).to_string();
-        let outcome = handle_line(&mut handshake, TOKEN, 1, &line);
-        assert!(outcome.shutdown);
-        assert_eq!(reply(&outcome)["result"], json!({}));
+        handle_local(
+            &mut handshake,
+            TOKEN,
+            &hello_frame(TOKEN, crate::API_VERSION),
+        );
+        let frame = json!({"jsonrpc": "2.0", "id": "abc", "method": "ping"});
+        let local = handle_local(&mut handshake, TOKEN, &frame);
+        assert_eq!(reply(&local)["result"], json!({}));
+        assert_eq!(reply(&local)["id"], "abc");
+    }
+
+    #[test]
+    fn shutdown_after_hello_is_a_shutdown() {
+        let mut handshake = Handshake::default();
+        handle_local(
+            &mut handshake,
+            TOKEN,
+            &hello_frame(TOKEN, crate::API_VERSION),
+        );
+        let frame = json!({"jsonrpc": "2.0", "id": 9, "method": "shutdown"});
+        let local = handle_local(&mut handshake, TOKEN, &frame);
+        assert!(matches!(local, Local::Shutdown(_)));
+        assert_eq!(reply(&local)["result"], json!({}));
     }
 
     #[test]
     fn shutdown_before_hello_is_an_error() {
         let mut handshake = Handshake::default();
-        let line = json!({"jsonrpc": "2.0", "id": 9, "method": "shutdown"}).to_string();
-        let outcome = handle_line(&mut handshake, TOKEN, 1, &line);
-        assert!(!outcome.shutdown);
-        assert_eq!(error_code(reply(&outcome)), Some(HELLO_REQUIRED));
+        let frame = json!({"jsonrpc": "2.0", "id": 9, "method": "shutdown"});
+        let local = handle_local(&mut handshake, TOKEN, &frame);
+        assert!(!matches!(local, Local::Shutdown(_)));
+        assert_eq!(error_code(reply(&local)), Some(HELLO_REQUIRED));
     }
 
     #[test]
-    fn unknown_methods_report_method_not_found() {
+    fn agent_methods_are_routed() {
         let mut handshake = Handshake::default();
-        handle_line(&mut handshake, TOKEN, 1, &hello(TOKEN, 1));
-        let line = json!({"jsonrpc": "2.0", "id": 3, "method": "team.create"}).to_string();
-        let outcome = handle_line(&mut handshake, TOKEN, 1, &line);
-        let response = reply(&outcome);
-        assert_eq!(error_code(response), Some(METHOD_NOT_FOUND));
-        assert_eq!(response["error"]["message"], "method not found");
+        handle_local(
+            &mut handshake,
+            TOKEN,
+            &hello_frame(TOKEN, crate::API_VERSION),
+        );
+        for method in [
+            "agent.attach",
+            "agent.detach",
+            "agent.stop",
+            "agent.list",
+            "tunnel.send",
+        ] {
+            let frame = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": {}});
+            assert_eq!(
+                handle_local(&mut handshake, TOKEN, &frame),
+                Local::Route,
+                "{method} must be routed"
+            );
+        }
     }
 
     #[test]
-    fn invalid_json_is_a_parse_error() {
+    fn invalid_json_frames_are_parse_errors() {
         let mut handshake = Handshake::default();
-        let outcome = handle_line(&mut handshake, TOKEN, 1, "{not json");
-        let response = reply(&outcome);
-        assert_eq!(error_code(response), Some(PARSE_ERROR));
-        assert_eq!(response["id"], Value::Null);
+        let local = handle_local(&mut handshake, TOKEN, &json!("text"));
+        assert_eq!(error_code(reply(&local)), Some(PARSE_ERROR));
     }
 
     #[test]
-    fn a_request_without_a_method_is_invalid() {
+    fn a_frame_without_a_method_is_invalid() {
         let mut handshake = Handshake::default();
-        let outcome = handle_line(&mut handshake, TOKEN, 1, "{\"jsonrpc\":\"2.0\",\"id\":1}");
-        assert_eq!(error_code(reply(&outcome)), Some(INVALID_REQUEST));
+        let frame = json!({"jsonrpc": "2.0", "id": 1});
+        assert_eq!(
+            error_code(reply(&handle_local(&mut handshake, TOKEN, &frame))),
+            Some(INVALID_REQUEST)
+        );
     }
+}
 
-    #[test]
-    fn notifications_get_no_response() {
-        let mut handshake = Handshake::default();
-        handle_line(&mut handshake, TOKEN, 1, &hello(TOKEN, 1));
-        let line = json!({"jsonrpc": "2.0", "method": "ping"}).to_string();
-        let outcome = handle_line(&mut handshake, TOKEN, 1, &line);
-        assert_eq!(outcome.response, None);
+#[cfg(test)]
+mod big_line_tests {
+    use super::*;
+    use tokio::io::BufReader;
+
+    /// The limit of PROTOCOL.md section 6, above the one of section 2.
+    const AGENT_LIMIT: usize = 32 * 1024 * 1024;
+
+    #[tokio::test]
+    async fn a_huge_line_is_dropped_and_reading_resumes() {
+        let mut data = vec![b'x'; AGENT_LIMIT + 1];
+        data.push(b'\n');
+        data.extend_from_slice(b"{\"ok\":1}\n");
+        let mut reader = BufReader::with_capacity(8 * 1024, &data[..]);
+        let line = read_line_limited(&mut reader, AGENT_LIMIT)
+            .await
+            .expect("read");
+        assert!(matches!(line, Line::TooLong(_)), "got {line:?}");
+        let line = read_line_limited(&mut reader, AGENT_LIMIT)
+            .await
+            .expect("read next");
+        assert_eq!(line, Line::Text("{\"ok\":1}".to_string()));
     }
 }

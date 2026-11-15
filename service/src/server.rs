@@ -8,11 +8,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use serde_json::Value;
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 
+use crate::hub::{Command, Hub, HubEvent, Outbox};
 use crate::paths::Paths;
-use crate::protocol::{self, Handshake, Outcome};
+use crate::protocol::{self, Local};
+use crate::runtime::StopTimeouts;
 use crate::transport::{self, Listener, Stream};
 use crate::{token, API_VERSION};
 
@@ -20,8 +23,8 @@ use crate::{token, API_VERSION};
 /// allowed, handy for tests).
 pub const IDLE_TIMEOUT_ENV: &str = "NVIM_ADE_SERVER_IDLE_TIMEOUT_SECS";
 
-/// Default idle timeout: exit after this long without any client.
-pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Default idle timeout (PROTOCOL.md section 8).
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
 
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
@@ -29,6 +32,18 @@ pub struct ServeOptions {
     pub socket: Option<PathBuf>,
     /// Idle timeout; `None` means "use the environment or the default".
     pub idle_timeout: Option<Duration>,
+    /// Stop timings for agent processes; `None` uses the environment/default.
+    pub stop_timeouts: Option<StopTimeouts>,
+}
+
+impl ServeOptions {
+    pub fn new(socket: Option<PathBuf>, idle_timeout: Option<Duration>) -> Self {
+        Self {
+            socket,
+            idle_timeout,
+            stop_timeouts: None,
+        }
+    }
 }
 
 pub enum ServeStatus {
@@ -81,6 +96,7 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
         None => Paths::resolve()?,
     };
     let timeout = idle_timeout(options.idle_timeout)?;
+    let stop_timeouts = options.stop_timeouts.unwrap_or_else(StopTimeouts::from_env);
 
     prepare_dir(&paths)?;
     let lock = match acquire_lock(&paths)? {
@@ -131,18 +147,39 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
     );
 
     let shutdown = Arc::new(Notify::new());
+    let stopped = Arc::new(Notify::new());
+    let (hub_commands, hub_commands_rx) = mpsc::channel::<Command>(256);
+    let (hub_events, mut hub_events_rx) = mpsc::unbounded_channel::<HubEvent>();
+
+    let hub = Hub::new(
+        hub_commands_rx,
+        hub_events,
+        Arc::clone(&stopped),
+        stop_timeouts,
+    );
+    let hub_task = tokio::spawn(hub.run());
+
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<ConnectionEvent>();
     let mut active: usize = 0;
+    let mut next_conn: u64 = 0;
+    let mut busy = false;
     // No client has connected yet, so the idle clock starts now.
     let mut idle_since = Some(tokio::time::Instant::now());
+    let shutting_down = false;
 
     let termination = termination_signal();
     tokio::pin!(termination);
 
     loop {
-        let deadline = idle_since.map(|since| since + timeout);
+        // Idle only when no connection is open and nothing is in flight.
+        let idle_deadline = if active == 0 && !busy {
+            idle_since.map(|since| since + timeout)
+        } else {
+            idle_since = None;
+            None
+        };
         let sleeping = async {
-            match deadline {
+            match idle_deadline {
                 Some(deadline) => tokio::time::sleep_until(deadline).await,
                 None => std::future::pending().await,
             }
@@ -161,12 +198,20 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
                 break;
             }
 
-            accepted = listener.accept() => {
+            accepted = listener.accept(), if !shutting_down => {
                 match accepted {
                     Ok(stream) => {
+                        next_conn += 1;
                         active += 1;
                         idle_since = None;
-                        spawn_connection(stream, token.clone(), shutdown.clone(), events_tx.clone());
+                        spawn_connection(
+                            next_conn,
+                            stream,
+                            token.clone(),
+                            shutdown.clone(),
+                            hub_commands.clone(),
+                            events_tx.clone(),
+                        );
                     }
                     Err(error) => {
                         eprintln!("nvim_ade_server: accept failed: {error}");
@@ -187,9 +232,23 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
                 }
             }
 
+            event = hub_events_rx.recv() => {
+                match event {
+                    Some(HubEvent::Busy(value)) => {
+                        busy = value;
+                        if busy {
+                            idle_since = None;
+                        } else if active == 0 {
+                            idle_since = Some(tokio::time::Instant::now());
+                        }
+                    }
+                    None => {}
+                }
+            }
+
             _ = sleeping => {
                 eprintln!(
-                    "nvim_ade_server: no clients for {}s, exiting",
+                    "nvim_ade_server: idle for {}s, exiting",
                     duration_secs(timeout)
                 );
                 break;
@@ -197,9 +256,22 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
         }
     }
 
+    // Run the stop sequence for every instance before the socket goes away.
+    stop_instances(&hub_commands, &stopped).await;
     listener.cleanup();
+    drop(hub_commands);
+    let _ = hub_task.await;
     drop(lock);
     Ok(ServeStatus::Exited { socket })
+}
+
+/// Ask the hub to stop every instance and wait until it is done.
+async fn stop_instances(commands: &mpsc::Sender<Command>, stopped: &Notify) {
+    let notified = stopped.notified();
+    tokio::pin!(notified);
+    if commands.send(Command::Shutdown).await.is_ok() {
+        let _ = notified.await;
+    }
 }
 
 fn duration_secs(duration: Duration) -> String {
@@ -243,28 +315,69 @@ async fn termination_signal() {
 }
 
 fn spawn_connection(
+    conn: u64,
     stream: Stream,
     token: String,
     shutdown: Arc<Notify>,
+    hub: mpsc::Sender<Command>,
     events: mpsc::UnboundedSender<ConnectionEvent>,
 ) {
     tokio::spawn(async move {
-        if let Err(error) = handle_connection(stream, &token, &shutdown).await {
+        if let Err(error) = handle_connection(conn, stream, &token, &shutdown, &hub).await {
             eprintln!("nvim_ade_server: connection error: {error}");
         }
+        let _ = hub.send(Command::Disconnected { conn }).await;
         let _ = events.send(ConnectionEvent::Closed);
     });
 }
 
-async fn handle_connection(stream: Stream, token: &str, shutdown: &Notify) -> io::Result<()> {
-    let (reader, mut writer) = tokio::io::split(stream);
+async fn handle_connection(
+    conn: u64,
+    stream: Stream,
+    token: &str,
+    shutdown: &Notify,
+    hub: &mpsc::Sender<Command>,
+) -> io::Result<()> {
+    let (reader, writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
-    let mut handshake = Handshake::default();
 
-    loop {
-        let line = match protocol::read_message(&mut reader).await {
+    // The writer task owns the outbound side: the hub and this task only
+    // queue bytes, so frames from both are written one after another.
+    let (close_tx, close_rx) = watch::channel(false);
+    let (outbox, mut outbox_rx) = Outbox::new(close_tx.clone());
+    let mut writer = writer;
+    let writer_task = tokio::spawn(async move {
+        while let Some(bytes) = outbox_rx.recv().await {
+            if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err() {
+                return;
+            }
+        }
+    });
+
+    let mut handshake = protocol::Handshake::default();
+    let _ = hub
+        .send(Command::Register {
+            conn,
+            outbox: outbox.clone(),
+        })
+        .await;
+
+    let mut close_rx = close_rx;
+    let result = loop {
+        // The hub closes the connection when its outbound queue would exceed
+        // its limit; that must end the connection even while no frame arrives.
+        let line = tokio::select! {
+            biased;
+            changed = close_rx.changed() => {
+                let _ = changed;
+                break Ok(());
+            }
+            line = protocol::read_message(&mut reader, protocol::MAX_MESSAGE_BYTES) => line,
+        };
+
+        let line = match line {
             Ok(Some(line)) => line,
-            Ok(None) => return Ok(()),
+            Ok(None) => break Ok(()),
             // A client that goes away mid-line is a normal disconnect, not an
             // error worth reporting.
             Err(error)
@@ -272,56 +385,99 @@ async fn handle_connection(stream: Stream, token: &str, shutdown: &Notify) -> io
                     || error.kind() == io::ErrorKind::UnexpectedEof
                     || error.kind() == io::ErrorKind::ConnectionReset =>
             {
-                return Ok(())
+                break Ok(())
             }
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                // Framing errors are per-connection: the stream cannot be
-                // resynchronised, so drop this client.
                 eprintln!("nvim_ade_server: dropping client: {error}");
-                return Ok(());
+                break Ok(());
             }
-            Err(error) => return Err(error),
+            Err(error) => break Err(error),
         };
         if line.trim().is_empty() {
             continue;
         }
 
+        let frame: Value = match serde_json::from_str(&line) {
+            Ok(frame) => frame,
+            Err(_) => {
+                // The stream is still in sync, so report and keep going.
+                outbox.send(&parse_error());
+                continue;
+            }
+        };
+
         let was_authenticated = handshake.is_authenticated();
-        let outcome = protocol::handle_line(&mut handshake, token, API_VERSION, &line);
-        let close = outcome.close;
-        let stopping = outcome.shutdown;
-        write_outcome(&mut writer, outcome).await?;
-        if !was_authenticated && handshake.is_authenticated() {
-            eprintln!(
-                "nvim_ade_server: client {} ({}) authenticated",
-                handshake.client().unwrap_or("unknown"),
-                handshake.client_version().unwrap_or("unknown")
-            );
+        match protocol::handle_local(&mut handshake, token, &frame) {
+            Local::Reply(response) => {
+                if handshake.is_authenticated() && !was_authenticated {
+                    log_authenticated(&handshake);
+                }
+                // A null response means "no reply" (notification).
+                if !response.is_null() {
+                    outbox.send(&response);
+                }
+            }
+            Local::Close(response) => {
+                outbox.send(&response);
+                flush_outbox(&outbox).await;
+                break Ok(());
+            }
+            Local::Shutdown(response) => {
+                if !response.is_null() {
+                    outbox.send(&response);
+                }
+                flush_outbox(&outbox).await;
+                shutdown.notify_one();
+                break Ok(());
+            }
+            Local::Route => {
+                if handshake.is_authenticated() && !was_authenticated {
+                    log_authenticated(&handshake);
+                }
+                if hub.send(Command::Frame { conn, frame }).await.is_err() {
+                    break Ok(());
+                }
+            }
         }
-        if stopping {
-            // `notify_one` keeps a permit if the main loop is not waiting yet,
-            // so this signal cannot be lost.
-            shutdown.notify_one();
-            return Ok(());
-        }
-        if close {
-            return Ok(());
-        }
-    }
+    };
+
+    // The hub may still hold a clone of the outbox; closing the watch makes
+    // every later send fail, and aborting the writer releases the socket.
+    flush_outbox(&outbox).await;
+    close_tx.send(true).ok();
+    cancel_writer(writer_task).await;
+    result
 }
 
-async fn write_outcome<W>(writer: &mut W, outcome: Outcome) -> io::Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    if let Some(response) = outcome.response {
-        protocol::write_message(writer, &response).await?;
-    }
-    if outcome.close || outcome.shutdown {
-        // Half-close so the client sees a clean end of stream.
-        writer.shutdown().await?;
-    }
-    Ok(())
+/// Wait (briefly) until every queued frame was written.
+async fn flush_outbox(outbox: &Outbox) {
+    let _ = tokio::time::timeout(Duration::from_millis(200), async {
+        while !outbox.is_empty() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await;
+}
+
+async fn cancel_writer(task: tokio::task::JoinHandle<()>) {
+    task.abort();
+    let _ = task.await;
+}
+
+fn log_authenticated(handshake: &protocol::Handshake) {
+    eprintln!(
+        "nvim_ade_server: client {} ({}) authenticated",
+        handshake.client().unwrap_or("unknown"),
+        handshake.client_version().unwrap_or("unknown")
+    );
+}
+
+fn parse_error() -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": null,
+        "error": { "code": protocol::PARSE_ERROR, "message": "parse error" },
+    })
 }
 
 /// Create the directory with permission 0700.
@@ -449,8 +605,6 @@ fn socket_string(paths: &Paths) -> String {
     transport::socket_display(paths.socket())
 }
 
-/// Write the `ready` line to stdout and flush it, so a parent process waiting
-/// on the pipe sees it immediately.
 /// Write the `ready` line to stdout and flush it, so the parent process that
 /// waits on the pipe sees it immediately.
 fn announce_ready(socket: &str) -> Result<()> {
@@ -477,9 +631,9 @@ mod tests {
     }
 
     #[test]
-    fn idle_timeout_defaults_to_ten_minutes() {
+    fn idle_timeout_defaults_to_thirty_minutes() {
         let timeout = idle_timeout_from(None, env(&[])).expect("default");
-        assert_eq!(timeout, Duration::from_secs(600));
+        assert_eq!(timeout, Duration::from_secs(1800));
         assert_eq!(timeout, DEFAULT_IDLE_TIMEOUT);
     }
 
