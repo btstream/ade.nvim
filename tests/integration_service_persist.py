@@ -49,6 +49,10 @@ except ImportError:  # pragma: no cover - optional test dependency
 
 ROOT = str(Path(__file__).resolve().parent.parent)
 MOCK_AGENT = str(Path(ROOT) / "tests" / "mock_agent.py")
+
+# Imported by path so the script works when invoked from any directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import persist_helpers as helpers  # noqa: E402
 MINIMAL_INIT = str(Path(ROOT) / "tests" / "minimal_init.lua")
 WAIT = 20.0
 
@@ -178,6 +182,28 @@ def wait_until(condition, timeout=WAIT, interval=0.05, label="condition"):
 
 def wait_gone(pid, timeout=WAIT, label="process to exit"):
     return wait_until(lambda: not pid_alive(pid), timeout, 0.05, label)
+
+
+def _cmdline(pid):
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(
+            "utf-8", "replace"
+        )
+    except OSError:
+        return ""
+
+
+def _env_of(pid):
+    try:
+        return Path(f"/proc/{pid}/environ").read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _all_pids():
+    for entry in Path("/proc").iterdir():
+        if entry.name.isdigit():
+            yield int(entry.name)
 
 
 def pids_matching(pattern):
@@ -352,7 +378,7 @@ class Editor:
         self.messages = []
         self._log_handle = None
 
-    def start(self, service_env=None):
+    def start(self, service_env=None, service=None, idle_timeout=None):
         env = dict(os.environ)
         env.update(isolated_env(self.case_dir))
         # `minimal_init.lua` wires a service backend from these when they are set
@@ -391,19 +417,27 @@ class Editor:
                 return None
 
         self.nvim = wait_until(attach, WAIT, 0.05, f"{self.label} to accept a connection")
-        self.configure()
+        self.configure(idle_timeout=idle_timeout, service=service)
 
-    def configure(self, idle_timeout=None):
+    def configure(self, idle_timeout=None, service=None):
+        """Call `require("ade").setup` with the scenario's service settings.
+
+        `service` merges over the defaults, so scenario 12 can turn the event log
+        off and scenario 15 can cap the reconnect attempts without repeating the
+        whole table.
+        """
         # The plugin's minimum is 60 s; scenario 2 needs a shorter one, which the
         # service takes from NVIM_ADE_SERVER_IDLE_TIMEOUT_SECS (see its start()).
         timeout = idle_timeout if idle_timeout is not None else self.idle_timeout
+        service_opts = {
+            "path": self.binary,
+            "keep_alive": True,
+            "idle_timeout": timeout,
+        }
+        service_opts.update(service or {})
         opts = {
             "backend": "service",
-            "service": {
-                "path": self.binary,
-                "keep_alive": True,
-                "idle_timeout": timeout,
-            },
+            "service": service_opts,
             "agent": "opencode",
             "agents": {
                 "opencode": {
@@ -536,6 +570,83 @@ class Editor:
             """
         )
         return normalize(raw or [])
+
+    def attach_info(self):
+        """What `agent.attach` reported: `created`, `sessions` (PROTOCOL.md 3.2)."""
+        raw = self.lua(
+            """
+            local client = require("ade.controller").state().conn.client
+            if not client then
+              return nil
+            end
+            local sessions = {}
+            for _, entry in ipairs(client.sessions or {}) do
+              sessions[#sessions + 1] = {
+                session_id = entry.sessionId,
+                id = entry.id,
+                cwd = entry.cwd,
+                running = entry.running,
+                updated_at = entry.updated_at,
+              }
+            end
+            return {
+              created = client.created,
+              sessions = sessions,
+              instance = client.proc and client.proc.instance,
+            }
+            """
+        )
+        return normalize(raw)
+
+    def reconnect_status(self):
+        """The transient "reconnecting (n/m)" text, or nil when not retrying."""
+        return self.lua(
+            "return require('ade.controller').state().conn.reconnect_status"
+        )
+
+    def reconnector_state(self):
+        raw = self.lua(
+            """
+            local r = require("ade.controller").state().conn.reconnector
+            if not r then
+              return nil
+            end
+            return { running = r.running, attempt = r.attempt }
+            """
+        )
+        return normalize(raw)
+
+    def service_connection_listeners(self):
+        """Who subscribes to `__disconnected` on the real service connection.
+
+        `S.conn.service` is the application connection; the transport, the
+        reconnect loop and the panel all subscribe on the service connection it
+        wraps, which is what `service_connection()` returns. Returns
+        `{methods: [...], channels: {method: [channel ids]}}`.
+        """
+        raw = self.lua(
+            """
+            local app = require("ade.controller").state().conn.service
+            if type(app.service_connection) ~= "function" then
+              return { methods = {}, channels = {} }
+            end
+            local real = app:service_connection()
+            local methods, channels = {}, {}
+            for method, list in pairs(real.listeners or {}) do
+              methods[#methods + 1] = method
+              local ids = {}
+              for id in pairs(list) do ids[#ids + 1] = id end
+              table.sort(ids)
+              channels[method] = ids
+            end
+            table.sort(methods)
+            return { methods = methods, channels = channels }
+            """
+        )
+        return normalize(raw or {"methods": [], "channels": {}})
+
+    def session_status(self):
+        return (self.state().get("session") or {}).get("status")
 
     def answer_permission(self, option_id="allow"):
         self.lua(
@@ -748,21 +859,30 @@ class Case:
         self.editors.append(editor)
         return editor
 
-    def raw_service(self, idle_timeout):
-        service = RawService(self.binary, os.path.join(self.dir, "raw"), idle_timeout)
+    def raw_service(self, idle_timeout, binary=None):
+        """A service started by the test itself, without Neovim."""
+        service = RawService(binary or self.binary, os.path.join(self.dir, "raw"), idle_timeout)
         os.makedirs(os.path.join(self.dir, "raw"), exist_ok=True)
         self.raw.append(service)
         return service
 
     def service_pid(self):
-        pids = pids_matching(os.path.join(self.dir, "server", "nvim_ade_server.sock"))
-        if not pids:
-            pids = [
-                pid
-                for pid in pids_matching("nvim_ade_server serve")
-                if self._env_dir_of(pid) == os.path.join(self.dir, "server")
-            ]
-        return pids[0] if pids else None
+        """The pid of the service this case started (never anyone else's).
+
+        Matching is by the process environment: `NVIM_ADE_SERVER_DIR` points at
+        this case's directory, which no other service on the machine shares.
+        Both the real binary and the scenario wrappers (a python script, a shell
+        script) are matched through it, so a wrapped service is still found.
+        """
+        candidates = []
+        for pid in pids_matching("nvim_ade_server"):
+            if self._env_dir_of(pid) == os.path.join(self.dir, "server"):
+                candidates.append((pid, _cmdline(pid)))
+        # A wrapper also listens on the socket but does not have "nvim_ade_server"
+        # in its command line; prefer the real service when both exist, since
+        # killing it is what the scenario means by "kill the service".
+        real = [pid for pid, line in candidates if "nvim_ade_server" in line]
+        return (real or [pid for pid, _ in candidates] or [None])[0]
 
     @staticmethod
     def _env_dir_of(pid):
@@ -818,13 +938,21 @@ class Case:
                     pass
 
     def _service_pids(self):
-        """Services belonging to this case: the plugin's and the raw ones."""
+        """Every process of this case's service, wrappers included.
+
+        Matched only by `NVIM_ADE_SERVER_DIR` in the process environment, which
+        is this case's private directory. That finds the real binary and the
+        scenario wrappers (a python or shell script) that proxy it, so nothing
+        this case started survives it.
+        """
+        own = {
+            os.path.join(self.dir, "server"),
+            os.path.join(self.dir, "raw", "server"),
+        }
         out = []
-        for pid in pids_matching("nvim_ade_server"):
+        for pid in _all_pids():
             directory = self._env_dir_of(pid)
-            if directory and (directory == os.path.join(self.dir, "server")):
-                out.append(pid)
-            elif directory and directory.startswith(os.path.join(self.dir, "raw")):
+            if directory in own:
                 out.append(pid)
         return out
 
@@ -1496,6 +1624,828 @@ Editor.wait_until_permission = _wait_until_permission
 
 
 # ---------------------------------------------------------------------------
+# S1b scenarios: the event log, replay, turn adoption, reconnect
+# ---------------------------------------------------------------------------
+
+
+def scenario_reopen_restores(case):
+    """10. Opening a new editor shows the conversation the log holds.
+
+    `service.restore` (default true) reopens the most recent session for this
+    cwd when the instance already exists. The transcript must come back from the
+    service's event log through the emulated `session/load` (PROTOCOL.md 10-12),
+    with the same session id, and chat must continue in it.
+
+    Known defect (reported, fix in progress): `app/restore.lua` reads `entry.id`
+    while `agent.attach` reports `sessionId` (PROTOCOL.md 3.2), so nothing is
+    ever restored; and `Sessions:close_all_on_exit` sends `session/close` on
+    exit, which makes the service forget the session. Both are asserted against
+    the spec here, not worked around.
+    """
+    first = case.editor("a")
+    first.start()
+    first.connect()
+    first.submit("hello one")
+    first.wait_reply("Hello from the mock agent")
+    first.wait_turn_idle()
+    first.submit("hello two")
+    first.wait_reply("Hello from the mock agent")
+    first.wait_turn_idle()
+    before = first.state()
+    session_id = before["session"]["id"]
+    before_transcript = first.transcript()
+    assert_true(
+        any(b["kind"] == "user" and b["text"] == "hello one" for b in before_transcript),
+        f"the first editor did not record its own messages: {before_transcript!r}",
+    )
+    first.quit()
+
+    second = case.editor("b")
+    second.start()
+    second.capture_notifications()
+    second.connect()
+
+    # The instance is reused, so restoring is possible at all.
+    instances = second.wait_instances(lambda list_: len(list_) == 1, "one instance")
+    assert_true(instances[0]["sessions"] >= 1, "the service must still track a session")
+
+    attach = second.attach_info()
+    assert_true(attach is not None, "no client to inspect")
+    # `Client:initialize` computes `created` with `x and y or nil`, which turns a
+    # legitimate `false` ("reused an existing instance") into nil. Restore then
+    # bails out on its first guard and never loads anything.
+    assert_true(
+        attach.get("created") is False,
+        "the second editor cannot tell that it reused an existing instance: "
+        f"created={attach.get('created')!r} (attach {attach!r}). "
+        "`Client:initialize` folds `false` into nil via `proc.created or nil`, and "
+        "`Restore:after_ready` requires exactly `false`.",
+    )
+
+    state = second.wait_state(
+        lambda st: (st.get("session") or {}).get("id") == session_id,
+        f"the previous session ({session_id}) to be restored",
+    )
+    # The transcript is the point: it has to come back from the log.
+    transcript = wait_until(
+        lambda: (
+            second.transcript()
+            if any(
+                block["kind"] == "user" and block["text"] in ("hello one", "hello two")
+                for block in second.transcript()
+            )
+            else None
+        ),
+        WAIT,
+        0.1,
+        "the replayed conversation",
+    )
+    texts = [block["text"] for block in transcript if block["kind"] == "user"]
+    for expected in ("hello one", "hello two"):
+        assert_true(
+            expected in texts,
+            "the reopened editor must show the earlier prompts; it shows "
+            f"{texts!r}. attach reported {attach!r}.",
+        )
+    assert_true(
+        any(block["kind"] == "agent" for block in transcript),
+        f"the agent's replies must be replayed too: {transcript!r}",
+    )
+    assert_true(
+        state["session"]["id"] == session_id,
+        f"the session id changed: {state['session']!r}",
+    )
+
+    second.submit("hello three")
+    second.wait_reply("Hello from the mock agent")
+    second.wait_turn_idle()
+
+
+def scenario_adopt_running_turn(case):
+    """11. A turn that was running when the editor closed is adopted.
+
+    PROTOCOL.md 13: the front end that loads the session takes over the orphaned
+    `session/prompt`; the session shows as running, cancelling it ends the turn,
+    and chat continues afterwards.
+
+    Depends on the same restore defect as scenario 10 (nothing is loaded, so
+    nothing is adopted); asserted per spec.
+    """
+    first = case.editor("a")
+    first.start()
+    first.connect()
+    first.submit("slow please")
+    first.wait_instances(
+        lambda list_: len(list_) == 1 and list_[0].get("turns_running", 0) == 1,
+        "the turn to start",
+    )
+    # Wait for the first streamed chunk, so the transcript has partial output.
+    partial = first.wait_reply("working")
+    session_id = first.state()["session"]["id"]
+    first.quit()
+
+    second = case.editor("b")
+    second.start()
+    second.capture_notifications()
+    second.connect()
+
+    # The service kept the turn: its counter is still one.
+    running = second.wait_instances(
+        lambda list_: len(list_) == 1 and list_[0].get("turns_running", 0) == 1,
+        "the turn to still be running",
+    )
+    assert_true(running[0]["sessions"] >= 1, "the service must still track the session")
+
+    # The adopted session must be the one from the closed editor, with the
+    # partial output already in its transcript.
+    restored = second.wait_state(
+        lambda st: (st.get("session") or {}).get("id") == session_id,
+        f"the running session ({session_id}) to be loaded",
+    )
+    try:
+        transcript = wait_until(
+            lambda: (
+                second.transcript()
+                if any(block["text"] == partial["text"] for block in second.transcript())
+                else None
+            ),
+            WAIT,
+            0.1,
+            "the partial output to be replayed",
+        )
+    except TimeoutError:
+        raise AssertionError(
+            "the running turn was not adopted: its partial output never reached the "
+            f"second editor (transcript {second.transcript()!r}, attach "
+            f"{second.attach_info()!r}). Adoption follows a session load "
+            "(PROTOCOL.md 13), so this fails for the same reason as scenario 10."
+        ) from None
+    assert_true(
+        any(block["text"] == "slow please" for block in transcript),
+        f"the prompt of the running turn must be in the replay: {transcript!r}",
+    )
+
+    # The adopted turn looks running in the UI: the session status is not idle.
+    status = second.wait_state(
+        lambda st: (st.get("session") or {}).get("status") not in (None, "idle"),
+        "the adopted turn to show as running",
+    )
+    assert_true(
+        status["session"]["status"] != "idle",
+        f"the adopted turn must look running, status is {status['session']['status']!r}",
+    )
+
+    # Cancelling ends it, and the service's counter drops to zero.
+    second.lua(
+        """
+        local st = require("ade.controller").state()
+        st.conn.client:cancel(st.session.id)
+        """
+    )
+    second.wait_instances(
+        lambda list_: len(list_) == 1 and list_[0].get("turns_running", 0) == 0,
+        "the adopted turn to stop",
+    )
+    second.wait_turn_idle()
+    second.submit("hello after adopt")
+    second.wait_reply("Hello from the mock agent")
+    second.wait_turn_idle()
+
+
+def scenario_log_disabled(case):
+    """12. `service.event_log = false`: reattach, but no replay.
+
+    PROTOCOL.md 10: with the log off, `features` has no `"log"`, `attach` returns
+    no sessions and section 12 never applies. The agent instance is still shared,
+    so the second editor attaches to it; its conversation starts empty and chat
+    works. No error is reported.
+    """
+    first = case.editor("a")
+    first.start(service={"event_log": False})
+    first.connect()
+    first.submit("hello one")
+    first.wait_reply("Hello from the mock agent")
+    first.wait_turn_idle()
+    before = first.instances()
+    agent_pid = before[0]["pid"]
+    assert_true(
+        before[0].get("log_bytes", 0) == 0,
+        f"with the log off nothing is recorded, got {before[0].get('log_bytes')} bytes",
+    )
+    first.quit()
+
+    second = case.editor("b")
+    second.start(service={"event_log": False})
+    second.capture_notifications()
+    second.connect()
+
+    instances = second.wait_instances(lambda list_: len(list_) == 1, "one instance")
+    assert_true(
+        instances[0]["pid"] == agent_pid,
+        "the second editor must attach to the same agent",
+    )
+    assert_true(
+        instances[0].get("sessions", 0) == 0,
+        f"no sessions are tracked without a log, got {instances[0].get('sessions')}",
+    )
+    attach = second.attach_info()
+    assert_true(attach is not None, "no client to inspect")
+    # Reuse is asserted through the pid above; `created` is not asserted here
+    # because a separate defect (`Client:initialize` folds `false` into nil) makes
+    # it unavailable, and scenario 10 covers that defect directly.
+    assert_true(
+        not attach.get("sessions"),
+        f"attach must report no sessions without a log: {attach!r}",
+    )
+    assert_true(
+        not second.transcript(),
+        f"nothing can be replayed without a log: {second.transcript()!r}",
+    )
+    assert_true(
+        not any("error" in line.lower() or "unable" in line.lower() for line in second.notify_lines()),
+        f"turning the log off must not produce an error: {second.notify_lines()!r}",
+    )
+    # `Restore:after_ready` reports "the service has no sessions to restore"
+    # once; that is the documented explanation, not an error.
+    assert_true(
+        not any("error" in line.lower() or "unable" in line.lower() for line in second.notify_lines()),
+        f"no failure may be reported: {second.notify_lines()!r}",
+    )
+
+    second.submit("hello two")
+    second.wait_reply("Hello from the mock agent")
+    second.wait_turn_idle()
+
+
+def scenario_pruned_log_falls_back(case):
+    """13. A log too large to replay falls back to the agent's `session/load`.
+
+    PROTOCOL.md 12: above the replay ceiling the service forwards `session/load`
+    instead of answering it from the log. The ceiling is 32 MiB, and
+    `--event-log-max-mb` cannot go below 16, so filling it with real events would
+    mean hundreds of MiB. The service reads the ceiling from
+    `NVIM_ADE_SERVER_REPLAY_LIMIT_BYTES` (a documented test hook in
+    `service/src/hub.rs`), so the wrapper sets it below the log this scenario
+    records.
+
+    The observable difference is what comes back: the service replays what the
+    front end recorded, while the agent's own `session/load` replays the mock's
+    canned history ("old question" / "old answer"). This drives the service
+    protocol directly, because the plugin-side restore path is broken
+    independently (scenario 10) and would hide the fallback.
+    """
+    proxy = _write_trim_proxy(case)
+    raw = case.raw_service(idle_timeout=60, binary=proxy)
+    status = raw.start()
+    assert_true(status["status"] == "ready", f"the service did not start: {status!r}")
+    service_pid = status["pid"]
+    hello = raw.connect()
+    assert_true(
+        "log" in hello["features"],
+        f"the log must be on for this scenario: {hello!r}",
+    )
+
+    key = {
+        "agent": "opencode",
+        "command": "python3",
+        "args": [MOCK_AGENT],
+        "cwd": ROOT,
+    }
+    attached = raw.request("agent.attach", {"key": key, "client_capabilities": {}, "env": {}})
+    instance = attached["instance"]
+    conversation = RawConversation(raw, instance)
+    conversation.open()
+    conversation.prompt("hello one")
+    conversation.prompt("hello two")
+    listed = raw.request("agent.list", {})["instances"]
+    log_bytes = listed[0].get("log_bytes", 0)
+    assert_true(
+        log_bytes > 0,
+        "the log must hold the recorded events before testing the fallback",
+    )
+    assert_true(
+        log_bytes > 1000,
+        f"the wrapper sets the replay ceiling at 1 000 bytes; the log has {log_bytes}",
+    )
+
+    # A second connection loads the session. Above the ceiling the service must
+    # forward the request, and the agent answers with its own replay.
+    loader = RawConversation(raw, instance)
+    loader.replay = conversation.replay = []
+    replay = conversation.load_session("sess_mock")
+    texts = [text for text in replay if text]
+    assert_true(
+        "old question" in texts,
+        "the fallback must use the agent's session/load; the service's own replay "
+        f"would instead show the prompts 'hello one'/'hello two'. Got {texts!r} "
+        f"(log bytes {log_bytes}).",
+    )
+    assert_true(
+        "hello one" not in texts,
+        f"the service must not answer this load from the log: {texts!r}",
+    )
+    # And the service is still healthy afterwards.
+    assert_true(pid_alive(service_pid), "the service must survive the fallback")
+    conversation.prompt("hello three")
+
+
+def scenario_auto_reconnect(case):
+    """14. An unexpected service death reconnects automatically.
+
+    `service.reconnect_attempts` retries with backoff, and the manual
+    `:Ade reconnect` path runs on success. A deliberate `:Ade service stop` must
+    **not** start the loop.
+    """
+    editor = case.editor("a")
+    editor.start(service={"reconnect_attempts": 3})
+    editor.capture_notifications()
+    editor.connect()
+    editor.submit("hello one")
+    editor.wait_reply("Hello from the mock agent")
+    editor.wait_turn_idle()
+
+    # The reconnect loop must be wired at all. `bootstrap.lua` subscribes it as
+    # the "panel" channel on the *real* service connection; a subscription on the
+    # application wrapper is silently skipped (that object has no `subscribe`).
+    listeners = editor.service_connection_listeners()
+    panel = (listeners.get("channels") or {}).get("__disconnected") or []
+    assert_true(
+        "panel" in panel,
+        "nothing subscribes the panel to __disconnected, so an unexpected drop "
+        "can never start the reconnect loop. Subscribers on the real service "
+        f"connection: {listeners!r}",
+    )
+
+    service_pid = case.service_pid()
+    assert_true(service_pid, "the service must be running")
+    os.kill(service_pid, signal.SIGKILL)
+    wait_gone(service_pid, WAIT, "the killed service")
+
+    # The UI says it is reconnecting while it retries.
+    status = wait_until(
+        lambda: editor.reconnect_status() if editor.reconnect_status() else None,
+        WAIT,
+        0.05,
+        "the reconnecting status",
+    )
+    assert_true(
+        "reconnect" in str(status),
+        f"the status must say it is reconnecting, got {status!r}",
+    )
+    reconnected = editor.wait_notifications(
+        lambda lines: any("reconnected" in line for line in lines),
+        "the reconnected message",
+        timeout=WAIT + 10,
+    )
+    assert_true(
+        any("reconnected" in line for line in reconnected),
+        f"the editor never reported a reconnection: {reconnected!r}",
+    )
+    editor.connect()
+    editor.submit("hello after reconnect")
+    editor.wait_reply("Hello from the mock agent")
+    editor.wait_turn_idle()
+
+    # A deliberate stop is not an accident: no retry loop, no "reconnected".
+    editor.clear_notifications()
+    editor.run_command("Ade service stop")
+    time.sleep(1.5)
+    lines = editor.notify_lines()
+    assert_true(
+        not any("reconnected" in line or "reconnecting" in line for line in lines),
+        f"`:Ade service stop` must not reconnect: {lines!r}",
+    )
+    state = editor.reconnector_state()
+    assert_true(
+        state is not None and state.get("running") is False,
+        f"no retry loop may be running after a deliberate stop: {state!r}",
+    )
+
+
+def scenario_crash_loop(case):
+    """15. A service that dies immediately is not retried forever.
+
+    The wrapper starts the real service but kills itself shortly after, so every
+    reconnect succeeds and then drops again. With `service.reconnect_attempts = 3`
+    the loop must give up and say so, instead of restarting a service forever.
+    """
+    editor = case.editor("a")
+    proxy = _write_crash_proxy(case)
+    editor.start(service={"path": proxy, "reconnect_attempts": 3})
+    editor.capture_notifications()
+    editor.connect()
+
+    # Without the retry loop wired there is nothing to give up: say so instead of
+    # waiting out the ladder for a loop that will never run.
+    listeners = editor.service_connection_listeners()
+    panel = (listeners.get("channels") or {}).get("__disconnected") or []
+    if "panel" not in panel:
+        raise AssertionError(
+            "no automatic retry happens at all: nothing subscribes the panel to "
+            "__disconnected, so the loop that should give up after "
+            f"service.reconnect_attempts=3 never starts. Subscribers: {listeners!r}"
+        )
+
+    # Wait for the loop to exhaust itself. The backoff is 0.5s, 1s, 2s, so this
+    # needs a few seconds; polling keeps it as fast as the ladder allows.
+    gave_up = wait_until(
+        lambda: [
+            line
+            for line in editor.notify_lines()
+            if "could not reconnect" in line or "keeps disconnecting" in line
+        ]
+        or None,
+        WAIT + 20,
+        0.2,
+        "the reconnect loop to give up",
+    )
+    lines = editor.notify_lines()
+    assert_true(
+        any("could not reconnect" in line for line in lines),
+        f"the loop must explain that it gave up: {lines!r}",
+    )
+    assert_true(
+        any("3" in line for line in gave_up),
+        f"the message must name the attempt limit: {gave_up!r}",
+    )
+    state = editor.reconnector_state()
+    assert_true(
+        state is not None and state.get("running") is False,
+        f"the loop must stop after giving up: {state!r}",
+    )
+    # No further attempts: the loop is done, not sleeping between them.
+    time.sleep(2.0)
+    state = editor.reconnector_state()
+    assert_true(
+        state is not None and state.get("running") is False,
+        f"the loop restarted after giving up: {state!r}",
+    )
+
+
+def scenario_version_restart(case):
+    """16. A stale service is restarted when idle, kept when busy.
+
+    `version_check` restarts an idle service onto the new binary and says
+    "N idle agent(s) will restart with it"; a service with a running turn is
+    used as-is with a single warning.
+    """
+    proxy = helpers.write_version_proxy(case.dir, case.binary)
+
+    editor = case.editor("a")
+    editor.start(service={"path": proxy})
+    editor.capture_notifications()
+    editor.connect()
+    lines = editor.wait_notifications(
+        lambda seen: any("idle agent" in line for line in seen),
+        "the restart message for an idle service",
+        timeout=WAIT + 10,
+    )
+    assert_true(
+        any("idle agent" in line for line in lines),
+        "restarting a stale idle service must tell the user that idle agents "
+        f"restart with it; notifications were {lines!r}",
+    )
+    assert_true(
+        any("restarting nvim_ade_server" in line for line in lines),
+        f"the message must name the restart: {lines!r}",
+    )
+    editor.submit("hello after restart")
+    editor.wait_reply("Hello from the mock agent")
+    editor.wait_turn_idle()
+
+    # Busy: the same stale wrapper, but with a turn in flight it must not restart.
+    busy = case.editor("b")
+    os.makedirs(os.path.join(case.dir, "busy"), exist_ok=True)
+    busy_proxy = helpers.write_version_proxy(os.path.join(case.dir, "busy"), case.binary)
+    busy.start(service={"path": busy_proxy})
+    busy.capture_notifications()
+    busy.connect()
+    busy.submit("slow please")
+    busy.wait_instances(
+        lambda list_: len(list_) == 1 and list_[0].get("turns_running", 0) == 1,
+        "the busy turn",
+    )
+    pid_before = busy.instances()[0]["pid"]
+    busy.clear_notifications()
+
+    # A second editor attaches to the same busy service: it must warn once and
+    # leave the service alone.
+    third = case.editor("c")
+    third.start(service={"path": busy_proxy})
+    third.capture_notifications()
+    third.connect()
+    warnings = third.wait_notifications(
+        lambda seen: any("restarts automatically" in line for line in seen),
+        "the busy-service warning",
+        timeout=WAIT,
+    )
+    assert_true(
+        any("restarts automatically" in line for line in warnings),
+        f"a busy stale service must be explained once: {warnings!r}",
+    )
+    assert_true(
+        not any("idle agent" in line for line in warnings),
+        f"a busy service must not be restarted: {warnings!r}",
+    )
+    # The service (and therefore the agent) is the same process as before.
+    assert_true(
+        busy.instances()[0]["pid"] == pid_before,
+        "the busy service must not have been restarted",
+    )
+    busy.lua(
+        """
+        local st = require("ade.controller").state()
+        st.conn.client:cancel(st.session.id)
+        """
+    )
+    busy.wait_instances(
+        lambda list_: len(list_) == 1 and list_[0].get("turns_running", 0) == 0,
+        "the busy turn to stop",
+    )
+
+
+def scenario_retract_dialog(case):
+    """17. Answering a request in one editor closes it in the other.
+
+    PROTOCOL.md 14: a pending agent request delivered to several connections is
+    withdrawn from the others with `$/cancel_request` once answered.
+    """
+    first = case.editor("a")
+    first.start()
+    first.connect()
+    # A asks first, so A is the primary for the request.
+    first.submit("permission please")
+    first.wait_instances(
+        lambda list_: len(list_) == 1 and list_[0].get("pending_requests", 0) == 1,
+        "the permission request",
+    )
+    first.wait_until_permission()
+    assert_true(
+        len(first.pending_permissions()) == 1,
+        f"A must show the request: {first.pending_permissions()!r}",
+    )
+
+    # B attaches while it is pending: as the new primary it receives the request
+    # again (PROTOCOL.md 5.4), so both editors show it.
+    second = case.editor("b")
+    second.start()
+    second.capture_notifications()
+    second.connect()
+    second.wait_until_permission()
+    assert_true(
+        len(second.pending_permissions()) == 1,
+        f"B must be handed the pending request: {second.pending_permissions()!r}",
+    )
+    assert_true(
+        len(first.pending_permissions()) == 1,
+        "A still shows the request until it is answered",
+    )
+
+    # A answers: B's copy must close, and the agent finishes the turn.
+    first.answer_permission("allow")
+    wait_until(
+        lambda: second.pending_permissions() == [],
+        WAIT,
+        0.05,
+        "B's copy of the answered request to close",
+    )
+    assert_true(
+        first.pending_permissions() == [],
+        f"A's own copy must close too: {first.pending_permissions()!r}",
+    )
+    first.wait_reply("done")
+    first.wait_turn_idle()
+    first.wait_instances(
+        lambda list_: len(list_) == 1 and list_[0].get("pending_requests", 0) == 0,
+        "the request to be settled",
+    )
+
+
+def _write_trim_proxy(case):
+    """A wrapper around the real service that lowers the replay ceiling.
+
+    `--event-log-max-mb` is clamped to 16 MiB, and the replay ceiling is 32 MiB,
+    so filling either with real events is impractical in a test. The ceiling is
+    read from `NVIM_ADE_SERVER_REPLAY_LIMIT_BYTES` (`service/src/hub.rs`, a
+    documented test hook), which the wrapper sets below the log the scenario
+    records.
+    """
+    real = case.binary
+    path = os.path.join(case.dir, "trim_proxy.sh")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("#!/bin/sh\n")
+        handle.write('if [ "$1" = "version" ]; then exec %s version; fi\n' % _shell_quote(real))
+        handle.write(
+            'NVIM_ADE_SERVER_REPLAY_LIMIT_BYTES=1000 exec %s "$@"\n' % _shell_quote(real)
+        )
+    os.chmod(path, 0o755)
+    return path
+
+
+def _write_crash_proxy(case):
+    """A service that starts, answers for a moment, then kills itself.
+
+    The real service runs on a private socket; the wrapper owns the public one
+    and exits a few hundred milliseconds after the first connection, so every
+    reconnection succeeds and drops again.
+    """
+    real = case.binary
+    path = os.path.join(case.dir, "crash_proxy.py")
+    state = os.path.join(case.dir, "crash_proxy.state")
+    script = f'''#!{sys.executable}
+"""A service that dies shortly after each start (scenario 15)."""
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+REAL = {real!r}
+STATE = {state!r}
+DIR = os.environ.get("NVIM_ADE_SERVER_DIR", "")
+SOCKET = os.path.join(DIR, "nvim_ade_server.sock")
+REAL_SOCKET = os.path.join(DIR, "nvim_ade_server.real.sock")
+
+
+def bump():
+    try:
+        with open(STATE, encoding="utf-8") as handle:
+            count = int(handle.read().strip() or "0")
+    except (OSError, ValueError):
+        count = 0
+    with open(STATE, "w", encoding="utf-8") as handle:
+        handle.write(str(count + 1))
+    return count + 1
+
+
+def relay(src, dst):
+    try:
+        while True:
+            chunk = src.recv(1 << 16)
+            if not chunk:
+                break
+            dst.sendall(chunk)
+    except OSError:
+        pass
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] == "version":
+        print(json.dumps({{"version": "0.3.0", "api_version": 2}}))
+        return 0
+    if not DIR:
+        return 1
+    rest = argv[1:] if argv and argv[0] == "serve" else argv
+    forwarded = ["serve", "--socket", REAL_SOCKET]
+    index = 0
+    while index < len(rest):
+        if rest[index] == "--socket":
+            index += 2
+            continue
+        forwarded.append(rest[index])
+        index += 1
+    try:
+        os.unlink(REAL_SOCKET)
+    except OSError:
+        pass
+    real = subprocess.Popen([REAL] + forwarded, stdout=subprocess.PIPE, text=True)
+    line = real.stdout.readline()
+    if not line:
+        print(json.dumps({{"status": "error", "message": "real service did not start"}}), flush=True)
+        return 1
+    bump()
+    try:
+        os.unlink(SOCKET)
+    except OSError:
+        pass
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(SOCKET)
+    listener.listen(16)
+    print(json.dumps({{"status": "ready", "socket": SOCKET, "pid": os.getpid()}}), flush=True)
+
+    def killer():
+        time.sleep(0.4)
+        real.kill()
+        os._exit(1)
+
+    threading.Thread(target=killer, daemon=True).start()
+
+    while True:
+        try:
+            client, _ = listener.accept()
+        except OSError:
+            break
+
+        def serve(client=client):
+            upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                upstream.connect(REAL_SOCKET)
+            except OSError:
+                client.close()
+                return
+            for src, dst in ((client, upstream), (upstream, client)):
+                threading.Thread(target=relay, args=(src, dst), daemon=True).start()
+
+        threading.Thread(target=serve, daemon=True).start()
+    return 0
+
+
+if __name__ == "__main__":
+    main()
+'''
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(script)
+    os.chmod(path, 0o755)
+    return path
+
+
+def _shell_quote(path):
+    return "'" + str(path).replace("'", "'\\''") + "'"
+
+
+class RawConversation:
+    """A minimal ACP conversation over a `RawService` connection.
+
+    The service protocol scenarios (13) need the raw wire: the plugin's own
+    restore path is broken independently, so driving the service directly is what
+    isolates "the service forwards a too-large load" from that.
+    """
+
+    def __init__(self, service, instance):
+        self.service = service
+        self.instance = instance
+        self.next_id = 1000
+        self.messages = []
+        self.replay = []
+
+    def send_request(self, method, params, timeout=WAIT):
+        """Send an ACP request through the tunnel and wait for its response."""
+        self.next_id += 1
+        request_id = self.next_id
+        frame = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+        self.service.notify("tunnel.send", {"instance": self.instance, "message": frame})
+        return self.wait_response(request_id, timeout)
+
+    def wait_response(self, request_id, timeout=WAIT):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            message = self.service._read_message(deadline)
+            if message is None:
+                break
+            body = (message.get("params") or {}).get("message") or {}
+            if not body:
+                continue
+            self._record(body)
+            if body.get("id") == request_id and "method" not in body:
+                return body
+        raise TimeoutError(f"no response to request {request_id}")
+
+    def _record(self, body):
+        self.messages.append(body)
+        if body.get("method") == "session/update":
+            update = (body.get("params") or {}).get("update") or {}
+            text = (update.get("content") or {}).get("text")
+            if text:
+                self.replay.append(text)
+
+    def open(self):
+        self.send_request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+        response = self.send_request(
+            "session/new", {"cwd": ROOT, "mcpServers": []}
+        )
+        self.session_id = (response.get("result") or {}).get("sessionId", "sess_mock")
+        return self.session_id
+
+    def prompt(self, text, timeout=WAIT):
+        before = len(self.replay)
+        response = self.send_request(
+            "session/prompt",
+            {
+                "sessionId": self.session_id,
+                "prompt": [{"type": "text", "text": text}],
+            },
+            timeout=timeout,
+        )
+        return self.replay[before:], response
+
+    def load_session(self, session_id, timeout=WAIT):
+        """`session/load`, returning the texts the answer replayed."""
+        before = len(self.replay)
+        self.send_request(
+            "session/load",
+            {"sessionId": session_id, "cwd": ROOT, "mcpServers": []},
+            timeout=timeout,
+        )
+        # The replay frames were already consumed by `wait_response`.
+        return self.replay[before:]
+
+
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -1509,6 +2459,14 @@ SCENARIOS = [
     ("7 idle exit", scenario_idle_exit),
     ("8 two front ends", scenario_two_frontends),
     ("9 commands", scenario_commands),
+    ("10 reopen restores the conversation", scenario_reopen_restores),
+    ("11 adopt a running turn", scenario_adopt_running_turn),
+    ("12 log disabled", scenario_log_disabled),
+    ("13 pruned log falls back to the agent load", scenario_pruned_log_falls_back),
+    ("14 automatic reconnect", scenario_auto_reconnect),
+    ("15 crash loop gives up", scenario_crash_loop),
+    ("16 version mismatch restart", scenario_version_restart),
+    ("17 retract dialog", scenario_retract_dialog),
 ]
 
 
@@ -1548,22 +2506,6 @@ def main():
         return 1
     print("all persistence scenarios passed")
     return 0
-
-
-def _cmdline(pid):
-    try:
-        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(
-            "utf-8", "replace"
-        )
-    except OSError:
-        return ""
-
-
-def _env_of(pid):
-    try:
-        return Path(f"/proc/{pid}/environ").read_bytes().decode("utf-8", "replace")
-    except OSError:
-        return ""
 
 
 if __name__ == "__main__":
