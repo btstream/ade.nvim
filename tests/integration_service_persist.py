@@ -355,6 +355,12 @@ class Editor:
     def start(self, service_env=None):
         env = dict(os.environ)
         env.update(isolated_env(self.case_dir))
+        # `minimal_init.lua` wires a service backend from these when they are set
+        # in the environment (the single-process integration scripts use them).
+        # Setting them here would make every editor share one service directory
+        # instead of this case's, so the scenario must own the configuration.
+        for key in ("ADE_TEST_BACKEND", "ADE_TEST_SERVICE_BIN"):
+            env.pop(key, None)
         if service_env:
             env.update(service_env)
         argv = [
@@ -548,13 +554,82 @@ class Editor:
     def disconnect(self):
         self.lua("require('ade.controller').disconnect()")
 
+    # -- notification capture ------------------------------------------------
+
+    def capture_notifications(self):
+        """Replace `vim.notify` with a recorder and return the list.
+
+        `:Ade service ...` reports through `vim.notify`, so this is what the
+        user actually sees. The list is a Lua table the test reads back; each
+        entry keeps the level so a warning is distinguishable from info.
+        """
+        self.lua(
+            """
+            _G.ade_test_notifications = {}
+            vim.notify = function(message, level)
+              _G.ade_test_notifications[#_G.ade_test_notifications + 1] = {
+                message = tostring(message),
+                level = level or vim.log.levels.INFO,
+              }
+            end
+            """
+        )
+
+    def notifications(self):
+        raw = self.lua(
+            """
+            local out = {}
+            for _, entry in ipairs(_G.ade_test_notifications or {}) do
+              out[#out + 1] = { message = entry.message, level = entry.level }
+            end
+            return out
+            """
+        )
+        return normalize(raw or [])
+
+    def clear_notifications(self):
+        self.lua("_G.ade_test_notifications = {}")
+
+    def notify_lines(self):
+        return [entry["message"] for entry in self.notifications()]
+
+    def run_command(self, command):
+        """Run an Ex command and return what it notified."""
+        self.clear_notifications()
+        self.lua("vim.cmd(...)", command)
+        return self.notify_lines()
+
+    def wait_notifications(self, predicate, label="notification", timeout=WAIT):
+        """Poll the captured notifications until `predicate(list)` holds.
+
+        The failure message carries every line seen so far: these commands report
+        their problems through `vim.notify`, so the list is the diagnosis.
+        """
+
+        def check():
+            lines = self.notify_lines()
+            return lines if predicate(lines) else None
+
+        try:
+            return wait_until(check, timeout, 0.05, label)
+        except TimeoutError:
+            raise AssertionError(
+                f"{label}: only got notifications {self.notify_lines()!r}"
+            ) from None
+
     def service_status(self):
         raw = self.lua(
             """
             local Status = require("ade.service.status")
             local cfg = require("ade.config").effective()
             local st = Status.collect({ config = cfg })
-            return { running = st.running, reachable = st.reachable, socket = st.socket, dir = st.dir }
+            return {
+              running = st.running,
+              reachable = st.reachable,
+              socket = st.socket,
+              dir = st.dir,
+              instances = st.instances,
+            }
             """
         )
         return normalize(raw)
@@ -1216,6 +1291,197 @@ def scenario_two_frontends(case):
     assert_true(still[0]["attached"] == 1, f"only B must be attached: {still[0]['attached']}")
 
 
+def scenario_commands(case):
+    """9. The `:Ade service` commands report the real state.
+
+    The reported defect: `:Ade service agents` prints "unable to list agents:
+    nil" because the command reads the reply immediately, while
+    `Connection:request` is asynchronous (the reply arrives on the main loop).
+    The existing unit tests inject a *synchronous* fake connection, so they
+    cannot see it. This drives the real commands against the real service and
+    checks what the user is told.
+
+    Rules checked throughout:
+      * after a command runs, it must not print "unable" before the reply could
+        possibly have arrived;
+      * a command that has no answer (yet) must not invent a failure;
+      * `:Ade service status` must report the instance count.
+
+    All five checks run even when an earlier one fails, and the failure lists
+    every problem plus the full notification transcript: the three known causes
+    are independent, so a partial fix should still show what is left.
+    """
+    editor = case.editor("a")
+    editor.start()
+    editor.capture_notifications()
+    problems = []
+    transcript = {}
+
+    def record(label, lines):
+        transcript[label] = list(lines)
+
+    def expect(condition, message):
+        if not condition:
+            problems.append(message)
+
+    # Never `:Ade service stop` here: another service may belong to the user.
+    # The case directory isolates this one, and `Case.cleanup` kills only the
+    # processes whose environment points at it.
+
+    # 1) start, then `agents` with no chat: an empty list is not a failure.
+    started = editor.run_command("Ade service start")
+    record("Ade service start", started)
+    expect(
+        any("service is ready" in line or "already running" in line for line in started),
+        f"`:Ade service start` did not report a running service: {started!r}",
+    )
+
+    empty = editor.run_command("Ade service agents")
+    try:
+        editor.wait_notifications(
+            lambda lines: any("no agent instances" in line for line in lines)
+            or any("unable to list agents" in line for line in lines),
+            "`:Ade service agents` to answer (no chat yet)",
+        )
+    except AssertionError as error:
+        problems.append(str(error))
+    empty = editor.notify_lines()
+    record("Ade service agents (no chat)", empty)
+    expect(
+        not any("unable to list agents" in line for line in empty),
+        "`:Ade service agents` must not report a failure when the service simply "
+        f"holds no agents; it printed {empty!r}. Two known causes: the command "
+        "reads the reply before the asynchronous `agent.list` answer arrives "
+        "(so `failure` is still nil), and it calls `connection.shared()` without "
+        "passing `config`, so a shared connection created by the command itself "
+        'cannot resolve `service.path` ("not installed"); `M.start`/`M.stop`/'
+        "`M.status` all pass config, `M.agents`/`M.kill` do not.",
+    )
+    expect(
+        any("no agent instances" in line for line in empty),
+        f"`:Ade service agents` must say there are no instances, got {empty!r}",
+    )
+
+    # 2) create an instance through a normal chat turn, then list it.
+    editor.connect()
+    editor.submit("hello command")
+    editor.wait_reply("Hello from the mock agent")
+    editor.wait_turn_idle()
+    running = editor.wait_instances(lambda list_: len(list_) == 1, "one instance")
+    instance_id = running[0]["instance"]
+    agent_pid = running[0]["pid"]
+
+    listed = editor.run_command("Ade service agents")
+    try:
+        editor.wait_notifications(
+            lambda lines: any(instance_id in line for line in lines)
+            or any("unable to list agents" in line for line in lines),
+            "`:Ade service agents` to answer (with an instance)",
+        )
+    except AssertionError as error:
+        problems.append(str(error))
+    listed = editor.notify_lines()
+    record("Ade service agents (one instance)", listed)
+    expect(
+        not any("unable to list agents" in line for line in listed),
+        "`:Ade service agents` failed with a live instance: "
+        f"{listed!r} (the asynchronous reply is read before it arrives)",
+    )
+    line = next((text for text in listed if instance_id in text), None)
+    expect(line is not None, f"no line for instance {instance_id}: {listed!r}")
+    if line is not None:
+        # `status.instance_line` is "<instance>  <agent>  <cwd>  pid <pid> ...".
+        expect(
+            str(agent_pid) in line,
+            f"the line must carry the pid {agent_pid}: {line!r}",
+        )
+        expect("opencode" in line, f"the line must carry the agent name: {line!r}")
+
+    # 3) status must report the instance count.
+    status_lines = editor.run_command("Ade service status")
+    try:
+        editor.wait_notifications(
+            lambda lines: any("service is running" in text for text in lines),
+            "`:Ade service status` to answer",
+        )
+    except AssertionError as error:
+        problems.append(str(error))
+    status_lines = editor.notify_lines()
+    record("Ade service status", status_lines)
+    expect(
+        any("agent instances: 1" in text for text in status_lines),
+        "`:Ade service status` must report one agent instance, but printed "
+        f"{status_lines!r}. `Status.collect` sends `agent.list` asynchronously "
+        "and reads `listed` right after the call, so the count is always nil and "
+        "the line is never printed.",
+    )
+    expect(
+        not any("unable" in text.lower() for text in status_lines),
+        f"`:Ade service status` reported a failure: {status_lines!r}",
+    )
+
+    # 4) No command may claim failure before its reply could have arrived.
+    #    `run_command` clears the list and returns what was there after the Ex
+    #    command returned; a synchronous "unable" would already be in it.
+    for command in ("Ade service agents", "Ade service status"):
+        immediate = editor.run_command(command)
+        record(f"{command} (immediate)", immediate)
+        expect(
+            not any("unable" in line.lower() for line in immediate),
+            f"`:{command}` printed a failure synchronously, before any reply could "
+            f"arrive: {immediate!r}",
+        )
+
+    # 5) kill the instance, then the list is empty again.
+    killed = editor.run_command(f"Ade service kill {instance_id}")
+    try:
+        editor.wait_notifications(
+            lambda lines: any(instance_id in text for text in lines),
+            "`:Ade service kill` to answer",
+        )
+    except AssertionError as error:
+        problems.append(str(error))
+    killed = editor.notify_lines()
+    record(f"Ade service kill {instance_id}", killed)
+    expect(
+        not any("unable to stop" in line for line in killed),
+        f"`:Ade service kill {instance_id}` failed: {killed!r} "
+        "(same asynchronous-reply defect as `agents`)",
+    )
+    editor.wait_instances(lambda list_: len(list_) == 0, "the instance to be stopped")
+    wait_gone(agent_pid, WAIT, "the killed agent process")
+
+    after = editor.run_command("Ade service agents")
+    try:
+        editor.wait_notifications(
+            lambda lines: any("no agent instances" in text for text in lines)
+            or any("unable to list agents" in text for text in lines),
+            "`:Ade service agents` to answer after the kill",
+        )
+    except AssertionError as error:
+        problems.append(str(error))
+    after = editor.notify_lines()
+    record("Ade service agents (after kill)", after)
+    expect(
+        not any("unable to list agents" in line for line in after),
+        f"`:Ade service agents` failed after the kill: {after!r}",
+    )
+    expect(
+        any("no agent instances" in line for line in after),
+        f"`:Ade service agents` must be empty after the kill, got {after!r}",
+    )
+
+    if problems:
+        detail = "\n".join(f"  - {text}" for text in problems)
+        seen = "\n".join(
+            f"  {label}: {lines!r}" for label, lines in transcript.items()
+        )
+        raise AssertionError(
+            "`:Ade service` commands do not report the real state "
+            f"({len(problems)} problem(s)):\n{detail}\nnotifications seen:\n{seen}"
+        )
+
+
 # `Editor.wait_until_permission` is defined after the class for readability of
 # the scenarios above; attaching it here keeps the class body small.
 def _wait_until_permission(self, timeout=WAIT):
@@ -1242,6 +1508,7 @@ SCENARIOS = [
     ("6 service SIGKILL", scenario_service_sigkill),
     ("7 idle exit", scenario_idle_exit),
     ("8 two front ends", scenario_two_frontends),
+    ("9 commands", scenario_commands),
 ]
 
 
