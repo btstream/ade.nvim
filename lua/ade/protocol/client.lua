@@ -236,7 +236,15 @@ function Client:do_start(generation)
     capabilities = self.capabilities,
     auth_methods = self.auth_methods,
     agent_info = self.agent_info,
+    -- Sessions the service already tracks (PROTOCOL.md 3.2), when the transport
+    -- reports them; nil for the direct backend.
+    sessions = self.proc and self.proc.sessions or nil,
+    created = self.proc and self.proc.created or nil,
   })
+  -- Also on the client itself: the application layer reads them while handling
+  -- `ready`, and events are the only channel it has.
+  self.sessions = self.proc and self.proc.sessions or nil
+  self.created = self.proc and self.proc.created or nil
   return true, nil
 end
 
@@ -526,6 +534,20 @@ function Client:install_handlers()
       end
     end
   end
+  -- `_ade/*` are ACP extension notifications from nvim_ade_server
+  -- (PROTOCOL.md 13). A front end that does not know them ignores them, so they
+  -- only ever add behaviour for a service that sends them.
+  self:on_agent_notification("_ade/turn_adopted", function(params)
+    self:emit("turn_adopted", { session_id = type(params) == "table" and params.sessionId or nil })
+  end)
+  self:on_agent_notification("_ade/turn_finished", function(params)
+    params = type(params) == "table" and params or {}
+    self:emit("turn_finished", {
+      session_id = params.sessionId,
+      stop_reason = params.stopReason,
+      error = params.error,
+    })
+  end)
   self:on_agent_notification("session/update", function(params)
     self:emit("session_update", params)
   end)

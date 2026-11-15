@@ -36,6 +36,21 @@ M.defaults = {
     keep_alive = true,
     -- Seconds of idleness before the service stops itself (60-86400).
     idle_timeout = 1800,
+    -- Record the event log (PROTOCOL.md 10) so a later Neovim can rebuild a
+    -- conversation. The log only lives as long as the agent instance: it is
+    -- deleted when the instance stops or the service restarts. With
+    -- `event_log = false`, reopening later cannot show what happened while
+    -- nobody was attached.
+    event_log = true,
+    -- Per-instance cap for that log, in MiB (16-4096).
+    event_log_max_mb = 256,
+    -- When the server already has sessions (this Neovim was closed while an
+    -- agent kept running), reopen the most recent session for this cwd instead
+    -- of starting an empty one.
+    restore = true,
+    -- Automatic reconnection attempts after an unexpected connection loss.
+    -- 0 disables it; the backoff is 0.5s, 1s, 2s, 4s, 8s, then 15s each.
+    reconnect_attempts = 8,
   },
 
   ---@type table<string, AdeAgentConfig>
@@ -632,6 +647,20 @@ function M.validate(cfg)
   check_number(service.idle_timeout, 60, 86400, "service.idle_timeout")
   if service.idle_timeout % 1 ~= 0 then
     fail("service.idle_timeout must be a whole number of seconds")
+  end
+  if type(service.event_log) ~= "boolean" then
+    fail("service.event_log must be a boolean")
+  end
+  check_number(service.event_log_max_mb, 16, 4096, "service.event_log_max_mb")
+  if service.event_log_max_mb % 1 ~= 0 then
+    fail("service.event_log_max_mb must be a whole number of megabytes")
+  end
+  if type(service.restore) ~= "boolean" then
+    fail("service.restore must be a boolean")
+  end
+  check_number(service.reconnect_attempts, 0, 50, "service.reconnect_attempts")
+  if service.reconnect_attempts % 1 ~= 0 then
+    fail("service.reconnect_attempts must be a whole number")
   end
   if cfg.backend == "service" and service.path ~= nil and type(service.path) ~= "string" then
     fail("service.path must be a string or nil")

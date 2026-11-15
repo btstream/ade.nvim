@@ -131,8 +131,24 @@ function M.instance_line(instance, now)
       uptime = string.format(" %ds", seconds)
     end
   end
+  local sessions = tonumber(instance.sessions)
+  local log_bytes = tonumber(instance.log_bytes)
+  local extras = ""
+  if sessions then
+    extras = extras .. string.format("  sessions %d", sessions)
+  end
+  if log_bytes then
+    -- Human units: a log is often megabytes and the exact byte count is noise.
+    if log_bytes >= 1024 * 1024 then
+      extras = extras .. string.format("  log %.1f MiB", log_bytes / (1024 * 1024))
+    elseif log_bytes >= 1024 then
+      extras = extras .. string.format("  log %.1f KiB", log_bytes / 1024)
+    else
+      extras = extras .. string.format("  log %d B", log_bytes)
+    end
+  end
   return string.format(
-    "%s  %s  %s  pid %s%s  attached %s  turns %s  pending %s",
+    "%s  %s  %s  pid %s%s  attached %s  turns %s  pending %s%s",
     tostring(instance.instance),
     tostring(instance.agent),
     tostring(instance.cwd),
@@ -140,7 +156,8 @@ function M.instance_line(instance, now)
     uptime,
     tostring(instance.attached or 0),
     tostring(instance.turns_running or 0),
-    tostring(instance.pending_requests or 0)
+    tostring(instance.pending_requests or 0),
+    extras
   )
 end
 

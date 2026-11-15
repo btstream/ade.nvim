@@ -489,6 +489,10 @@ def main():
     # working.
     parser.add_argument("--idle-timeout", type=float, default=None)
     parser.add_argument("--socket", default=None)
+    # PROTOCOL.md 15: the real service accepts these; the stand-in records them
+    # so a test can assert the launcher passed the right flags.
+    parser.add_argument("--event-log", default="on", choices=["on", "off"])
+    parser.add_argument("--event-log-max-mb", type=int, default=256)
     args = parser.parse_args()
     if not args.server_version or args.api_version <= 0:
         parser.error("--server-version and --api-version are required (pass them from version.lua)")

@@ -361,6 +361,11 @@ function Connection:lost(payload)
   -- The agent is gone: its pending permission prompts can never be answered,
   -- so clear them instead of leaving the picker (and the toolbar badge) up.
   self.reset_permissions()
+  -- An adopted turn belonged to a client that is gone: settle it so no spinner
+  -- or cancel key outlives the connection.
+  if S.conn.adoption then
+    pcall(S.conn.adoption.reset, S.conn.adoption, "connection lost")
+  end
   if payload and payload.stderr and payload.stderr ~= "" then
     log.info("agent stderr:\n%s", payload.stderr)
   end

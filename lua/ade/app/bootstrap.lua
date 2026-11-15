@@ -31,6 +31,9 @@ local Input = require("ade.ui.input")
 local Status = require("ade.app.status")
 local Attachments = require("ade.app.attachments")
 local Events = require("ade.app.events")
+local Adoption = require("ade.app.adoption")
+local Restore = require("ade.app.restore")
+local Reconnector = require("ade.app.reconnector")
 local ConnectionFlow = require("ade.app.connection_flow")
 
 local M = {}
@@ -459,7 +462,18 @@ function M.build(ctx, opts, action)
       elseif S.sess.current and S.sess.current.needs_load then
         ctx.reload_session(S.sess.current.id)
       elseif not S.sess.current then
-        ctx.new_session()
+        -- Reopening a Neovim whose agent kept running: the service reports the
+        -- sessions it holds and, when one belongs to this cwd, that session is
+        -- loaded instead of starting an empty one (PROTOCOL.md 3.2).
+        local client = S.conn.client
+        local restored = S.conn.restore
+          and S.conn.restore:after_ready({
+            created = client and client.created,
+            sessions = client and client.sessions,
+          })
+        if not restored then
+          ctx.new_session()
+        end
       end
       local queued = S.conn.auth_after_ready
       S.conn.auth_after_ready = nil
@@ -563,6 +577,22 @@ function M.build(ctx, opts, action)
     refresh_chrome = ctx.refresh_chrome,
     focus = ctx.focus,
   })
+  -- Turn adoption (PROTOCOL.md 13): a turn the service kept alive for us.
+  S.conn.adoption = Adoption.new({
+    state = function()
+      return S
+    end,
+    refresh_chrome = ctx.refresh_chrome,
+    schedule_render = function()
+      if S.view.chat then
+        S.view.chat:schedule_render()
+      end
+    end,
+    dispatch_queued = ctx.dispatch_queued,
+    add_block = ctx.add_system_block,
+    notify = notify,
+  })
+
   S.conn.events = Events.new({
     state = function()
       return S
@@ -571,9 +601,76 @@ function M.build(ctx, opts, action)
     notify = notify,
     add_block = ctx.add_system_block,
     prune = ctx.prune_sessions,
+    adoption = S.conn.adoption,
     on_exit = function(payload)
       return S.conn.service:lost(payload)
     end,
+  })
+
+  -- Automatic reconnection after an *unexpected* drop. The loop itself lives in
+  -- `app/reconnector`; `ensure` restarts the service when needed and `reconnect`
+  -- is the same path `:Ade reconnect` takes.
+  S.conn.reconnector = Reconnector.new({
+    config = function()
+      return S.config or merged
+    end,
+    ensure = function(cb)
+      S.conn.service:ensure(cb)
+    end,
+    reconnect = function()
+      S.conn.service:reconnect()
+    end,
+    notify = notify,
+    set_status = function(text)
+      S.conn.reconnect_status = text
+      ctx.refresh_chrome()
+    end,
+  })
+
+  -- One subscription for the whole panel: an unexpected drop starts the retry
+  -- loop, a deliberate one (`:Ade service stop`, `:Ade disconnect`, editor exit)
+  -- cancels it.
+  local function on_service_lost(payload)
+    local intentional = type(payload) == "table" and payload.intentional == true
+    if intentional or S.conn.service.closed then
+      pcall(S.conn.reconnector.cancel, S.conn.reconnector, "deliberate disconnect")
+      return
+    end
+    -- Only the service backend can reconnect automatically: the direct backend
+    -- has no service to restart.
+    local backend = (S.config or merged).backend
+    if backend ~= "service" and backend ~= "auto" then
+      return
+    end
+    pcall(S.conn.reconnector.lost, S.conn.reconnector)
+  end
+  -- A fake connection injected by a test may not implement subscriptions; the
+  -- panel still works, it just has no automatic reconnect.
+  if type(S.conn.service.subscribe) == "function" then
+    S.conn.service:subscribe("panel", "__disconnected", on_service_lost)
+  end
+
+  S.conn.restore = Restore.new({
+    config = cfg,
+    cwd = function()
+      return S.conn.service and S.conn.service.cwd_hint and S.conn.service.cwd_hint() or ctx.resolve_cwd()
+    end,
+    supported = function()
+      local client = S.conn.client
+      if not client then
+        return false
+      end
+      local supports = require("ade.protocol.capabilities").supports
+      local agent = require("ade.protocol.capabilities").agent(client)
+      return supports(agent, "loadSession")
+    end,
+    load = function(session_id)
+      S.sess.service:load(session_id)
+    end,
+    create = function()
+      ctx.new_session()
+    end,
+    notify = notify,
   })
 
   S.view.panel = Panel.new({

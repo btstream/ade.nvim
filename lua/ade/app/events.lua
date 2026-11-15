@@ -11,7 +11,7 @@ M.__index = M
 
 ---@param deps {state: fun(): table, refresh_chrome: fun(), notify: fun(message: string, level: integer|nil),
 ---  add_block: fun(text: string, kind: string|nil, target: table|nil),
----  prune: fun(), on_exit: fun(payload: table): boolean}
+---  prune: fun(), on_exit: fun(payload: table): boolean, adoption?: table}
 ---@return table
 function M.new(deps)
   local self = setmetatable({ deps = deps, handlers = {} }, M)
@@ -130,6 +130,21 @@ function M:install_defaults()
       if S.view.chat then
         S.view.chat:schedule_render()
       end
+    end
+  end
+
+  -- Turn adoption (PROTOCOL.md 13): a turn the service was already running when
+  -- this front end attached. `deps.adoption` owns the state; these two events
+  -- are only the route.
+  self.handlers.turn_adopted = function(payload)
+    if deps.adoption then
+      deps.adoption:adopted_turn(payload)
+    end
+  end
+
+  self.handlers.turn_finished = function(payload)
+    if deps.adoption then
+      deps.adoption:finished_turn(payload)
     end
   end
 

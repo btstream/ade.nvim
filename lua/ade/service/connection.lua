@@ -236,11 +236,15 @@ function Connection:ensure(cb)
   if self.ensure_service then
     started, start_err = self.ensure_service(resolved)
   else
+    local service = self:service_config()
     started, start_err = require("ade.service.launcher").ensure({
       bin = resolved.path,
       config = self.opts.config,
       timeout = self.opts.timeout or 5000,
-      idle_timeout = self.idle_timeout,
+      idle_timeout = self.idle_timeout or service.idle_timeout,
+      -- Event-log flags only apply to a service this call starts; PROTOCOL.md 15.
+      event_log = service.event_log,
+      event_log_max_mb = service.event_log_max_mb,
     })
   end
   if not started then
@@ -267,19 +271,140 @@ function Connection:ensure(cb)
     return
   end
   if type(info) == "table" and info.api_version ~= nil and info.api_version ~= Version.API_VERSION then
+    -- An incompatible api_version is a different problem from a stale build: the
+    -- wire protocol changed. Retry once with the version the service reports, so
+    -- a service that is merely older can still be asked whether it is idle
+    -- (see `version_check`), and only then give up.
+    local retried = self:handshake_retry(client, info)
+    if not retried then
+      self.client = nil
+      client:close()
+      self:finish(
+        false,
+        string.format(
+          "the service speaks api_version %s but this plugin needs %d; run :Ade service install",
+          tostring(info.api_version),
+          Version.API_VERSION
+        )
+      )
+      return
+    end
+    info = retried
+  end
+  -- A different version on the same api_version means the plugin was updated
+  -- while an old service kept running. Reconcile it, preferably by restarting an
+  -- idle service onto the new binary.
+  local checker = require("ade.service.version_check").new({
+    config = function()
+      return self:service_config_all()
+    end,
+    request_sync = function(method, params, timeout)
+      return self:request_sync(method, params, timeout)
+    end,
+    restart = function(done)
+      -- Restart through the same path as everything else: stop the service, then
+      -- bring it back up. `restart_service` is injectable for tests.
+      self:restart_service(done)
+    end,
+    notify = function(message, level)
+      pcall(log.warn, "%s", message)
+      if self.opts.notify then
+        pcall(self.opts.notify, message, level)
+      end
+    end,
+  })
+  local usable = checker:check(info)
+  if not usable then
     self.client = nil
     client:close()
-    self:finish(
-      false,
-      string.format(
-        "the service speaks api_version %s but this plugin needs %d; run :Ade service install",
-        tostring(info.api_version),
-        Version.API_VERSION
-      )
-    )
+    self:finish(false, "the running service is not usable")
     return
   end
+  self.version_info = info
   self:finish(true, nil)
+end
+
+---Retry the handshake after `-32002`, using the version the service reports.
+---
+---PROTOCOL.md 3.1: the error carries `data.server_api_version`. Sending that
+---number again lets an older service complete the handshake so the idle probe
+---below can decide whether it may be replaced. Returns the handshake result, or
+---nil when the retry fails too.
+---@param client table
+---@param first table the failed handshake error
+---@return table|nil info
+function Connection:handshake_retry(client, first)
+  local data = type(first) == "table" and type(first.data) == "table" and first.data or {}
+  local reported = tonumber(data.server_api_version)
+  if not reported then
+    return nil
+  end
+  local ok, info = false, nil
+  client:connect_with_version(reported, function(connected, value)
+    ok, info = connected, value
+  end)
+  if ok and type(info) == "table" then
+    return info
+  end
+  return nil
+end
+
+---The `service` table of the effective configuration.
+---@return table
+function Connection:service_config()
+  local config = self:service_config_all()
+  return type(config.service) == "table" and config.service or {}
+end
+
+---The effective configuration, as a table.
+---@return table
+function Connection:service_config_all()
+  local config = self.opts.config
+  if config == nil then
+    local ok, value = pcall(function()
+      return require("ade.config").effective()
+    end)
+    config = ok and value or nil
+  end
+  if type(config) == "function" then
+    local ok, value = pcall(config)
+    config = ok and value or nil
+  end
+  return type(config) == "table" and config or {}
+end
+
+---Stop the service and start it again, then report through `done`.
+---
+---Injectable: tests replace it, so the version logic can be exercised without a
+---process. The real path is `shutdown` on the client, then one more `ensure`.
+---@param done fun(ok: boolean, err: string|nil)
+function Connection:restart_service(done)
+  if self.restart_service_impl then
+    self.restart_service_impl(done)
+    return
+  end
+  local client = self.client
+  local function start_again()
+    self.client = nil
+    self:ensure(function(ok, err)
+      -- `ensure` may have been refused because `closed` is set; that is not a
+      -- restart failure of the service.
+      done(ok == true, err)
+    end)
+  end
+  if not client or not client:is_ready() then
+    start_again()
+    return
+  end
+  local answered = false
+  client:shutdown(function()
+    answered = true
+    start_again()
+  end)
+  if not answered then
+    -- A wedged service: report rather than hang.
+    done(false, "the service did not answer shutdown")
+  end
 end
 
 ---Install the notification fan-out and the disconnect hook on a client.
@@ -309,7 +434,12 @@ function Connection:on_disconnect(reason)
   self.error = tostring(reason)
   self.client = nil
   log.warn("service connection lost: %s", self.error)
-  self:dispatch("__disconnected", { reason = self.error })
+  -- `intentional` tells the application whether automatic reconnection should
+  -- kick in: a user-issued `:Ade service stop` or `:Ade disconnect` is not an
+  -- accident, and retrying would fight the user.
+  local payload = { reason = self.error, intentional = self.intentional_disconnect == true }
+  self.intentional_disconnect = false
+  self:dispatch("__disconnected", payload)
 end
 
 ---Resolve the in-flight `ensure` callers.
@@ -430,6 +560,7 @@ end
 ---@param reason string|nil
 function Connection:close(reason)
   self.closed = true
+  self.intentional_disconnect = true
   local client = self.client
   self.client = nil
   if client then
@@ -447,6 +578,9 @@ function Connection:shutdown(cb)
     end
     return
   end
+  -- Mark this as deliberate before the socket closes, so the `__disconnected`
+  -- fan-out does not start an automatic reconnect against the user's wish.
+  self.intentional_disconnect = true
   self.client:shutdown(function(ok, value)
     -- The user stopped the service; they did not forbid using it later, so the
     -- connection object stays reusable (`on_disconnect` already cleared the

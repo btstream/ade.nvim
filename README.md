@@ -767,6 +767,10 @@ require("ade").setup({
     start_timeout = 5000,                  -- 等待服务就绪的超时
     keep_alive = true,                     -- 退出 Neovim 时让 agent 继续运行
     idle_timeout = 1800,                   -- 空闲多少秒后服务自行退出（60-86400）
+    event_log = true,                      -- 记录事件日志，供下次打开时重放
+    event_log_max_mb = 256,                -- 每个实例的日志上限（16-4096 MiB）
+    restore = true,                        -- 打开时恢复上次在这个目录里的会话
+    reconnect_attempts = 8,                -- 意外断线后的自动重连次数（0 关闭）
   },
   backend = "direct",                      -- "direct" | "service" | "auto"
 })
@@ -774,6 +778,29 @@ require("ade").setup({
 
 `keep_alive = false` 会让每次退出（关闭 Neovim、切换 agent）都停掉 agent，
 等价于直连模式的行为。
+
+**事件日志与恢复**：服务把 agent 的 `session/update`，以及前台发出的 prompt、模型/模式变更，
+记到服务目录下的事件日志里，这样重新打开 Neovim 时能重放离开期间的内容。日志**只在 agent
+实例存活期间保留**：实例停止或服务重启就删除整个日志文件。设 `event_log = false` 关闭记录，
+此后重新打开看不到离开期间的内容（重连后只能从那一刻开始）。
+
+`restore = true`（默认）时，附着到一个**已经在运行**的实例后，如果服务报告这个工作目录下有
+会话，就自动重新打开**最近有活动**的那个，而不是新建空会话；没有匹配的、agent 不支持
+`session/load`、或加载失败时回退到新建，并提示一次原因。
+
+**自动重连**：服务后端下，连接**意外**断开（不是 `:Ade service stop`、`:Ade disconnect`、
+关闭编辑器）时会自动重连，退避 0.5s、1s、2s、4s、8s，之后每 15s，最多
+`reconnect_attempts` 次（默认 8，约一分钟）。重连期间状态栏显示 `reconnecting (n/8)`，
+成功后提示一次；全部失败后停止并提示，仍可手动 `:Ade reconnect`。
+
+**版本不一致**：插件更新后旧服务可能还在运行。版本不同但 `api_version` 相同时，服务空闲
+就自动重启到新版本；有任务在跑时先用着旧的，提示一次“任务结束后会自动重启”。
+`api_version` 不同则先用服务报告的版本再握手一次，再按同样规则处理。
+
+重启服务会**连带停掉服务里还活着的 agent**（它们是服务的子进程），通知里会写明
+`restarting nvim_ade_server (X -> Y); N idle agent(s) will restart with it`。空闲判据保证
+没有进行中的回合、没有待处理的权限/elicitation 请求、也没有别的 Neovim 附着；重启后会话
+依赖 agent 自己的 `session/load` 恢复。
 
 `release_base` 必须是 `https://`：压缩包和 `SHA256SUMS` 来自同一个地址，若允许明文 http，
 中间人可以同时替换两者，校验就失去意义；下载时也会用 `curl --proto =https --proto-redir =https`
