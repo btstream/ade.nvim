@@ -41,6 +41,61 @@ return function(t)
     return client
   end
 
+  t.describe("attach metadata", function()
+    t.it("keeps created = false instead of swallowing it", function()
+      -- The service reports `created = false` for a reused instance. The old
+      -- `self.proc and self.proc.created or nil` turned that into nil, so the
+      -- restore gate in `restore.lua` (which requires `created == false`) never
+      -- opened and reopening a Neovim always started an empty session.
+      local events = {}
+      local state = { initialized = false }
+      local client = new_client(events)
+      -- A transport-shaped stand-in: `created = false`, sessions present.
+      local proc = {
+        sessions = { { sessionId = "s1", cwd = root, updated_at = 1 } },
+        created = false,
+        set_initialized = function()
+          state.initialized = true
+        end,
+        is_alive = function()
+          return true
+        end,
+        write = function()
+          return true
+        end,
+      }
+      client.proc = proc
+      client:apply_initialize_result({ protocolVersion = 1, agentCapabilities = {} })
+      t.eq(false, client.created, "created = false was swallowed")
+      t.truthy(client.sessions and client.sessions[1])
+      local ready
+      for _, event in ipairs(events) do
+        if event.name == "ready" then
+          ready = event.payload
+        end
+      end
+      t.truthy(ready, "no ready event was emitted")
+      t.eq(false, ready.created, "the ready event lost created = false")
+      t.eq("s1", ready.sessions[1].sessionId)
+    end)
+
+    t.it("keeps created = true", function()
+      local events = {}
+      local client = new_client(events)
+      client.proc = { created = true, sessions = {}, set_initialized = function() end }
+      client:apply_initialize_result({ protocolVersion = 1, agentCapabilities = {} })
+      t.eq(true, client.created)
+    end)
+
+    t.it("reports nil for the direct backend", function()
+      local client = new_client({})
+      client.proc = { set_initialized = function() end }
+      client:apply_initialize_result({ protocolVersion = 1, agentCapabilities = {} })
+      t.eq(nil, client.created)
+      t.eq(nil, client.sessions)
+    end)
+  end)
+
   t.describe("client", function()
     t.it("sends session/cancel before withdrawing the prompt RPC", function()
       local sent = {}

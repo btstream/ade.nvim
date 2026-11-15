@@ -644,10 +644,23 @@ function M.build(ctx, opts, action)
     end
     pcall(S.conn.reconnector.lost, S.conn.reconnector)
   end
-  -- A fake connection injected by a test may not implement subscriptions; the
-  -- panel still works, it just has no automatic reconnect.
-  if type(S.conn.service.subscribe) == "function" then
-    S.conn.service:subscribe("panel", "__disconnected", on_service_lost)
+  -- `Connection:subscribe` forwards to the shared *service* connection, which is
+  -- what actually receives `__disconnected`. Talking to `S.conn.service` used
+  -- to be a silent no-op — the app-level object had no `subscribe`, a
+  -- `type(...) == "function"` guard swallowed the mistake, and automatic
+  -- reconnection was never wired at all. A missing method is a wiring bug, not
+  -- an optional capability, so it must fail loudly.
+  if type(S.conn.service.subscribe) ~= "function" then
+    local message = "ade.nvim: the connection object cannot subscribe; automatic reconnection is disabled"
+    log.error(message)
+    -- Report it, but do not abort setup: the rest of the panel still works.
+    pcall(notify, message, vim.log.levels.ERROR)
+  else
+    local ok, err = pcall(S.conn.service.subscribe, S.conn.service, "panel", "__disconnected", on_service_lost)
+    if not ok then
+      log.error("subscribing to __disconnected failed: %s", tostring(err))
+      pcall(notify, "ade.nvim: automatic reconnection is disabled: " .. tostring(err), vim.log.levels.ERROR)
+    end
   end
 
   S.conn.restore = Restore.new({
@@ -664,8 +677,12 @@ function M.build(ctx, opts, action)
       local agent = require("ade.protocol.capabilities").agent(client)
       return supports(agent, "loadSession")
     end,
-    load = function(session_id)
-      S.sess.service:load(session_id)
+    -- The outcome callbacks travel through `Sessions:load`: without them
+    -- `restore.lua` cannot tell the user "restored session X" or why it fell
+    -- back, which is the whole difference between a restore and a fresh start
+    -- as far as the user can see.
+    load = function(session_id, load_opts)
+      S.sess.service:load(session_id, load_opts)
     end,
     create = function()
       ctx.new_session()

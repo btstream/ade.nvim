@@ -391,9 +391,16 @@ function Server:on_tunnel_send(params, client)
         ["session/new"] = { sessionId = "sess_mock", configOptions = {} },
         ["session/load"] = { configOptions = {} },
         ["session/prompt"] = { stopReason = "end_turn" },
+        ["session/close"] = {},
+        ["session/delete"] = {},
       }
       local result = message.method and replies[message.method]
       if result and message.id ~= nil then
+        -- Track session lifetimes exactly like the relay (PROTOCOL.md 11), and
+        -- report them in the `agent.attach` shape (PROTOCOL.md 3.2): a test
+        -- about restore must exercise `sessionId`, not a field the stand-in
+        -- invented.
+        self:track_message(instance, message, result)
         -- A JSON-RPC **response** wraps the payload in `result`.
         self:deliver(instance, {
           jsonrpc = "2.0",
@@ -444,23 +451,76 @@ function Server:deliver(instance, message)
   end
 end
 
+---Mirror the relay's session tracking for one canned-agent exchange.
+---
+---Shape comes from PROTOCOL.md 3.2 (`sessionId`, `cwd`, `running`,
+---`updated_at`); a stand-in that invents `id` would make a wrong reader look
+---right, which is exactly how the restore defect survived the unit suite.
+---@param instance table
+---@param message table the ACP request
+---@param result table the reply's `result`
+function Server:track_message(instance, message, result)
+  local method = message.method
+  local params = type(message.params) == "table" and message.params or {}
+  local cwd = params.cwd or (instance.key and instance.key.cwd) or ""
+  instance.sessions = instance.sessions or {}
+  local function put(session_id)
+    for _, entry in ipairs(instance.sessions) do
+      if entry.sessionId == session_id then
+        entry.updated_at = vim.uv.gettimeofday() * 1000
+        return
+      end
+    end
+    instance.sessions[#instance.sessions + 1] = {
+      sessionId = session_id,
+      cwd = cwd,
+      running = false,
+      updated_at = math.floor(vim.uv.gettimeofday() * 1000),
+    }
+  end
+  local function forget(session_id)
+    local kept = {}
+    for _, entry in ipairs(instance.sessions) do
+      if entry.sessionId ~= session_id then
+        kept[#kept + 1] = entry
+      end
+    end
+    instance.sessions = kept
+  end
+  if method == "session/new" and type(result.sessionId) == "string" then
+    put(result.sessionId)
+  elseif method == "session/load" and type(params.sessionId) == "string" then
+    put(params.sessionId)
+  elseif (method == "session/close" or method == "session/delete") and params.sessionId ~= nil then
+    forget(params.sessionId)
+  end
+end
+
 ---Give an instance a tracked session, as the relay would (PROTOCOL 11).
 ---@param instance string
----@param session {id: string, cwd: string, updated_at?: integer}
+---@param session {sessionId: string, cwd: string, running?: boolean, updated_at?: integer}
 function Server:track_session(instance, session)
   local record = self.instances[instance]
   if not record then
     return nil
   end
+  -- Always stored in the protocol shape, even when the caller omits a field:
+  -- a stand-in with a partial entry teaches the reader wrong assumptions.
+  local entry = {
+    sessionId = session.sessionId,
+    cwd = session.cwd,
+    running = session.running == true,
+    updated_at = session.updated_at or math.floor(vim.uv.gettimeofday() * 1000),
+  }
   record.sessions = record.sessions or {}
-  for index, entry in ipairs(record.sessions) do
-    if entry.id == session.id then
-      record.sessions[index] = session
-      return session
+  for index, existing in ipairs(record.sessions) do
+    if existing.sessionId == entry.sessionId then
+      record.sessions[index] = entry
+      return entry
     end
   end
-  record.sessions[#record.sessions + 1] = session
-  return session
+  record.sessions[#record.sessions + 1] = entry
+  return entry
 end
 
 ---Tell a connection it adopted an in-flight turn (PROTOCOL 13).

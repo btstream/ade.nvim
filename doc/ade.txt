@@ -1046,6 +1046,8 @@ keep_alive = false 让每次退出（关闭 Neovim、切换 agent）都停掉 ag
 事件日志只在 agent 实例存活期间保留，保存在服务目录，实例停止或服务重启即删除；
 event_log = false 关闭记录后，重新打开看不到离开期间的内容。
 
+退出 Neovim 不会关闭会话：会 detach 时（agent 继续运行）不发 session/close，只有显式关闭、
+删除或切换会话才发。keep_alive = false 与直连后端照常关闭。
 restore = true 时，附着到已在运行的实例后会自动重新打开该工作目录下最近有活动的会话，
 而不是新建空会话；没有匹配、agent 不支持 session/load 或加载失败时回退新建并提示一次。
 

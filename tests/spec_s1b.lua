@@ -263,27 +263,27 @@ return function(t)
   t.describe("session restore", function()
     t.it("picks the most recently updated session for the cwd", function()
       local sessions = {
-        { id = "old", cwd = "/proj", updated_at = 100 },
-        { id = "new", cwd = "/proj", updated_at = 300 },
-        { id = "other", cwd = "/elsewhere", updated_at = 900 },
+        { sessionId = "old", cwd = "/proj", updated_at = 100 },
+        { sessionId = "new", cwd = "/proj", updated_at = 300 },
+        { sessionId = "other", cwd = "/elsewhere", updated_at = 900 },
       }
       local picked = Restore.pick(sessions, "/proj")
       t.truthy(picked)
-      t.eq("new", picked.id)
+      t.eq("new", picked.sessionId)
     end)
 
     t.it("does not pick another project's session", function()
-      local picked, reason = Restore.pick({ { id = "a", cwd = "/other", updated_at = 1 } }, "/proj")
+      local picked, reason = Restore.pick({ { sessionId = "a", cwd = "/other", updated_at = 1 } }, "/proj")
       t.falsy(picked)
       t.match("/proj", reason)
     end)
 
     t.it("breaks ties deterministically", function()
       local sessions = {
-        { id = "b", cwd = "/p", updated_at = 5 },
-        { id = "a", cwd = "/p", updated_at = 5 },
+        { sessionId = "b", cwd = "/p", updated_at = 5 },
+        { sessionId = "a", cwd = "/p", updated_at = 5 },
       }
-      t.eq("a", Restore.pick(sessions, "/p").id)
+      t.eq("a", Restore.pick(sessions, "/p").sessionId)
     end)
 
     t.it("reports an empty session list", function()
@@ -306,8 +306,18 @@ return function(t)
         supported = function()
           return opts.supported ~= false
         end,
-        load = function(id)
+        load = function(id, load_opts)
           record.loaded[#record.loaded + 1] = id
+          record.load_opts = load_opts
+          if opts.fail_load then
+            if load_opts and load_opts.on_failed then
+              load_opts.on_failed(opts.fail_load)
+            end
+            return
+          end
+          if load_opts and load_opts.on_restored then
+            load_opts.on_restored()
+          end
         end,
         create = function()
           record.created = record.created + 1
@@ -323,7 +333,7 @@ return function(t)
       local instance, record = harness()
       local restored = instance:after_ready({
         created = false,
-        sessions = { { id = "s9", cwd = "/proj", updated_at = 10 } },
+        sessions = { { sessionId = "s9", cwd = "/proj", updated_at = 10 } },
       })
       t.truthy(restored)
       t.eq({ "s9" }, record.loaded)
@@ -333,7 +343,7 @@ return function(t)
       local instance, record = harness()
       local restored = instance:after_ready({
         created = true,
-        sessions = { { id = "s9", cwd = "/proj", updated_at = 10 } },
+        sessions = { { sessionId = "s9", cwd = "/proj", updated_at = 10 } },
       })
       t.falsy(restored)
       t.eq({}, record.loaded)
@@ -343,7 +353,7 @@ return function(t)
       local instance, record = harness({ config = config_with({ service = { restore = false } }) })
       local restored = instance:after_ready({
         created = false,
-        sessions = { { id = "s9", cwd = "/proj", updated_at = 10 } },
+        sessions = { { sessionId = "s9", cwd = "/proj", updated_at = 10 } },
       })
       t.falsy(restored)
       t.eq({}, record.loaded)
@@ -354,26 +364,113 @@ return function(t)
       local instance, record = harness()
       local restored = instance:after_ready({
         created = false,
-        sessions = { { id = "s9", cwd = "/other", updated_at = 10 } },
+        sessions = { { sessionId = "s9", cwd = "/other", updated_at = 10 } },
       })
       t.falsy(restored)
       t.eq(1, #record.notes)
       t.match("/proj", record.notes[1].message)
       -- A second attempt stays quiet.
-      instance:after_ready({ created = false, sessions = { { id = "s8", cwd = "/other" } } })
+      instance:after_ready({ created = false, sessions = { { sessionId = "s8", cwd = "/other" } } })
       t.eq(1, #record.notes)
+    end)
+
+    t.it("ignores an entry shaped like the old non-spec field", function()
+      -- PROTOCOL.md 3.2 says `sessionId`. Reading `id` as well would hide a
+      -- service (or a stand-in) that drifted from the spec: the whole defect
+      -- this test exists for was a fake that used `id` and a reader to match.
+      local picked, reason = Restore.pick({ { id = "wrong", cwd = "/p", updated_at = 1 } }, "/p")
+      t.falsy(picked)
+      t.match("no session for /p", reason)
+    end)
+
+    t.it("tells the user which session was restored", function()
+      local instance, record = harness()
+      instance:after_ready({
+        created = false,
+        sessions = { { sessionId = "s9", cwd = "/proj", updated_at = 10 } },
+      })
+      t.eq(1, #record.notes, "a restore must say so")
+      t.eq(vim.log.levels.INFO, record.notes[1].level)
+      t.match("restored session s9", record.notes[1].message)
+    end)
+
+    t.it("says why a session could not be restored", function()
+      local instance, record = harness({ fail_load = "session not found" })
+      instance:after_ready({
+        created = false,
+        sessions = { { sessionId = "s7", cwd = "/proj", updated_at = 10 } },
+      })
+      t.eq({ "s7" }, record.loaded)
+      local joined = {}
+      for _, note in ipairs(record.notes) do
+        joined[#joined + 1] = note.message
+        t.eq(vim.log.levels.WARN, note.level, "a failed restore is a warning")
+      end
+      t.match("session s7 could not be restored", table.concat(joined, "\n"))
+      t.match("session not found", table.concat(joined, "\n"))
+    end)
+
+    t.it("says why a session could not be restored (fallback)", function()
+      local instance, record = harness({ supported = false })
+      instance:after_ready({
+        created = false,
+        sessions = { { sessionId = "s9", cwd = "/proj", updated_at = 10 } },
+      })
+      t.eq(1, #record.notes)
+      t.eq(vim.log.levels.WARN, record.notes[1].level, "a fallback the user did not ask for is a warning")
     end)
 
     t.it("falls back when the agent cannot load sessions", function()
       local instance, record = harness({ supported = false })
       local restored = instance:after_ready({
         created = false,
-        sessions = { { id = "s9", cwd = "/proj", updated_at = 10 } },
+        sessions = { { sessionId = "s9", cwd = "/proj", updated_at = 10 } },
       })
       t.falsy(restored)
       t.eq({}, record.loaded)
       t.eq(1, #record.notes)
       t.match("cannot load", record.notes[1].message)
+    end)
+  end)
+
+  t.describe("stand-in shapes match the protocol", function()
+    t.it("reports sessions as {sessionId, cwd, running, updated_at}", function()
+      -- A stand-in that uses a different field name than PROTOCOL.md 3.2 would
+      -- make a wrong reader look correct: that is how `restore.lua` read `id`
+      -- and still passed every test.
+      local fake = require("tests.fake_service")
+      local dir = tmpdir("shape")
+      local service = fake.new({ dir = dir, canned_agent = true })
+      service.spawn_agent = function()
+        return true
+      end
+      t.truthy(service:listen())
+      t.cleanup(function()
+        service:close()
+      end)
+      local first = service:attach({
+        key = { agent = "a", command = "b", args = {}, cwd = "/proj" },
+        client_capabilities = {},
+      }, { greeted = true, attached = {} }, 1)
+      local instance = first.result.instance
+      t.truthy(instance)
+      service:track_session(instance, { sessionId = "s1", cwd = "/proj", updated_at = 5 })
+      service:track_session(instance, { sessionId = "s2", cwd = "/proj", updated_at = 9 })
+      local ok, reply = pcall(service.attach, service, {
+        key = { agent = "a", command = "b", args = {}, cwd = "/proj" },
+        client_capabilities = {},
+      }, { greeted = true, attached = {} }, 2)
+      t.truthy(ok, tostring(reply))
+      t.eq(instance, reply.result.instance)
+      local sessions = reply.result.sessions
+      t.eq(2, #sessions)
+      for _, entry in ipairs(sessions) do
+        t.truthy(entry.sessionId, "a stand-in session without sessionId")
+        t.eq(nil, entry.id, "the stand-in must not invent an `id` field")
+        t.truthy(entry.cwd)
+        t.eq(false, entry.running)
+        t.truthy(type(entry.updated_at) == "number")
+      end
     end)
   end)
 
@@ -692,8 +789,46 @@ return function(t)
       local instance, record = harness({ restart_ok = false })
       t.truthy(instance:check({ server_version = Version.VERSION .. "-old", api_version = Version.API_VERSION }))
       t.eq(1, record.restarts)
-      t.match("could not restart", record.notes[1].message)
-      t.eq(vim.log.levels.WARN, record.notes[1].level)
+      t.match("restarting nvim_ade_server", record.notes[1].message)
+      t.match("could not restart", record.notes[2].message)
+      t.eq(vim.log.levels.WARN, record.notes[2].level)
+    end)
+
+    t.it("does not report a failure while an asynchronous restart is in flight", function()
+      -- A real restart is `shutdown` (socket round trip) then `ensure` (another
+      -- one). Reading its result in the same statement always saw false, so a
+      -- successful restart was reported as a failure. Its callback arrives on a
+      -- later tick; nothing may be reported before then.
+      local record = { notes = {}, restarts = 0, done = 0 }
+      local pending_cb = nil
+      local instance = VersionCheck.new({
+        config = function()
+          return config_with({})
+        end,
+        request_sync = function()
+          return true, { instances = {} }
+        end,
+        restart = function(cb)
+          record.restarts = record.restarts + 1
+          pending_cb = cb
+        end,
+        notify = function(message, level)
+          record.notes[#record.notes + 1] = { message = message, level = level }
+        end,
+      })
+      local usable = instance:check({ server_version = Version.VERSION .. "-old" }, function()
+        record.done = record.done + 1
+      end)
+      t.eq("pending", usable, "an in-flight restart must not claim to be settled")
+      t.eq(1, record.restarts)
+      -- Nothing has failed yet: only the "restarting ..." notice exists.
+      t.eq(1, #record.notes)
+      t.match("restarting nvim_ade_server", record.notes[1].message)
+      -- The restart succeeds on a later tick.
+      pending_cb(true, nil)
+      t.eq(1, record.done)
+      t.eq(1, #record.notes, "a successful restart must not add a failure notice")
+      t.match("restarting", record.notes[1].message)
     end)
   end)
 end

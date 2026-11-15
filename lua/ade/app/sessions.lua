@@ -134,7 +134,7 @@ end
 ---the agent-side context comes back, the transcript does not. The user is told,
 ---because an empty transcript after "open session" otherwise looks like a bug.
 ---@param session_id string
----@param opts {kind: string|nil}|nil
+---@param opts {kind: string|nil, on_failed: fun(err: string)|nil, on_restored: fun()|nil}|nil
 function Sessions:resume(session_id, opts)
   opts = opts or {}
   local client = self.get_client()
@@ -176,6 +176,9 @@ function Sessions:resume(session_id, opts)
         "unable to resume the session: " .. message,
         opts.kind == "restore" and vim.log.levels.WARN or vim.log.levels.ERROR
       )
+      if opts.on_failed then
+        pcall(opts.on_failed, message)
+      end
       -- Restoring has no session to fall back on: the old one is already gone.
       if opts.kind == "restore" then
         self:create()
@@ -201,9 +204,15 @@ function Sessions:resume(session_id, opts)
     self.on_changed()
     self.notify("Session resumed (history is not replayed)")
     self.catalog:refresh_title(entry)
+    if opts.on_restored then
+      pcall(opts.on_restored)
+    end
   end, function(err)
     runtime:rollback(entry)
     self.notify("unable to resume the session: " .. tostring(err), vim.log.levels.ERROR)
+    if opts.on_failed then
+      pcall(opts.on_failed, tostring(err))
+    end
   end, function(_, owned)
     if not owned then
       return
@@ -257,6 +266,9 @@ function Sessions:replay(session_id, opts)
         "unable to " .. (opts.kind or "load") .. " the session: " .. message,
         opts.kind == "restore" and vim.log.levels.WARN or vim.log.levels.ERROR
       )
+      if opts.on_failed then
+        pcall(opts.on_failed, message)
+      end
       if opts.kind == "restore" then
         self:create()
       end
@@ -281,9 +293,15 @@ function Sessions:replay(session_id, opts)
     self.prune()
     self.on_changed()
     self.catalog:refresh_title(entry)
+    if opts.on_restored then
+      pcall(opts.on_restored)
+    end
   end, function(err)
     runtime:rollback(entry)
     self.notify("unable to load the session: " .. tostring(err), vim.log.levels.ERROR)
+    if opts.on_failed then
+      pcall(opts.on_failed, tostring(err))
+    end
   end, function(_, owned)
     if not owned then
       return
@@ -320,10 +338,22 @@ function Sessions:restore(session_id)
 end
 
 ---Load a previous session, replaying its history.
+---
+---`opts.on_failed` / `opts.on_restored` let the caller report the outcome of an
+---automatic restore: the user must be able to tell "reopened your conversation"
+---from "started a new one because X".
 ---@param session_id string
-function Sessions:load(session_id)
+---@param opts {kind: string|nil, on_failed: fun(err: string)|nil, on_restored: fun()|nil}|nil
+function Sessions:load(session_id, opts)
+  opts = opts or {}
+  local function failed(message)
+    if opts.on_failed then
+      pcall(opts.on_failed, message)
+    end
+  end
   if not self:ready() then
     self.notify("No agent process is running", vim.log.levels.WARN)
+    failed("no agent process is running")
     return
   end
   local runtime = self.get_runtime()
@@ -332,10 +362,14 @@ function Sessions:load(session_id)
     runtime:intend()
     self.activate(cached)
     self.dispatch_queued(cached)
+    if opts.on_restored then
+      pcall(opts.on_restored)
+    end
     return
   end
   if self.replaying then
     self.notify("Wait for the session to finish before loading its history", vim.log.levels.WARN)
+    failed("another replay is in progress")
     return
   end
   local client = self.get_client()
@@ -343,17 +377,18 @@ function Sessions:load(session_id)
     -- Resuming restores the agent-side context without replaying history; it is
     -- the closest this agent can get to "open that session".
     if capabilities.supports(capabilities.agent(client), "sessionCapabilities.resume") then
-      self:resume(session_id)
+      self:resume(session_id, { kind = opts.kind, on_failed = opts.on_failed, on_restored = opts.on_restored })
       return
     end
     self.notify("This agent cannot load sessions; starting a new one", vim.log.levels.WARN)
+    failed("the agent cannot load sessions")
     self:create()
     return
   end
   -- Agents reject session/load when the cwd does not match the session.
   -- Loading replays authoritative history, even for a cached session; appending
   -- to the cached object would duplicate every message on subsequent visits.
-  self:replay(session_id, { kind = "load" })
+  self:replay(session_id, { kind = opts.kind or "load", on_failed = opts.on_failed, on_restored = opts.on_restored })
 end
 
 ---Whether the client can be asked to close a session.
@@ -388,14 +423,45 @@ function Sessions:close(session_id)
   end)
 end
 
+---Whether leaving the editor will detach instead of stopping the agent.
+---
+---The transport owns this decision (`Channel:will_detach`, which folds in
+---`keep_alive`, a successful `initialize` and "nothing went wrong"); asking it
+---rather than re-deriving the rule here keeps the exit path and the actual
+---detach/stop in step.
+---@param client table|nil
+---@return boolean
+local function will_detach_on_exit(client)
+  if not client then
+    return false
+  end
+  if type(client.will_detach) ~= "function" then
+    -- The direct backend has no `leave`: its agent is a child process that dies
+    -- with the editor, so nothing can be reopened anyway.
+    return false
+  end
+  local ok, value = pcall(client.will_detach, client)
+  return ok and value == true
+end
+
 ---Close every active session synchronously, for editor exit.
 ---
 ---The process is killed right after this runs, so the request has to complete
 ---on this turn of the event loop; a fire-and-forget coroutine would leave the
 ---notification unsent.
+---
+---A detachable exit sends nothing. The service treats a successful
+---`session/close` as "forget this session" (PROTOCOL.md 11): after it, the
+---sessions are missing from `agent.attach` and the event log can never be
+---replayed for them, so closing here would defeat the whole point of keeping
+---the agent alive. The agent is going to outlive the editor, and the next one
+---must be able to reopen the conversation.
 function Sessions:close_all_on_exit()
   local client = self.get_client()
   if not can_close(client) then
+    return
+  end
+  if will_detach_on_exit(client) then
     return
   end
   local runtime = self.get_runtime()

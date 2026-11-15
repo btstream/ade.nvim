@@ -84,6 +84,50 @@ function Connection:service_connection()
   return self.service
 end
 
+---Subscribe to a service notification, on the real service connection.
+---
+---The app-level `Connection` is *not* the thing that receives socket events:
+---the shared `ade.service.connection` is. Wiring that called
+---`S.conn.service:subscribe(...)` directly silently did nothing, so automatic
+---reconnection was never registered. This forwarder exists so callers can stay
+---on the app object without guessing which layer to talk to.
+---@param channel_id string
+---@param method string
+---@param fn fun(payload: any)
+function Connection:subscribe(channel_id, method, fn)
+  local service = self:service_connection()
+  if type(service.subscribe) ~= "function" then
+    error("ade.nvim: the service connection has no subscribe(); the wiring is broken", 2)
+  end
+  return service:subscribe(channel_id, method, fn)
+end
+
+---Start the service and connect, when it is not connected already.
+---
+---Forwards to the shared service connection: the app-level object owns the
+---*agent* lifecycle, not the socket. Automatic reconnection needs exactly this
+---(start the service again, then re-attach), so it belongs here as a named
+---forwarder rather than as a second implementation.
+---@param cb fun(ok: boolean, err: string|nil)
+function Connection:ensure(cb)
+  return self:service_connection():ensure(cb)
+end
+
+---@return boolean
+function Connection:is_service_connected()
+  local service = self.service
+  return service ~= nil and service:is_connected()
+end
+
+---@param channel_id string
+---@param method string
+function Connection:unsubscribe(channel_id, method)
+  local service = self:service_connection()
+  if type(service.unsubscribe) == "function" then
+    service:unsubscribe(channel_id, method)
+  end
+end
+
 ---Whether the agent may outlive this Neovim.
 ---@param cfg table
 ---@return boolean

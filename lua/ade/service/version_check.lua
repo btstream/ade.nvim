@@ -84,11 +84,18 @@ end
 ---Handle a successful handshake. Returns whether the connection may be used
 ---as-is.
 ---
----Synchronous on purpose: `ensure()` is a synchronous API (callers wait for its
----callback), and the idle probe is one `agent.list` with a bounded wait.
+---The idle probe is synchronous (`agent.list` with a bounded wait), but the
+---restart itself is not: `shutdown` and the following `ensure` both reply on a
+---socket callback. Reading the result of `restart()` immediately after calling
+---it therefore always saw "not restarted" and reported a failure for a restart
+---that went on to succeed. So the caller may pass `done`; then a restart reports
+---back through it.
+---
 ---@param info table handshake result: `{server_version, api_version}`
----@return boolean usable
-function Check:check(info)
+---@param done fun()|nil called once the reconciliation finished (possibly later)
+---@return boolean|string usable `true`, `false`, or `"pending"` when `done` is
+---  still to come
+function Check:check(info, done)
   info = type(info) == "table" and info or {}
   if M.matches(info.server_version) then
     return true
@@ -131,38 +138,58 @@ function Check:check(info)
     end
     return true
   end
-  local restarted, err = false, nil
+  -- The agents are the service's children: shutting it down stops them too,
+  -- and only each agent's own `session/load` brings a session back. Saying so
+  -- is the difference between a surprise and an expected restart — and it is
+  -- said *before* the restart, so it does not depend on a reply.
+  local agents = type(instances) == "table" and #instances or 0
+  self.deps.notify(
+    string.format(
+      "restarting nvim_ade_server (%s -> %s); %d idle agent(s) will restart with it",
+      tostring(info.server_version),
+      Version.VERSION,
+      agents
+    ),
+    vim.log.levels.INFO
+  )
+  local settled, restarted, err = false, false, nil
   self.deps.restart(function(a, b)
-    restarted, err = a, b
+    settled, restarted, err = true, a == true, b
+    if not restarted then
+      self:report_failed_restart(err)
+    end
+    if done then
+      pcall(done)
+    end
   end)
-  if restarted then
-    -- The agents are the service's children: shutting it down stops them too,
-    -- and only each agent's own `session/load` brings a session back. Saying so
-    -- is the difference between a surprise and an expected restart.
-    local agents = type(instances) == "table" and #instances or 0
-    self.deps.notify(
-      string.format(
-        "restarting nvim_ade_server (%s -> %s); %d idle agent(s) will restart with it",
-        tostring(info.server_version),
-        Version.VERSION,
-        agents
-      ),
-      vim.log.levels.INFO
-    )
+  if settled then
     return true
   end
-  if not self.warned then
-    self.warned = true
-    self.deps.notify(
-      string.format(
-        "could not restart the service onto %s (%s); run :Ade service stop and reconnect",
-        Version.VERSION,
-        tostring(err)
-      ),
-      vim.log.levels.WARN
-    )
+  if done then
+    -- The restart's callback owns the outcome; `ensure` must not finish early
+    -- and must not report anything yet.
+    return "pending"
   end
+  -- No callback and no synchronous answer: the restart is in flight. The
+  -- connection is still usable, and a failure is reported when it happens.
   return true
+end
+
+---Report a restart that did not happen, once per front end.
+---@param err any
+function Check:report_failed_restart(err)
+  if self.warned then
+    return
+  end
+  self.warned = true
+  self.deps.notify(
+    string.format(
+      "could not restart the service onto %s (%s); run :Ade service stop and reconnect",
+      Version.VERSION,
+      tostring(err)
+    ),
+    vim.log.levels.WARN
+  )
 end
 
 ---Forget the one-shot warning. A new client means a new chance to report.

@@ -306,14 +306,34 @@ function Connection:ensure(cb)
       -- bring it back up. `restart_service` is injectable for tests.
       self:restart_service(done)
     end,
+    -- PROTOCOL.md 3.2: the app layer supplies `notify`; without it the user
+    -- never sees the version notice (the old code only logged). Falling back to
+    -- `vim.notify` keeps commands (`:Ade service agents`) that build the shared
+    -- connection without a panel from swallowing it.
     notify = function(message, level)
       pcall(log.warn, "%s", message)
-      if self.opts.notify then
-        pcall(self.opts.notify, message, level)
+      local target = self.opts.notify
+      if type(target) == "function" then
+        pcall(target, message, level)
+      else
+        pcall(vim.notify, "ade.nvim: " .. tostring(message), level or vim.log.levels.INFO)
       end
     end,
   })
-  local usable = checker:check(info)
+  local usable = checker:check(info, function()
+    -- The restart finished later (shutdown + reconnect round-trips). Report the
+    -- connection as usable now: `ensure` cannot wait indefinitely, and the
+    -- restart's own notification says what happened.
+    if not self.connecting then
+      return
+    end
+    self.version_info = info
+    self:finish(true, nil)
+  end)
+  if usable == "pending" then
+    -- The checker will resolve the handshake; do not finish twice.
+    return
+  end
   if not usable then
     self.client = nil
     client:close()
@@ -386,9 +406,20 @@ function Connection:restart_service(done)
   local client = self.client
   local function start_again()
     self.client = nil
+    -- This runs *inside* an `ensure` (the version check is part of the
+    -- handshake), so the in-flight state has to be cleared first: a second
+    -- `ensure` while `connecting` is true would only queue another waiter and
+    -- the restart would never be attempted. The original callers are resolved
+    -- from here, because the nested `ensure` owns `waiters` now.
+    local waiters = self.waiters or {}
+    self.connecting = false
+    self.waiters = nil
     self:ensure(function(ok, err)
       -- `ensure` may have been refused because `closed` is set; that is not a
       -- restart failure of the service.
+      for _, waiter in ipairs(waiters) do
+        pcall(waiter, ok, err)
+      end
       done(ok == true, err)
     end)
   end

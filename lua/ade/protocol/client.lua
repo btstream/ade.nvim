@@ -49,6 +49,20 @@ end
 local Client = {}
 Client.__index = Client
 
+---The transport's `created` flag, preserving `false`.
+---
+---`self.proc and self.proc.created or nil` turns a legitimate `false` into
+---`nil`, so this is spelled out: three states are meaningful (nil = direct
+---backend has no opinion, false = reused instance, true = new instance).
+---@param proc table|nil
+---@return boolean|nil
+local function attached_created(proc)
+  if not proc or proc.created == nil then
+    return nil
+  end
+  return proc.created == true
+end
+
 ---@param opts {agent: table, cwd: string, client_capabilities: table, limits?: table, scheduler?: table, interactions?: table, mcp_servers?: table[], launch?: table, transport?: table, connection?: table, agent_id?: string, keep_alive?: boolean, on_event: fun(name: string, payload: any)}
 ---@return AdeClient
 function M.new(opts)
@@ -222,6 +236,16 @@ function Client:do_start(generation)
     return false, msg
   end
 
+  self:apply_initialize_result(result)
+  return true, nil
+end
+
+---Record a successful `initialize` result and announce readiness.
+---
+---Split out of `do_start` so the attach metadata (PROTOCOL.md 3.2 `sessions` and
+---`created`) can be tested without a live agent.
+---@param result table the `initialize` response's `result`
+function Client:apply_initialize_result(result)
   self.capabilities = result.agentCapabilities or {}
   self.auth_methods = result.authMethods or {}
   self.agent_info = result.agentInfo or {}
@@ -238,14 +262,18 @@ function Client:do_start(generation)
     agent_info = self.agent_info,
     -- Sessions the service already tracks (PROTOCOL.md 3.2), when the transport
     -- reports them; nil for the direct backend.
+    --
+    -- `created` must not go through `x and y or nil`: the service reports
+    -- `false` for a reused instance, and `false or nil` is `nil`, which closes
+    -- the restore gate before it can ever fire. `attached_created` returns the
+    -- value verbatim, including `false`.
     sessions = self.proc and self.proc.sessions or nil,
-    created = self.proc and self.proc.created or nil,
+    created = attached_created(self.proc),
   })
   -- Also on the client itself: the application layer reads them while handling
   -- `ready`, and events are the only channel it has.
   self.sessions = self.proc and self.proc.sessions or nil
-  self.created = self.proc and self.proc.created or nil
-  return true, nil
+  self.created = attached_created(self.proc)
 end
 
 ---Send a request and block the current coroutine until it resolves.
@@ -343,7 +371,12 @@ function Client:request(method, params, timeout, extendable, prompt_session)
             -- ignore it and keep running the abandoned turn.
             self:_withdraw_prompt(prompt_session, false, err)
           else
-            rpc:cancel(id)
+            -- `rpc` may have been closed while this timer was pending (a
+            -- reconnect replaces it); cancelling then is meaningless, and the
+            -- settle still has to happen.
+            if rpc and rpc.cancel then
+              rpc:cancel(id)
+            end
             settle(false, err)
           end
         end)
