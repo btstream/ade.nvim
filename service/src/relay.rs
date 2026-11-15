@@ -1075,8 +1075,13 @@ impl Relay {
         let session_id = session_id.to_string();
 
         let mut events = Vec::new();
-        if self.log_enabled {
-            // The agent's own update, verbatim.
+        // The agent's own update, verbatim, except its `user_message_chunk`
+        // echo: the prompt is already in the log as the synthetic
+        // `user_prompt`, and recording both would replay every user message
+        // twice (PROTOCOL.md 10). The echo is still forwarded live.
+        let echoed_user_message =
+            update.get("sessionUpdate").and_then(Value::as_str) == Some("user_message_chunk");
+        if self.log_enabled && !echoed_user_message {
             events.push(PendingEvent {
                 seq,
                 session_id: Some(session_id.clone()),
@@ -2134,6 +2139,143 @@ mod tests {
         assert!(relay.session_summaries().is_empty());
         assert_eq!(relay.session_count(), 0);
         assert!(!relay.session_is_complete("sess_1"));
+    }
+
+    #[test]
+    fn the_agents_user_message_echo_is_forwarded_but_not_recorded() {
+        let mut relay = Relay::new(json!({}));
+        session_new(&mut relay, A, json!(1), "/tmp/project");
+
+        // The agent echoes the user's text back as an update.
+        let echo = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess_1",
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "messageId": "u1",
+                    "content": {"type": "text", "text": "hello"},
+                },
+            },
+        });
+        let outcome = relay.agent_message_full(&echo, &[A]);
+
+        // Live delivery is unchanged: every attached connection still gets it.
+        match &outcome.action {
+            Some(AgentAction::Notification { message, .. }) => assert_eq!(message, &echo),
+            other => panic!("the echo must still be forwarded: {other:?}"),
+        }
+        // Nothing is recorded for it (the synthetic prompt already is).
+        assert!(
+            outcome.events.is_empty(),
+            "the agent echo must not reach the log: {:?}",
+            outcome.events
+        );
+
+        // A different update of the same shape is still recorded.
+        let tool = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess_1",
+                "update": {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Read"},
+            },
+        });
+        let outcome = relay.agent_message_full(&tool, &[A]);
+        assert_eq!(outcome.events.len(), 1, "other updates are recorded");
+        assert!(!outcome.events[0].synthetic);
+        assert!(outcome.events[0].message.contains("tool_call"));
+    }
+
+    #[test]
+    fn a_prompt_records_exactly_one_user_message_event() {
+        let mut relay = Relay::new(json!({}));
+        session_new(&mut relay, A, json!(1), "/tmp/project");
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": "sess_1",
+                "prompt": [{"type": "text", "text": "hello"}],
+            },
+        });
+        let action = relay.frontend_message(A, &request);
+        let events = action.events();
+        assert_eq!(events.len(), 1, "one synthetic prompt event");
+        assert!(events[0].synthetic);
+        assert_eq!(events[0].session_id.as_deref(), Some("sess_1"));
+
+        // Replay form: the single synthetic event becomes one user chunk.
+        let stored = crate::store::Event {
+            seq: events[0].seq,
+            instance_key: "k".to_string(),
+            session_id: Some("sess_1".to_string()),
+            kind: crate::store::EventKind::Synthetic,
+            message: events[0].message.clone(),
+            ts_ms: 0,
+        };
+        let replayed = Relay::replay_messages(&[stored]);
+        assert_eq!(replayed.len(), 1, "one user chunk, not two");
+        assert_eq!(
+            replayed[0].1["params"]["update"]["sessionUpdate"],
+            "user_message_chunk"
+        );
+    }
+
+    #[test]
+    fn user_message_echo_is_not_recorded_when_a_prompt_is_in_flight() {
+        // The whole point: prompt (synthetic) + echo (skipped) = one copy.
+        let mut relay = Relay::new(json!({}));
+        session_new(&mut relay, A, json!(1), "/tmp/project");
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/prompt",
+            "params": {"sessionId": "sess_1", "prompt": [{"type": "text", "text": "hi"}]},
+        });
+        let prompt_events = relay.frontend_message(A, &request).events().to_vec();
+        assert_eq!(prompt_events.len(), 1);
+
+        let echo = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess_1",
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "messageId": "u1",
+                    "content": {"type": "text", "text": "hi"},
+                },
+            },
+        });
+        assert!(relay.agent_message_full(&echo, &[A]).events.is_empty());
+
+        // Replayed user chunks: exactly one, the synthetic one.
+        let stored: Vec<crate::store::Event> = prompt_events
+            .iter()
+            .map(|event| crate::store::Event {
+                seq: event.seq,
+                instance_key: "k".to_string(),
+                session_id: event.session_id.clone(),
+                kind: if event.synthetic {
+                    crate::store::EventKind::Synthetic
+                } else {
+                    crate::store::EventKind::AgentNotification
+                },
+                message: event.message.clone(),
+                ts_ms: 0,
+            })
+            .collect();
+        let replayed = Relay::replay_messages(&stored);
+        let user_chunks = replayed
+            .iter()
+            .filter(|(_, message)| {
+                message["params"]["update"]["sessionUpdate"] == "user_message_chunk"
+            })
+            .count();
+        assert_eq!(user_chunks, 1, "the user message is replayed once");
     }
 
     // --- turn adoption (PROTOCOL.md 13) --------------------------------------

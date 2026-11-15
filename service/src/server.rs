@@ -162,17 +162,6 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
         }
     }
 
-    let mut listener = Listener::bind(paths.socket())
-        .with_context(|| format!("binding socket {}", socket_string(&paths)))?;
-    let socket = socket_string(&paths);
-    announce_ready(&socket)?;
-    eprintln!(
-        "nvim_ade_server {} (api {}) listening on {}",
-        crate::SERVER_VERSION,
-        API_VERSION,
-        socket
-    );
-
     // The event log is opened before the socket is announced, so a front end
     // that sees "ready" can rely on replay working (PROTOCOL.md 10).
     let recorder = if options.event_log {
@@ -184,6 +173,17 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
         Recorder::disabled()
     };
 
+    let mut listener = Listener::bind(paths.socket())
+        .with_context(|| format!("binding socket {}", socket_string(&paths)))?;
+    let socket = socket_string(&paths);
+    announce_ready(&socket)?;
+    eprintln!(
+        "nvim_ade_server {} (api {}) listening on {}",
+        crate::SERVER_VERSION,
+        API_VERSION,
+        socket
+    );
+
     let shutdown = Arc::new(Notify::new());
     let stopped = Arc::new(Notify::new());
     let (hub_commands, hub_commands_rx) = mpsc::channel::<Command>(256);
@@ -191,6 +191,7 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
 
     let hub = Hub::new(
         hub_commands_rx,
+        hub_commands.clone(),
         hub_events,
         Arc::clone(&stopped),
         stop_timeouts,
