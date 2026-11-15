@@ -679,6 +679,36 @@ fn tunnel_send_requires_an_attached_connection() {
 }
 
 #[test]
+fn the_stop_reply_arrives_after_the_instance_is_gone() {
+    // PROTOCOL.md 3.4: the reply comes after the process exited, so a front end
+    // that sends `agent.list` right after it never sees the instance again.
+    let server = TestServer::start("agent-stop-order");
+    let mut client = server.connect();
+    client.hello(&server.token(), 2);
+    let script = write_stubborn_agent(
+        server.dir(),
+        "exits-on-stdin.sh",
+        "#!/bin/sh\ncat > /dev/null\nexit 0\n",
+    );
+    let (mut client, instance) = {
+        let attached = attach_custom(&server, &script, &[]);
+        (attached.0, attached.1)
+    };
+    let _ = &mut client;
+
+    let reply = client.request(2, "agent.stop", json!({"instance": instance}));
+    assert_eq!(reply["result"]["exited"], true);
+
+    // No polling: the very next list must be empty.
+    let list = client.request(3, "agent.list", json!({}));
+    assert_eq!(
+        list["result"]["instances"],
+        json!([]),
+        "the stopped instance is gone before the reply: {list}"
+    );
+}
+
+#[test]
 fn detach_keeps_the_agent_running_and_reconnect_finds_it() {
     let server = TestServer::start("agent-detach");
     let mut first = Agent::attach(&server, "detach");
@@ -1930,6 +1960,53 @@ impl Peer {
 }
 
 #[test]
+fn a_replay_has_exactly_one_user_message_chunk_per_prompt() {
+    // The regression: the synthetic prompt and the agent's echo used to be
+    // recorded both, so every user message was replayed twice.
+    let server = TestServer::start("s1b-dedup");
+    let mut first = Peer::attach(&server, "dedup");
+    first.initialize();
+    let session_id = session_id_of(&first.new_session(json!(10)));
+    first.set_session(&session_id);
+    let (live_updates, _) = first.run_prompt(json!(11), "one and only");
+    // The live stream still carries the agent's echo, untouched by the fix.
+    assert!(
+        live_updates
+            .iter()
+            .any(|update| update["sessionUpdate"] == "user_message_chunk"),
+        "the live stream keeps the agent's user_message_chunk: {live_updates:?}"
+    );
+    drop(first);
+
+    let mut second = Peer::attach(&server, "dedup");
+    second.set_session(&session_id);
+    let (replayed, _, _) = second.load_session(json!(20), &session_id);
+
+    let user_chunks: Vec<&Value> = replayed
+        .iter()
+        .filter(|update| update["sessionUpdate"] == "user_message_chunk")
+        .collect();
+    assert_eq!(
+        user_chunks.len(),
+        1,
+        "the replay must hold exactly one user_message_chunk: {replayed:?}"
+    );
+    assert_eq!(
+        user_chunks[0]["messageId"],
+        format!(
+            "ade-user-{}",
+            user_chunks[0]["messageId"]
+                .as_str()
+                .map(|id| id.trim_start_matches("ade-user-"))
+                .unwrap_or_default()
+        ),
+        "the surviving chunk is the synthetic one"
+    );
+    // Its text is the user's prompt, so nothing was lost by dropping the echo.
+    assert_eq!(user_chunks[0]["content"]["text"], "one and only");
+}
+
+#[test]
 fn session_load_replays_the_conversation_and_the_tracked_state() {
     let server = TestServer::start("s1b-load");
     let mut first = Peer::attach(&server, "load");
@@ -1953,34 +2030,40 @@ fn session_load_replays_the_conversation_and_the_tracked_state() {
     let (replayed, response, adoptions) = second.load_session(json!(20), &session_id);
     assert!(adoptions.is_empty(), "no orphan turn was running");
 
-    // The agent's own stream appears verbatim and in order; the synthetic user
-    // chunks (our prompts) are interleaved but filtered out here. The mock
-    // echoes the user text itself, so compare by content, not by kind.
-    let replayed_updates: Vec<Value> = replayed
+    // The agent's own stream appears verbatim and in order, except its
+    // `user_message_chunk` echo: that one is forwarded live but not recorded
+    // (PROTOCOL.md 10), because the synthetic prompt already carries the text.
+    let replayed_agent_updates: Vec<Value> = replayed
         .iter()
-        .filter(|update| {
-            !(update["sessionUpdate"] == "user_message_chunk"
-                && update["messageId"]
-                    .as_str()
-                    .is_some_and(|id| id.starts_with("ade-user-")))
-        })
+        .filter(|update| update["sessionUpdate"] != "user_message_chunk")
+        .cloned()
+        .collect();
+    let live_agent_updates: Vec<Value> = live
+        .iter()
+        .filter(|update| update["sessionUpdate"] != "user_message_chunk")
         .cloned()
         .collect();
     assert_eq!(
-        replayed_updates, live,
+        replayed_agent_updates, live_agent_updates,
         "the replay is the recorded agent stream, in order"
     );
-    // Both prompts come back as synthetic user_message_chunk updates.
-    let user_chunks = replayed
+
+    // Every user message appears exactly once, as the synthetic chunk.
+    let user_chunks: Vec<&Value> = replayed
         .iter()
-        .filter(|update| {
-            update["sessionUpdate"] == "user_message_chunk"
-                && update["messageId"]
-                    .as_str()
-                    .is_some_and(|id| id.starts_with("ade-user-"))
-        })
-        .count();
-    assert_eq!(user_chunks, 2, "both prompts replay: {replayed:?}");
+        .filter(|update| update["sessionUpdate"] == "user_message_chunk")
+        .collect();
+    assert_eq!(
+        user_chunks.len(),
+        2,
+        "exactly one user chunk per prompt, no duplicate: {replayed:?}"
+    );
+    assert!(
+        user_chunks.iter().all(|update| update["messageId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("ade-user-"))),
+        "the only user chunks are the synthetic ones: {user_chunks:?}"
+    );
 
     assert_eq!(
         response["result"], state,

@@ -304,7 +304,7 @@ other notifications).
 
 | Recorded event | When | Replayed as |
 |---|---|---|
-| agent `session/update` | the agent writes it | itself, unchanged |
+| agent `session/update` | the agent writes it, **except** `user_message_chunk` (see below) | itself, unchanged |
 | synthetic `user_prompt` | a front end sends `session/prompt` | one `user_message_chunk` update per prompt content block |
 | synthetic `config` | a `session/set_config_option` response carries `configOptions`, or an update replaces them | a `config_option_update` update with the full list |
 | synthetic `mode` | a `session/set_mode` succeeds | a `current_mode_update` update |
@@ -325,6 +325,12 @@ Rules:
   (section 12 declines to replay it).
 - A synthetic `user_prompt` event is limited to 8 MiB: a content block larger than
   1 MiB is replaced by a text block `[content omitted from the replay log]`.
+- The agent's `user_message_chunk` updates are **not** recorded. ACP agents echo
+  the user's prompt back as `user_message_chunk`, and the front end's prompt is
+  already in the log as the synthetic `user_prompt`; recording both would replay
+  every user message twice. The echo is still delivered to the front end live; it
+  is only left out of the log, so the replay has exactly one copy of each user
+  message (the synthetic event).
 - `--event-log off` disables recording entirely: `features` has no `"log"`,
   `attach` returns no sessions, and section 12 never applies.
 - Writing the log never blocks the relay. A read for replay first waits until

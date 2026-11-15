@@ -88,7 +88,9 @@ nothing is tracked, the list is empty and `hello` advertises only `"tunnel"`.
 With the log on (the default), the service records what a later front end needs
 to rebuild a conversation: the agent's `session/update` notifications, plus
 synthetic events for what only the front end said (the prompts, config and mode
-changes). It lives in `<dir>/nvim_ade_server.events.sqlite3` (0600), capped per
+changes). The agent's `user_message_chunk` echo is not recorded (the prompt is
+already there as a synthetic event), so a replay holds each user message exactly
+once; the echo is still delivered live. It lives in `<dir>/nvim_ade_server.events.sqlite3` (0600), capped per
 instance by `--event-log-max-mb`, and is deleted with its instance and on every
 service start.
 

@@ -145,6 +145,18 @@ pub enum Command {
     },
     /// Stop every instance. The hub notifies [`Hub::stopped`] when done.
     Shutdown,
+    /// Every instance stopped during shutdown: the hub can end its loop.
+    Stopped,
+    /// The stop sequence of one instance finished; reply once the hub has
+    /// removed the instance, so `agent.list` right after the reply cannot show
+    /// it any more (PROTOCOL.md 3.4).
+    StopFinished {
+        conn: u64,
+        instance: String,
+        id: Option<Value>,
+        code: Option<i32>,
+        signal: Option<String>,
+    },
 }
 
 /// Events from the hub to the server loop.
@@ -343,12 +355,19 @@ pub struct Hub {
     limits: Limits,
     /// Load tasks report here; the hub stays the only state owner.
     load_sender: mpsc::UnboundedSender<LoadResult>,
+    /// Replies to `agent.stop` whose instance has not been removed yet.
+    pending_stop_replies: HashMap<String, Vec<(u64, Value)>>,
+    /// The hub's own command sender, so spawned tasks can report back.
+    command_sender: mpsc::Sender<Command>,
+    /// Set when the shutdown sequence completed; the run loop then ends.
+    finished: bool,
     load_results: mpsc::UnboundedReceiver<LoadResult>,
 }
 
 impl Hub {
     pub fn new(
         commands: mpsc::Receiver<Command>,
+        command_sender: mpsc::Sender<Command>,
         events: mpsc::UnboundedSender<HubEvent>,
         stopped: Arc<Notify>,
         timeouts: StopTimeouts,
@@ -375,6 +394,9 @@ impl Hub {
             limits: Limits::default(),
             load_sender,
             load_results,
+            pending_stop_replies: HashMap::new(),
+            command_sender,
+            finished: false,
         }
     }
 
@@ -400,6 +422,9 @@ impl Hub {
                 command = self.commands.recv() => {
                     let Some(command) = command else { return };
                     self.handle_command(command);
+                    if self.finished {
+                        return;
+                    }
                 }
                 event = self.runtime_events.recv() => {
                     let Some(event) = event else { return };
@@ -433,6 +458,32 @@ impl Hub {
                 }
                 self.handle_frame(conn, frame);
             }
+            Command::Stopped => {
+                self.finished = true;
+            }
+            Command::StopFinished {
+                conn,
+                instance,
+                id,
+                code,
+                signal,
+            } => {
+                // Still present means its exit event has not been processed
+                // yet: remember the reply and send it from `instance_exited`.
+                if self.instances.contains_key(&instance) {
+                    if let Some(id) = id {
+                        self.pending_stop_replies
+                            .entry(instance)
+                            .or_default()
+                            .push((conn, id));
+                    }
+                } else if let Some(id) = id {
+                    self.send_to(
+                        conn,
+                        &success(&id, json!({"exited": true, "code": code, "signal": signal})),
+                    );
+                }
+            }
             Command::Shutdown => {
                 if self.closing {
                     return;
@@ -451,9 +502,13 @@ impl Hub {
                     .collect();
                 let timeouts = self.timeouts;
                 let stopped = Arc::clone(&self.stopped);
+                let sender = self.command_sender.clone();
                 tokio::spawn(async move {
                     Self::stop_all(instances, timeouts).await;
                     stopped.notify_waiters();
+                    // The hub holds a sender of its own, so it must be told to
+                    // end its loop explicitly.
+                    let _ = sender.send(Command::Stopped).await;
                 });
             }
         }
@@ -734,8 +789,7 @@ impl Hub {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let timeouts = self.timeouts;
-        let outbox = self.conns.get(&conn).cloned();
-        let id = id.clone();
+        let reply_id = if is_request { Some(id.clone()) } else { None };
         let name = instance_id.to_string();
 
         // The instance leaves the identity lookup now, not when the process
@@ -759,7 +813,9 @@ impl Hub {
         }
 
         // The reply is sent after the process exited, so the wait happens off
-        // the hub loop (it can take seconds).
+        // the hub loop (it can take seconds). It is queued through the hub so
+        // the instance is gone from `agent.list` before the reply goes out.
+        let sender = self.command_sender.clone();
         tokio::spawn(async move {
             control.stop(force, timeouts).await;
             let patience = if force {
@@ -768,18 +824,15 @@ impl Hub {
                 timeouts.after_stdin + timeouts.after_term + Duration::from_secs(5)
             };
             let info = exited.wait(patience).await.unwrap_or_default();
-            if is_request {
-                if let Some(outbox) = outbox {
-                    outbox.send(&success(
-                        &id,
-                        json!({
-                            "exited": true,
-                            "code": info.code,
-                            "signal": info.signal,
-                        }),
-                    ));
-                }
-            }
+            let _ = sender
+                .send(Command::StopFinished {
+                    conn,
+                    instance: name.clone(),
+                    id: reply_id,
+                    code: info.code,
+                    signal: info.signal,
+                })
+                .await;
             eprintln!("nvim_ade_server: agent.stop finished for {name}");
         });
     }
@@ -1308,6 +1361,15 @@ impl Hub {
             "nvim_ade_server: agent instance {instance_id} exited (code {:?}, signal {:?})",
             info.code, info.signal
         );
+        // `agent.stop` replies wait until the instance is gone, so the very next
+        // `agent.list` cannot show it (PROTOCOL.md 3.4).
+        for (conn, id) in self
+            .pending_stop_replies
+            .remove(instance_id)
+            .unwrap_or_default()
+        {
+            self.send_to(conn, &success(&id, stop_reply(&info)));
+        }
     }
 
     fn update_busy(&mut self) {
@@ -1426,6 +1488,15 @@ fn forget_identity(
     } else {
         false
     }
+}
+
+/// The `agent.stop` result for one exit.
+fn stop_reply(info: &crate::runtime::ExitInfo) -> Value {
+    json!({
+        "exited": true,
+        "code": info.code,
+        "signal": info.signal,
+    })
 }
 
 fn request_id(frame: &Value) -> Value {
