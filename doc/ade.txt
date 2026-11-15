@@ -1005,8 +1005,13 @@ follow_cursor = false 让输入框停在打开时的位置。审查内容随窗�
 ==============================================================================
 24. 服务后端（nvim_ade_server）                          *ade-service*
 
-后续版本把 agent 的管理搬到 Rust 后台服务 nvim_ade_server。**目前服务还没接管聊天**：
-默认仍是 Lua 直连（backend = "direct"），本节只涉及服务的安装与状态查看。
+Agent 可以交给 Rust 后台服务 nvim_ade_server 持有，这样 Neovim 退出后 agent 继续运行，
+重新打开时按同一个实例 key 附着回去。默认仍是 Lua 直连（backend = "direct"），不装服务
+也能照常使用：
+
+    backend = "direct"    Neovim 自己启动并持有 agent（默认，与旧行为一致）
+    backend = "service"   通过服务通道收发 ACP；服务不可用时明确报错，不回退
+    backend = "auto"      服务可用就用服务，不可用只提示一次再回退直连
 
 安装（lazy.nvim 的 build 钩子）：
 
@@ -1027,8 +1032,12 @@ service/rust-toolchain.toml 锁定日期的 nightly 工具链，**建议安装 r
       release_base = "https://github.com/btstream/ade.nvim/releases/download", -- 必须 https（回环 http 例外）
       install_timeout = 10 * 60 * 1000,
       start_timeout = 5000,
+      keep_alive = true,              -- 退出 Neovim 时让 agent 继续运行
+      idle_timeout = 1800,            -- 空闲多少秒后服务自行退出（60-86400）
     },
     backend = "direct",               -- "direct" | "service" | "auto"
+
+keep_alive = false 让每次退出（关闭 Neovim、切换 agent）都停掉 agent，等价于直连模式。
 
 release_base 必须是 https://：压缩包与 SHA256SUMS 同源，明文 http 下中间人可同时替换两者，
 校验失效；下载时 curl 也限制 --proto =https --proto-redir =https，不允许跟随重定向降级。
@@ -1042,6 +1051,18 @@ URL 中出现反斜杠、空白或控制字符，或 authority 里带 @（userin
     :Ade service status     已安装版本、二进制、是否在运行、api_version 是否匹配
     :Ade service start      在后台启动服务；已在运行则复用
     :Ade service stop       让服务退出
+    :Ade service agents     列出服务持有的实例（id、agent、cwd、pid、运行时长、
+                            附着数、进行中的回合、待处理请求）
+    :Ade service kill <id>  停掉一个实例
+
+服务模式下 :Ade disconnect 会真正停止 agent；关闭 Neovim 或切换 agent 时按
+service.keep_alive 决定 detach（保留）还是 stop。stop 与 detach 都不阻塞界面：
+服务在处理请求时就把实例从身份表摘掉，所以紧接着用同一个 key attach 一定得到新实例。
+
+多个 Neovim 附着同一实例时，每个连接都会收到该实例的全部 session/update；不属于
+自己的会话的更新会被 reducer 直接丢弃（不缓冲），正在创建会话的那一小段时间最多
+缓冲 256 条 / 1 MiB；客户端待派发队列上限 64 MiB，超出时不丢消息，而是按连接丢失
+处理（断开并让各实例通道上报退出），重新连接即可。
 
 `:checkhealth ade` 中的 “ade.nvim service” 一节与 status 相同，只报告不修改。
 服务目录、socket 与令牌路径：优先 $NVIM_ADE_SERVER_DIR，其次 $XDG_RUNTIME_DIR/ade、

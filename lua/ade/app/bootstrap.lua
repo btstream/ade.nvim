@@ -137,7 +137,9 @@ function M.build(ctx, opts, action)
   end
 
   if S.conn.client then
-    pcall(S.conn.client.shutdown, S.conn.client, true)
+    -- Reconfiguring switches agent (or wiring): the old agent may keep running
+    -- under the service backend, so leave rather than kill it.
+    pcall(S.conn.client.leave, S.conn.client, true)
     S.conn.client = nil
   end
   S.sess.current = nil

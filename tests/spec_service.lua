@@ -698,7 +698,7 @@ return function(t)
       local client, ok, info, service = connect()
       t.truthy(ok, tostring(info))
       local reasons = {}
-      client.on_disconnect = function(reason)
+      client.on_disconnect_cb = function(reason)
         reasons[#reasons + 1] = reason
       end
       service:close()
@@ -1484,6 +1484,137 @@ return function(t)
     end)
   end)
 
+  t.describe("service agents and kill commands", function()
+    local Commands = require("ade.service.commands")
+
+    local function listing(instances)
+      return {
+        request = function(_, method, _, cb)
+          if method == "agent.list" then
+            cb(true, { instances = instances })
+          elseif method == "agent.stop" then
+            cb(true, { exited = true, code = 0 })
+          end
+        end,
+      }
+    end
+
+    t.it("lists every instance with its runtime facts", function()
+      local messages = {}
+      local instances = {
+        {
+          instance = "inst-1",
+          agent = "opencode",
+          cwd = "/proj",
+          pid = 42,
+          started_at = math.floor(vim.uv.gettimeofday() * 1000) - 65000,
+          attached = 1,
+          turns_running = 2,
+          pending_requests = 3,
+        },
+        {
+          instance = "inst-2",
+          agent = "claude",
+          cwd = "/other",
+          pid = 43,
+          started_at = math.floor(vim.uv.gettimeofday() * 1000) - 5000,
+          attached = 0,
+        },
+      }
+      local got = Commands.agents({
+        connection = listing(instances),
+        notify = function(message)
+          messages[#messages + 1] = tostring(message)
+        end,
+      })
+      t.eq(2, #got)
+      local joined = table.concat(messages, "\n")
+      t.match("inst%-1", joined)
+      t.match("opencode", joined)
+      t.match("pid 42", joined)
+      t.match("attached 1", joined)
+      t.match("turns 2", joined)
+      t.match("pending 3", joined)
+      t.match("1m0", joined)
+      t.match("inst%-2", joined)
+    end)
+
+    t.it("says so when no instance is running", function()
+      local messages = {}
+      Commands.agents({
+        connection = listing({}),
+        notify = function(message)
+          messages[#messages + 1] = tostring(message)
+        end,
+      })
+      t.match("no agent instances", table.concat(messages, "\n"))
+    end)
+
+    t.it("reports an unreachable service instead of raising", function()
+      local messages = {}
+      Commands.agents({
+        connection = {
+          request = function(_, _, _, cb)
+            cb(false, { code = -32000, message = "not connected to the service" })
+          end,
+        },
+        notify = function(message)
+          messages[#messages + 1] = tostring(message)
+        end,
+      })
+      t.match("unable to list", table.concat(messages, "\n"))
+    end)
+
+    t.it("kills one instance and refuses without an id", function()
+      local seen = nil
+      local connection = {
+        request = function(_, method, params, cb)
+          seen = { method = method, params = params }
+          cb(true, { exited = true })
+        end,
+      }
+      local messages = {}
+      local ok = Commands.kill("inst-7", {
+        connection = connection,
+        notify = function(message)
+          messages[#messages + 1] = tostring(message)
+        end,
+      })
+      t.truthy(ok)
+      t.eq("agent.stop", seen.method)
+      t.eq("inst-7", seen.params.instance)
+      t.match("stopped agent inst%-7", table.concat(messages, "\n"))
+
+      local refused, refused_notify = nil, {}
+      refused = Commands.kill(nil, {
+        connection = connection,
+        notify = function(message)
+          refused_notify[#refused_notify + 1] = tostring(message)
+        end,
+      })
+      t.falsy(refused)
+      t.match("needs an instance id", table.concat(refused_notify, "\n"))
+    end)
+
+    t.it("dispatches agents and kill from the service subcommand", function()
+      local seen = {}
+      local saved = { Commands.agents, Commands.kill }
+      Commands.agents = function()
+        seen[#seen + 1] = "agents"
+      end
+      Commands.kill = function(instance)
+        seen[#seen + 1] = "kill:" .. tostring(instance)
+      end
+      local ok, err = pcall(function()
+        Commands.dispatch("agents")
+        Commands.dispatch("kill", { rest = "inst-9" })
+      end)
+      Commands.agents, Commands.kill = saved[1], saved[2]
+      assert(ok, err)
+      t.eq({ "agents", "kill:inst-9" }, seen)
+    end)
+  end)
+
   t.describe("service status and config", function()
     local function config_with(overrides)
       local raw = Config.merge(Config.defaults, overrides or {})
@@ -1493,10 +1624,30 @@ return function(t)
     t.it("defaults to the direct backend and leaves chat untouched", function()
       local cfg = config_with({})
       t.eq("direct", cfg.backend)
+      t.eq(true, cfg.service.keep_alive)
+      t.eq(1800, cfg.service.idle_timeout)
       t.eq(nil, cfg.service.path)
       t.eq(Install.DEFAULT_RELEASE_BASE, cfg.service.release_base)
       t.eq(600000, cfg.service.install_timeout)
       t.eq(5000, cfg.service.start_timeout)
+    end)
+
+    t.it("validates keep_alive and idle_timeout", function()
+      t.eq(false, config_with({ service = { keep_alive = false } }).service.keep_alive)
+      t.eq(60, config_with({ service = { idle_timeout = 60 } }).service.idle_timeout)
+      t.eq(86400, config_with({ service = { idle_timeout = 86400 } }).service.idle_timeout)
+      t.raises(function()
+        config_with({ service = { keep_alive = "yes" } })
+      end, "keep_alive must be a boolean")
+      t.raises(function()
+        config_with({ service = { idle_timeout = 30 } })
+      end, "idle_timeout")
+      t.raises(function()
+        config_with({ service = { idle_timeout = 86401 } })
+      end, "idle_timeout")
+      t.raises(function()
+        config_with({ service = { idle_timeout = 90.5 } })
+      end, "whole number")
     end)
 
     t.it("validates backend and service settings", function()

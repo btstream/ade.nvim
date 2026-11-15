@@ -36,6 +36,7 @@ function M.collect(opts)
     api_version = nil,
     api_ok = nil,
     server_version = nil,
+    instances = nil,
     warning = nil,
     error = nil,
   }
@@ -83,6 +84,19 @@ function M.collect(opts)
       status.api_version = info.api_version or status.api_version
       status.api_ok = info.api_version == Version.API_VERSION
       client:ping(function() end)
+      -- Instance count is part of status (`:Ade service status` asks for it),
+      -- and it must not turn a working service into an error when the count is
+      -- unavailable: `agent.list` only exists from api_version 2.
+      local listed = false
+      client:request("agent.list", {}, function(ok, value)
+        if ok and type(value) == "table" and type(value.instances) == "table" then
+          status.instances = #value.instances
+          listed = true
+        end
+      end)
+      if not listed then
+        status.instances = nil
+      end
     else
       status.error = status.error or tostring(info)
     end
@@ -90,6 +104,37 @@ function M.collect(opts)
   end
 
   return status
+end
+
+---One line for an `agent.list` entry.
+---@param instance table
+---@param now integer|nil unix seconds
+---@return string
+function M.instance_line(instance, now)
+  now = now or os.time()
+  local started = tonumber(instance.started_at)
+  local uptime = ""
+  if started then
+    local seconds = math.max(0, now - math.floor(started / 1000))
+    if seconds >= 3600 then
+      uptime = string.format(" %dh%02dm", math.floor(seconds / 3600), math.floor(seconds % 3600 / 60))
+    elseif seconds >= 60 then
+      uptime = string.format(" %dm%02ds", math.floor(seconds / 60), seconds % 60)
+    else
+      uptime = string.format(" %ds", seconds)
+    end
+  end
+  return string.format(
+    "%s  %s  %s  pid %s%s  attached %s  turns %s  pending %s",
+    tostring(instance.instance),
+    tostring(instance.agent),
+    tostring(instance.cwd),
+    tostring(instance.pid),
+    uptime,
+    tostring(instance.attached or 0),
+    tostring(instance.turns_running or 0),
+    tostring(instance.pending_requests or 0)
+  )
 end
 
 ---Human-readable lines for the status command and the health section.
@@ -104,7 +149,7 @@ function M.lines(status)
     "info",
     "required service version: " .. status.required_version .. " (api_version " .. status.required_api_version .. ")"
   )
-  add("info", "backend: " .. tostring(status.backend) .. " (the service does not carry chat yet)")
+  add("info", "backend: " .. tostring(status.backend))
   if status.configured_path then
     add("info", "service.path: " .. tostring(status.configured_path))
   end
@@ -130,6 +175,9 @@ function M.lines(status)
       "ok",
       "service is running" .. (status.server_version and (" (version " .. tostring(status.server_version) .. ")") or "")
     )
+    if status.instances ~= nil then
+      add("info", "agent instances: " .. tostring(status.instances))
+    end
   elseif status.reachable then
     add("warn", "the socket accepts connections but hello/ping failed")
   else

@@ -49,11 +49,18 @@ end
 local Client = {}
 Client.__index = Client
 
----@param opts {agent: table, cwd: string, client_capabilities: table, limits?: table, scheduler?: table, interactions?: table, mcp_servers?: table[], launch?: table, on_event: fun(name: string, payload: any)}
+---@param opts {agent: table, cwd: string, client_capabilities: table, limits?: table, scheduler?: table, interactions?: table, mcp_servers?: table[], launch?: table, transport?: table, connection?: table, agent_id?: string, keep_alive?: boolean, on_event: fun(name: string, payload: any)}
 ---@return AdeClient
 function M.new(opts)
   local self = setmetatable({
     agent = opts.agent,
+    -- Optional backend wiring: a transport module (defaults to the direct
+    -- process module) and, for the service backend, the shared connection and
+    -- the agent id used as the instance key.
+    transport = opts.transport,
+    connection = opts.connection,
+    agent_id = opts.agent_id,
+    keep_alive = opts.keep_alive,
     -- The exact spec this client was started with. The terminal login reads it
     -- so it runs the same release as the conversation, even if a newer one was
     -- installed in between.
@@ -145,7 +152,11 @@ function Client:do_start(generation)
   local max_line = limits.max_line_bytes or 32 * 1024 * 1024
   local stderr_keep = limits.stderr_keep_bytes or 64 * 1024
 
-  local proc, err = process.spawn({
+  -- The transport is injectable: the direct backend passes the real child
+  -- process module, the service backend passes a channel that relays the same
+  -- frames through nvim_ade_server. ACP logic does not know the difference.
+  local transport = self.transport or process
+  local proc, err = transport.spawn({
     command = cfg.command,
     args = cfg.args,
     cwd = self.cwd,
@@ -157,8 +168,17 @@ function Client:do_start(generation)
     spill_bytes = limits.spill_bytes,
     dispatch_budget_ms = limits.dispatch_budget_ms,
     scheduler = self.scheduler,
+    agent_id = self.agent_id,
+    client_capabilities = self.client_capabilities,
+    connection = self.connection,
+    keep_alive = self.keep_alive,
     on_line = function(line)
       return self:on_line(line)
+    end,
+    -- The service channel already has a decoded message in hand; decode once
+    -- there instead of re-encoding a line just to parse it again.
+    on_message = function(message)
+      return self:on_message(message, nil)
     end,
     on_exit = function(code, stderr)
       self:handle_exit(code, stderr, generation)
@@ -206,6 +226,11 @@ function Client:do_start(generation)
   self.auth_methods = result.authMethods or {}
   self.agent_info = result.agentInfo or {}
   self.initialized = true
+  -- The service channel may only detach once the ACP session really exists;
+  -- before that nothing can be resumed, so it stops instead.
+  if self.proc and self.proc.set_initialized then
+    pcall(self.proc.set_initialized, self.proc, true)
+  end
   Log.info("initialized with %s", self.agent_info.name or "agent")
   self:emit("ready", {
     capabilities = self.capabilities,
@@ -354,14 +379,33 @@ function Client:on_line(line)
   if Log.protocol_enabled() then
     Log.debug("<- %s", Log.redact(line, 2000))
   end
+  return self:on_message(decoded, line)
+end
+
+---Route one already-decoded agent message.
+---
+---Split out of `on_line` so a transport that receives structured messages (the
+---service tunnel) can hand them over directly without a decode/encode round
+---trip. `raw` is only used for protocol logging.
+---@param decoded any
+---@param raw string|nil
+---@return function|nil dispatch
+function Client:on_message(decoded, raw)
   if not self.rpc then
-    return
+    return nil
+  end
+  if not raw and Log.protocol_enabled() then
+    local ok, encoded = pcall(vim.json.encode, decoded)
+    if ok then
+      Log.debug("<- %s", Log.redact(encoded, 2000))
+    end
   end
   local dispatch = self:chunk_update(decoded)
   if dispatch then
     return dispatch
   end
-  self.rpc:handle(decoded, line)
+  self.rpc:handle(decoded, raw)
+  return nil
 end
 
 local TEXT_CHUNK = 64 * 1024
@@ -872,6 +916,10 @@ function Client:handle_exit(code, stderr, generation)
 end
 
 ---Terminate the connection.
+---
+---`shutdown(force)` kills the agent; use it for every failure, restart and
+---explicit stop. `leave()` is the deliberate-exit path (editor exit, agent
+---switch), where a service-backed agent may keep running.
 ---@param force boolean|nil
 function Client:shutdown(force, reason)
   if self.start_co then
@@ -896,6 +944,45 @@ function Client:shutdown(force, reason)
   end
   self.rpc = nil
   self:finish_start(false, reason or { message = "client shutdown" })
+end
+
+---Stop talking to the agent while letting it run when the backend supports it.
+---
+---The service backend detaches (the agent survives this Neovim) when the user
+---allowed it and the session was actually initialized; every other transport —
+---and every unsafe case — stops the process, which is what the direct backend
+---did before. `allow_detach` is false at call sites where the user asked for
+---the agent to stop.
+---@param allow_detach boolean|nil defaults to true
+function Client:leave(allow_detach)
+  local proc = self.proc
+  local can_detach = allow_detach ~= false and proc ~= nil and type(proc.leave) == "function"
+  if self.start_co then
+    async.cancel(self.start_co)
+    self.start_co = nil
+  end
+  if self.interactions then
+    self.interactions:cancel_all("client left")
+  end
+  for key in pairs(self.permissions or {}) do
+    pcall(self.resolve_permission, self, key, nil)
+  end
+  self.permissions = {}
+  self.starting = false
+  if self.rpc then
+    self.rpc:close("client left")
+  end
+  self.initialized = false
+  if proc then
+    if can_detach then
+      proc:leave(true)
+    else
+      proc:stop(false)
+    end
+    self.proc = nil
+  end
+  self.rpc = nil
+  self:finish_start(false, { message = "client left" })
 end
 
 ---@return boolean

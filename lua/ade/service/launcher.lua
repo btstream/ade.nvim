@@ -86,7 +86,7 @@ end
 ---
 ---`spawn` is injectable: tests replace it with a scripted function so no real
 ---process is started.
----@param opts {bin: string, paths: table, timeout?: integer,
+---@param opts {bin: string, paths: table, timeout?: integer, idle_timeout?: integer,
 ---  spawn?: fun(argv: string[], on_line: fun(line: string), on_exit: fun(code: integer)): boolean}
 ---@return boolean ok
 ---@return string|nil err
@@ -94,10 +94,16 @@ end
 function M.start(opts)
   local timeout = opts.timeout or M.DEFAULT_START_TIMEOUT
   local paths = opts.paths or Paths.paths()
+  local argv = { opts.bin, "serve" }
+  -- The service owns the idle timer, so the configured value has to travel with
+  -- the command line rather than in any front-end state.
+  if type(opts.idle_timeout) == "number" and opts.idle_timeout > 0 then
+    vim.list_extend(argv, { "--idle-timeout", tostring(math.floor(opts.idle_timeout)) })
+  end
   local spawn = opts.spawn
-    or function(argv, on_line, on_exit)
+    or function(cmd, on_line, on_exit)
       local lines = {}
-      local id = vim.fn.jobstart(argv, {
+      local id = vim.fn.jobstart(cmd, {
         detach = true,
         stdin = "null",
         on_stdout = function(_, data)
@@ -116,7 +122,7 @@ function M.start(opts)
     end
 
   local status, failure, exited = nil, nil, nil
-  local started = spawn({ opts.bin, "serve" }, function(line)
+  local started = spawn(argv, function(line)
     if status then
       return
     end
@@ -158,8 +164,8 @@ end
 ---`false, reason` when there is no usable binary; the reason is written to be
 ---shown to the user as-is.
 ---@param opts {bin?: string, config?: table, path?: string, data_dir?: string,
----  timeout?: integer, spawn?: function, probe?: fun(paths: table): boolean,
----  run?: function}|nil
+---  timeout?: integer, idle_timeout?: integer, spawn?: function,
+---  probe?: fun(paths: table): boolean, run?: function}|nil
 ---@return boolean ok
 ---@return string|nil err
 ---@return table|nil info `{paths, status, bin, version, source, warning}`
@@ -201,7 +207,13 @@ function M.ensure(opts)
   end
 
   log.info("starting nvim_ade_server: %s", bin)
-  local ok, err, status = M.start({ bin = bin, paths = paths, timeout = opts.timeout, spawn = opts.spawn })
+  local ok, err, status = M.start({
+    bin = bin,
+    paths = paths,
+    timeout = opts.timeout,
+    idle_timeout = opts.idle_timeout,
+    spawn = opts.spawn,
+  })
   if not ok then
     return false, err, nil
   end
