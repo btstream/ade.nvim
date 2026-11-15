@@ -58,7 +58,7 @@ fn hello_then_ping() {
     assert_eq!(hello["id"], 1);
     assert_eq!(hello["result"]["server_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(hello["result"]["api_version"], 2);
-    assert_eq!(hello["result"]["features"], json!(["tunnel"]));
+    assert_eq!(hello["result"]["features"], json!(["tunnel", "log"]));
 
     let ping = client.call(2, "ping");
     assert_eq!(ping["id"], 2);
@@ -517,4 +517,65 @@ fn two_servers_in_different_directories_do_not_collide() {
     let mut other = first.connect();
     let response = other.hello(&second.token(), 2);
     assert_eq!(response["error"]["code"], -32001);
+}
+
+#[test]
+fn out_of_range_event_log_max_mb_is_a_startup_error() {
+    for value in ["8", "4097", "0"] {
+        let dir = TempDir::new("event-log-range");
+        let output = std::process::Command::new(common::BINARY)
+            .args(["serve", "--event-log-max-mb", value])
+            .env("NVIM_ADE_SERVER_DIR", dir.path())
+            .env_remove("XDG_RUNTIME_DIR")
+            .env_remove("XDG_STATE_HOME")
+            .output()
+            .expect("run serve");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "--event-log-max-mb {value} must be rejected"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout.lines().next().expect("one stdout line");
+        let parsed: serde_json::Value = serde_json::from_str(line).expect("JSON");
+        assert_eq!(parsed["status"], "error");
+        assert!(
+            parsed["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("16 and 4096")),
+            "the message explains the range: {parsed}"
+        );
+    }
+}
+
+#[test]
+fn an_invalid_event_log_value_is_rejected_by_the_parser() {
+    let dir = TempDir::new("event-log-enum");
+    let output = std::process::Command::new(common::BINARY)
+        .args(["serve", "--event-log", "maybe"])
+        .env("NVIM_ADE_SERVER_DIR", dir.path())
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .expect("run serve");
+    assert_eq!(output.status.code(), Some(2), "clap rejects the value");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("on") && stderr.contains("off"), "{stderr}");
+}
+
+#[test]
+fn features_follow_the_event_log_flag() {
+    let on = TestServer::start("event-log-on");
+    let mut client = on.connect();
+    let hello = client.hello(&on.token(), 2);
+    assert_eq!(hello["result"]["features"], json!(["tunnel", "log"]));
+
+    let off = TestServer::start_with(
+        "event-log-off",
+        &["--idle-timeout", "600", "--event-log", "off"],
+        &[],
+    );
+    let mut client = off.connect();
+    let hello = client.hello(&off.token(), 2);
+    assert_eq!(hello["result"]["features"], json!(["tunnel"]));
 }

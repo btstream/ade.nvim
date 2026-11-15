@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, watch, Notify};
 use crate::hub::{Command, Hub, HubEvent, Outbox};
 use crate::paths::Paths;
 use crate::protocol::{self, Local};
+use crate::recorder::Recorder;
 use crate::runtime::StopTimeouts;
 use crate::transport::{self, Listener, Stream};
 use crate::{token, API_VERSION};
@@ -26,6 +27,25 @@ pub const IDLE_TIMEOUT_ENV: &str = "NVIM_ADE_SERVER_IDLE_TIMEOUT_SECS";
 /// Default idle timeout (PROTOCOL.md section 8).
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
 
+/// Event log file in the service directory (PROTOCOL.md section 10).
+pub const EVENT_LOG_FILE_NAME: &str = "nvim_ade_server.events.sqlite3";
+
+/// Default per-instance event log cap (PROTOCOL.md section 15).
+pub const DEFAULT_EVENT_LOG_MAX_MB: u64 = 256;
+/// Allowed range of `--event-log-max-mb` (PROTOCOL.md section 15).
+pub const MIN_EVENT_LOG_MAX_MB: u64 = 16;
+pub const MAX_EVENT_LOG_MAX_MB: u64 = 4096;
+
+/// Validate `--event-log-max-mb`; out-of-range values are a start-up error.
+pub fn validate_event_log_max_mb(value: u64) -> Result<u64> {
+    if !(MIN_EVENT_LOG_MAX_MB..=MAX_EVENT_LOG_MAX_MB).contains(&value) {
+        bail!(
+            "--event-log-max-mb must be between {MIN_EVENT_LOG_MAX_MB} and {MAX_EVENT_LOG_MAX_MB}, got {value}"
+        );
+    }
+    Ok(value)
+}
+
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     /// Explicit socket path (`--socket`), if any.
@@ -34,6 +54,10 @@ pub struct ServeOptions {
     pub idle_timeout: Option<Duration>,
     /// Stop timings for agent processes; `None` uses the environment/default.
     pub stop_timeouts: Option<StopTimeouts>,
+    /// Event log setting (`--event-log`), default on (PROTOCOL.md 15).
+    pub event_log: bool,
+    /// Per-instance event log cap in MiB (`--event-log-max-mb`).
+    pub event_log_max_mb: u64,
 }
 
 impl ServeOptions {
@@ -42,6 +66,8 @@ impl ServeOptions {
             socket,
             idle_timeout,
             stop_timeouts: None,
+            event_log: true,
+            event_log_max_mb: DEFAULT_EVENT_LOG_MAX_MB,
         }
     }
 }
@@ -97,6 +123,7 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
     };
     let timeout = idle_timeout(options.idle_timeout)?;
     let stop_timeouts = options.stop_timeouts.unwrap_or_else(StopTimeouts::from_env);
+    validate_event_log_max_mb(options.event_log_max_mb)?;
 
     prepare_dir(&paths)?;
     let lock = match acquire_lock(&paths)? {
@@ -146,6 +173,17 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
         socket
     );
 
+    // The event log is opened before the socket is announced, so a front end
+    // that sees "ready" can rely on replay working (PROTOCOL.md 10).
+    let recorder = if options.event_log {
+        let path = paths.dir().join(EVENT_LOG_FILE_NAME);
+        let max_bytes = options.event_log_max_mb * 1024 * 1024;
+        Recorder::open(&path, max_bytes)
+            .with_context(|| format!("opening the event log {}", path.display()))?
+    } else {
+        Recorder::disabled()
+    };
+
     let shutdown = Arc::new(Notify::new());
     let stopped = Arc::new(Notify::new());
     let (hub_commands, hub_commands_rx) = mpsc::channel::<Command>(256);
@@ -156,7 +194,9 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
         hub_events,
         Arc::clone(&stopped),
         stop_timeouts,
-    );
+    )
+    .with_event_log(options.event_log, options.event_log_max_mb, recorder)
+    .with_limits(crate::hub::Limits::from_env());
     let hub_task = tokio::spawn(hub.run());
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<ConnectionEvent>();
@@ -211,6 +251,7 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
                             shutdown.clone(),
                             hub_commands.clone(),
                             events_tx.clone(),
+                            options.event_log,
                         );
                     }
                     Err(error) => {
@@ -321,9 +362,12 @@ fn spawn_connection(
     shutdown: Arc<Notify>,
     hub: mpsc::Sender<Command>,
     events: mpsc::UnboundedSender<ConnectionEvent>,
+    event_log: bool,
 ) {
     tokio::spawn(async move {
-        if let Err(error) = handle_connection(conn, stream, &token, &shutdown, &hub).await {
+        if let Err(error) =
+            handle_connection(conn, stream, &token, &shutdown, &hub, event_log).await
+        {
             eprintln!("nvim_ade_server: connection error: {error}");
         }
         let _ = hub.send(Command::Disconnected { conn }).await;
@@ -337,6 +381,7 @@ async fn handle_connection(
     token: &str,
     shutdown: &Notify,
     hub: &mpsc::Sender<Command>,
+    event_log: bool,
 ) -> io::Result<()> {
     let (reader, writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
@@ -407,7 +452,7 @@ async fn handle_connection(
         };
 
         let was_authenticated = handshake.is_authenticated();
-        match protocol::handle_local(&mut handshake, token, &frame) {
+        match protocol::handle_local_with(&mut handshake, token, &frame, event_log) {
             Local::Reply(response) => {
                 if handshake.is_authenticated() && !was_authenticated {
                     log_authenticated(&handshake);

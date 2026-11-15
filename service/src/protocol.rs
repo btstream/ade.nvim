@@ -30,8 +30,20 @@ pub const FRAME_REJECTED: i64 = -32025;
 /// Maximum length of one line in either direction (PROTOCOL.md section 2).
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Features advertised by `hello`.
+/// Features advertised by `hello` with the event log disabled.
 pub const FEATURES: &[&str] = &["tunnel"];
+/// Features advertised by `hello` with the event log enabled (PROTOCOL.md 3.1
+/// and 10).
+pub const FEATURES_WITH_LOG: &[&str] = &["tunnel", "log"];
+
+/// The `features` list for one service configuration.
+pub fn features(log_enabled: bool) -> &'static [&'static str] {
+    if log_enabled {
+        FEATURES_WITH_LOG
+    } else {
+        FEATURES
+    }
+}
 
 /// One line read from a peer.
 #[derive(Debug, PartialEq)]
@@ -192,6 +204,16 @@ pub enum Local {
 /// `frame` must be a JSON object. Anything without a `method`, or with an
 /// unknown method, is routed so the caller reports the right error.
 pub fn handle_local(handshake: &mut Handshake, token: &str, frame: &Value) -> Local {
+    handle_local_with(handshake, token, frame, true)
+}
+
+/// Like [`handle_local`], with an explicit event-log setting for `features`.
+pub fn handle_local_with(
+    handshake: &mut Handshake,
+    token: &str,
+    frame: &Value,
+    log_enabled: bool,
+) -> Local {
     let Some(object) = frame.as_object() else {
         return Local::Reply(failure(&Value::Null, PARSE_ERROR, "parse error"));
     };
@@ -213,7 +235,7 @@ pub fn handle_local(handshake: &mut Handshake, token: &str, frame: &Value) -> Lo
     }
 
     match method {
-        "hello" => hello(handshake, token, object, &id, is_notification),
+        "hello" => hello(handshake, token, object, &id, is_notification, log_enabled),
         "ping" => Local::Reply(success(&id, json!({}))),
         "shutdown" => {
             if is_notification {
@@ -244,6 +266,7 @@ fn hello(
     object: &serde_json::Map<String, Value>,
     id: &Value,
     is_notification: bool,
+    log_enabled: bool,
 ) -> Local {
     let Some(params) = object.get("params").and_then(Value::as_object) else {
         return reject(is_notification, id, INVALID_PARAMS, "invalid params");
@@ -292,7 +315,7 @@ fn hello(
         json!({
             "server_version": crate::SERVER_VERSION,
             "api_version": crate::API_VERSION,
-            "features": FEATURES,
+            "features": features(log_enabled),
         }),
     ))
 }
@@ -422,8 +445,32 @@ mod tests {
         let response = reply(&local);
         assert_eq!(response["result"]["server_version"], crate::SERVER_VERSION);
         assert_eq!(response["result"]["api_version"], crate::API_VERSION);
-        assert_eq!(response["result"]["features"], json!(["tunnel"]));
+        assert_eq!(response["result"]["features"], json!(["tunnel", "log"]));
         assert_eq!(handshake.client(), Some("ade.nvim"));
+    }
+
+    #[test]
+    fn features_depend_on_the_event_log_setting() {
+        let mut handshake = Handshake::default();
+        let local = handle_local_with(
+            &mut handshake,
+            TOKEN,
+            &hello_frame(TOKEN, crate::API_VERSION),
+            false,
+        );
+        assert_eq!(reply(&local)["result"]["features"], json!(["tunnel"]));
+
+        let mut handshake = Handshake::default();
+        let local = handle_local_with(
+            &mut handshake,
+            TOKEN,
+            &hello_frame(TOKEN, crate::API_VERSION),
+            true,
+        );
+        assert_eq!(
+            reply(&local)["result"]["features"],
+            json!(["tunnel", "log"])
+        );
     }
 
     #[test]
