@@ -94,7 +94,14 @@ Error `-32020` unknown instance.
 
 `-> {instance, force?}` `<- {exited: true, code, signal}`
 
-Terminates the agent and removes the instance. Sequence (unix): close the
+Terminates the agent and removes the instance. The instance leaves the
+identity lookup **immediately**, when the request is processed, not when the
+process exits: an `agent.attach` with the same identity sent right after
+`agent.stop` (even before the stop reply arrives) creates a **new** instance
+with a new id and a new process, never the dying one. The old instance stays
+reachable by its id (for `tunnel.send` in flight, `agent.list`, with
+`stopping: true`) until it exits; its `agent.exited` goes only to the
+connections attached to the old id. Sequence (unix): close the
 child's stdin, wait up to 3 s, `SIGTERM` the process group, wait up to 3 s,
 `SIGKILL` the group. `force = true` skips straight to `SIGKILL`. The reply is
 sent after the process exited. All attached connections receive
@@ -106,13 +113,14 @@ sent after the process exited. All attached connections receive
 
 ```
 { instance, agent, command, args, cwd, pid, started_at /* unix ms */,
-  initialized, attached, turns_running, pending_requests }
+  initialized, attached, turns_running, pending_requests, stopping }
 ```
 
 - `turns_running`: pending `session/prompt` requests (sent by a front end,
   not yet answered by the agent).
 - `pending_requests`: agent-to-client requests not yet answered by a front end
   (section 5.4).
+- `stopping`: true while an `agent.stop` is in progress for this instance.
 
 ### 3.6 `tunnel.send` (notification, `->`)
 
@@ -271,6 +279,10 @@ indefinitely.
    from cache when the instance is already initialized), then the normal ACP
    conversation.
 4. Leaving on purpose: `agent.detach` (agent keeps running). Agent is broken
-   or the user asks to stop it: `agent.stop`.
+   or the user asks to stop it: `agent.stop`. Neither needs to be awaited
+   before the next `agent.attach`: requests on one connection are processed in
+   order, and a stopped instance is already gone from the identity lookup. The
+   only reason to wait is the editor exiting, so the frame is flushed to the
+   socket before the process ends.
 5. Reconnecting later: `agent.attach` with the same key finds the running
    instance (`created = false`); pending permission requests arrive again.
