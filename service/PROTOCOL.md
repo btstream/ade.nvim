@@ -363,6 +363,9 @@ When a front end sends `session/load` and **all** of these hold:
 - the instance has the `"log"` feature enabled;
 - the session id is one the instance tracks (section 11) and is complete;
 - the agent advertised `loadSession` in its `initialize` result;
+- the instance's recorded bytes are at most **32 MiB** (a replay can never be
+  larger than that), so one replay always fits the connection's outbound queue
+  and a bounded amount of memory;
 
 the service does **not** forward the request. It answers it itself:
 
@@ -376,7 +379,12 @@ the service does **not** forward the request. It answers it itself:
    after it, in order.
 
 In every other case (`session/load` of an unknown or incomplete session, log
-disabled, no `loadSession`) the request is forwarded to the agent as before.
+disabled, no `loadSession`, a log larger than 32 MiB, or a log that cannot be
+read) the request is forwarded to the agent as before.
+
+While a connection waits for its replay, the live messages for it are buffered.
+That buffer is capped like the outbound queue (64 MiB): past it the service
+closes the connection instead of dropping anything.
 
 Replay messages carry `seq` equal to the event they replay; synthetic events
 use their own numbers.
