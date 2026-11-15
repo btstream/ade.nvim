@@ -87,6 +87,7 @@ end
 ---`spawn` is injectable: tests replace it with a scripted function so no real
 ---process is started.
 ---@param opts {bin: string, paths: table, timeout?: integer, idle_timeout?: integer,
+---  event_log?: boolean, event_log_max_mb?: integer,
 ---  spawn?: fun(argv: string[], on_line: fun(line: string), on_exit: fun(code: integer)): boolean}
 ---@return boolean ok
 ---@return string|nil err
@@ -99,6 +100,14 @@ function M.start(opts)
   -- the command line rather than in any front-end state.
   if type(opts.idle_timeout) == "number" and opts.idle_timeout > 0 then
     vim.list_extend(argv, { "--idle-timeout", tostring(math.floor(opts.idle_timeout)) })
+  end
+  -- Event-log flags only apply when this call starts the service; a front end
+  -- that finds one already running cannot change them (PROTOCOL.md 15).
+  if opts.event_log ~= nil then
+    vim.list_extend(argv, { "--event-log", opts.event_log and "on" or "off" })
+  end
+  if type(opts.event_log_max_mb) == "number" and opts.event_log_max_mb > 0 then
+    vim.list_extend(argv, { "--event-log-max-mb", tostring(math.floor(opts.event_log_max_mb)) })
   end
   local spawn = opts.spawn
     or function(cmd, on_line, on_exit)
@@ -164,7 +173,8 @@ end
 ---`false, reason` when there is no usable binary; the reason is written to be
 ---shown to the user as-is.
 ---@param opts {bin?: string, config?: table, path?: string, data_dir?: string,
----  timeout?: integer, idle_timeout?: integer, spawn?: function,
+---  timeout?: integer, idle_timeout?: integer, event_log?: boolean,
+---  event_log_max_mb?: integer, spawn?: function,
 ---  probe?: fun(paths: table): boolean, run?: function}|nil
 ---@return boolean ok
 ---@return string|nil err
@@ -212,6 +222,8 @@ function M.ensure(opts)
     paths = paths,
     timeout = opts.timeout,
     idle_timeout = opts.idle_timeout,
+    event_log = opts.event_log,
+    event_log_max_mb = opts.event_log_max_mb,
     spawn = opts.spawn,
   })
   if not ok then

@@ -1034,10 +1034,32 @@ service/rust-toolchain.toml 锁定日期的 nightly 工具链，**建议安装 r
       start_timeout = 5000,
       keep_alive = true,              -- 退出 Neovim 时让 agent 继续运行
       idle_timeout = 1800,            -- 空闲多少秒后服务自行退出（60-86400）
+      event_log = true,               -- 记录事件日志，供下次打开时重放
+      event_log_max_mb = 256,         -- 每个实例的日志上限（16-4096 MiB）
+      restore = true,                 -- 打开时恢复上次在这个目录里的会话
+      reconnect_attempts = 8,         -- 意外断线后的自动重连次数（0 关闭）
     },
     backend = "direct",               -- "direct" | "service" | "auto"
 
 keep_alive = false 让每次退出（关闭 Neovim、切换 agent）都停掉 agent，等价于直连模式。
+
+事件日志只在 agent 实例存活期间保留，保存在服务目录，实例停止或服务重启即删除；
+event_log = false 关闭记录后，重新打开看不到离开期间的内容。
+
+restore = true 时，附着到已在运行的实例后会自动重新打开该工作目录下最近有活动的会话，
+而不是新建空会话；没有匹配、agent 不支持 session/load 或加载失败时回退新建并提示一次。
+
+服务模式下意外断线会自动重连：0.5s、1s、2s、4s、8s，之后每 15s，最多
+reconnect_attempts 次（默认 8）。状态栏显示 reconnecting (n/8)，成功后提示一次；
+全部失败后停止并提示，仍可 :Ade reconnect。
+
+版本不一致时：api_version 相同则服务空闲就自动重启到新版本；有任务在跑就先用着并提示一次。
+api_version 不同则用服务报告的版本再握手一次，再按同样规则处理。
+
+重启服务会连带停掉服务里还活着的 agent（它们是服务的子进程），通知里写明
+restarting nvim_ade_server (X -> Y); N idle agent(s) will restart with it。空闲判据保证
+没有进行中的回合、没有待处理的权限/elicitation 请求、也没有别的 Neovim 附着；重启后
+会话依赖 agent 自己的 session/load 恢复。
 
 release_base 必须是 https://：压缩包与 SHA256SUMS 同源，明文 http 下中间人可同时替换两者，
 校验失效；下载时 curl 也限制 --proto =https --proto-redir =https，不允许跟随重定向降级。

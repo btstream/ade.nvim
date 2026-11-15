@@ -159,7 +159,8 @@ end
 ---A refused connection (no service) is reported as a plain error string, not an
 ---exception, so the caller can fall back to the direct backend silently.
 ---@param cb fun(ok: boolean, info: table|string)
-function Client:connect(cb)
+---@param api_version integer|nil override for the retry after `-32002`
+function Client:connect(cb, api_version)
   if self.pipe then
     cb(false, "already connected")
     return
@@ -217,6 +218,38 @@ function Client:connect(cb)
     cb(false, token_err)
     return
   end
+  self.hello_api_version = api_version
+  self:hello(token, cb)
+end
+
+---Send a second `hello` on an already-connected socket with a different
+---`api_version`.
+---
+---Used after `-32002` (PROTOCOL.md 3.1): the error carries the version the
+---service speaks, and asking again with that number is what lets an older
+---service answer at all. The socket is reused, so this never opens a second
+---connection.
+---@param api_version integer
+---@param cb fun(ok: boolean, info: table|string)
+function Client:connect_with_version(api_version, cb)
+  if not self.rpc or self.closed then
+    cb(false, "not connected to the service")
+    return
+  end
+  self.hello_api_version = api_version
+  self.ready = false
+  self:hello_from_socket(cb)
+end
+
+---Read and validate the token, then send `hello`.
+---@param cb fun(ok: boolean, info: table|string)
+function Client:hello_from_socket(cb)
+  local token, token_err = Paths.read_token(self.paths.token)
+  if not token then
+    self:close()
+    cb(false, token_err)
+    return
+  end
   self:hello(token, cb)
 end
 
@@ -239,7 +272,7 @@ function Client:hello(token, cb)
     token = token,
     client = "ade.nvim",
     client_version = Version.VERSION,
-    api_version = Version.API_VERSION,
+    api_version = self.hello_api_version or Version.API_VERSION,
   }, function(ok, value)
     if ok then
       self.ready = true

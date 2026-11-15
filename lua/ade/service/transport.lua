@@ -143,6 +143,15 @@ function M.spawn(opts)
     self.stats.instance = value.instance
     self.stats.attach_ms = math.floor((vim.uv.hrtime() - started) / 1e6)
     self.attached = true
+    -- The service reports the sessions it already tracks for this instance
+    -- (PROTOCOL.md 3.2). The application layer uses them to reopen the most
+    -- recent session for this cwd instead of starting an empty one; the
+    -- transport only carries the data.
+    self.sessions = type(value.sessions) == "table" and value.sessions or nil
+    self.created = value.created == true
+    if opts.on_attach_result then
+      pcall(opts.on_attach_result, value)
+    end
     self:flush()
   end)
 

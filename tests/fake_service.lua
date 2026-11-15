@@ -28,7 +28,7 @@ Server.__index = Server
 ---@param opts {dir: string, token?: string, api_version?: number, server_version?: string,
 ---  wrong_token?: boolean, require_hello?: boolean, on_hello?: fun(params: table),
 ---  spawn_agent?: fun(instance: table): boolean|nil, exit_code?: integer,
----  stop_delay_ms?: integer}|nil
+---  stop_delay_ms?: integer, canned_agent?: boolean}|nil
 ---@return FakeService
 function M.new(opts)
   opts = opts or {}
@@ -47,6 +47,9 @@ function M.new(opts)
     exit_code = opts.exit_code,
     -- Tests use this to prove `stop` does not block on the reply.
     stop_delay_ms = opts.stop_delay_ms,
+    -- Answer ACP requests with canned replies instead of spawning a child. Used
+    -- by tests about notifications, where a real agent would only add noise.
+    canned_agent = opts.canned_agent == true,
     clients = {},
     instances = {},
     -- Instances whose stop was requested but whose exit has not been announced
@@ -246,8 +249,10 @@ function Server:dispatch(message, client)
         started_at = instance.started_at,
         initialized = instance.initialized == true,
         attached = vim.tbl_count(instance.attached),
-        turns_running = 0,
+        turns_running = instance.turns_running or 0,
         pending_requests = #(instance.pending or {}),
+        sessions = #(instance.sessions or {}),
+        log_bytes = instance.log_bytes or 0,
       }
     end
     table.sort(instances, function(a, b)
@@ -334,6 +339,10 @@ function Server:attach(params, client, ident)
       pid = instance.pid or 0,
       initialized = instance.initialized == true,
       attached = vim.tbl_count(instance.attached),
+      -- PROTOCOL.md 3.2/10: the sessions this instance tracks, so a front end
+      -- can reopen one instead of starting an empty session.
+      sessions = instance.sessions or {},
+      log_bytes = instance.log_bytes or 0,
     },
   }
 end
@@ -375,6 +384,25 @@ function Server:on_tunnel_send(params, client)
   -- event context forbids, and socket reads arrive there. One scheduled hop is
   -- enough and keeps the frame order.
   vim.schedule(function()
+    if not instance.handler and self.canned_agent then
+      -- A minimal ACP answerer: `initialize`, `session/new`, `session/prompt`.
+      local replies = {
+        initialize = { protocolVersion = 1, agentCapabilities = { loadSession = true }, authMethods = {} },
+        ["session/new"] = { sessionId = "sess_mock", configOptions = {} },
+        ["session/load"] = { configOptions = {} },
+        ["session/prompt"] = { stopReason = "end_turn" },
+      }
+      local result = message.method and replies[message.method]
+      if result and message.id ~= nil then
+        -- A JSON-RPC **response** wraps the payload in `result`.
+        self:deliver(instance, {
+          jsonrpc = "2.0",
+          id = message.id,
+          result = vim.deepcopy(result),
+        })
+      end
+      return
+    end
     if not instance.handler or not self.instances[instance.id] then
       return
     end
@@ -414,6 +442,104 @@ function Server:deliver(instance, message)
       message = message,
     })
   end
+end
+
+---Give an instance a tracked session, as the relay would (PROTOCOL 11).
+---@param instance string
+---@param session {id: string, cwd: string, updated_at?: integer}
+function Server:track_session(instance, session)
+  local record = self.instances[instance]
+  if not record then
+    return nil
+  end
+  record.sessions = record.sessions or {}
+  for index, entry in ipairs(record.sessions) do
+    if entry.id == session.id then
+      record.sessions[index] = session
+      return session
+    end
+  end
+  record.sessions[#record.sessions + 1] = session
+  return session
+end
+
+---Tell a connection it adopted an in-flight turn (PROTOCOL 13).
+---@param instance string
+---@param session_id string
+function Server:adopt(instance, session_id)
+  local record = self.instances[instance]
+  if not record then
+    return false
+  end
+  record.adopted = record.adopted or {}
+  record.adopted[session_id] = true
+  for client in pairs(record.attached) do
+    self:emit(client, "tunnel.recv", {
+      instance = instance,
+      seq = self.seq[instance] or 0,
+      message = { jsonrpc = "2.0", method = "_ade/turn_adopted", params = { sessionId = session_id } },
+    })
+  end
+  return true
+end
+
+---Finish an adopted turn (PROTOCOL 13).
+---@param instance string
+---@param session_id string
+---@param stop_reason string|nil
+---@param err table|nil
+function Server:finish_adopted(instance, session_id, stop_reason, err)
+  local record = self.instances[instance]
+  if not record then
+    return false
+  end
+  local params = { sessionId = session_id, stopReason = stop_reason or "end_turn" }
+  if err then
+    params.stopReason = "error"
+    params.error = err
+  end
+  if record.adopted then
+    record.adopted[session_id] = nil
+  end
+  for client in pairs(record.attached) do
+    self:emit(client, "tunnel.recv", {
+      instance = instance,
+      seq = self.seq[instance] or 0,
+      message = { jsonrpc = "2.0", method = "_ade/turn_finished", params = params },
+    })
+  end
+  return true
+end
+
+---Retract a pending agent request from every other connection (PROTOCOL 14).
+---@param instance string
+---@param request_id integer
+---@param answered_by table|nil the connection that answered it
+function Server:retract(instance, request_id, answered_by)
+  local record = self.instances[instance]
+  if not record then
+    return false
+  end
+  for index, pending in ipairs(record.pending or {}) do
+    if pending.id == request_id then
+      table.remove(record.pending, index)
+      break
+    end
+  end
+  for client in pairs(record.attached) do
+    if client ~= answered_by then
+      self:emit(client, "tunnel.recv", {
+        instance = instance,
+        seq = self.seq[instance] or 0,
+        message = {
+          jsonrpc = "2.0",
+          method = "$/cancel_request",
+          params = { id = request_id },
+        },
+      })
+    end
+  end
+  return true
 end
 
 ---Stop an instance, notifying every attached connection.
