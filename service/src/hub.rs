@@ -18,8 +18,13 @@ use crate::protocol::{
     failure, success, FRAME_REJECTED, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
     NOT_ATTACHED, SPAWN_FAILED, UNKNOWN_INSTANCE,
 };
-use crate::relay::{parse_env, AgentAction, FrontendAction, InstanceKey, Relay};
+use crate::recorder::{RecordedEvent, Recorder};
+use crate::relay::{
+    parse_env, AgentAction, FrontendAction, InstanceKey, LoadCandidate, PendingEvent, Relay,
+    Retracted,
+};
 use crate::runtime::{self, Exited, ProcControl, RuntimeEvent, SpawnSpec, StopTimeouts};
+use crate::store::EventKind;
 
 /// Maximum bytes queued for one connection (PROTOCOL.md section 7).
 pub const MAX_OUTBOX_BYTES: usize = 64 * 1024 * 1024;
@@ -57,6 +62,12 @@ impl Outbox {
                 queued,
             },
         )
+    }
+
+    /// Ask the connection's own task to close it (back pressure, or a replay
+    /// buffer that overflowed).
+    pub fn close(&self) {
+        let _ = self.closer.send(true);
     }
 
     /// Number of bytes still queued for this connection.
@@ -143,6 +154,132 @@ pub enum HubEvent {
     Busy(bool),
 }
 
+/// A `tunnel.recv` held back while a replay is read (PROTOCOL.md 12).
+#[derive(Debug, Clone)]
+struct GateEntry {
+    instance: String,
+    seq: u64,
+    message: Value,
+}
+
+/// The buffered live traffic of one connection that is waiting for a replay.
+///
+/// Counted in bytes (the JSON text of each message) and capped like the
+/// outbound queue: past the cap the connection is closed, never silently
+/// thinned out (PROTOCOL.md 7 and 12).
+#[derive(Debug)]
+struct Gate {
+    entries: Vec<GateEntry>,
+    bytes: usize,
+    limit: usize,
+}
+
+impl Gate {
+    fn new(limit: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            bytes: 0,
+            limit,
+        }
+    }
+
+    /// Buffer one message. `Err` means the cap was exceeded: the caller closes
+    /// the connection and cancels the replay.
+    fn push(&mut self, entry: GateEntry) -> Result<(), ()> {
+        let size = entry.message.to_string().len() + entry.instance.len() + 64;
+        if self.bytes.saturating_add(size) > self.limit {
+            return Err(());
+        }
+        self.bytes += size;
+        self.entries.push(entry);
+        Ok(())
+    }
+
+    fn take(&mut self) -> Vec<GateEntry> {
+        self.bytes = 0;
+        std::mem::take(&mut self.entries)
+    }
+}
+
+/// Default cap for a connection waiting for a replay: the outbound queue's
+/// 64 MiB, so the replay plus what it buffered still fits one connection.
+pub const MAX_GATE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Default ceiling for emulating `session/load`: above this many log bytes the
+/// request is forwarded instead, so a replay always fits the outbound queue
+/// (PROTOCOL.md 12).
+pub const MAX_REPLAY_LOG_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Environment variable overriding [`MAX_GATE_BYTES`] (tests).
+pub const GATE_LIMIT_ENV: &str = "NVIM_ADE_SERVER_GATE_LIMIT_BYTES";
+/// Environment variable overriding [`MAX_REPLAY_LOG_BYTES`] (tests).
+pub const REPLAY_LIMIT_ENV: &str = "NVIM_ADE_SERVER_REPLAY_LIMIT_BYTES";
+/// Test hook: delay the replay by this many milliseconds, so live traffic
+/// arrives while the gate is closed (PROTOCOL.md 12 has no such knob).
+pub const REPLAY_DELAY_ENV: &str = "NVIM_ADE_SERVER_REPLAY_DELAY_MS";
+
+/// The two bounds of section 12, plus the test-only replay delay.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    pub gate_bytes: usize,
+    pub replay_bytes: u64,
+    pub replay_delay: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            gate_bytes: MAX_GATE_BYTES,
+            replay_bytes: MAX_REPLAY_LOG_BYTES,
+            replay_delay: Duration::ZERO,
+        }
+    }
+}
+
+impl Limits {
+    /// Read the environment overrides; unset or invalid values keep the default.
+    pub fn from_env() -> Self {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    pub fn from_lookup<F>(lookup: F) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let mut limits = Self::default();
+        if let Some(value) = lookup(GATE_LIMIT_ENV).and_then(|v| v.trim().parse().ok()) {
+            limits.gate_bytes = value;
+        }
+        if let Some(value) = lookup(REPLAY_LIMIT_ENV).and_then(|v| v.trim().parse().ok()) {
+            limits.replay_bytes = value;
+        }
+        if let Some(value) = lookup(REPLAY_DELAY_ENV).and_then(|v| v.trim().parse().ok()) {
+            limits.replay_delay = Duration::from_millis(value);
+        }
+        limits
+    }
+}
+
+/// Outcome of reading the log for an emulated `session/load`.
+#[derive(Debug)]
+enum LoadResult {
+    /// Replay these messages, then answer with `state`, then release the gate.
+    Replay {
+        conn: u64,
+        instance: String,
+        messages: Vec<(u64, Value)>,
+        state: Value,
+        frontend_id: Value,
+        session_id: String,
+    },
+    /// The log cannot answer the load: forward the original request.
+    Forward {
+        conn: u64,
+        instance: String,
+        frame: Value,
+    },
+}
+
 /// Pending agent requests to deliver, each with the `seq` it arrived with.
 type Replay = Vec<(u64, Value)>;
 
@@ -190,6 +327,23 @@ pub struct Hub {
     next_instance: u64,
     busy: bool,
     closing: bool,
+    /// Whether the event log is on: affects `hello.features`, session tracking
+    /// and `agent.attach` (PROTOCOL.md 10 and 12).
+    event_log: bool,
+    /// Per-instance event log cap in MiB (`--event-log-max-mb`).
+    event_log_max_mb: u64,
+    /// The event log (PROTOCOL.md 10).
+    recorder: Recorder,
+    /// Connections whose `tunnel.recv` is buffered while a replay is read, so
+    /// the replay and the live stream have no gap and no duplicate
+    /// (PROTOCOL.md 12). Keyed by connection.
+    gates: HashMap<u64, Gate>,
+    /// Bounds of section 12: the gate cap, the replay ceiling and the
+    /// test-only replay delay.
+    limits: Limits,
+    /// Load tasks report here; the hub stays the only state owner.
+    load_sender: mpsc::UnboundedSender<LoadResult>,
+    load_results: mpsc::UnboundedReceiver<LoadResult>,
 }
 
 impl Hub {
@@ -200,6 +354,7 @@ impl Hub {
         timeouts: StopTimeouts,
     ) -> Self {
         let (runtime_sender, runtime_events) = mpsc::unbounded_channel::<RuntimeEvent>();
+        let (load_sender, load_results) = mpsc::unbounded_channel::<LoadResult>();
         Self {
             commands,
             runtime_events,
@@ -213,7 +368,29 @@ impl Hub {
             next_instance: 0,
             busy: false,
             closing: false,
+            event_log: true,
+            event_log_max_mb: crate::server::DEFAULT_EVENT_LOG_MAX_MB,
+            recorder: Recorder::disabled(),
+            gates: HashMap::new(),
+            limits: Limits::default(),
+            load_sender,
+            load_results,
         }
+    }
+
+    /// Override the section 12 bounds (tests, or a future flag).
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Apply the `--event-log` / `--event-log-max-mb` flags (PROTOCOL.md 15)
+    /// and install the recorder.
+    pub fn with_event_log(mut self, enabled: bool, max_mb: u64, recorder: Recorder) -> Self {
+        self.event_log = enabled;
+        self.event_log_max_mb = max_mb;
+        self.recorder = recorder;
+        self
     }
 
     /// Run until every sender is gone (the server drops them on exit).
@@ -228,6 +405,11 @@ impl Hub {
                     let Some(event) = event else { return };
                     self.handle_runtime(event);
                 }
+                result = self.load_results.recv() => {
+                    let Some(result) = result else { return };
+                    self.finish_load(result);
+                    self.update_busy();
+                }
             }
         }
     }
@@ -239,6 +421,9 @@ impl Hub {
             }
             Command::Disconnected { conn } => {
                 self.conns.remove(&conn);
+                // A connection that vanishes during a replay must not leave a
+                // gate behind (nothing would ever release it).
+                self.gates.remove(&conn);
                 self.detach_everywhere(conn);
             }
             Command::Frame { conn, frame } => {
@@ -358,9 +543,7 @@ impl Hub {
                     if is_request {
                         self.send_to(conn, &success(&id, result));
                     }
-                    for (seq, message) in replay {
-                        self.send_tunnel_recv(conn, &instance, seq, &message);
-                    }
+                    self.replay_pending(conn, &instance, replay);
                 }
                 Err((code, message)) => {
                     if is_request {
@@ -383,8 +566,13 @@ impl Hub {
             "agent.stop" => self.agent_stop(conn, &params, &id, is_request),
             "agent.list" => {
                 if is_request {
-                    let instances: Vec<Value> =
-                        self.instances.values().map(instance_summary).collect();
+                    let instances: Vec<Value> = self
+                        .instances
+                        .values()
+                        .map(|instance| {
+                            instance_summary(instance, self.log_bytes(&instance.key.identity()))
+                        })
+                        .collect();
                     self.send_to(conn, &success(&id, json!({ "instances": instances })));
                 }
             }
@@ -433,6 +621,12 @@ impl Hub {
         // remove them: they stay pending until answered, and each keeps the
         // `seq` it was first delivered with.
         let replay = attach_replay(was_attached, instance.relay.pending_messages());
+        let sessions: Vec<Value> = instance
+            .relay
+            .session_summaries()
+            .iter()
+            .map(|session| session.to_json())
+            .collect();
         self.update_busy();
         Ok((
             json!({
@@ -441,9 +635,15 @@ impl Hub {
                 "pid": pid,
                 "initialized": initialized,
                 "attached": attached,
+                "sessions": sessions,
             }),
             replay,
         ))
+    }
+
+    /// Bytes of event log held for one instance (PROTOCOL.md 3.5).
+    fn log_bytes(&self, instance_key: &str) -> u64 {
+        self.recorder.bytes(instance_key)
     }
 
     fn spawn(
@@ -474,6 +674,8 @@ impl Hub {
             "nvim_ade_server: spawned agent instance {instance_id} (pid {})",
             started.pid
         );
+        // A fresh process starts from a clean log (PROTOCOL.md 10).
+        self.recorder.forget_instance(&identity);
         self.by_identity.insert(identity, instance_id.clone());
         self.instances.insert(
             instance_id.clone(),
@@ -484,7 +686,7 @@ impl Hub {
                 started_at: now_ms(),
                 control: started.control,
                 exited,
-                relay: Relay::new(key.capabilities),
+                relay: Relay::with_log(key.capabilities, self.event_log),
                 attached: Vec::new(),
                 stopping: false,
             },
@@ -506,9 +708,7 @@ impl Hub {
         let primary = instance.primary();
         let instance_id = instance_id.to_string();
         if let Some(primary) = primary {
-            for (seq, message) in replay {
-                self.send_tunnel_recv(primary, &instance_id, seq, &message);
-            }
+            self.replay_pending(primary, &instance_id, replay);
         }
         self.update_busy();
         Ok(())
@@ -546,6 +746,8 @@ impl Hub {
         if !instance.stopping {
             instance.stopping = true;
             let identity = instance.key.identity();
+            // The log lives exactly as long as its instance (PROTOCOL.md 10).
+            self.recorder.forget_instance(&identity);
             if self
                 .by_identity
                 .get(&identity)
@@ -600,9 +802,7 @@ impl Hub {
             ));
         }
         for (instance_id, primary, replay) in moved {
-            for (seq, message) in replay {
-                self.send_tunnel_recv(primary, &instance_id, seq, &message);
-            }
+            self.replay_pending(primary, &instance_id, replay);
             eprintln!(
                 "nvim_ade_server: instance {instance_id} primary is now connection {primary}"
             );
@@ -687,18 +887,30 @@ impl Hub {
             let handle = self.instances.get_mut(instance_id).expect("checked above");
             handle.relay.frontend_message(conn, &message)
         };
+        // A front-end prompt (and any synthetic event) is recorded even when
+        // the frame is answered locally (PROTOCOL.md 10).
+        let events = action.events().to_vec();
+        self.record_events(instance_id, events);
         match action {
             FrontendAction::Forward(frame) => {
-                let handle = self.instances.get(instance_id).expect("checked above");
-                if !handle.control.send_frame(frame) {
-                    self.send_tunnel_error(
-                        conn,
-                        instance_id,
-                        FRAME_REJECTED,
-                        "the agent is not accepting messages",
-                        message_id,
-                    );
+                self.send_to_agent(conn, instance_id, frame, message_id);
+            }
+            FrontendAction::ForwardWith {
+                frame,
+                retractions,
+                // Already recorded above, before the branch.
+                events: _,
+            } => {
+                // The answered request is gone: tell the other connections
+                // that received it before forwarding the answer (PROTOCOL.md 14).
+                let retractions = retractions.clone();
+                for retraction in &retractions {
+                    self.send_cancel_request(instance_id, retraction);
                 }
+                self.send_to_agent(conn, instance_id, frame, message_id);
+            }
+            FrontendAction::LoadCandidate(candidate) => {
+                self.start_emulated_load(conn, instance_id, candidate);
             }
             FrontendAction::Reply(response, seq) => {
                 // A local answer carries the seq of the agent message it is
@@ -708,6 +920,255 @@ impl Hub {
             FrontendAction::Drop => {}
         }
         self.update_busy();
+    }
+
+    /// Queue one frame for the agent, reporting a dead writer.
+    fn send_to_agent(
+        &mut self,
+        conn: u64,
+        instance_id: &str,
+        frame: Value,
+        message_id: Option<Value>,
+    ) {
+        let handle = match self.instances.get(instance_id) {
+            Some(handle) => handle,
+            None => return,
+        };
+        if !handle.control.send_frame(frame) {
+            self.send_tunnel_error(
+                conn,
+                instance_id,
+                FRAME_REJECTED,
+                "the agent is not accepting messages",
+                message_id,
+            );
+        }
+    }
+
+    /// Record one event the relay produced (PROTOCOL.md 10).
+    fn record_events(&self, instance_id: &str, events: Vec<PendingEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let Some(instance) = self.instances.get(instance_id) else {
+            return;
+        };
+        let key = instance.key.identity();
+        let ts_ms = now_ms() as i64;
+        for event in events {
+            self.recorder.record(RecordedEvent {
+                instance_key: key.clone(),
+                seq: event.seq,
+                session_id: event.session_id,
+                kind: if event.synthetic {
+                    EventKind::Synthetic
+                } else {
+                    EventKind::AgentNotification
+                },
+                message: event.message,
+                ts_ms,
+            });
+        }
+    }
+
+    /// Answer a `session/load` from the event log when the log is complete
+    /// (PROTOCOL.md 12); otherwise forward the original request.
+    ///
+    /// Ordering: everything this connection receives from now on is buffered
+    /// until the replay and the response are queued, so the replay and the live
+    /// stream have no gap. The replay only contains what was recorded up to
+    /// `up_to_seq`, so nothing is duplicated either. The read runs on the
+    /// blocking pool (inside the recorder), never on the hub task.
+    fn start_emulated_load(&mut self, conn: u64, instance_id: &str, candidate: LoadCandidate) {
+        let Some(instance) = self.instances.get(instance_id) else {
+            return;
+        };
+        let key = instance.key.identity();
+        // The replay must fit the outbound queue: above the ceiling the request
+        // is forwarded instead, before anything is read into memory
+        // (PROTOCOL.md 12).
+        if self.recorder.bytes(&key) > self.limits.replay_bytes {
+            eprintln!(
+                "nvim_ade_server: log for {instance_id} is too large to replay; forwarding session/load"
+            );
+            self.forward_load(conn, instance_id, &candidate.frame);
+            return;
+        }
+        // Buffer live traffic before the replay starts, so nothing slips in
+        // between the read and the switch-over.
+        self.gates.insert(conn, Gate::new(self.limits.gate_bytes));
+        let recorder = self.recorder.clone();
+        let sender = self.load_sender.clone();
+        let instance_id = instance_id.to_string();
+        let delay = self.limits.replay_delay;
+        tokio::spawn(async move {
+            if !delay.is_zero() {
+                // Test hook: let live traffic pile up behind the gate.
+                tokio::time::sleep(delay).await;
+            }
+            let replay = recorder
+                .read_session(&key, &candidate.session_id, candidate.up_to_seq)
+                .await;
+            let result = match replay {
+                Ok(replay) if replay.complete => LoadResult::Replay {
+                    conn,
+                    instance: instance_id,
+                    messages: crate::relay::Relay::replay_messages(&replay.events),
+                    state: candidate.state,
+                    frontend_id: candidate.frontend_id,
+                    session_id: candidate.session_id,
+                },
+                Ok(_) => LoadResult::Forward {
+                    conn,
+                    instance: instance_id,
+                    frame: candidate.frame,
+                },
+                Err(error) => {
+                    eprintln!("nvim_ade_server: cannot read the event log: {error}");
+                    LoadResult::Forward {
+                        conn,
+                        instance: instance_id,
+                        frame: candidate.frame,
+                    }
+                }
+            };
+            let _ = sender.send(result);
+        });
+    }
+
+    /// Forward a `session/load` to the agent (the emulation is not possible).
+    fn forward_load(&mut self, conn: u64, instance_id: &str, frame: &Value) {
+        let Some(handle) = self.instances.get_mut(instance_id) else {
+            return;
+        };
+        let action = handle.relay.forward_request(conn, frame);
+        let Some(frame) = action.forwarded().cloned() else {
+            return;
+        };
+        if let Some(handle) = self.instances.get(instance_id) {
+            if !handle.control.send_frame(frame) {
+                self.send_tunnel_error(
+                    conn,
+                    instance_id,
+                    FRAME_REJECTED,
+                    "the agent is not accepting messages",
+                    None,
+                );
+            }
+        }
+    }
+
+    /// Handle the outcome of an emulated load: replay, answer, then release the
+    /// gate so live traffic follows in order.
+    fn finish_load(&mut self, result: LoadResult) {
+        match result {
+            LoadResult::Forward {
+                conn,
+                instance,
+                frame,
+            } => {
+                // The log cannot answer this load: fall back to the relay.
+                self.release_gate(conn);
+                self.forward_load(conn, &instance, &frame);
+            }
+            LoadResult::Replay {
+                conn,
+                instance,
+                messages,
+                state,
+                frontend_id,
+                session_id,
+            } => {
+                for (seq, message) in &messages {
+                    self.send_tunnel_recv(conn, &instance, *seq, message);
+                }
+                // The response carries the tracked state, with the request's
+                // id, and its own seq: a replayed number is never reused.
+                let response_seq = self
+                    .instances
+                    .get_mut(&instance)
+                    .map(|handle| handle.relay.allocate_seq())
+                    .unwrap_or(0);
+                self.send_tunnel_recv(conn, &instance, response_seq, &success(&frontend_id, state));
+                // A turn whose front end left can be adopted now (PROTOCOL.md
+                // 13): the adopter hears about it right after the load reply.
+                let adopted = self.instances.get_mut(&instance).and_then(|handle| {
+                    let attached = handle.attached.clone();
+                    handle.relay.adopt(conn, &session_id, &attached)
+                });
+                if let Some(adopted) = adopted {
+                    self.send_tunnel_recv(
+                        conn,
+                        &instance,
+                        adopted.seq,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "method": "_ade/turn_adopted",
+                            "params": { "sessionId": adopted.session_id },
+                        }),
+                    );
+                }
+                self.release_gate(conn);
+            }
+        }
+    }
+
+    /// Send everything buffered for `conn` while a replay was being read.
+    fn release_gate(&mut self, conn: u64) {
+        let Some(mut gate) = self.gates.remove(&conn) else {
+            return;
+        };
+        for entry in gate.take() {
+            self.send_tunnel_recv(conn, &entry.instance, entry.seq, &entry.message);
+        }
+    }
+
+    /// Close a connection whose replay buffer overflowed, and cancel the replay
+    /// (its result is ignored because the gate is gone).
+    fn close_gated(&mut self, conn: u64) {
+        self.gates.remove(&conn);
+        if let Some(outbox) = self.conns.get(&conn) {
+            // Same mechanism as back pressure: the connection's own task closes
+            // it as soon as it notices.
+            outbox.close();
+        }
+        eprintln!(
+            "nvim_ade_server: connection {conn} fell behind during a replay buffer; closing it"
+        );
+    }
+
+    /// Whether `conn` is waiting for a replay.
+    fn gated(&self, conn: u64) -> bool {
+        self.gates.contains_key(&conn)
+    }
+
+    /// Send the pending agent requests to `conn` and remember that it received
+    /// them, so a later answer from someone else can be retracted from it
+    /// (PROTOCOL.md 5.4 and 14).
+    fn replay_pending(&mut self, conn: u64, instance_id: &str, replay: Replay) {
+        for (seq, message) in replay {
+            self.send_tunnel_recv(conn, instance_id, seq, &message);
+            if let Some(id) = message.get("id").cloned() {
+                if let Some(instance) = self.instances.get_mut(instance_id) {
+                    instance.relay.mark_delivered(&id, conn);
+                }
+            }
+        }
+    }
+
+    /// Tell one connection that a pending request it received is withdrawn
+    /// (PROTOCOL.md 14): a standard `$/cancel_request` with the agent's id.
+    fn send_cancel_request(&mut self, instance_id: &str, retraction: &Retracted) {
+        self.send_tunnel_recv(
+            retraction.conn,
+            instance_id,
+            retraction.seq,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "$/cancel_request",
+                "params": { "id": retraction.id },
+            }),
+        );
     }
 
     fn handle_runtime(&mut self, event: RuntimeEvent) {
@@ -750,29 +1211,68 @@ impl Hub {
             return;
         };
         let attached = instance.attached.clone();
-        let action = instance.relay.agent_message(&value, &attached);
-        match action {
-            AgentAction::Response { conn, seq, message } => {
+        let outcome = instance.relay.agent_message_full(&value, &attached);
+        // Record what the agent said before anything is delivered: the log is
+        // the source of later replays (PROTOCOL.md 10).
+        let events = outcome.events.clone();
+        self.record_events(instance_id, events);
+
+        // Retractions come first: a front end must close the question before
+        // the agent sees the answer (PROTOCOL.md 14).
+        let retractions = outcome.retractions.clone();
+        for retraction in &retractions {
+            self.send_cancel_request(instance_id, retraction);
+        }
+        match outcome.action {
+            Some(AgentAction::Response { conn, seq, message }) => {
                 self.send_tunnel_recv(conn, instance_id, seq, &message);
             }
-            AgentAction::Notification { seq, message } => {
+            Some(AgentAction::Notification { seq, message }) => {
                 for conn in attached {
                     self.send_tunnel_recv(conn, instance_id, seq, &message);
                 }
             }
-            AgentAction::Request {
+            Some(AgentAction::Request {
                 seq,
                 message,
                 target: Some(conn),
-            } => {
+            }) => {
                 self.send_tunnel_recv(conn, instance_id, seq, &message);
+                // Remember that this connection saw the request, so it can be
+                // retracted if another one answers (PROTOCOL.md 14).
+                if let Some(id) = message.get("id") {
+                    let id = id.clone();
+                    if let Some(instance) = self.instances.get_mut(instance_id) {
+                        instance.relay.mark_delivered(&id, conn);
+                    }
+                }
             }
             // No attached connection: the request stays in the pending set.
-            AgentAction::Request { target: None, .. } => {}
-            AgentAction::Drop => {}
-            AgentAction::Invalid => {
+            Some(AgentAction::Request { target: None, .. }) => {}
+            Some(AgentAction::Drop) | None => {}
+            Some(AgentAction::Invalid) => {
                 eprintln!(
                     "nvim_ade_server: agent {instance_id} wrote a frame that cannot be relayed; dropped"
+                );
+            }
+        }
+
+        // A prompt that finished while adopted: the adopters hear it and the
+        // turn stops counting (PROTOCOL.md 13).
+        if let Some(finished) = outcome.finished_turn {
+            if let Some(instance) = self.instances.get_mut(instance_id) {
+                instance.relay.forget_turn(&finished.session_id);
+            }
+            for conn in &finished.adopters {
+                self.send_tunnel_recv(
+                    *conn,
+                    instance_id,
+                    finished.seq,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "method": "_ade/turn_finished",
+                        "params": finished.params,
+                    }),
                 );
             }
         }
@@ -785,7 +1285,9 @@ impl Hub {
         // A stopped instance was already removed from the identity table, so a
         // newer instance with the same key may be registered there. Only delete
         // an entry that still points at this instance.
-        forget_identity(&mut self.by_identity, &instance.key.identity(), instance_id);
+        let identity = instance.key.identity();
+        self.recorder.forget_instance(&identity);
+        forget_identity(&mut self.by_identity, &identity, instance_id);
         let info = instance.exited.get().unwrap_or_default();
         for conn in &instance.attached {
             self.send_to(
@@ -824,7 +1326,24 @@ impl Hub {
         }
     }
 
-    fn send_tunnel_recv(&self, conn: u64, instance: &str, seq: u64, message: &Value) {
+    fn send_tunnel_recv(&mut self, conn: u64, instance: &str, seq: u64, message: &Value) {
+        if self.gated(conn) {
+            let entry = GateEntry {
+                instance: instance.to_string(),
+                seq,
+                message: message.clone(),
+            };
+            let overflowed = match self.gates.get_mut(&conn) {
+                Some(gate) => gate.push(entry).is_err(),
+                None => false,
+            };
+            if overflowed {
+                // The waiter cannot keep up: close it like an overflowing
+                // outbound queue (PROTOCOL.md 7 and 12) and cancel the replay.
+                self.close_gated(conn);
+            }
+            return;
+        }
         self.send_to(
             conn,
             &json!({
@@ -913,7 +1432,7 @@ fn request_id(frame: &Value) -> Value {
     frame.get("id").cloned().unwrap_or(Value::Null)
 }
 
-fn instance_summary(instance: &Instance) -> Value {
+fn instance_summary(instance: &Instance, log_bytes: u64) -> Value {
     json!({
         "instance": instance.id,
         "agent": instance.key.agent,
@@ -927,6 +1446,8 @@ fn instance_summary(instance: &Instance) -> Value {
         "turns_running": instance.relay.turns_running(),
         "pending_requests": instance.relay.pending_requests(),
         "stopping": instance.stopping,
+        "sessions": instance.relay.session_count(),
+        "log_bytes": log_bytes,
     })
 }
 
@@ -965,6 +1486,84 @@ mod tests {
         // This frame pushes the queue over the 8-byte limit.
         assert!(!outbox.send(&json!({"bb": 2})));
         assert!(*watch.borrow());
+    }
+
+    #[test]
+    fn a_gate_buffers_until_its_byte_cap() {
+        // Each entry costs its message text plus a fixed overhead; a cap of
+        // exactly three entries makes the fourth one fail.
+        let entry_size = {
+            let probe = GateEntry {
+                instance: "i1".to_string(),
+                seq: 1,
+                message: json!({"method": "session/update", "params": {"n": 1}}),
+            };
+            probe.message.to_string().len() + probe.instance.len() + 64
+        };
+        let mut gate = Gate::new(entry_size * 3);
+        for seq in 1..=3 {
+            let entry = GateEntry {
+                instance: "i1".to_string(),
+                seq,
+                message: json!({"method": "session/update", "params": {"n": seq}}),
+            };
+            gate.push(entry).expect("under the cap");
+        }
+        assert_eq!(gate.entries.len(), 3);
+        assert!(gate.bytes > 0);
+
+        // One more message pushes it over: the caller closes the connection.
+        let entry = GateEntry {
+            instance: "i1".to_string(),
+            seq: 4,
+            message: json!({"method": "session/update", "params": {"n": 4}}),
+        };
+        assert!(gate.push(entry).is_err(), "the cap is enforced");
+        assert_eq!(gate.entries.len(), 3, "nothing is dropped silently");
+
+        let taken = gate.take();
+        assert_eq!(taken.len(), 3);
+        assert_eq!(gate.bytes, 0);
+    }
+
+    #[test]
+    fn a_single_oversized_message_does_not_pass_a_small_gate() {
+        let mut gate = Gate::new(10);
+        let entry = GateEntry {
+            instance: "i1".to_string(),
+            seq: 1,
+            message: json!({"payload": "x".repeat(100)}),
+        };
+        assert!(gate.push(entry).is_err());
+        assert!(gate.entries.is_empty());
+    }
+
+    #[test]
+    fn limits_default_to_64_mib_gate_and_32_mib_replay() {
+        let limits = Limits::default();
+        assert_eq!(limits.gate_bytes, 64 * 1024 * 1024);
+        assert_eq!(limits.replay_bytes, 32 * 1024 * 1024);
+        assert!(limits.replay_delay.is_zero());
+    }
+
+    #[test]
+    fn limits_read_the_environment() {
+        let limits = Limits::from_lookup(|key| match key {
+            "NVIM_ADE_SERVER_GATE_LIMIT_BYTES" => Some("1024".to_string()),
+            "NVIM_ADE_SERVER_REPLAY_LIMIT_BYTES" => Some("2048".to_string()),
+            "NVIM_ADE_SERVER_REPLAY_DELAY_MS" => Some("250".to_string()),
+            _ => None,
+        });
+        assert_eq!(limits.gate_bytes, 1024);
+        assert_eq!(limits.replay_bytes, 2048);
+        assert_eq!(limits.replay_delay, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn limits_ignore_garbage() {
+        let limits = Limits::from_lookup(|_| Some("soon".to_string()));
+        assert_eq!(limits.gate_bytes, MAX_GATE_BYTES);
+        assert_eq!(limits.replay_bytes, MAX_REPLAY_LOG_BYTES);
     }
 
     #[test]
@@ -1038,7 +1637,7 @@ mod tests {
             attached: vec![1, 2],
             stopping: false,
         };
-        let summary = instance_summary(&instance);
+        let summary = instance_summary(&instance, 0);
         for field in [
             "instance",
             "agent",
@@ -1052,6 +1651,8 @@ mod tests {
             "turns_running",
             "pending_requests",
             "stopping",
+            "sessions",
+            "log_bytes",
         ] {
             assert!(summary.get(field).is_some(), "missing {field}");
         }
@@ -1059,5 +1660,7 @@ mod tests {
         assert_eq!(summary["turns_running"], 0);
         assert_eq!(summary["pending_requests"], 0);
         assert_eq!(summary["stopping"], false);
+        assert_eq!(summary["sessions"], 0);
+        assert_eq!(summary["log_bytes"], 0);
     }
 }

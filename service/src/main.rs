@@ -34,6 +34,19 @@ struct Cli {
     command: Command,
 }
 
+/// `--event-log on|off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum EventLogFlag {
+    On,
+    Off,
+}
+
+impl EventLogFlag {
+    fn enabled(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run the service.
@@ -42,14 +55,22 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         socket: Option<PathBuf>,
 
-        /// Exit after this many seconds without any client (default: 600, or
-        /// NVIM_ADE_SERVER_IDLE_TIMEOUT_SECS).
+        /// Exit after this many seconds without any client (default: 1800,
+        /// or NVIM_ADE_SERVER_IDLE_TIMEOUT_SECS).
         #[arg(long, value_name = "SECONDS")]
         idle_timeout: Option<f64>,
 
         /// Print the resolved paths as JSON and exit, without binding anything.
         #[arg(long)]
         print_paths: bool,
+
+        /// Event log for conversation replay (PROTOCOL.md section 10).
+        #[arg(long, value_name = "on|off", default_value = "on")]
+        event_log: EventLogFlag,
+
+        /// Per-instance event log cap in MiB (16 to 4096).
+        #[arg(long, value_name = "MB", default_value_t = server::DEFAULT_EVENT_LOG_MAX_MB)]
+        event_log_max_mb: u64,
     },
 
     /// Print the service version and the protocol version as JSON.
@@ -79,6 +100,8 @@ fn main() -> ExitCode {
             socket,
             idle_timeout,
             print_paths,
+            event_log,
+            event_log_max_mb,
         } => {
             if print_paths {
                 return match print_paths_json(socket) {
@@ -86,7 +109,10 @@ fn main() -> ExitCode {
                     Err(error) => fail(&error, false),
                 };
             }
-            serve(socket, idle_timeout)
+            match server::validate_event_log_max_mb(event_log_max_mb) {
+                Ok(max_mb) => serve(socket, idle_timeout, event_log.enabled(), max_mb),
+                Err(error) => fail(&error, true),
+            }
         }
     }
 }
@@ -104,7 +130,12 @@ fn print_paths_json(socket: Option<PathBuf>) -> Result<()> {
     })
 }
 
-fn serve(socket: Option<PathBuf>, idle_timeout: Option<f64>) -> ExitCode {
+fn serve(
+    socket: Option<PathBuf>,
+    idle_timeout: Option<f64>,
+    event_log: bool,
+    event_log_max_mb: u64,
+) -> ExitCode {
     let options = ServeOptions {
         socket,
         // A non-positive or non-finite timeout means "exit as soon as idle".
@@ -116,6 +147,8 @@ fn serve(socket: Option<PathBuf>, idle_timeout: Option<f64>) -> ExitCode {
             })
         }),
         stop_timeouts: None,
+        event_log,
+        event_log_max_mb,
     };
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()

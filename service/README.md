@@ -13,8 +13,8 @@ below, everything else is there.
 
 | Command | What it does |
 |---|---|
-| `nvim_ade_server serve [--socket <path>] [--idle-timeout <secs>] [--print-paths]` | Run the service. `--idle-timeout` overrides `NVIM_ADE_SERVER_IDLE_TIMEOUT_SECS` (default 1800); `--print-paths` prints the resolved paths and exits without binding. |
-| `nvim_ade_server version` | Print `{"version":"0.2.0","api_version":2}` on one line. |
+| `nvim_ade_server serve [--socket <path>] [--idle-timeout <secs>] [--print-paths] [--event-log on\|off] [--event-log-max-mb <n>]` | Run the service. `--idle-timeout` overrides `NVIM_ADE_SERVER_IDLE_TIMEOUT_SECS` (default 1800); `--print-paths` prints the resolved paths and exits without binding. `--event-log` (default `on`) and `--event-log-max-mb` (default 256, 16–4096) are the event log flags of PROTOCOL.md section 15. |
+| `nvim_ade_server version` | Print `{"version":"0.3.0","api_version":2}` on one line. |
 | `nvim_ade_server mcp --token <t>` | Placeholder for the per-agent MCP server; prints "not implemented yet" to stderr and exits 3. |
 
 `serve` prints exactly one line on stdout:
@@ -76,6 +76,41 @@ replaces the child environment completely. Instances keep running when the front
 end disconnects, so a later `agent.attach` with the same key gets
 `created: false`. `agent.list`, `agent.detach` and `agent.stop` manage them.
 
+The relay also tracks the sessions living in each agent (PROTOCOL.md 11):
+`session/new`, `session/load` and `session/resume` register one, `session/close`
+and `session/delete` forget it, and configuration/mode updates keep its state
+current. `agent.attach` reports them (`sessions`, newest activity first) and
+`agent.list` counts them (`sessions`, plus `log_bytes`). With `--event-log off`
+nothing is tracked, the list is empty and `hello` advertises only `"tunnel"`.
+
+## Event log and emulated `session/load`
+
+With the log on (the default), the service records what a later front end needs
+to rebuild a conversation: the agent's `session/update` notifications, plus
+synthetic events for what only the front end said (the prompts, config and mode
+changes). It lives in `<dir>/nvim_ade_server.events.sqlite3` (0600), capped per
+instance by `--event-log-max-mb`, and is deleted with its instance and on every
+service start.
+
+A `session/load` for a session the service tracks, whose log is complete and
+whose agent advertised `loadSession`, is answered by the service itself: it
+replays the recorded updates (in `seq` order, on that connection only), answers
+with the tracked `session/new` state, and then switches that connection to live
+delivery with no gap and no duplicate. Anything else is forwarded to the agent.
+
+If the session still has a `session/prompt` whose front end went away, the
+loading connection **adopts** the turn: it receives `_ade/turn_adopted`, and when
+the agent answers, `_ade/turn_finished` with the stop reason (or the error).
+Methods starting with `_` are ACP extension methods; clients that do not know
+them ignore them.
+
+The log never blocks the relay: writes are asynchronous and a replay reads from
+the store on a blocking thread. Both steps are bounded: a load is only emulated
+when the instance's log is at most 32 MiB (so one replay always fits the
+connection's outbound queue), and live messages held back while a replay is read
+are capped at 64 MiB — past either limit the request is forwarded, or the
+connection is closed, never silently truncated.
+
 The stop sequence is: close stdin, wait 3 s, `SIGTERM` the process group, wait
 3 s, `SIGKILL` the group (`force: true` goes straight to `SIGKILL`). The timeouts
 are shortened by `NVIM_ADE_SERVER_STOP_TIMEOUT_MS` (milliseconds, used by the
@@ -99,7 +134,8 @@ is kept for `agent.exited`.
 [`PROTOCOL.md`](PROTOCOL.md) is normative; this is a short orientation.
 
 JSON-RPC 2.0, one UTF-8 JSON object per line, terminated by `\n`, max 64 MiB.
-The current `api_version` is **2** and `hello` reports `features: ["tunnel"]`.
+The current `api_version` is **2** and `hello` reports `features: ["tunnel",
+"log"]` (only `["tunnel"]` with `--event-log off`).
 
 | Method | Direction | Purpose |
 |---|---|---|
@@ -115,15 +151,21 @@ attach call), agent-to-client requests go to the most recently attached live
 connection ("primary") and are replayed to whoever becomes primary next, and
 `$/cancel_request` ids are translated per connection.
 
+Each connection has a 64 MiB outbound queue; a connection that cannot keep up
+is closed, while the agent keeps running.
+
+Pending agent requests can be delivered to more than one connection (a new
+primary receives them again). When one of them answers — or the agent withdraws
+the request — the others receive a standard `$/cancel_request` with the agent's
+id, so they can close the question; their late `-32800` reply is ignored.
+
 Errors: `-32020` unknown instance, `-32022` spawn failed, `-32023` initialize
 capabilities differ, `-32024` not attached, `-32025` frame rejected, plus the
 standard JSON-RPC codes. `-32001` (bad token) closes the connection.
 
 Each connection keeps its own state; several clients can be connected at once
 and one disconnecting does not affect the others or the agents. Messages
-without an `id` are notifications and never get a response. Each connection has
-a 64 MiB outbound queue; a connection that cannot keep up is closed, while the
-agent keeps running.
+without an `id` are notifications and never get a response.
 
 ## Building and testing
 
