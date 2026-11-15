@@ -35,8 +35,12 @@ return function(t)
 
   -- A binary is only ever a script: the tests check the version protocol, not
   -- the ELF header. Running it through `run` keeps everything offline.
-  local function fake_binary(path, version)
-    write(path, '#!/bin/sh\necho \'{"version":"' .. version .. '","api_version":1}\'\n')
+  --
+  -- The API version defaults to the plugin's own constant; a case that wants a
+  -- mismatch passes `api_version` explicitly instead of hardcoding a number.
+  local function fake_binary(path, version, api_version)
+    api_version = api_version or Version.API_VERSION
+    write(path, '#!/bin/sh\necho \'{"version":"' .. version .. '","api_version":' .. tostring(api_version) .. "}'\n")
     vim.uv.fs_chmod(path, 448)
     return path
   end
@@ -264,7 +268,11 @@ return function(t)
         data_dir = data,
         target = target,
         run = function()
-          return { code = 0, stdout = '{"version":"' .. Version.VERSION .. '","api_version":1}', stderr = "" }
+          return {
+            code = 0,
+            stdout = '{"version":"' .. Version.VERSION .. '","api_version":' .. Version.API_VERSION .. "}",
+            stderr = "",
+          }
         end,
       }))
 
@@ -343,7 +351,10 @@ return function(t)
       local target = "x86_64-unknown-linux-musl"
       local harness = installers({ compile_fails = false })
       local service_dir = tmpdir("sources")
-      write(service_dir .. "/Cargo.toml", '[package]\nname = "nvim_ade_server"\nversion = "0.1.0"\n')
+      write(
+        service_dir .. "/Cargo.toml",
+        '[package]\nname = "nvim_ade_server"\nversion = "' .. Version.VERSION .. '"\n'
+      )
       write(service_dir .. "/rust-toolchain.toml", '[toolchain]\nchannel = "nightly-2026-05-28"\n')
 
       local ok, err = Install.run({
@@ -425,11 +436,12 @@ return function(t)
       -- A different version with a matching api_version is allowed, with a
       -- warning; an incompatible api_version is refused. Both come from the
       -- same resolver that start/status/health use.
-      local wrong = fake_binary(tmpdir("configured-wrong") .. "/nvim_ade_server", "9.9.9")
+      local other_version = Version.VERSION .. "-other"
+      local wrong = fake_binary(tmpdir("configured-wrong") .. "/nvim_ade_server", other_version)
       local older, warning = Install.check_configured({ path = wrong, run = harness.run })
       t.truthy(older)
-      t.eq("9.9.9", older.version)
-      t.match("9%.9%.9", warning)
+      t.eq(other_version, older.version)
+      t.truthy(warning)
     end)
 
     t.it("switches the pointer atomically, leaving no temporary file", function()
@@ -440,7 +452,11 @@ return function(t)
         data_dir = data,
         target = target,
         run = function()
-          return { code = 0, stdout = '{"version":"' .. Version.VERSION .. '","api_version":1}', stderr = "" }
+          return {
+            code = 0,
+            stdout = '{"version":"' .. Version.VERSION .. '","api_version":' .. Version.API_VERSION .. "}",
+            stderr = "",
+          }
         end,
       })
       t.truthy(ok, tostring(err))
@@ -462,7 +478,11 @@ return function(t)
         data_dir = data,
         target = target,
         run = function()
-          return { code = 0, stdout = '{"version":"' .. Version.VERSION .. '","api_version":2}', stderr = "" }
+          return {
+            code = 0,
+            stdout = '{"version":"' .. Version.VERSION .. '","api_version":' .. (Version.API_VERSION + 1) .. "}",
+            stderr = "",
+          }
         end,
       })
       t.falsy(ok)
@@ -608,7 +628,7 @@ return function(t)
     t.it("performs hello and ping over the socket", function()
       local client, ok, info, service = connect()
       t.truthy(ok, tostring(info))
-      t.eq("0.1.0", info.server_version)
+      t.eq(Version.VERSION, info.server_version)
       t.eq(Version.API_VERSION, info.api_version)
       t.truthy(client.ready)
       local pinged, ping_err = false, nil
@@ -629,7 +649,7 @@ return function(t)
     end)
 
     t.it("reports -32002 as a version mismatch and suggests reinstalling", function()
-      local client, ok, info, service = connect({ api_version = 2 })
+      local client, ok, info, service = connect({ api_version = Version.API_VERSION + 1 })
       t.falsy(ok)
       t.match("api_version", tostring(info))
       t.match("Ade service install", tostring(info))
@@ -1073,7 +1093,11 @@ return function(t)
           return vim.fn.sha256("ARCHIVE")
         end,
         run = function(argv)
-          return { code = 0, stdout = '{"version":"' .. Version.VERSION .. '","api_version":1}', stderr = "" }
+          return {
+            code = 0,
+            stdout = '{"version":"' .. Version.VERSION .. '","api_version":' .. Version.API_VERSION .. "}",
+            stderr = "",
+          }
         end,
       })
       -- The scripted SHA256SUMS above intentionally does not match, so the run
@@ -1149,7 +1173,11 @@ return function(t)
           return vim.fn.sha256("ARCHIVE")
         end,
         run = function()
-          return { code = 0, stdout = '{"version":"' .. Version.VERSION .. '","api_version":1}', stderr = "" }
+          return {
+            code = 0,
+            stdout = '{"version":"' .. Version.VERSION .. '","api_version":' .. Version.API_VERSION .. "}",
+            stderr = "",
+          }
         end,
       })
       t.falsy(ok, "the scripted SHA256SUMS does not match; the point is that it was fetched")
@@ -1200,23 +1228,27 @@ return function(t)
     end)
 
     t.it("allows a different version with a warning when api_version matches", function()
-      local binary = fake_binary(tmpdir("resolve-older") .. "/nvim_ade_server", "9.9.9")
-      local resolved, err = resolve({ path = binary }, { version = "9.9.9", api_version = Version.API_VERSION })
+      -- Deliberately *not* the plugin's version; derived so a bump cannot make
+      -- this accidentally equal again.
+      local other_version = Version.VERSION .. "-other"
+      local binary = fake_binary(tmpdir("resolve-older") .. "/nvim_ade_server", other_version)
+      local resolved, err = resolve({ path = binary }, { version = other_version, api_version = Version.API_VERSION })
       t.truthy(resolved, tostring(err))
-      t.eq("9.9.9", resolved.version)
+      t.eq(other_version, resolved.version)
       t.truthy(resolved.warning)
-      t.match("9%.9%.9", resolved.warning)
       t.match("api_version", resolved.warning)
     end)
 
     t.it("rejects service.path with an incompatible api_version", function()
       local binary = fake_binary(tmpdir("resolve-api") .. "/nvim_ade_server", Version.VERSION)
-      local resolved, err = resolve({ path = binary }, { version = Version.VERSION, api_version = 99 })
+      local newer = Version.API_VERSION + 1
+      local resolved, err = resolve({ path = binary }, { version = Version.VERSION, api_version = newer })
       t.falsy(resolved)
       t.match("api_version", err)
-      t.match("99", err)
+      t.match(tostring(newer), err)
       -- An older api_version is refused too, not just a newer one.
-      local old, old_err = resolve({ path = binary }, { version = Version.VERSION, api_version = 0 })
+      local older = math.max(0, Version.API_VERSION - 1)
+      local old, old_err = resolve({ path = binary }, { version = Version.VERSION, api_version = older })
       t.falsy(old)
       t.match("api_version", old_err)
     end)
@@ -1242,7 +1274,11 @@ return function(t)
         data_dir = data,
         target = target,
         run = function()
-          return { code = 0, stdout = '{"version":"' .. Version.VERSION .. '","api_version":1}', stderr = "" }
+          return {
+            code = 0,
+            stdout = '{"version":"' .. Version.VERSION .. '","api_version":' .. Version.API_VERSION .. "}",
+            stderr = "",
+          }
         end,
       }))
       local resolved, err = resolve({ data_dir = data, target = target }, {
@@ -1387,7 +1423,7 @@ return function(t)
 
     t.it("start refuses a service.path with an incompatible api_version", function()
       server_dir("start-api")
-      local binary = service_binary("api-binary", { api_version = 2 })
+      local binary = service_binary("api-binary", { api_version = Version.API_VERSION + 1 })
       local record = {}
       fake_spawn(record)
       local messages = {}
@@ -1404,7 +1440,9 @@ return function(t)
 
     t.it("start allows a different version with matching api_version and warns", function()
       server_dir("start-older")
-      local binary = service_binary("older-binary", { version = "0.0.1" })
+      -- Derived so a version bump cannot make this equal to the real one.
+      local other_version = Version.VERSION .. "-other"
+      local binary = service_binary("older-binary", { version = other_version })
       local record = {}
       fake_spawn(record)
       local messages = {}
@@ -1419,7 +1457,7 @@ return function(t)
       t.truthy(started, table.concat(messages, "\n"))
       t.eq(binary, record.bin)
       local joined = table.concat(messages, "\n")
-      t.match("0%.0%.1", joined)
+      t.truthy(joined:find(other_version, 1, true), joined)
       local warned = false
       for _, level in ipairs(levels) do
         if level == vim.log.levels.WARN then

@@ -94,7 +94,7 @@ check("the client completes hello and ping", function()
     ok, info = result, value
   end)
   assert(ok, tostring(info))
-  assert(info.api_version == 1, vim.inspect(info))
+  assert(info.api_version == require("ade.service.version").API_VERSION, vim.inspect(info))
   local pinged, ping_err = false, nil
   client:ping(function(result, value)
     pinged, ping_err = result, value

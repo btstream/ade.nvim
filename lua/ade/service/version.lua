@@ -3,14 +3,18 @@
 -- The Rust service lives in `service/` and has its own version. The plugin
 -- requests exactly this release: `service.install` downloads
 -- `nvim_ade_server-v<VERSION>`, and `tests/spec_service.lua` fails when
--- `service/Cargo.toml` disagrees (once that file exists on this branch).
+-- `service/Cargo.toml` disagrees.
 --
 -- `api_version` is the integer front-end protocol version from
--- `.acp-work/contract.md`. It changes only when the JSON-RPC surface breaks.
+-- `service/PROTOCOL.md`. It changes only when the JSON-RPC surface breaks.
+--
+-- Everything in the plugin and its tests reads these two constants; no test may
+-- hardcode a version or an API version, so bumping this file is the only edit
+-- a version change needs.
 local M = {}
 
-M.VERSION = "0.1.0"
-M.API_VERSION = 1
+M.VERSION = "0.2.0"
+M.API_VERSION = 2
 
 ---Release tag the prebuilt archives are published under.
 ---@return string
