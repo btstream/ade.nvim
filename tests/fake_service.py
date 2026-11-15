@@ -48,6 +48,10 @@ class Instance:
         # Ids of `initialize` requests forwarded to the agent; the answer is a
         # response object, so the method name is not available to check there.
         self.initialize_ids = set()
+        # Sessions the relay tracks for this instance (PROTOCOL.md 11), in the
+        # exact shape `agent.attach` reports them (PROTOCOL.md 3.2):
+        # `{sessionId, cwd, running, updated_at}`.
+        self.sessions = []
 
     def start(self):
         """Spawn the real agent command, like the service does."""
@@ -260,6 +264,8 @@ class Server:
                         "turns_running": 0,
                         "pending_requests": 0,
                         "stopping": instance.stopping,
+                        "sessions": len(instance.sessions),
+                        "log_bytes": 0,
                     }
                     for instance in list(self.instances.values()) + list(self.stopping.values())
                 ]
@@ -305,6 +311,11 @@ class Server:
                 "pid": 0,
                 "initialized": found.initialized,
                 "attached": len(found.attached),
+                # PROTOCOL.md 3.2. Newest activity first; an entry uses
+                # `sessionId`, never `id`.
+                "sessions": sorted(
+                    found.sessions, key=lambda item: (-item.get("updated_at", 0), item.get("sessionId", ""))
+                ),
             },
         )
 
@@ -338,6 +349,7 @@ class Server:
         reply = self.answer(instance, message)
         if reply is not None:
             with self.lock:
+                self.track(instance, message, reply)
                 instance.seq += 1
                 seq = instance.seq
                 if message.get("method") == "initialize":
@@ -398,6 +410,46 @@ class Server:
                 {"instance": instance.id, "code": code if code is not None else 0, "signal": None, "stderr_tail": ""},
             )
 
+    def track(self, instance, message, reply):
+        """Mirror the relay's session tracking (PROTOCOL.md 11).
+
+        Only what the canned agent exercises: `session/new` and `session/load`
+        on success. `session/close` and `session/delete` forget the session, so
+        a test can assert that the exit path did *not* send one.
+        """
+        if not isinstance(message, dict) or not isinstance(reply, dict):
+            return
+        method = message.get("method")
+        params = message.get("params") or {}
+        result = reply.get("result")
+        if method == "session/new" and isinstance(result, dict) and isinstance(result.get("sessionId"), str):
+            instance.sessions = [
+                entry for entry in instance.sessions if entry.get("sessionId") != result["sessionId"]
+            ]
+            instance.sessions.append(
+                {
+                    "sessionId": result["sessionId"],
+                    "cwd": params.get("cwd") or instance.key.get("cwd") or "",
+                    "running": False,
+                    "updated_at": int(time.time() * 1000),
+                }
+            )
+        elif method == "session/load" and isinstance(result, dict) and isinstance(params.get("sessionId"), str):
+            if all(entry.get("sessionId") != params["sessionId"] for entry in instance.sessions):
+                instance.sessions.append(
+                    {
+                        "sessionId": params["sessionId"],
+                        "cwd": params.get("cwd") or instance.key.get("cwd") or "",
+                        "running": False,
+                        "updated_at": int(time.time() * 1000),
+                    }
+                )
+        elif method in ("session/close", "session/delete") and isinstance(result, dict):
+            if params.get("sessionId") is not None:
+                instance.sessions = [
+                    entry for entry in instance.sessions if entry.get("sessionId") != params["sessionId"]
+                ]
+
     def answer(self, instance, message):
         """A tiny canned agent: enough to prove the tunnel, not an ACP agent."""
         method = message.get("method")
@@ -412,6 +464,8 @@ class Server:
             return {"jsonrpc": "2.0", "id": ident, "result": {"sessionId": "fake-session"}}
         if method == "session/prompt":
             return {"jsonrpc": "2.0", "id": ident, "result": {"stopReason": "end_turn"}}
+        if method in ("session/close", "session/delete"):
+            return {"jsonrpc": "2.0", "id": ident, "result": {}}
         return None
 
     def stop_instance(self, instance, force=False):
