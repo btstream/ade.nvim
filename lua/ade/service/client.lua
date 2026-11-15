@@ -366,7 +366,15 @@ function Client:read_loop()
       return
     end
     self.decoder:feed(data, function(line)
-      local ok, decoded = pcall(vim.json.decode, line)
+      -- Same options as the direct transport (`Client:on_line`): JSON null must
+      -- become Lua nil before it reaches the reducers. `vim.NIL` there trips the
+      -- `assert(result[field] == nil or type(result[field]) == "table")` in
+      -- `Session:configure` for a `session/resume` reply carrying
+      -- `configOptions: null`, silently turning a resume into a new session.
+      --
+      -- The send direction deliberately uses the opposite option: see
+      -- `transport.lua` (`Channel:send`), where null must round-trip as null.
+      local ok, decoded = pcall(vim.json.decode, line, { luanil = { object = true, array = true } })
       if not ok or type(decoded) ~= "table" then
         log.warn("service sent a non-JSON line: %s", line:sub(1, 200))
         return

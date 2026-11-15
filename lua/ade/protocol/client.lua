@@ -957,17 +957,39 @@ end
 function Client:leave(allow_detach)
   local proc = self.proc
   local can_detach = allow_detach ~= false and proc ~= nil and type(proc.leave) == "function"
+  -- Whether the agent will survive this front end. Only then may pending
+  -- requests be left unanswered: the service keeps them and hands them to the
+  -- next front end (PROTOCOL.md 5.4 / 9.5). Detaching without an initialized
+  -- session, or with keep_alive off, stops the agent — and a stopped agent can
+  -- never receive the answer, so those requests must be cancelled.
+  local will_detach
+  if can_detach and type(proc.will_detach) == "function" then
+    -- The service channel owns the rule (keep_alive, initialized, no error);
+    -- asking it keeps the answer and the actual stop/detach in step.
+    will_detach = proc:will_detach() == true
+  else
+    will_detach = can_detach and self.keep_alive ~= false and self.initialized
+  end
   if self.start_co then
     async.cancel(self.start_co)
     self.start_co = nil
   end
-  if self.interactions then
-    self.interactions:cancel_all("client left")
+  if will_detach then
+    -- Abandon, do not answer: replying `cancelled` here would make the service
+    -- forget the request, breaking the hand-over.
+    if self.interactions then
+      self.interactions:abandon_all("client left")
+    end
+    self.permissions = {}
+  else
+    if self.interactions then
+      self.interactions:cancel_all("client left")
+    end
+    for key in pairs(self.permissions or {}) do
+      pcall(self.resolve_permission, self, key, nil)
+    end
+    self.permissions = {}
   end
-  for key in pairs(self.permissions or {}) do
-    pcall(self.resolve_permission, self, key, nil)
-  end
-  self.permissions = {}
   self.starting = false
   if self.rpc then
     self.rpc:close("client left")

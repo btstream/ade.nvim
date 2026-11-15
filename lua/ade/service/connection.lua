@@ -181,6 +181,11 @@ function Connection:resolve()
 end
 
 ---Start the service when needed and connect.
+---
+---Only `close()` (the editor is exiting) is permanent. A dropped socket or an
+---explicit `:Ade service stop` merely invalidates the current client: the next
+---call starts the service again and greets it, which is what PROTOCOL.md 7 and
+---9 promise. Concurrent callers share one attempt.
 ---@param cb fun(ok: boolean, err: string|nil)
 function Connection:ensure(cb)
   if self.closed then
@@ -190,6 +195,13 @@ function Connection:ensure(cb)
   if self:is_connected() then
     cb(true, nil)
     return
+  end
+  -- A client that is present but not connected is a dead socket: drop it so the
+  -- reconnect below cannot reuse it.
+  if self.client and not self.client:is_ready() then
+    local stale = self.client
+    self.client = nil
+    pcall(stale.close, stale)
   end
   if self.connecting then
     -- A second caller during the handshake waits for the same result instead of
@@ -272,12 +284,16 @@ function Connection:install_handlers(client)
 end
 
 ---Report a dropped connection once, to every channel.
+---
+---The shared object stays usable on purpose: an unexpected drop or a user-issued
+---`:Ade service stop` only ends *this* socket. The channels attached to it report
+---their exit, and a later `ensure()` starts a new service and re-attaches. Only
+---`close()` is permanent.
 ---@param reason string
 function Connection:on_disconnect(reason)
   if self.closed then
     return
   end
-  self.closed = true
   self.error = tostring(reason)
   self.client = nil
   log.warn("service connection lost: %s", self.error)
@@ -326,7 +342,10 @@ function Connection:notify(method, params)
   end)
 end
 
----Drop the connection without stopping the service or its agents.
+---Close for good: the editor is exiting.
+---
+---This is the only permanent state. `shutdown()` (the user stopped the service)
+---and a dropped socket both leave the object reusable.
 ---@param reason string|nil
 function Connection:close(reason)
   self.closed = true
@@ -348,7 +367,10 @@ function Connection:shutdown(cb)
     return
   end
   self.client:shutdown(function(ok, value)
-    self.closed = true
+    -- The user stopped the service; they did not forbid using it later, so the
+    -- connection object stays reusable (`on_disconnect` already cleared the
+    -- client).
+    self.client = nil
     if cb then
       cb(ok, value)
     end

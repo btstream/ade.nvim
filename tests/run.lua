@@ -139,5 +139,7 @@ require("tests.spec_service_channel")(t)
 require("tests.spec_backend")(t)
 require("tests.spec_stop_semantics")(t)
 require("tests.spec_service_burst")(t)
+require("tests.spec_service_reconnect")(t)
+require("tests.spec_service_leave")(t)
 
 t.run()

@@ -334,4 +334,51 @@ function Interactions:cancel_all(reason)
   end
 end
 
+---Give up local interactions **without answering the agent**.
+---
+---Used when the front end is leaving on purpose and the service will hold the
+---request for the next front end (PROTOCOL.md 5.4 / 9.5). Answering `cancelled`
+---here would destroy the request: the service has nothing left to deliver, so
+---the next Neovim never sees the prompt.
+---
+---The picker is dismissed and the entry is forgotten, but `respond` is never
+---called — the request stays pending in the service.
+---@param reason string|nil only for logging and the record's state
+function Interactions:abandon_all(reason)
+  for _, interaction in ipairs(self:pending()) do
+    self:abandon(interaction.id, reason)
+  end
+end
+
+---Forget one interaction without replying to the agent.
+---@param id string
+---@param reason string|nil
+---@return boolean abandoned
+function Interactions:abandon(id, reason)
+  local interaction = self.items[id]
+  if not interaction or interaction.state ~= "pending" then
+    return false
+  end
+  interaction.state = "abandoned"
+  interaction.reason = reason
+  -- Close the picker if this is the one on screen.
+  if self.shown == id then
+    self.shown = nil
+    local presenter = self.presenters[interaction.type]
+    if presenter and presenter.dismiss then
+      pcall(presenter.dismiss, interaction)
+    end
+  end
+  -- Deliberately no `respond`: the reply would reach the agent and the service
+  -- would forget the request.
+  interaction.respond = nil
+  pcall(self.on_settle, interaction, nil)
+  self:_retire(interaction)
+  self.on_changed()
+  vim.schedule(function()
+    self:show_next()
+  end)
+  return true
+end
+
 return M

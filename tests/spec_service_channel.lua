@@ -653,7 +653,10 @@ return function(t)
       t.eq({ "b:i2" }, seen)
     end)
 
-    t.it("reports a lost connection once to every channel", function()
+    t.it("tells every channel each time the connection drops", function()
+      -- One notification per drop, delivered to every subscriber. Two drops are
+      -- two events: the connection object stays usable between them (a later
+      -- `ensure()` reconnects), so a second loss must still be reported.
       local Connection = require("ade.service.connection")
       local connection = Connection.new({})
       local reasons = {}
@@ -665,8 +668,9 @@ return function(t)
       end)
       connection:on_disconnect("socket closed")
       connection:on_disconnect("socket closed again")
-      t.eq(2, #reasons, "each channel is told exactly once")
+      t.eq(4, #reasons, "each drop is reported to each channel")
       t.match("socket closed", reasons[1])
+      t.match("again", reasons[3])
     end)
 
     t.it("reports an unusable service without a retry loop", function()
@@ -698,6 +702,140 @@ return function(t)
       t.truthy(again)
       t.eq(1, #service.clients, "one socket for the whole editor")
       connection:close()
+    end)
+  end)
+
+  t.describe("JSON null normalisation", function()
+    ---Every `vim.NIL` reachable from `value`, as a path for the failure message.
+    ---@param value any
+    ---@param path string
+    ---@param out string[]
+    local function find_nil(value, path, out)
+      if value == vim.NIL then
+        out[#out + 1] = path
+        return out
+      end
+      if type(value) ~= "table" then
+        return out
+      end
+      for key, item in pairs(value) do
+        find_nil(item, path .. "." .. tostring(key), out)
+      end
+      return out
+    end
+
+    ---A `session/resume`-shaped response with nulls in every position the ACP
+    ---schema allows: a scalar field, an array element and a nested object.
+    ---
+    ---Written as raw JSON, not encoded from a Lua table: `vim.NIL` in a table
+    ---does not survive `vim.json.encode` predictably, and the wire form is what
+    ---the decoder under test actually sees.
+    local function response_with_nulls()
+      return table.concat({
+        '{"jsonrpc":"2.0","id":7,"result":{',
+        '"sessionId":"sess_old",',
+        '"configOptions":null,',
+        '"modes":null,',
+        '"capabilities":{"images":null,"tools":[null,"read"]},',
+        '"nested":{"deeper":{"value":null}}',
+        "}}",
+      })
+    end
+
+    t.it("normalises null to nil the same way the direct transport does", function()
+      local decoded = {}
+      local client = require("ade.service.client").new({ timeout = 2000 })
+      t.cleanup(function()
+        client:close()
+      end)
+      -- `rpc:handle(message)` prepends the rpc table as `self`, so the message
+      -- is the *second* parameter.
+      client.rpc = {
+        handle = function(_, message)
+          decoded[#decoded + 1] = message
+        end,
+        close = function() end,
+      }
+      client.ready = true
+      local wire = response_with_nulls()
+      t.truthy(wire:find("null", 1, true), "the fixture must really contain null")
+      -- Feed the decoder exactly like the socket callback does, then dispatch
+      -- through the production path.
+      client.decoder:feed(wire .. "\n", function(line)
+        local ok, message = pcall(vim.json.decode, line, { luanil = { object = true, array = true } })
+        t.truthy(ok)
+        client:enqueue(message)
+      end)
+      client:schedule_drain()
+      vim.wait(3000, function()
+        return #decoded > 0
+      end, 5)
+      t.eq(1, #decoded)
+
+      local nulls = find_nil(decoded[1], "message", {})
+      t.eq({}, nulls, "vim.NIL leaked into the decoded message: " .. table.concat(nulls, ", "))
+      -- A null scalar becomes nil.
+      t.eq(nil, decoded[1].result.configOptions)
+      t.eq(nil, decoded[1].result.modes)
+      t.eq(nil, decoded[1].result.capabilities.images)
+      -- A null array element becomes a hole, not a value: this is exactly what
+      -- the direct transport produces with the same options, and the reason
+      -- both paths must decode identically.
+      t.eq(nil, decoded[1].result.capabilities.tools[1])
+      t.eq("read", decoded[1].result.capabilities.tools[2])
+    end)
+
+    t.it("comes through the real socket without vim.NIL", function()
+      -- The unit above hand-decodes; this one proves the production reader
+      -- (`Client:read_loop`) uses the same options by pushing a frame over a
+      -- real unix socket.
+      local service, dir = start_service({ no_agent = true })
+      local connection, ok, err = connect(service, dir)
+      t.truthy(ok, tostring(err))
+      local received = {}
+      local client = require("ade.service.client").new({ timeout = 2000 })
+      t.cleanup(function()
+        client:close()
+      end)
+      client.paths = {
+        dir = dir,
+        socket = service:socket(),
+        token = dir .. "/nvim_ade_server.token",
+        pipe = false,
+      }
+      local connected = false
+      client.pipe = vim.uv.new_pipe(false)
+      client.pipe:connect(service:socket(), function(connect_err)
+        connected = connect_err == nil
+      end)
+      vim.wait(3000, function()
+        return connected
+      end, 10)
+      t.truthy(connected)
+      client.rpc = {
+        handle = function(_, message)
+          received[#received + 1] = message
+        end,
+        close = function() end,
+      }
+      client.ready = true
+      client:read_loop()
+      local peer = service.clients[#service.clients]
+      t.truthy(peer, "the fake service did not accept the connection")
+      -- The tunnel envelope carries the raw JSON text of the ACP message.
+      peer.peer:write(
+        '{"jsonrpc":"2.0","method":"tunnel.recv","params":{"instance":"inst-1","seq":1,"message":'
+          .. response_with_nulls()
+          .. "}}\n"
+      )
+      vim.wait(5000, function()
+        return #received > 0
+      end, 10)
+      t.eq(1, #received)
+      local nulls = find_nil(received[1], "message", {})
+      t.eq({}, nulls, "vim.NIL leaked through the socket: " .. table.concat(nulls, ", "))
+      client:close()
+      service:close()
     end)
   end)
 end

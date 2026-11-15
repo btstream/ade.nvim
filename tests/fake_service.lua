@@ -247,7 +247,7 @@ function Server:dispatch(message, client)
         initialized = instance.initialized == true,
         attached = vim.tbl_count(instance.attached),
         turns_running = 0,
-        pending_requests = 0,
+        pending_requests = #(instance.pending or {}),
       }
     end
     table.sort(instances, function(a, b)
@@ -300,6 +300,9 @@ function Server:attach(params, client, ident)
       started_at = math.floor(vim.uv.gettimeofday() * 1000),
       initialized = false,
       agent = nil,
+      -- Agent -> client requests this instance has relayed and that nobody has
+      -- answered yet, in arrival order (PROTOCOL.md 5.4).
+      pending = {},
     }
     self.instances[id] = instance
     if self.spawn_agent then
@@ -313,6 +316,15 @@ function Server:attach(params, client, ident)
   local instance = self.instances[id]
   instance.attached[client] = true
   client.attached[id] = true
+  -- Becoming (most recently attached) primary: hand over every request that no
+  -- front end answered, in arrival order.
+  for _, message in ipairs(instance.pending or {}) do
+    self:emit(client, "tunnel.recv", {
+      instance = id,
+      seq = self.seq[id] or 0,
+      message = message,
+    })
+  end
   return {
     jsonrpc = "2.0",
     id = ident,
@@ -349,6 +361,16 @@ function Server:on_tunnel_send(params, client)
     return
   end
   self.sent[#self.sent + 1] = { instance = params.instance, message = vim.deepcopy(message) }
+  -- A response from a front end answers a relayed agent request: forget it, so
+  -- `agent.list` reports the same pending set the service would (PROTOCOL 5.1).
+  if message.method == nil and message.id ~= nil and instance.pending then
+    for index, pending in ipairs(instance.pending) do
+      if pending.id == message.id then
+        table.remove(instance.pending, index)
+        break
+      end
+    end
+  end
   -- Writing to a child's stdin uses Vimscript (`chansend`), which libuv's fast
   -- event context forbids, and socket reads arrive there. One scheduled hop is
   -- enough and keeps the frame order.
@@ -368,6 +390,19 @@ end
 ---@param instance table
 ---@param message table
 function Server:deliver(instance, message)
+  if type(message) == "table" and message.method and message.id ~= nil then
+    -- An agent request: keep it until some front end answers it.
+    instance.pending = instance.pending or {}
+    instance.pending[#instance.pending + 1] = message
+  elseif type(message) == "table" and not message.method and message.id ~= nil then
+    -- A response to one of those requests: forget it.
+    for index, pending in ipairs(instance.pending or {}) do
+      if pending.id == message.id then
+        table.remove(instance.pending, index)
+        break
+      end
+    end
+  end
   self.seq[instance.id] = (self.seq[instance.id] or 0) + 1
   if message.method == "initialize" then
     instance.initialized = true

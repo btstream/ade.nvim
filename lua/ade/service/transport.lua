@@ -378,6 +378,16 @@ function Channel:stop(force)
   flush_if_exiting(state, 2000)
 end
 
+---Whether `leave(true)` would detach rather than stop.
+---
+---The Client asks this before deciding how to settle its pending interactions:
+---requests must survive only when the process really does. Keeping the decision
+---in one place stops the two sides from drifting apart.
+---@return boolean
+function Channel:will_detach()
+  return self.instance ~= nil and self.keep_alive and self.initialized and not self.failed and self:is_alive()
+end
+
 ---Leave the instance, detaching when that is safe.
 ---
 ---Detach keeps the agent alive for the next Neovim, which is only correct when
