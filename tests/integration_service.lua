@@ -40,12 +40,17 @@ local function install_fake()
   vim.fn.mkdir(dir, "p")
   local script = dir .. "/nvim_ade_server"
   local fh = assert(io.open(script, "wb"))
+  local Version = require("ade.service.version")
+  -- The stand-in takes its versions from the plugin's constants, so a bump in
+  -- the merge commit needs no edit here and the handshake keeps working.
   fh:write(
     string.format(
-      '#!/bin/sh\nexec %s %s %s "$@"\n',
+      '#!/bin/sh\nexec %s %s %s %s %s "$@"\n',
       vim.fn.exepath("python3"),
       root .. "tests/fake_service.py",
-      "--dir " .. vim.env.NVIM_ADE_SERVER_DIR
+      "--dir " .. vim.env.NVIM_ADE_SERVER_DIR,
+      "--server-version " .. Version.VERSION,
+      "--api-version " .. tostring(Version.API_VERSION)
     )
   )
   fh:close()

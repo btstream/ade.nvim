@@ -11,11 +11,11 @@ M.defaults = {
   agent = "opencode",
 
   -- Which implementation drives the chat.
-  --   "direct"  the Lua ACP client in this plugin (the only one that works today)
-  --   "service" nvim_ade_server (S1: it does not carry chat yet)
+  --   "direct"  the Lua ACP client in this plugin
+  --   "service" nvim_ade_server holds the agent (it outlives Neovim)
   --   "auto"    use the service when it is reachable, otherwise direct
-  -- The default stays direct so S0 changes nothing about existing behaviour;
-  -- "service"/"auto" currently only affect :Ade service and :checkhealth.
+  -- Direct stays the default: the service backend is new, and a user who never
+  -- installs the binary should keep working exactly as before.
   ---@type "direct"|"service"|"auto"
   backend = "direct",
 
@@ -31,6 +31,11 @@ M.defaults = {
     install_timeout = 10 * 60 * 1000,
     -- Milliseconds to wait for the service's ready line after spawning it.
     start_timeout = 5000,
+    -- Leave a running agent behind when this Neovim exits or switches agent.
+    -- Off means every exit stops the agent, which is the old direct behaviour.
+    keep_alive = true,
+    -- Seconds of idleness before the service stops itself (60-86400).
+    idle_timeout = 1800,
   },
 
   ---@type table<string, AdeAgentConfig>
@@ -621,6 +626,16 @@ function M.validate(cfg)
   end
   check_number(service.install_timeout, 1000, 3600000, "service.install_timeout")
   check_number(service.start_timeout, 100, 120000, "service.start_timeout")
+  if type(service.keep_alive) ~= "boolean" then
+    fail("service.keep_alive must be a boolean")
+  end
+  check_number(service.idle_timeout, 60, 86400, "service.idle_timeout")
+  if service.idle_timeout % 1 ~= 0 then
+    fail("service.idle_timeout must be a whole number of seconds")
+  end
+  if cfg.backend == "service" and service.path ~= nil and type(service.path) ~= "string" then
+    fail("service.path must be a string or nil")
+  end
   local completion = cfg.completion
   if type(completion) ~= "table" or type(completion.files) ~= "table" then
     fail("completion and completion.files must be tables")

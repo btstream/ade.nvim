@@ -721,8 +721,15 @@ require("ade").setup({
 
 ## 服务后端（nvim_ade_server）
 
-后续版本会把 agent 的管理搬到 Rust 后台服务 `nvim_ade_server`。**目前服务还没接管聊天**：
-默认仍是 Lua 直连（`backend = "direct"`），这一节只涉及服务的安装与状态查看，不改变现有体验。
+Agent 可以交给 Rust 后台服务 `nvim_ade_server` 持有，这样 Neovim 退出后 agent 继续工作，
+重新打开时按同一个 key 附着回同一个实例。默认仍是 Lua 直连（`backend = "direct"`），
+不装服务也能照常使用：
+
+| `backend` | 行为 |
+|---|---|
+| `"direct"`（默认） | Neovim 自己启动并持有 agent，与旧行为完全一致 |
+| `"service"` | 通过服务通道收发 ACP；服务不可用时明确报错，**不回退** |
+| `"auto"` | 服务可用就用服务，不可用只提示一次然后回退直连 |
 
 ### 安装
 
@@ -758,9 +765,15 @@ require("ade").setup({
     release_base = "https://github.com/btstream/ade.nvim/releases/download", -- 可选，必须 https
     install_timeout = 10 * 60 * 1000,      -- 下载或编译的总超时
     start_timeout = 5000,                  -- 等待服务就绪的超时
+    keep_alive = true,                     -- 退出 Neovim 时让 agent 继续运行
+    idle_timeout = 1800,                   -- 空闲多少秒后服务自行退出（60-86400）
   },
+  backend = "direct",                      -- "direct" | "service" | "auto"
 })
 ```
+
+`keep_alive = false` 会让每次退出（关闭 Neovim、切换 agent）都停掉 agent，
+等价于直连模式的行为。
 
 `release_base` 必须是 `https://`：压缩包和 `SHA256SUMS` 来自同一个地址，若允许明文 http，
 中间人可以同时替换两者，校验就失去意义；下载时也会用 `curl --proto =https --proto-redir =https`
@@ -777,6 +790,11 @@ require("ade").setup({
 | `:Ade service status` | 已安装版本、二进制路径、是否在运行、`api_version` 是否匹配 |
 | `:Ade service start` | 在后台启动服务（已运行则直接复用） |
 | `:Ade service stop` | 让服务退出 |
+| `:Ade service agents` | 列出服务持有的 agent 实例：id、agent、cwd、pid、运行时长、附着数、进行中的回合、待处理请求 |
+| `:Ade service kill <instance>` | 停掉一个实例（agent 进程立即结束） |
+
+服务模式下 `:Ade disconnect` 会真正停止 agent；关闭 Neovim（或切换 agent）时则按
+`service.keep_alive` 决定是 detach（保留）还是 stop。
 
 `:checkhealth ade` 里的 “ade.nvim service” 一节与 `status` 内容一致，只报告不修改。
 服务目录、socket 和令牌路径遵循同一套规则：优先 `$NVIM_ADE_SERVER_DIR`，其次
@@ -1486,6 +1504,26 @@ ade.nvim 显示表单：
   插件里应用或回滚某一块改动。
 - 会话历史来自 Agent（`session/list`），ade.nvim 不额外保存一份对话库。
 - 部分能力（压缩、用量、子会话）依赖 Agent 的扩展，缺失时会自动降级。
+
+### 服务后端（`backend = "service"` / `"auto"`）
+
+- 服务模式下 agent 归 nvim_ade_server 持有，因此 Neovim 退出后 agent 仍在运行。
+  但 Lua 侧的托管安装租约（`manager` 的 lease）仍只由本进程持有：Neovim 退出、
+  租约释放后，另一个实例执行 `:Ade update` / `:Ade uninstall` 可能删掉这个仍在
+  运行的 agent 依赖的 release 目录。S2 把托管安装迁入服务后才解决。在此之前，
+  用服务模式时避免在其它 Neovim 里更新/卸载正在被后台 agent 使用的托管 Agent。
+- 连接断开（服务崩溃、被 `:Ade service stop`）不会自动重连，界面显示为断开，
+  需要手动 `:Ade reconnect`；自动重连与按序号补发在后续阶段实现。
+- 同一时刻只保留一个到服务的连接（每个 Neovim 一个），但多个 Neovim 可以同时
+  附着到同一实例；agent → 客户端的请求（权限、提问）由最后附着的连接回答。
+- 多个 Neovim 附着同一实例时，每个连接都会收到该实例的全部 `session/update`。
+  对**不属于自己的会话**的更新，reducer 直接丢弃（`session_update` 找不到会话就
+  return，只写一条 debug 日志），既不入队也不缓存，因此不会因为别人的会话而增长。
+  唯一会缓冲的是"正在 `session/new`、会话 id 还没拿到"的那一小段，它有上限
+  （256 条 / 1 MiB，超出丢最旧的）。此外客户端自己的待派发队列上限 64 MiB，
+  与服务端每个连接 64 MiB 的出站队列上限一致；**超出时不丢任何一条消息**，
+  而是按连接丢失处理（断开、清空队列、各实例通道上报退出并说明是前台处理不过来），
+  重新连接即可——丢一条响应或权限请求只会让对应请求悬挂到超时或让状态悄悄错乱。
 
 ## 开发
 

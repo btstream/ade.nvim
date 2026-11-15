@@ -46,3 +46,67 @@ vim.opt.swapfile = false
 vim.opt.shadafile = "NONE"
 vim.opt.laststatus = 3
 vim.opt.splitkeep = "screen"
+
+---------------------------------------------------------------------------
+-- Optional service backend for the integration scripts.
+--
+-- Every integration script calls `ade.setup()`, so injecting the backend here
+-- runs the *same* script against either transport:
+--
+--   ADE_TEST_BACKEND=service ADE_TEST_SERVICE_BIN=/path/to/nvim_ade_server \
+--     nvim --headless -u tests/minimal_init.lua -l tests/integration.lua
+--
+-- The service directory and its token live under the isolated tree, so no test
+-- can reach the user's real one. `keep_alive = false` keeps the scripts'
+-- existing "the agent is gone afterwards" assumptions intact.
+local backend = os.getenv("ADE_TEST_BACKEND")
+if backend == "service" or backend == "auto" then
+  local service_bin = os.getenv("ADE_TEST_SERVICE_BIN")
+  if service_bin == nil or service_bin == "" then
+    io.write("ADE_TEST_BACKEND=" .. backend .. " needs ADE_TEST_SERVICE_BIN\n")
+    vim.cmd("cq 1")
+  end
+  local service_dir = isolated .. "/service"
+  vim.fn.mkdir(service_dir, "p", 448)
+  vim.env.NVIM_ADE_SERVER_DIR = service_dir
+  vim.env.ADE_TEST_SERVICE_BIN = service_bin
+  vim.env.ADE_TEST_BACKEND = backend
+
+  local service_opts = {
+    backend = backend,
+    service = {
+      path = service_bin,
+      keep_alive = false,
+      -- The scripts finish in seconds; a service that lingers would keep the
+      -- test run alive on a slow machine.
+      idle_timeout = 60,
+    },
+  }
+
+  -- Wrap `setup` once, in every module instance the scripts may require. The
+  -- plugin API and the controller both expose `setup`, and scripts use either.
+  local function wrap(module)
+    if type(module) ~= "table" or type(module.setup) ~= "function" or module.__service_wrapped then
+      return
+    end
+    local original = module.setup
+    module.setup = function(opts, action)
+      local merged = vim.tbl_deep_extend("force", {}, service_opts, opts or {})
+      return original(merged, action)
+    end
+    module.__service_wrapped = true
+  end
+  wrap(require("ade"))
+  wrap(require("ade.controller"))
+
+  -- Stop the service before Neovim exits so a test run leaves no process
+  -- behind. `:Ade service stop` is the documented path; a failure here is only
+  -- logged, because it must not turn a passing run into a failing one.
+  vim.api.nvim_create_autocmd("VimLeavePre", {
+    callback = function()
+      pcall(function()
+        require("ade.service.commands").stop({ notify = function() end })
+      end)
+    end,
+  })
+end

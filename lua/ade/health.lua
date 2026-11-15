@@ -184,7 +184,7 @@ Add to your edgy config:
   else
     health.error("vim.json is required")
   end
-  -- Service (S0): report what is installed and whether it is reachable. This
+  -- Service: report what is installed and whether it is reachable. This
   -- section must stay read-only: `:checkhealth` is a diagnostic, and installing
   -- or starting a background process from it would be a surprise.
   local ok_service, status = pcall(function()
@@ -207,7 +207,7 @@ Add to your edgy config:
       end
     end
     if status.backend ~= "direct" then
-      health.info("backend " .. status.backend .. " is configured; S0 still routes chat through the direct client")
+      health.info("chat backend: " .. status.backend)
     end
   end
 end

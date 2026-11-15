@@ -39,7 +39,7 @@ local SUBCOMMANDS = {
 }
 
 ---Subcommands of `:Ade service`.
-local SERVICE_SUBCOMMANDS = { "install", "status", "start", "stop" }
+local SERVICE_SUBCOMMANDS = { "install", "status", "start", "stop", "agents", "kill" }
 
 ---Complete subcommands, and agent ids for the commands that take one.
 local function complete(arglead, cmdline)
@@ -181,7 +181,15 @@ local function setup()
       elseif sub == "diagnostics" then
         ade.add_diagnostics()
       elseif sub == "service" then
-        require("ade.service.commands").dispatch(rest ~= "" and rest or nil)
+        -- `rest` is "<sub> [arg]"; `kill` needs the instance id it carries.
+        local service_sub, service_rest = rest:match("^(%S+)%s*(.-)%s*$")
+        if service_sub then
+          require("ade.service.commands").dispatch(service_sub, {
+            rest = service_rest ~= "" and service_rest or nil,
+          })
+        else
+          require("ade.service.commands").dispatch(nil)
+        end
       else
         vim.notify("ade.nvim: unknown subcommand " .. sub, vim.log.levels.WARN)
       end

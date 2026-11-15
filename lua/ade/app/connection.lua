@@ -6,6 +6,8 @@ local client_mod = require("ade.protocol.client")
 local capabilities = require("ade.protocol.capabilities")
 local work_scheduler = require("ade.ui.work_scheduler")
 local Resolve = require("ade.manager.resolve")
+local ServiceConnection = require("ade.service.connection")
+local service_transport = require("ade.service.transport")
 
 local Connection = {}
 Connection.__index = Connection
@@ -38,6 +40,7 @@ function Connection.new(opts)
     on_render = opts.on_render,
     store = opts.store,
     locks = opts.locks,
+    service = opts.service,
     lease = nil,
     pending_reload = nil,
   }, Connection)
@@ -49,6 +52,86 @@ end
 
 -- Exposed for the protocol conformance tests.
 Connection.client_capabilities = build_client_capabilities
+
+---The shared service connection, created on first use.
+---
+---It is created with the connection's own config function so `service.path` and
+---`service.idle_timeout` are read from the live configuration rather than from
+---defaults.
+---@return table
+function Connection:service_connection()
+  if not self.service then
+    local service = ServiceConnection.shared()
+    -- Fill in what the shared object could not know when it was created first:
+    -- whoever gets here first supplies the config accessor, and later panels
+    -- reuse the same socket. An explicitly injected connection is left alone.
+    if service.opts and not service.opts.config then
+      service.opts.config = self.config
+    end
+    -- Inbound frames use the same bounded dispatch as the direct transport, so
+    -- a streaming agent cannot starve timers or input on either backend.
+    if service.opts and not service.opts.scheduler then
+      service.opts.scheduler = work_scheduler.shared
+    end
+    if type(self.config) == "function" then
+      local ok, cfg = pcall(self.config)
+      if ok and type(cfg) == "table" and type(cfg.service) == "table" then
+        service.idle_timeout = cfg.service.idle_timeout
+      end
+    end
+    self.service = service
+  end
+  return self.service
+end
+
+---Whether the agent may outlive this Neovim.
+---@param cfg table
+---@return boolean
+function Connection:service_keep_alive(cfg)
+  local service = type(cfg.service) == "table" and cfg.service or {}
+  return service.keep_alive ~= false
+end
+
+---Decide the backend for one connection attempt.
+---
+---Returns `true` for the service, `false` for direct, and `nil, reason` when an
+---explicit `backend = "service"` cannot be satisfied. `auto` warns once and
+---falls back, which is why the warning is latched on the connection rather than
+---repeated on every reconnect.
+---@param cfg table
+---@return boolean|nil use_service
+---@return string|nil err
+function Connection:use_service(cfg)
+  local backend = cfg.backend or "direct"
+  if backend == "direct" then
+    return false, nil
+  end
+  local connection = self:service_connection()
+  -- Keep the idle timeout in step with the config; the service picks it up when
+  -- it starts.
+  connection.idle_timeout = type(cfg.service) == "table" and cfg.service.idle_timeout or nil
+  local ok, err
+  connection:ensure(function(result, reason)
+    ok, err = result, reason
+  end)
+  if ok then
+    return true, nil
+  end
+  if backend == "service" then
+    return nil,
+      'ade.nvim: backend = "service" but the service is unavailable: '
+        .. tostring(err)
+        .. '. Run :Ade service install, or set backend = "direct".'
+  end
+  if not self.auto_notified then
+    self.auto_notified = true
+    self.notify(
+      "ade.nvim: the service is unavailable (" .. tostring(err) .. "); using the direct backend",
+      vim.log.levels.WARN
+    )
+  end
+  return false, nil
+end
 
 ---Take a lease on the release this launch uses, if it is a managed one.
 ---
@@ -95,6 +178,8 @@ function Connection:connect()
     self.runtime_lost()
     S.conn.client = nil
     self:release_lease()
+    -- Not-ready means there is no ACP session to preserve; a service instance
+    -- in that state must be killed, not detached.
     previous:shutdown(true)
   end
   S.conn.phase = "starting"
@@ -117,6 +202,17 @@ function Connection:connect()
     -- and a prune in another instance would otherwise delete the files while
     -- they are being loaded. A failed start releases it again below.
     self:hold_lease(launch)
+    local use_service, backend_err = self:use_service(cfg)
+    if use_service == nil then
+      -- An explicit service backend that is unusable: report it and stay
+      -- disconnected. Falling back silently would run an agent the user did not
+      -- ask for in a mode they did not choose.
+      self:release_lease()
+      S.conn.phase = "disconnected"
+      self.on_changed()
+      self.on_start_failed({ message = backend_err or "the service is unavailable" })
+      return
+    end
     client = client_mod.new({
       agent = vim.tbl_extend("force", {}, cfg.agents[cfg.agent], {
         command = launch.command,
@@ -130,6 +226,12 @@ function Connection:connect()
       scheduler = work_scheduler.shared,
       interactions = self.interactions and self.interactions() or nil,
       limits = cfg.transport,
+      agent_id = cfg.agent,
+      keep_alive = self:service_keep_alive(cfg),
+      -- The backend only changes how frames reach the agent; the Client's ACP
+      -- logic, timeouts and permission handling are the same in both.
+      transport = use_service and service_transport or nil,
+      connection = use_service and self:service_connection() or nil,
       on_event = function(name, payload)
         local function dispatch()
           if self.state().conn.client == client and self.generation() == generation then
@@ -192,6 +294,7 @@ function Connection:disconnect()
   local client = S.conn.client
   S.conn.client = nil
   if client then
+    -- `:Ade disconnect` is an explicit stop: never leave the agent running.
     client:shutdown()
   end
   self:release_lease()
@@ -223,6 +326,8 @@ function Connection:restart()
   self.reset_permissions()
   self.pending_reload = previous and previous.id or nil
   if S.conn.client then
+    -- A login changed credentials on disk, so the next attach must create a new
+    -- process instead of reusing the old one: stop, never detach.
     S.conn.client:shutdown(true)
     S.conn.client = nil
   end
@@ -264,14 +369,19 @@ function Connection:lost(payload)
   return interrupted
 end
 
+---Leaving Neovim (or switching agent): detach when the backend allows it.
+---
+---The service backend keeps the agent running so a later Neovim can attach to
+---the same instance; the direct backend has nothing to detach, so `leave` stops
+---the child exactly like the old `shutdown(true)` did.
 function Connection:terminate()
   local S = self.state()
   if S.conn.client then
-    S.conn.client:shutdown(true)
+    S.conn.client:leave(true)
     S.conn.client = nil
   end
   self:release_lease()
-  log.debug("agent process terminated")
+  log.debug("agent connection terminated")
 end
 
 return Connection
