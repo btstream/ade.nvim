@@ -364,21 +364,31 @@ impl Client {
         self.recv().expect("method response")
     }
 
-    /// Send a request with params and read its response, skipping any
-    /// notification that arrives in between.
+    /// Send a request with params and read *its* response, skipping
+    /// notifications and any other response that arrives in between (for
+    /// example the reply of an earlier request still in flight).
     pub fn request(&mut self, id: impl Into<Value>, method: &str, params: Value) -> Value {
+        let id = id.into();
         self.send(&serde_json::json!({
             "jsonrpc": "2.0",
-            "id": id.into(),
+            "id": id.clone(),
             "method": method,
             "params": params,
         }));
         loop {
+            // A response already buffered may be the one we want.
+            if let Some(index) = self
+                .pending
+                .iter()
+                .position(|frame| frame.get("method").is_none() && frame.get("id") == Some(&id))
+            {
+                return self.pending.remove(index);
+            }
             let frame = self.recv().expect("method response");
-            if frame.get("method").is_none() {
+            if frame.get("method").is_none() && frame.get("id") == Some(&id) {
                 return frame;
             }
-            // Keep notifications for `next_notification`.
+            // Notifications and foreign responses are kept for the caller.
             self.pending.push(frame);
         }
     }

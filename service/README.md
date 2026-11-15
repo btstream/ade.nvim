@@ -81,6 +81,14 @@ The stop sequence is: close stdin, wait 3 s, `SIGTERM` the process group, wait
 are shortened by `NVIM_ADE_SERVER_STOP_TIMEOUT_MS` (milliseconds, used by the
 tests).
 
+`agent.stop` frees the instance's identity **immediately**, before the process
+exits: an `agent.attach` with the same key right after it (even before the stop
+reply) spawns a new instance with a new id and pid. The stopped instance stays
+reachable by its id (`tunnel.send`, `agent.list` with `stopping: true`) until it
+exits, and its `agent.exited` goes only to connections attached to that id. The
+front end therefore never has to wait for the process to die before starting a
+new agent.
+
 Agent stdout is split into lines; a line above 32 MiB is dropped and reported
 with `tunnel.error -32025`, and reading resumes after the next newline. Lines
 that are not JSON objects go to the service's stderr. The last 64 KiB of stderr

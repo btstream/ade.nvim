@@ -1067,3 +1067,317 @@ fn a_turn_that_outlives_its_connection_keeps_the_service_alive_until_it_ends() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// An agent that answers `ping` and refuses to exit on its own: it ignores
+/// SIGTERM and keeps running after stdin closes, so `agent.stop` has to use its
+/// full escalation and the instance survives long enough to be observed.
+fn slow_to_die_agent(server: &TestServer) -> PathBuf {
+    write_stubborn_agent(
+        server.dir(),
+        "slow-to-die.py",
+        r#"#!/usr/bin/env python3
+import json, signal, sys, time
+
+# Ignore SIGTERM: only SIGKILL ends this process (unless it is asked politely).
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+def reply(msg_id, result):
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": result}) + "\n")
+    sys.stdout.flush()
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        # stdin closed: keep running, so agent.stop has to escalate.
+        time.sleep(60)
+        continue
+    line = line.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    if message.get("method") == "ping":
+        reply(message["id"], {"echo": message["id"]})
+"#,
+    )
+}
+
+fn attach_key(server: &TestServer, client: &mut common::Client, command: &Path) -> Value {
+    client.request(
+        100,
+        "agent.attach",
+        json!({
+            "key": {
+                "agent": "stubborn",
+                "command": command.to_string_lossy(),
+                "args": [],
+                "cwd": server.dir().to_string_lossy(),
+            },
+            "client_capabilities": {},
+        }),
+    )
+}
+
+fn list_instances(client: &mut common::Client, id: i64) -> Vec<Value> {
+    let list = client.request(id, "agent.list", json!({}));
+    list["result"]["instances"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Process ids currently in `instances`, by instance id.
+fn pids_by_instance(instances: &[Value]) -> HashMap<String, u64> {
+    instances
+        .iter()
+        .filter_map(|instance| {
+            Some((
+                instance["instance"].as_str()?.to_string(),
+                instance["pid"].as_u64()?,
+            ))
+        })
+        .collect()
+}
+
+fn process_alive(pid: u64) -> bool {
+    PathBuf::from(format!("/proc/{pid}")).exists()
+}
+
+#[test]
+fn stop_frees_the_identity_immediately() {
+    let server = TestServer::start_with(
+        "agent-stop-identity",
+        &["--idle-timeout", "600"],
+        &[("NVIM_ADE_SERVER_STOP_TIMEOUT_MS", "600")],
+    );
+    let script = slow_to_die_agent(&server);
+    let mut client = server.connect();
+    client.hello(&server.token(), 2);
+
+    let attached = attach_key(&server, &mut client, &script);
+    let old_instance = attached["result"]["instance"].as_str().unwrap().to_string();
+    let old_pid = attached["result"]["pid"].as_u64().unwrap();
+    assert_eq!(attached["result"]["created"], true);
+
+    // The old instance answers before the stop.
+    client.notify(
+        "tunnel.send",
+        json!({
+            "instance": old_instance,
+            "message": {"jsonrpc": "2.0", "id": "before", "method": "ping", "params": {}},
+        }),
+    );
+    assert_eq!(
+        client.next_tunnel_recv(Duration::from_secs(10))["message"]["id"],
+        "before"
+    );
+
+    // Ask for the stop and do not wait for the reply: the identity must be
+    // free right now.
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 20,
+        "method": "agent.stop",
+        "params": {"instance": old_instance},
+    }));
+
+    let attached = attach_key(&server, &mut client, &script);
+    assert_eq!(
+        attached["result"]["created"], true,
+        "attach after stop must create a new instance: {attached}"
+    );
+    let new_instance = attached["result"]["instance"].as_str().unwrap().to_string();
+    let new_pid = attached["result"]["pid"].as_u64().unwrap();
+    assert_ne!(new_instance, old_instance);
+    assert_ne!(new_pid, old_pid, "the new instance runs a new process");
+
+    // Both instances are listed until the old one exits; only the old one is
+    // stopping.
+    let instances = list_instances(&mut client, 30);
+    let pids = pids_by_instance(&instances);
+    assert!(
+        pids.contains_key(&old_instance),
+        "the stopping instance is listed: {instances:?}"
+    );
+    assert!(pids.contains_key(&new_instance));
+    let old = instances
+        .iter()
+        .find(|instance| instance["instance"] == old_instance.as_str())
+        .expect("old instance");
+    let new = instances
+        .iter()
+        .find(|instance| instance["instance"] == new_instance.as_str())
+        .expect("new instance");
+    assert_eq!(
+        old["stopping"], true,
+        "the stopped instance is marked: {old}"
+    );
+    assert_eq!(new["stopping"], false);
+
+    // `tunnel.send` is still accepted for the stopping instance (its stdin is
+    // already closed, so it may not answer any more): the service must not
+    // report -32020/-32024 for it.
+    client.notify(
+        "tunnel.send",
+        json!({
+            "instance": old_instance,
+            "message": {"jsonrpc": "2.0", "id": "during", "method": "ping", "params": {}},
+        }),
+    );
+
+    // The new instance is fully functional, the old one exits, and the stop
+    // reply arrives — in any order, so collect until all three are seen.
+    client.notify(
+        "tunnel.send",
+        json!({
+            "instance": new_instance,
+            "message": {"jsonrpc": "2.0", "id": "new", "method": "ping", "params": {}},
+        }),
+    );
+    let mut saw_new_reply = false;
+    let mut saw_exited_old = false;
+    let mut stop_reply = None;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !(saw_new_reply && saw_exited_old && stop_reply.is_some()) {
+        assert!(
+            Instant::now() < deadline,
+            "did not see the new reply ({saw_new_reply}), the old exit ({saw_exited_old}) \
+             or the stop reply ({stop_reply:?})"
+        );
+        let Some(frame) = client.try_next_notification(Duration::from_secs(5)) else {
+            continue;
+        };
+        match frame["method"].as_str() {
+            Some("agent.exited") => {
+                assert_eq!(
+                    frame["params"]["instance"], old_instance,
+                    "agent.exited must name the old instance: {frame}"
+                );
+                saw_exited_old = true;
+            }
+            Some("tunnel.error") => {
+                assert!(
+                    frame["params"]["code"] != -32020 && frame["params"]["code"] != -32024,
+                    "the stopping instance must stay reachable: {frame}"
+                );
+            }
+            Some("tunnel.recv") => {
+                let instance = frame["params"]["instance"].as_str().unwrap_or_default();
+                let message = &frame["params"]["message"];
+                if message["id"] == "new" {
+                    assert_eq!(instance, new_instance);
+                    saw_new_reply = true;
+                } else if instance == old_instance {
+                    // In-flight traffic for the stopping instance is fine, but
+                    // nothing may be sent on its behalf to the new instance.
+                    assert_ne!(instance, new_instance);
+                }
+            }
+            _ => {
+                if frame["id"] == 20 {
+                    assert_eq!(frame["result"]["exited"], true);
+                    stop_reply = Some(frame);
+                }
+            }
+        }
+    }
+
+    // Only the new instance is left.
+    let instances = list_instances(&mut client, 40);
+    let pids = pids_by_instance(&instances);
+    assert!(!pids.contains_key(&old_instance));
+    assert!(pids.contains_key(&new_instance));
+
+    // Clean up: stop the new instance too.
+    client.request(50, "agent.stop", json!({"instance": new_instance}));
+}
+
+#[test]
+fn repeated_stop_and_attach_cycles_do_not_leak_processes() {
+    let server = TestServer::start_with(
+        "agent-stop-cycles",
+        &["--idle-timeout", "600"],
+        &[("NVIM_ADE_SERVER_STOP_TIMEOUT_MS", "300")],
+    );
+    let script = slow_to_die_agent(&server);
+    let mut client = server.connect();
+    client.hello(&server.token(), 2);
+
+    let mut seen: Vec<(String, u64)> = Vec::new();
+    let mut current = attach_key(&server, &mut client, &script);
+    assert_eq!(current["result"]["created"], true);
+
+    for cycle in 0..2 {
+        let instance = current["result"]["instance"].as_str().unwrap().to_string();
+        let pid = current["result"]["pid"].as_u64().unwrap();
+        seen.push((instance.clone(), pid));
+
+        // Stop and immediately attach again: no waiting for the stop reply.
+        client.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 200 + cycle,
+            "method": "agent.stop",
+            "params": {"instance": instance},
+        }));
+        let next = attach_key(&server, &mut client, &script);
+        assert_eq!(
+            next["result"]["created"], true,
+            "cycle {cycle}: attach after stop creates a new instance: {next}"
+        );
+        let next_pid = next["result"]["pid"].as_u64().unwrap();
+        assert_ne!(next_pid, pid, "cycle {cycle}: a new process");
+        current = next;
+    }
+
+    let last_instance = current["result"]["instance"].as_str().unwrap().to_string();
+    let last_pid = current["result"]["pid"].as_u64().unwrap();
+    seen.push((last_instance.clone(), last_pid));
+
+    // The new instance works after all those cycles.
+    client.notify(
+        "tunnel.send",
+        json!({
+            "instance": last_instance,
+            "message": {"jsonrpc": "2.0", "id": "alive", "method": "ping", "params": {}},
+        }),
+    );
+    loop {
+        let recv = client.next_tunnel_recv(Duration::from_secs(10));
+        if recv["message"]["id"] == "alive" {
+            break;
+        }
+    }
+
+    // Every earlier process is reaped; nothing is leaked.
+    let deadline = Instant::now() + Duration::from_secs(45);
+    for (instance, pid) in &seen[..seen.len() - 1] {
+        loop {
+            if !process_alive(*pid) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "instance {instance} (pid {pid}) was leaked"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    // Only the last instance remains.
+    let instances = list_instances(&mut client, 300);
+    let pids = pids_by_instance(&instances);
+    assert_eq!(pids.len(), 1, "only one instance is left: {instances:?}");
+    assert!(pids.contains_key(&last_instance));
+
+    client.request(301, "agent.stop", json!({"instance": last_instance}));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if !process_alive(seen[seen.len() - 1].1) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the last agent was leaked");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        list_instances(&mut client, 302).is_empty(),
+        "no instance is left after the last stop"
+    );
+}

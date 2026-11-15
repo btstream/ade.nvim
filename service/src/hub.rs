@@ -165,6 +165,9 @@ struct Instance {
     relay: Relay,
     /// Attached connections in attach order; the last one is the primary.
     attached: Vec<u64>,
+    /// True once `agent.stop` was accepted; the instance stays reachable by id
+    /// until the process exits (PROTOCOL.md 3.4).
+    stopping: bool,
 }
 
 impl Instance {
@@ -483,6 +486,7 @@ impl Hub {
                 exited,
                 relay: Relay::new(key.capabilities),
                 attached: Vec::new(),
+                stopping: false,
             },
         );
         Ok(instance_id)
@@ -533,6 +537,25 @@ impl Hub {
         let outbox = self.conns.get(&conn).cloned();
         let id = id.clone();
         let name = instance_id.to_string();
+
+        // The instance leaves the identity lookup now, not when the process
+        // exits: an `agent.attach` with the same key right after this call must
+        // create a fresh instance instead of reusing the dying one
+        // (PROTOCOL.md 3.4). It stays reachable by its id until it exits.
+        let instance = self.instances.get_mut(&name).expect("checked above");
+        if !instance.stopping {
+            instance.stopping = true;
+            let identity = instance.key.identity();
+            if self
+                .by_identity
+                .get(&identity)
+                .is_some_and(|live| *live == name)
+            {
+                self.by_identity.remove(&identity);
+            }
+            eprintln!("nvim_ade_server: stopping agent instance {name}");
+        }
+
         // The reply is sent after the process exited, so the wait happens off
         // the hub loop (it can take seconds).
         tokio::spawn(async move {
@@ -759,7 +782,10 @@ impl Hub {
         let Some(instance) = self.instances.remove(instance_id) else {
             return;
         };
-        self.by_identity.remove(&instance.key.identity());
+        // A stopped instance was already removed from the identity table, so a
+        // newer instance with the same key may be registered there. Only delete
+        // an entry that still points at this instance.
+        forget_identity(&mut self.by_identity, &instance.key.identity(), instance_id);
         let info = instance.exited.get().unwrap_or_default();
         for conn in &instance.attached {
             self.send_to(
@@ -860,6 +886,29 @@ fn touch_attached(attached: &mut Vec<u64>, conn: u64) {
     attached.push(conn);
 }
 
+/// Forget the identity entry of `instance` only when it still points at this
+/// instance.
+///
+/// A stopped instance leaves the table before it exits (PROTOCOL.md 3.4), so by
+/// the time its exit is processed a newer instance with the same key may own
+/// the entry. Blindly removing it would unregister the live instance and make
+/// the next `agent.attach` spawn a duplicate.
+fn forget_identity(
+    by_identity: &mut HashMap<String, String>,
+    identity: &str,
+    instance_id: &str,
+) -> bool {
+    if by_identity
+        .get(identity)
+        .is_some_and(|live| live == instance_id)
+    {
+        by_identity.remove(identity);
+        true
+    } else {
+        false
+    }
+}
+
 fn request_id(frame: &Value) -> Value {
     frame.get("id").cloned().unwrap_or(Value::Null)
 }
@@ -877,6 +926,7 @@ fn instance_summary(instance: &Instance) -> Value {
         "attached": instance.attached.len(),
         "turns_running": instance.relay.turns_running(),
         "pending_requests": instance.relay.pending_requests(),
+        "stopping": instance.stopping,
     })
 }
 
@@ -915,6 +965,27 @@ mod tests {
         // This frame pushes the queue over the 8-byte limit.
         assert!(!outbox.send(&json!({"bb": 2})));
         assert!(*watch.borrow());
+    }
+
+    #[test]
+    fn forgetting_an_identity_never_unregisters_a_newer_instance() {
+        let mut by_identity = HashMap::new();
+        by_identity.insert("k".to_string(), "i2".to_string());
+
+        // The old instance i1 exits after i2 took over its identity.
+        assert!(!forget_identity(&mut by_identity, "k", "i1"));
+        assert_eq!(
+            by_identity.get("k"),
+            Some(&"i2".to_string()),
+            "the live instance must stay registered"
+        );
+
+        // The instance that owns the entry may remove it.
+        assert!(forget_identity(&mut by_identity, "k", "i2"));
+        assert!(by_identity.is_empty());
+
+        // A missing entry is not an error.
+        assert!(!forget_identity(&mut by_identity, "k", "i9"));
     }
 
     #[test]
@@ -965,6 +1036,7 @@ mod tests {
             exited: Exited::new(),
             relay: Relay::new(json!({})),
             attached: vec![1, 2],
+            stopping: false,
         };
         let summary = instance_summary(&instance);
         for field in [
@@ -979,11 +1051,13 @@ mod tests {
             "attached",
             "turns_running",
             "pending_requests",
+            "stopping",
         ] {
             assert!(summary.get(field).is_some(), "missing {field}");
         }
         assert_eq!(summary["attached"], 2);
         assert_eq!(summary["turns_running"], 0);
         assert_eq!(summary["pending_requests"], 0);
+        assert_eq!(summary["stopping"], false);
     }
 }
