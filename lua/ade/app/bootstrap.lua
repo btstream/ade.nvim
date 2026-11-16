@@ -340,6 +340,20 @@ function M.build(ctx, opts, action)
       S.conn.creating_session = value
     end,
     prune = ctx.prune_sessions,
+    -- PROTOCOL.md 13: the adoption notification precedes the committed replay,
+    -- so it is deferred until the session exists, then applied from here.
+    session_ready = function(session)
+      if S.conn.adoption then
+        pcall(S.conn.adoption.session_ready, S.conn.adoption, session)
+      end
+    end,
+    session_forget = function(session_id)
+      if S.conn.adoption then
+        -- The replay ended without committing this id: keep an adoption marker
+        -- the pending entry had to clear, because the old object is still current.
+        pcall(S.conn.adoption.forget_pending, S.conn.adoption, session_id, true)
+      end
+    end,
     auth = function()
       return S.view.auth
     end,

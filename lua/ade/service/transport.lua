@@ -362,10 +362,18 @@ function Channel:stop(force)
   -- service answers with `agent.exited` after the process is gone, and the Client
   -- needs that event to move the UI to "disconnected" exactly like a direct
   -- child process' exit callback does.
+  --
+  -- A channel that cannot reach the service (its connection was lost) or whose
+  -- agent already exited must not send `agent.stop`: `Connection:request` would
+  -- `ensure()` and can bring the service back just as the editor is leaving, and
+  -- the service already detached this connection when the socket closed
+  -- (PROTOCOL.md 5.4/9.4). Record the exit locally instead.
+  local reachable = self.alive and not self.stopping
   self.stopping = true
   local instance = self.instance
-  if not instance then
+  if not instance or not reachable then
     self.alive = false
+    self.attached = false
     self.connection:unsubscribe_all(self.channel_id)
     -- Nothing was attached yet; the queued attach will see `stopping` and leave
     -- the (possibly created) instance to the service's idle timeout.
@@ -392,9 +400,16 @@ end
 ---The Client asks this before deciding how to settle its pending interactions:
 ---requests must survive only when the process really does. Keeping the decision
 ---in one place stops the two sides from drifting apart.
+---
+---`stopping` and `failed` forbid a detach: an explicit stop or a broken channel
+---is not a hand-over. A channel whose connection was lost (`alive == false`)
+---does detach: the service removed this connection from `attached` when the
+---socket closed and keeps the instance and its pending set pending
+---(PROTOCOL.md 5.4 and 9.4), so the agent survives and this front end must
+---abandon, not cancel, its requests.
 ---@return boolean
 function Channel:will_detach()
-  return self.instance ~= nil and self.keep_alive and self.initialized and not self.failed and self:is_alive()
+  return self.instance ~= nil and self.keep_alive and self.initialized and not self.failed and not self.stopping
 end
 
 ---Leave the instance, detaching when that is safe.
@@ -404,6 +419,13 @@ end
 ---finished initializing, and nothing went wrong. Every other case stops the
 ---process: keeping a half-initialized or broken agent around only leaves a
 ---process nobody can reach.
+---
+---The branch is `will_detach()` itself, so the decision `Client:leave` takes
+---(abandon pending requests vs. answer them `cancelled`) is exactly the action
+---taken here. A channel that lost its connection has already been detached by
+---the service when the socket closed (PROTOCOL.md 5.4/9.4); it marks itself
+---detached and sends nothing, because any request would reconnect a service
+---this front end is leaving.
 ---@param allow_detach boolean
 function Channel:leave(allow_detach)
   local instance = self.instance
@@ -411,14 +433,18 @@ function Channel:leave(allow_detach)
     self:stop(true)
     return
   end
-  if not allow_detach or not self.keep_alive or not self.initialized or self.failed then
+  if not allow_detach or not self:will_detach() then
     self:stop(false)
     return
   end
+  local reachable = self.alive and not self.stopping
   self.alive = false
   self.detached = true
   self.stats.detach = true
   self.connection:unsubscribe_all(self.channel_id)
+  if not reachable then
+    return
+  end
   local state = { done = false }
   self.connection:request("agent.detach", { instance = instance }, function(ok, value)
     state.done = true

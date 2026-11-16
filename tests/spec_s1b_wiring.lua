@@ -385,5 +385,473 @@ return function(t)
       t.match("idle agent", text)
       controller.hide()
     end)
+    t.it("does not forget the session when the editor exits by detaching", function()
+      local service, dir = start_service("exit")
+      setup("exit", service, dir)
+      ade.open()
+      wait_ready()
+      local S = state()
+      local instance_id
+      for _, record in pairs(service.instances) do
+        instance_id = record.id
+      end
+      t.truthy(instance_id, "the stand-in has no instance")
+      t.truthy(S.conn.client, "no client to ask")
+      -- The application layer must be able to ask the real client, not just a
+      -- hand-built stand-in: `Sessions:close_all_on_exit` used to look for a
+      -- method only the transport channel had, so it always decided "stop".
+      t.truthy(S.conn.client:will_detach(), "the service client must report that it detaches")
+
+      -- The real exit hook: the panel's VimLeavePre autocmd (window.lua). It
+      -- closes the sessions before leaving, which is exactly what must be
+      -- skipped for a detachable exit (PROTOCOL.md 11: close means forget).
+      vim.api.nvim_exec_autocmds("VimLeavePre", { group = S.view.panel.augroup })
+      vim.wait(3000, function()
+        local record = service.instances[instance_id]
+        return record ~= nil and next(record.attached) == nil
+      end, 20)
+
+      local closed = {}
+      for _, frame in ipairs(service.sent) do
+        local message = frame.message or {}
+        if message.method == "session/close" then
+          closed[#closed + 1] = (message.params or {}).sessionId
+        end
+      end
+      t.eq({}, closed, "exiting by detaching must not send session/close")
+      -- The detach is what makes "keep the session" meaningful: the next editor
+      -- finds the same instance and the same agent-side session.
+      t.truthy(
+        service.instances[instance_id] ~= nil and next(service.instances[instance_id].attached) == nil,
+        "the editor must detach from the instance instead of stopping it"
+      )
+      controller.hide()
+    end)
+
+    t.it("adopts a turn announced before the load reply is committed", function()
+      local service, dir = start_service("adoptrace")
+      setup("adoptrace", service, dir)
+      ade.open()
+      wait_ready()
+      local instance_id
+      for _, record in pairs(service.instances) do
+        instance_id = record.id
+      end
+      t.truthy(instance_id, "the stand-in has no instance")
+
+      -- PROTOCOL.md 13: the service sends `_ade/turn_adopted` right after the
+      -- `session/load` reply, before the front end has committed the replay.
+      -- Deliver it *before* the reply here to exercise the worst ordering.
+      local original = service.on_tunnel_send
+      local raced = false
+      service.on_tunnel_send = function(self, params, client)
+        local message = params.message or {}
+        if message.method == "session/load" and not raced then
+          raced = true
+          self:adopt(params.instance, (message.params or {}).sessionId)
+        end
+        original(self, params, client)
+      end
+      local ok, err = pcall(function()
+        controller.load_session("sess_restored")
+        wait(function()
+          local current = state().sess.current
+          return current ~= nil and current.id == "sess_restored"
+        end, 10000, "the session was loaded")
+      end)
+      service.on_tunnel_send = original
+      t.truthy(ok, tostring(err))
+      t.truthy(raced, "the test did not exercise the race")
+      wait(function()
+        local current = state().sess.current
+        return current ~= nil and current.status == "running"
+      end, 10000, "the adopted turn is running after its load")
+      t.truthy(state().conn.adoption:is_adopted("sess_restored"))
+
+      t.truthy(service:finish_adopted(instance_id, "sess_restored", "end_turn"))
+      wait(function()
+        local current = state().sess.current
+        return current ~= nil and current.status == "idle"
+      end, 10000, "the adopted turn ended")
+      t.falsy(state().conn.adoption:is_adopted("sess_restored"))
+      controller.hide()
+    end)
+
+    t.it("adopts a turn announced after the load reply was sent", function()
+      local service, dir = start_service("adoptraceafter")
+      setup("adoptraceafter", service, dir)
+      ade.open()
+      wait_ready()
+      local instance_id
+      for _, record in pairs(service.instances) do
+        instance_id = record.id
+      end
+      t.truthy(instance_id, "the stand-in has no instance")
+
+      -- The service's actual order: reply first, then `_ade/turn_adopted`. Both
+      -- still arrive before the replay coroutine resumes, so this reaches the
+      -- same pending path.
+      local original = service.on_tunnel_send
+      local raced = false
+      service.on_tunnel_send = function(self, params, client)
+        original(self, params, client)
+        local message = params.message or {}
+        if message.method == "session/load" and not raced then
+          raced = true
+          self:adopt(params.instance, (message.params or {}).sessionId)
+        end
+      end
+      local ok, err = pcall(function()
+        controller.load_session("sess_after")
+        wait(function()
+          local current = state().sess.current
+          return current ~= nil and current.id == "sess_after"
+        end, 10000, "the session was loaded")
+      end)
+      service.on_tunnel_send = original
+      t.truthy(ok, tostring(err))
+      t.truthy(raced, "the test did not exercise the race")
+      wait(function()
+        local current = state().sess.current
+        return current ~= nil and current.status == "running"
+      end, 10000, "the adopted turn is running after its load")
+      t.truthy(state().conn.adoption:is_adopted("sess_after"))
+
+      t.truthy(service:finish_adopted(instance_id, "sess_after", "end_turn"))
+      wait(function()
+        local current = state().sess.current
+        return current ~= nil and current.status == "idle"
+      end, 10000, "the adopted turn ended")
+      controller.hide()
+    end)
+
+    t.it("adopts onto the reloaded session, not the object commit replaced", function()
+      local service, dir = start_service("adoptreload")
+      setup("adoptreload", service, dir)
+      ade.open()
+      wait_ready()
+      local instance_id
+      for _, record in pairs(service.instances) do
+        instance_id = record.id
+      end
+      t.truthy(instance_id, "the stand-in has no instance")
+
+      -- First load commits `sess_reload` and leaves it idle.
+      controller.load_session("sess_reload")
+      wait(function()
+        local current = state().sess.current
+        return current ~= nil and current.id == "sess_reload" and current.status == "idle"
+      end, 10000, "the first load of the session")
+      -- Loading an idle cached session replays it again, so `Runtime:stage`
+      -- keeps the committed object visible in `sess.all` until commit. The
+      -- adoption below must not land on that old object.
+      local original = service.on_tunnel_send
+      local raced = false
+      service.on_tunnel_send = function(self, params, client)
+        local message = params.message or {}
+        if message.method == "session/load" and not raced then
+          raced = true
+          self:adopt(params.instance, (message.params or {}).sessionId)
+        end
+        original(self, params, client)
+      end
+      local ok, err = pcall(function()
+        controller.load_session("sess_reload")
+        -- Wait for the replay itself to settle: until commit the still-visible
+        -- object is the old one, so checking "running" too early would pass
+        -- against the object commit is about to replace.
+        local started = vim.wait(2000, function()
+          return state().conn.replaying == true
+        end, 5)
+        t.truthy(started, "the second load did not start a replay")
+        wait(function()
+          return state().conn.replaying == false
+        end, 10000, "the reload settled")
+        local current = state().sess.current
+        t.eq("sess_reload", current and current.id, "the reloaded session must be current")
+        t.eq("running", current and current.status, "the reloaded session adopted the turn")
+      end)
+      service.on_tunnel_send = original
+      t.truthy(ok, tostring(err))
+      t.truthy(raced, "the test did not exercise the race")
+      t.truthy(state().conn.adoption:is_adopted("sess_reload"))
+
+      t.truthy(service:finish_adopted(instance_id, "sess_reload", "end_turn"))
+      wait(function()
+        local current = state().sess.current
+        return current ~= nil and current.status == "idle"
+      end, 10000, "the adopted turn ended")
+      controller.hide()
+    end)
+
+    t.it("forgets a pending adoption when its load fails", function()
+      local service, dir = start_service("adoptfail")
+      setup("adoptfail", service, dir)
+      ade.open()
+      wait_ready()
+      local S = state()
+      local instance_id
+      for _, record in pairs(service.instances) do
+        instance_id = record.id
+      end
+      t.truthy(instance_id, "the stand-in has no instance")
+      local id = S.sess.current.id
+
+      -- Emit an adoption and then let the load fail: the adoption belongs to a
+      -- session that never arrives and must not survive to the next load. The
+      -- mock agent rejects a load whose cwd differs from the session's, which is
+      -- a real agent-side error, not a synthetic reply.
+      local original = service.on_tunnel_send
+      local raced = false
+      service.on_tunnel_send = function(self, params, client)
+        local message = params.message or {}
+        if message.method == "session/load" and not raced then
+          raced = true
+          self:adopt(params.instance, (message.params or {}).sessionId)
+        end
+        original(self, params, client)
+      end
+      local good_cwd = S.sess.cwds[id]
+      S.sess.cwds[id] = "/tmp/ade-adopt-failure-elsewhere"
+      local notices = {}
+      local original_notify = vim.notify
+      vim.notify = function(message)
+        notices[#notices + 1] = tostring(message)
+      end
+      local failed = false
+      local ok, err = pcall(function()
+        controller.load_session(id)
+        failed = vim.wait(10000, function()
+          for _, line in ipairs(notices) do
+            if line:find("unable to load the session", 1, true) then
+              return true
+            end
+          end
+          return false
+        end, 20)
+      end)
+      vim.notify = original_notify
+      service.on_tunnel_send = original
+      t.truthy(ok, tostring(err))
+      t.truthy(raced, "the test did not exercise the failure race")
+      t.truthy(failed, "the failed load was not reported: " .. table.concat(notices, "\n"))
+      local adoption = state().conn.adoption
+      t.eq(nil, adoption.pending[id], "a failed load must drop its pending adoption")
+      -- The next load is only accepted once the failed replay has settled.
+      t.truthy(
+        vim.wait(5000, function()
+          return state().conn.replaying == false
+        end, 20),
+        "the failed replay must release the replaying flag"
+      )
+
+      -- The same session loads again, with no adoption from the service: it must
+      -- stay idle instead of applying the stale one.
+      S.sess.cwds[id] = good_cwd
+      controller.load_session(id)
+      t.truthy(
+        vim.wait(3000, function()
+          return state().conn.replaying == true
+        end, 5),
+        "the second load did not start a replay"
+      )
+      t.truthy(
+        vim.wait(10000, function()
+          return state().conn.replaying == false
+        end, 20),
+        "the second replay did not settle"
+      )
+      local current = state().sess.current
+      t.eq(id, current and current.id, "the second load must make the session current")
+      t.eq("idle", current and current.status, "the second load must leave the session idle")
+      t.falsy(adoption:is_adopted(id))
+      local loads = 0
+      for _, frame in ipairs(service.sent) do
+        if (frame.message or {}).method == "session/load" then
+          loads = loads + 1
+        end
+      end
+      t.eq(2, loads, "the service must have received both load attempts")
+      controller.hide()
+    end)
+
+    t.it("keeps a reloaded session idle when its turn finished before commit", function()
+      local service, dir = start_service("adoptfinish")
+      setup("adoptfinish", service, dir)
+      ade.open()
+      wait_ready()
+      local instance_id
+      for _, record in pairs(service.instances) do
+        instance_id = record.id
+      end
+      t.truthy(instance_id, "the stand-in has no instance")
+
+      -- First load commits the session; the service then adopts a turn so the
+      -- old object is running and marked adopted.
+      controller.load_session("sess_cycle")
+      wait(function()
+        local current = state().sess.current
+        return current ~= nil and current.id == "sess_cycle" and current.status == "idle"
+      end, 10000, "the first load of the session")
+      t.truthy(service:adopt(instance_id, "sess_cycle"))
+      wait(function()
+        local current = state().sess.current
+        return current ~= nil and current.status == "running"
+      end, 10000, "the first adopted turn to run")
+
+      -- A running cached session would just be activated; force the replay path
+      -- that a reconnect/restore takes.
+      state().sess.all["sess_cycle"].needs_load = true
+      local original = service.on_tunnel_send
+      local raced = false
+      service.on_tunnel_send = function(self, params, client)
+        local message = params.message or {}
+        if message.method == "session/load" and not raced then
+          raced = true
+          local sid = (message.params or {}).sessionId
+          -- The service re-announces the adoption for this load and the turn
+          -- finishes before the replay commits.
+          self:adopt(params.instance, sid)
+          self:finish_adopted(params.instance, sid, "end_turn")
+        end
+        original(self, params, client)
+      end
+      local ok, err = pcall(function()
+        controller.load_session("sess_cycle")
+        t.truthy(
+          vim.wait(2000, function()
+            return state().conn.replaying == true
+          end, 5),
+          "the reload did not start a replay"
+        )
+        wait(function()
+          return state().conn.replaying == false
+        end, 10000, "the reload settled")
+      end)
+      service.on_tunnel_send = original
+      t.truthy(ok, tostring(err))
+      t.truthy(raced, "the test did not exercise the finish-before-commit race")
+      local current = state().sess.current
+      t.eq("sess_cycle", current and current.id, "the reloaded session must be current")
+      t.eq(
+        "idle",
+        current and current.status,
+        "a turn that finished before commit must not leave the reloaded session running"
+      )
+      t.falsy(state().conn.adoption:is_adopted("sess_cycle"))
+      controller.hide()
+    end)
+
+    t.it("settles the old adopted turn when its reload fails after the finish", function()
+      local service, dir = start_service("adoptfinishfail")
+      setup("adoptfinishfail", service, dir)
+      ade.open()
+      wait_ready()
+      local S = state()
+      local instance_id
+      for _, record in pairs(service.instances) do
+        instance_id = record.id
+      end
+      t.truthy(instance_id, "the stand-in has no instance")
+
+      -- The session the editor created: the mock agent knows its cwd, so a
+      -- load under a different cwd is a real agent-side error.
+      local id = S.sess.current.id
+      t.truthy(service:adopt(instance_id, id))
+      wait(function()
+        local current = state().sess.current
+        return current ~= nil and current.status == "running"
+      end, 10000, "the first adopted turn to run")
+
+      -- Reload: the service re-announces the adoption, the turn finishes before
+      -- commit, and then the load itself fails (real agent error, cwd mismatch).
+      state().sess.all[id].needs_load = true
+      local good_cwd = S.sess.cwds[id]
+      S.sess.cwds[id] = "/tmp/ade-adopt-finish-failure"
+      local original = service.on_tunnel_send
+      local raced = false
+      service.on_tunnel_send = function(self, params, client)
+        local message = params.message or {}
+        if message.method == "session/load" and not raced then
+          raced = true
+          local sid = (message.params or {}).sessionId
+          self:adopt(params.instance, sid)
+          self:finish_adopted(params.instance, sid, "end_turn")
+        end
+        original(self, params, client)
+      end
+      local ok, err = pcall(function()
+        controller.load_session(id)
+        t.truthy(
+          vim.wait(2000, function()
+            return state().conn.replaying == true
+          end, 5),
+          "the reload did not start a replay"
+        )
+        wait(function()
+          return state().conn.replaying == false
+        end, 10000, "the failed reload settled")
+      end)
+      service.on_tunnel_send = original
+      S.sess.cwds[id] = good_cwd
+      t.truthy(ok, tostring(err))
+      t.truthy(raced, "the test did not exercise the finish-before-failure race")
+      local current = state().sess.current
+      t.eq(id, current and current.id, "the old session must stay current")
+      t.eq("idle", current and current.status, "the consumed finish must settle the old object")
+      t.falsy(state().conn.adoption:is_adopted(id))
+      controller.hide()
+    end)
+
+    t.it("drops a cancelled load's staging record and pending adoption", function()
+      local service, dir = start_service("adoptcancel")
+      setup("adoptcancel", service, dir)
+      ade.open()
+      wait_ready()
+
+      local original = service.on_tunnel_send
+      local loads = 0
+      service.on_tunnel_send = function(self, params, client)
+        local message = params.message or {}
+        if message.method == "session/load" then
+          loads = loads + 1
+          if loads == 1 then
+            self:adopt(params.instance, (message.params or {}).sessionId)
+            -- Hold the reply until after the replay has been cancelled; it then
+            -- arrives for a task the scope no longer owns.
+            vim.defer_fn(function()
+              original(self, params, client)
+            end, 100)
+            return
+          end
+        end
+        original(self, params, client)
+      end
+      local ok, err = pcall(function()
+        local service_obj = state().sess.service
+        service_obj:replay("sess_cancel_one", {})
+        t.truthy(
+          vim.wait(3000, function()
+            return loads >= 1
+          end, 10),
+          "the first load did not reach the service"
+        )
+        -- Starting the same key again is how the scope cancels an in-flight
+        -- replay (`Scope:run` cancels the previous task): cancel, then load
+        -- again immediately. The public load path refuses while a replay is in
+        -- flight, so the replacement is made directly.
+        service_obj:replay("sess_cancel_two", {})
+        t.truthy(
+          vim.wait(3000, function()
+            return state().sess.runtime.replays["sess_cancel_one"] == nil
+          end, 20),
+          "a cancelled load must drop its staging record"
+        )
+        t.eq(nil, state().conn.adoption.pending["sess_cancel_one"], "a cancelled load must drop its pending adoption")
+      end)
+      service.on_tunnel_send = original
+      t.truthy(ok, tostring(err))
+      controller.hide()
+    end)
   end)
 end

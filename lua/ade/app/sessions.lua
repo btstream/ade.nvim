@@ -20,6 +20,8 @@ Sessions.__index = Sessions
 ---  dispatch_queued: fun(session: table), on_changed: fun(),
 ---  on_replaying: fun(value: boolean), on_creating: fun(value: boolean),
 ---  prune: fun(), auth: fun(): table|nil,
+---  session_ready: fun(session: table)|nil,
+---  session_forget: fun(session_id: string)|nil,
 ---  notify: fun(message: string, level: integer|nil)}
 function Sessions.new(opts)
   return setmetatable({
@@ -38,6 +40,8 @@ function Sessions.new(opts)
     render = opts.render,
     dispatch_queued = opts.dispatch_queued,
     get_auth = opts.auth,
+    on_session_ready = opts.session_ready,
+    on_session_forget = opts.session_forget,
     on_changed = opts.on_changed,
     on_replaying = opts.on_replaying,
     on_creating = opts.on_creating,
@@ -238,6 +242,10 @@ function Sessions:replay(session_id, opts)
   local entry = runtime:stage(session_id, cwd)
   local intent = opts.intent or runtime:intend()
   local client = self.get_client()
+  -- Identifies this attempt so a cancelled/superseded replay's cleanup does not
+  -- clear the flag of a newer one.
+  self.replay_seq = (self.replay_seq or 0) + 1
+  local replay_seq = self.replay_seq
   self.replaying = true
   self.on_replaying(true)
   self.run("replay", client, entry, function(task)
@@ -283,6 +291,13 @@ function Sessions:replay(session_id, opts)
     if not runtime:commit(entry) then
       return
     end
+    -- PROTOCOL.md 13: the service sends `_ade/turn_adopted` right after this
+    -- load reply, so the notification can arrive before the replay is committed
+    -- and the session is visible. `Adoption` keeps it pending; hand it the
+    -- committed session now so the adopted turn shows as running.
+    if self.on_session_ready then
+      pcall(self.on_session_ready, entry)
+    end
     if self.catalog:apply_title(entry) then
       self.on_changed()
     end
@@ -303,12 +318,30 @@ function Sessions:replay(session_id, opts)
       pcall(opts.on_failed, tostring(err))
     end
   end, function(_, owned)
+    -- The replay is over however it ended. Staging/cleanup is per id: a newer
+    -- attempt for a *different* session must not keep this id's `replays` record
+    -- alive, and a newer attempt for the *same* id owns the bookkeeping now.
+    local newer_same_id = runtime.replays[entry.id]
+    if not newer_same_id or newer_same_id.session == entry then
+      -- A deferred adoption belongs to this attempt only: success already
+      -- applied it, and a failure, rollback or unowned (cancelled) replay must
+      -- not leave a stale one behind for the next load of the same id.
+      if self.on_session_forget then
+        pcall(self.on_session_forget, entry.id)
+      end
+      -- A cancelled or failed replay used to leave `replays[id]` behind, which
+      -- made `Adoption:replaying(id)` true forever and sent every later
+      -- adoption for that id into a pending entry nobody would consume.
+      runtime:rollback(entry)
+    end
+    -- The `replaying` flag is global: only the newest attempt may clear it.
+    if self.replay_seq == replay_seq then
+      self.replaying = false
+      self.on_replaying(false)
+    end
     if not owned then
       return
     end
-    runtime:rollback(entry)
-    self.replaying = false
-    self.on_replaying(false)
     if runtime.sessions[entry.id] == entry then
       self.dispatch_queued(entry)
     end

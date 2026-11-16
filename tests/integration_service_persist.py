@@ -940,19 +940,17 @@ class Case:
     def _service_pids(self):
         """Every process of this case's service, wrappers included.
 
-        Matched only by `NVIM_ADE_SERVER_DIR` in the process environment, which
-        is this case's private directory. That finds the real binary and the
-        scenario wrappers (a python or shell script) that proxy it, so nothing
-        this case started survives it.
+        Matched only by `NVIM_ADE_SERVER_DIR` under the case's private
+        directory, which is this case's tree (the main socket dir and the
+        per-scenario ones such as `busy/server`). That finds the real binary and
+        the scenario wrappers (a python or shell script) that proxy it, so
+        nothing this case started survives it.
         """
-        own = {
-            os.path.join(self.dir, "server"),
-            os.path.join(self.dir, "raw", "server"),
-        }
+        root = self.dir + os.sep
         out = []
         for pid in _all_pids():
             directory = self._env_dir_of(pid)
-            if directory in own:
+            if directory and directory.startswith(root):
                 out.append(pid)
         return out
 
@@ -2088,6 +2086,13 @@ def scenario_version_restart(case):
     `version_check` restarts an idle service onto the new binary and says
     "N idle agent(s) will restart with it"; a service with a running turn is
     used as-is with a single warning.
+
+    The busy half cannot be produced by having an editor *start* the service:
+    the version check runs inside `ensure()`, before that editor attaches any
+    agent, so the service is idle by definition and the documented rule
+    (`version_check.lua`: restart when idle) makes it restart the very first
+    time. The turn is therefore started over the raw protocol first, and the
+    editor attaches to the already-busy service afterwards.
     """
     proxy = helpers.write_version_proxy(case.dir, case.binary)
 
@@ -2113,25 +2118,63 @@ def scenario_version_restart(case):
     editor.wait_reply("Hello from the mock agent")
     editor.wait_turn_idle()
 
-    # Busy: the same stale wrapper, but with a turn in flight it must not restart.
-    busy = case.editor("b")
+    # Busy: a stale service with a turn in flight must not be restarted. The
+    # turn has to exist *before* the version check runs, because the check is
+    # part of `ensure()` and happens before any agent attaches; an editor that
+    # started and connected to a fresh service would find it idle and restart
+    # it (that is this scenario's first half). So the stale service is started
+    # through the raw protocol here, with a turn already running.
     os.makedirs(os.path.join(case.dir, "busy"), exist_ok=True)
-    busy_proxy = helpers.write_version_proxy(os.path.join(case.dir, "busy"), case.binary)
-    busy.start(service={"path": busy_proxy})
-    busy.capture_notifications()
-    busy.connect()
-    busy.submit("slow please")
-    busy.wait_instances(
-        lambda list_: len(list_) == 1 and list_[0].get("turns_running", 0) == 1,
-        "the busy turn",
+    busy_dir = os.path.join(case.dir, "busy")
+    busy_proxy = helpers.write_version_proxy(busy_dir, case.binary)
+    # Its own service directory: the first editor's service is still running and
+    # the two must not unlink each other's socket.
+    raw = RawService(busy_proxy, busy_dir, 60)
+    case.raw.append(raw)
+    raw.start()
+    stale = raw.connect()
+    assert_true(
+        stale.get("server_version") == helpers.OLD_VERSION,
+        f"the wrapper must report the old version for this test: {stale!r}",
     )
-    pid_before = busy.instances()[0]["pid"]
-    busy.clear_notifications()
+    key = {
+        "agent": "opencode",
+        "command": "python3",
+        "args": [MOCK_AGENT],
+        "cwd": ROOT,
+    }
+    # The instance identity includes `client_capabilities` (PROTOCOL.md 3.2 /
+    # relay `InstanceKey`), so the raw attach must send exactly what the plugin
+    # sends or the editor would spawn a second agent instead of reusing this
+    # one. Ask the live editor for its own capabilities table.
+    caps = normalize(
+        editor.lua(
+            """
+            local cfg = require("ade.config").effective()
+            return require("ade.protocol.capabilities").client(cfg)
+            """
+        )
+    )
+    attached = raw.request("agent.attach", {"key": key, "client_capabilities": caps, "env": {}})
+    busy_instance = attached["instance"]
+    conversation = RawConversation(raw, busy_instance)
+    conversation.open()
+    conversation.start_prompt("slow please")
+
+    def busy_turn():
+        instances = raw.request("agent.list", {})["instances"]
+        return instances if len(instances) == 1 and instances[0].get("turns_running", 0) == 1 else None
+
+    wait_until(busy_turn, WAIT, 0.05, "the busy turn")
+    pid_before = raw.request("agent.list", {})["instances"][0]["pid"]
 
     # A second editor attaches to the same busy service: it must warn once and
     # leave the service alone.
     third = case.editor("c")
-    third.start(service={"path": busy_proxy})
+    third.start(
+        service_env={"NVIM_ADE_SERVER_DIR": os.path.join(busy_dir, "server")},
+        service={"path": busy_proxy},
+    )
     third.capture_notifications()
     third.connect()
     warnings = third.wait_notifications(
@@ -2148,20 +2191,35 @@ def scenario_version_restart(case):
         f"a busy service must not be restarted: {warnings!r}",
     )
     # The service (and therefore the agent) is the same process as before.
+    still = raw.request("agent.list", {})["instances"]
+    assert_true(len(still) == 1, f"the busy service must hold one instance: {still!r}")
     assert_true(
-        busy.instances()[0]["pid"] == pid_before,
+        still[0]["pid"] == pid_before,
         "the busy service must not have been restarted",
     )
-    busy.lua(
-        """
-        local st = require("ade.controller").state()
-        st.conn.client:cancel(st.session.id)
-        """
+    raw.notify(
+        "tunnel.send",
+        {
+            "instance": busy_instance,
+            "message": {
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": {"sessionId": conversation.session_id},
+            },
+        },
     )
-    busy.wait_instances(
-        lambda list_: len(list_) == 1 and list_[0].get("turns_running", 0) == 0,
+    wait_until(
+        lambda: raw.request("agent.list", {})["instances"][0].get("turns_running", 0) == 0,
+        WAIT,
+        0.05,
         "the busy turn to stop",
     )
+    # The wrapper outlives the editor; stop its service so the case leaves no
+    # process behind.
+    try:
+        raw.request("shutdown", {})
+    except (TimeoutError, OSError):
+        pass
 
 
 def scenario_retract_dialog(case):
@@ -2441,6 +2499,26 @@ class RawConversation:
         )
         # The replay frames were already consumed by `wait_response`.
         return self.replay[before:]
+
+    def start_prompt(self, text):
+        """Send `session/prompt` without waiting for its reply.
+
+        Scenario 16 needs a turn that is still in flight when another editor
+        attaches; `prompt` would block until the agent answered.
+        """
+        self.next_id += 1
+        request_id = self.next_id
+        frame = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": self.session_id,
+                "prompt": [{"type": "text", "text": text}],
+            },
+        }
+        self.service.notify("tunnel.send", {"instance": self.instance, "message": frame})
+        return request_id
 
 
 

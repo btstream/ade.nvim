@@ -359,6 +359,96 @@ return function(t)
       end
     end)
 
+    t.it("detaches without sending when the connection was already lost", function()
+      local listeners, calls = {}, {}
+      local connection = {
+        subscribe = function(_, _, method, fn)
+          listeners[method] = fn
+        end,
+        unsubscribe_all = function() end,
+        request = function(_, method, params, cb)
+          calls[#calls + 1] = { method = method, params = params }
+          if cb then
+            cb(true, { instance = "inst-1" })
+          end
+        end,
+        notify = function()
+          return true
+        end,
+      }
+      local channel = assert(service_transport.spawn({
+        connection = connection,
+        command = "agent",
+        args = {},
+        cwd = "/tmp",
+      }))
+      channel:set_initialized(true)
+      -- The socket is gone: the service already removed this connection from
+      -- `attached` and keeps the instance and its pending set (PROTOCOL 5.4/9.4).
+      listeners["__disconnected"]({ reason = "socket closed" })
+      t.eq(false, channel:is_alive())
+      t.truthy(channel:will_detach(), "a lost connection must still count as a detach")
+
+      channel:leave(true)
+      local methods = {}
+      for _, call in ipairs(calls) do
+        methods[#methods + 1] = call.method
+      end
+      -- Nothing to send: `agent.detach` would reopen a service this front end is
+      -- leaving, and `agent.stop` would kill an agent that survived.
+      t.eq({ "agent.attach" }, methods, "a lost connection must not send detach or stop")
+      t.truthy(channel.detached, "the channel must record the detach")
+    end)
+
+    t.it("does not ask a dead or already-exited channel to stop the agent", function()
+      local function report(kill)
+        local listeners, calls = {}, {}
+        local connection = {
+          subscribe = function(_, _, method, fn)
+            listeners[method] = fn
+          end,
+          unsubscribe_all = function() end,
+          request = function(_, method, params, cb)
+            calls[#calls + 1] = { method = method, params = params }
+            if cb then
+              cb(true, { instance = "inst-1" })
+            end
+          end,
+          notify = function()
+            return true
+          end,
+        }
+        local channel = assert(service_transport.spawn({
+          connection = connection,
+          command = "agent",
+          args = {},
+          cwd = "/tmp",
+        }))
+        channel:set_initialized(true)
+        kill(listeners)
+        channel:stop(false)
+        local methods = {}
+        for _, call in ipairs(calls) do
+          methods[#methods + 1] = call.method
+        end
+        return methods, channel
+      end
+
+      -- Initialized=false is the interesting variant here: `will_detach` says
+      -- stop, but the connection is already gone, so `agent.stop` would make
+      -- `Connection:request` ensure() a service just as the editor leaves.
+      local disconnected, channel = report(function(listeners)
+        listeners["__disconnected"]({ reason = "socket closed" })
+      end)
+      t.eq(false, channel:is_alive())
+      t.eq({ "agent.attach" }, disconnected, "a lost connection must not send agent.stop")
+
+      local exited = report(function(listeners)
+        listeners["agent.exited"]({ instance = "inst-1", code = 0, stderr_tail = "" })
+      end)
+      t.eq({ "agent.attach" }, exited, "an agent that already exited must not be stopped again")
+    end)
+
     t.it("runs a real ACP conversation through the tunnel", function()
       if vim.fn.executable("python3") ~= 1 then
         io.write("SKIP: python3 is required for the mock agent\n")

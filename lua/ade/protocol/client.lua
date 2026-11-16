@@ -1001,6 +1001,29 @@ function Client:shutdown(force, reason)
   self:finish_start(false, reason or { message = "client shutdown" })
 end
 
+---Whether leaving the editor would detach instead of stopping the agent.
+---
+---The transport owns the rule (`Channel:will_detach` folds in `keep_alive`, a
+---successful `initialize` and "nothing went wrong"). Exposing it here also lets
+---the application layer ask the same question — `Sessions:close_all_on_exit`
+---must not send `session/close` when the exit is a detach — instead of reading
+---the transport's field itself.
+---@return boolean
+function Client:will_detach()
+  local proc = self.proc
+  if not proc or type(proc.leave) ~= "function" then
+    -- The direct backend has no `leave`: its agent is a child process that dies
+    -- with the editor, so nothing can be reopened anyway.
+    return false
+  end
+  if type(proc.will_detach) == "function" then
+    -- The service channel owns the rule (keep_alive, initialized, no error);
+    -- asking it keeps the answer and the actual stop/detach in step.
+    return proc:will_detach() == true
+  end
+  return self.keep_alive ~= false and self.initialized == true
+end
+
 ---Stop talking to the agent while letting it run when the backend supports it.
 ---
 ---The service backend detaches (the agent survives this Neovim) when the user
@@ -1017,14 +1040,7 @@ function Client:leave(allow_detach)
   -- next front end (PROTOCOL.md 5.4 / 9.5). Detaching without an initialized
   -- session, or with keep_alive off, stops the agent — and a stopped agent can
   -- never receive the answer, so those requests must be cancelled.
-  local will_detach
-  if can_detach and type(proc.will_detach) == "function" then
-    -- The service channel owns the rule (keep_alive, initialized, no error);
-    -- asking it keeps the answer and the actual stop/detach in step.
-    will_detach = proc:will_detach() == true
-  else
-    will_detach = can_detach and self.keep_alive ~= false and self.initialized
-  end
+  local will_detach = can_detach and self:will_detach()
   if self.start_co then
     async.cancel(self.start_co)
     self.start_co = nil
