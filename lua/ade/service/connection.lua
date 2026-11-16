@@ -34,7 +34,11 @@ Connection.__index = Connection
 
 ---Listeners are keyed per channel and per notification name so one channel
 ---cannot accidentally receive another's messages.
-local NAMES = { "tunnel.recv", "agent.exited", "tunnel.error" }
+---
+---`install.progress` is in the list so the client subscribes to it: a
+---notification with no handler on the JSON-RPC object is dropped before it can
+---reach the manager (PROTOCOL.md 16.3 broadcasts it to every connection).
+local NAMES = { "tunnel.recv", "agent.exited", "tunnel.error", "install.progress" }
 
 ---@param opts {paths?: table, timeout?: integer, resolve_binary?: fun(): table|nil,string|nil,
 ---  ensure_service?: fun(): boolean,string|nil, client?: table, idle_timeout?: integer}|nil
@@ -487,6 +491,58 @@ function Connection:finish(ok, err)
   for _, cb in ipairs(waiters) do
     pcall(cb, ok, err)
   end
+end
+
+---Send a request and expose the JSON-RPC id it was written with.
+---
+---`install.*` cancellation (PROTOCOL.md 16.3) names the id of the request the
+---front end wants to stop, so the caller has to know it before the reply. The
+---handle's `id` stays nil when `ensure()` did not complete synchronously.
+---@param method string
+---@param params any
+---@param cb fun(ok: boolean, value: any)
+---@return {id: integer|nil}
+function Connection:request_tracked(method, params, cb)
+  local handle = { id = nil }
+  self:ensure(function(ok, err)
+    if not ok then
+      cb(false, { code = -32000, message = err or "the service is unavailable" })
+      return
+    end
+    handle.id = self.client:request(method, params, cb)
+  end)
+  return handle
+end
+
+---Ask the service to cancel one of this connection's requests.
+---
+---A plain `$/cancel_request` notification, not `Rpc:cancel`: the service still
+---answers the original request (with `-32800`), and that answer is what the
+---caller is waiting for. `Rpc:cancel` would drop the pending callback.
+---@param id integer|nil
+---@return boolean sent
+function Connection:cancel_request(id)
+  if type(id) ~= "number" or not self.client or not self.client:is_ready() then
+    return false
+  end
+  return self.client:notify("$/cancel_request", { id = id }) == true
+end
+
+---Whether the running service advertised a feature in its hello.
+---@param name string
+---@return boolean
+function Connection:has_feature(name)
+  local info = self.version_info
+  local features = type(info) == "table" and info.features or nil
+  if type(features) ~= "table" then
+    return false
+  end
+  for _, feature in ipairs(features) do
+    if feature == name then
+      return true
+    end
+  end
+  return false
 end
 
 ---Send one request, connecting first when needed.

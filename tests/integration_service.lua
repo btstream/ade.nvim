@@ -115,6 +115,84 @@ check(":Ade service status reports the running service", function()
   assert(joined:find("service is running", 1, true), joined)
 end)
 
+check("managed installs go through the service store (PROTOCOL 16)", function()
+  local client = Client.new({ timeout = 5000 })
+  local connected = false
+  client:connect(function(ok)
+    connected = ok
+  end)
+  assert(connected, "the client did not connect")
+  local install_root = base .. "/agents"
+  vim.fn.mkdir(install_root, "p")
+
+  local resolved, resolve_err = nil, nil
+  client:request("install.resolve", {
+    root = install_root,
+    package = "@geohar/pi-acp",
+    spec = "latest",
+    npm = "npm",
+    env = { PATH = vim.env.PATH or "" },
+  }, function(ok, value)
+    if ok then
+      resolved = value.version
+    else
+      resolve_err = value
+    end
+  end)
+  wait(function()
+    return resolved ~= nil or resolve_err ~= nil
+  end, 5000, "install.resolve")
+  assert(resolved, vim.inspect(resolve_err))
+  assert(type(resolved) == "string" and resolved ~= "latest", tostring(resolved))
+
+  local run, run_err = nil, nil
+  client:request("install.run", {
+    job = "it-install-1",
+    root = install_root,
+    agent = "pi",
+    action = "install",
+    package = "@geohar/pi-acp",
+    entry = "dist/index.js",
+    version = resolved,
+    npm = "npm",
+    env = { PATH = vim.env.PATH or "" },
+  }, function(ok, value)
+    if ok then
+      run = value
+    else
+      run_err = value
+    end
+  end)
+  wait(function()
+    return run ~= nil or run_err ~= nil
+  end, 15000, "install.run")
+  assert(run, vim.inspect(run_err))
+  assert(run.status == "committed", vim.inspect(run))
+  assert(vim.fn.filereadable(install_root .. "/pi/current.json") == 1, "no pointer was written")
+  local entry = install_root .. "/pi/releases/" .. run.installId .. "/node_modules/@geohar/pi-acp/dist/index.js"
+  assert(vim.fn.filereadable(entry) == 1, "the entrypoint was not installed: " .. entry)
+
+  local removed, remove_err = nil, nil
+  client:request("install.uninstall", {
+    job = "it-uninstall-1",
+    root = install_root,
+    agent = "pi",
+    installId = run.installId,
+  }, function(ok, value)
+    if ok then
+      removed = value
+    else
+      remove_err = value
+    end
+  end)
+  wait(function()
+    return removed ~= nil or remove_err ~= nil
+  end, 5000, "install.uninstall")
+  assert(removed, vim.inspect(remove_err))
+  assert(vim.fn.filereadable(install_root .. "/pi/current.json") == 0, "the pointer survived the uninstall")
+  client:close()
+end)
+
 check(":Ade service stop asks the service to exit", function()
   local messages = {}
   local stopped = require("ade.service.commands").stop({

@@ -20,6 +20,7 @@ Version numbers are **not** hardcoded here: `--server-version` and
 import argparse
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -116,6 +117,13 @@ class Server:
         self.stopping = {}
         self.counter = 0
         self.lock = threading.Lock()
+        # Live connections, for install progress broadcast (PROTOCOL.md 16.3).
+        self.connections = []
+        self.install_jobs = {}
+        self.install_locks = {}
+        self.pending_installs = {}
+        self.install_version = args.install_version
+        self.latest_version = args.latest_version or args.install_version
 
     def prepare(self):
         os.makedirs(self.args.dir, mode=0o700, exist_ok=True)
@@ -132,6 +140,16 @@ class Server:
         buffer = b""
         greeted = False
         attached = set()
+        with self.lock:
+            self.connections.append(conn)
+        try:
+            self._handle(conn, buffer, greeted, attached)
+        finally:
+            with self.lock:
+                if conn in self.connections:
+                    self.connections.remove(conn)
+
+    def _handle(self, conn, buffer, greeted, attached):
         while True:
             try:
                 chunk = conn.recv(65536)
@@ -220,7 +238,7 @@ class Server:
                 {
                     "server_version": self.args.server_version,
                     "api_version": self.args.api_version,
-                    "features": ["tunnel"],
+                    "features": ["tunnel"] + (["install"] if self.args.api_version >= 3 else []),
                 },
             )
         if self.args.require_hello and not attached and not self._greeted(conn):
@@ -271,10 +289,222 @@ class Server:
                 ]
             instances.sort(key=lambda item: item["instance"])
             return self.result(ident, {"instances": instances})
+        if method == "$/cancel_request":
+            job = self.pending_installs.get(params.get("id"))
+            if job:
+                self.cancel_install(job)
+            return None
+        if method == "install.resolve":
+            threading.Thread(target=self.resolve_version, args=(params, conn, ident), daemon=True).start()
+            return None
+        if method == "install.run":
+            return self.install_run(params, conn, ident)
+        if method == "install.uninstall":
+            return self.install_uninstall(params, conn, ident)
         if method == "tunnel.send":
             self.tunnel_send(params, conn, attached)
             return None
         return self.error(ident, -32601, "Method not found: " + str(method))
+
+    # --- managed installs (PROTOCOL.md 16) -------------------------------
+
+    def broadcast(self, method, params):
+        with self.lock:
+            connections = list(self.connections)
+        for conn in connections:
+            self.emit(conn, method, params)
+
+    def emit_install(self, job, event):
+        event["job"] = job["job"]
+        event["agent"] = job["agent"]
+        event["action"] = job["params"].get("action")
+        self.broadcast("install.progress", event)
+
+    def resolve_version(self, params, conn, ident):
+        time.sleep(0.01)
+        spec = params.get("spec") or "latest"
+        version = spec if spec != "latest" else (self.latest_version or self.install_version)
+        self.send(conn, self.result(ident, {"version": version}))
+
+    @staticmethod
+    def read_json(path):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                value = json.load(handle)
+            return value if isinstance(value, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def write_json(path, value):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(value, handle)
+
+    @staticmethod
+    def install_id_for(version):
+        base = re.sub(r"[^0-9a-z.-]", "_", version.lower())[:64]
+        return "v%s-%d" % (base, int(time.time() * 1000) % 1000000000)
+
+    def finish_install(self, job, reply):
+        self.install_locks.pop(job["agent"], None)
+        self.install_jobs.pop(job["job"], None)
+        self.pending_installs.pop(job["id"], None)
+        self.send(job["conn"], reply)
+
+    def install_run(self, params, conn, ident):
+        agent = params.get("agent")
+        if agent in self.install_locks:
+            return self.error(ident, -32042, "another instance is using this agent", {"reason": "pid 4242 is running"})
+        root = params.get("root") or ""
+        version = params.get("version")
+        agent_dir = os.path.join(root, agent or "")
+        current = self.read_json(os.path.join(agent_dir, "current.json"))
+        if params.get("action") == "update" and current and current.get("version") == version:
+            return self.result(ident, {
+                "status": "unchanged",
+                "installId": current.get("installId"),
+                "version": version,
+            })
+        self.install_locks[agent] = True
+        job = {
+            "id": ident,
+            "job": params.get("job"),
+            "agent": agent,
+            "params": params,
+            "conn": conn,
+            "cancelled": False,
+        }
+        self.install_jobs[job["job"]] = job
+        self.pending_installs[ident] = job
+        threading.Thread(target=self.run_install_steps, args=(job,), daemon=True).start()
+        return None
+
+    def run_install_steps(self, job):
+        params = job["params"]
+        agent = job["agent"]
+        version = params.get("version")
+        delay = 0.01
+        time.sleep(delay)
+        if job["cancelled"]:
+            return
+        self.emit_install(job, {"phase": "checking"})
+        time.sleep(delay)
+        if job["cancelled"]:
+            return
+        install_id = self.install_id_for(version)
+        agent_dir = os.path.join(params.get("root") or "", agent)
+        release = os.path.join(agent_dir, "releases", install_id)
+        job["dir"] = release
+        os.makedirs(release, exist_ok=True)
+        self.emit_install(job, {"phase": "installing", "version": version, "dir": release})
+        time.sleep(delay)
+        if job["cancelled"]:
+            return
+        self.write_json(os.path.join(release, "package.json"), {
+            "name": "ade-nvim-managed",
+            "private": True,
+            "version": "0.0.0",
+            "description": "Installed by ade.nvim; do not edit.",
+            "dependencies": {params.get("package"): version},
+        })
+        self.emit_install(job, {
+            "phase": "output",
+            "line": "$ npm install --no-audit --no-fund --omit=dev --loglevel=notice --progress=false",
+        })
+        package = params.get("package") or "package"
+        entry = params.get("entry") or "dist/index.js"
+        package_dir = os.path.join(release, "node_modules", package)
+        os.makedirs(os.path.join(package_dir, os.path.dirname(entry)), exist_ok=True)
+        self.write_json(os.path.join(package_dir, "package.json"), {"name": package, "version": version})
+        try:
+            with open(os.path.join(package_dir, entry), "w", encoding="utf-8") as handle:
+                handle.write("#!/usr/bin/env node\n")
+        except OSError:
+            pass
+        self.emit_install(job, {"phase": "verifying", "version": version})
+        time.sleep(delay)
+        if job["cancelled"]:
+            return
+        import platform as _platform
+
+        system = _platform.system()
+        arch = _platform.machine()
+        platform_name = {"Darwin": "OSX", "Windows": "Windows"}.get(system, system)
+        arch_name = {"x86_64": "x64", "AMD64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(arch, arch)
+        self.write_json(os.path.join(release, "receipt.json"), {
+            "schemaVersion": 1,
+            "agentId": agent,
+            "installId": install_id,
+            "package": package,
+            "version": version,
+            "entry": "node_modules/%s/%s" % (package, entry),
+            "runtime": "node",
+            "installedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "platform": platform_name,
+            "arch": arch_name,
+        })
+        self.write_json(os.path.join(agent_dir, "current.json"), {
+            "schemaVersion": 1,
+            "installId": install_id,
+            "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "package": package,
+            "version": version,
+        })
+        self.emit_install(job, {"phase": "committed", "version": version})
+        self.finish_install(job, self.result(job["id"], {
+            "status": "committed",
+            "installId": install_id,
+            "version": version,
+            "dir": release,
+        }))
+
+    def install_uninstall(self, params, conn, ident):
+        agent = params.get("agent")
+        if agent in self.install_locks:
+            return self.error(ident, -32042, "another instance is using this agent", {"reason": "pid 4242 is running"})
+        root = params.get("root") or ""
+        agent_dir = os.path.join(root, agent or "")
+        current = self.read_json(os.path.join(agent_dir, "current.json"))
+        if not current or not isinstance(current.get("installId"), str):
+            return self.error(ident, -32045, "this agent has no manager-owned install")
+        if params.get("installId") and params["installId"] != current.get("installId"):
+            return self.error(ident, -32042, "the installed release changed", {"reason": "changed"})
+        self.install_locks[agent] = True
+        job = {
+            "id": ident,
+            "job": params.get("job"),
+            "agent": agent,
+            "params": params,
+            "conn": conn,
+            "cancelled": False,
+        }
+        self.install_jobs[job["job"]] = job
+        self.pending_installs[ident] = job
+        threading.Thread(target=self.run_uninstall_steps, args=(job, current), daemon=True).start()
+        return None
+
+    def run_uninstall_steps(self, job, current):
+        time.sleep(0.01)
+        if job["cancelled"]:
+            return
+        agent_dir = os.path.join(job["params"].get("root") or "", job["agent"])
+        try:
+            os.remove(os.path.join(agent_dir, "current.json"))
+        except OSError:
+            pass
+        import shutil
+        shutil.rmtree(os.path.join(agent_dir, "releases", current.get("installId")), ignore_errors=True)
+        self.emit_install(job, {"phase": "removed"})
+        self.finish_install(job, self.result(job["id"], {"installId": current.get("installId")}))
+
+    def cancel_install(self, job):
+        job["cancelled"] = True
+        if job.get("dir"):
+            import shutil
+            shutil.rmtree(job["dir"], ignore_errors=True)
+        self.emit_install(job, {"phase": "cancelled"})
+        self.finish_install(job, self.error(job["id"], -32800, "request cancelled"))
 
     def _greeted(self, conn):
         return True
@@ -533,6 +763,8 @@ def main():
     parser.add_argument("--message", default="boom")
     parser.add_argument("--no-ready-line", action="store_true")
     parser.add_argument("--require-hello", action="store_true")
+    parser.add_argument("--install-version", default="1.0.0")
+    parser.add_argument("--latest-version", default=None)
     parser.add_argument("--lifetime", type=float, default=30.0)
     # Spawn the command from `agent.attach` like the real service; the canned
     # agent is only used when this is off (launcher-only tests).

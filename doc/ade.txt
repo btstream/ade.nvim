@@ -429,6 +429,7 @@ ade.nvim 的两个窗口默认锁定到自己的 buffer（'winfixbuf'），:edit
     U       更新全部有新版本的
     X       卸载托管副本
     C       检查新版本
+    x       取消正在运行的任务（仅服务后端）
     <CR>    展开/收起详情
     s       把聊天切换到这个 Agent
     g?      帮助
@@ -448,6 +449,13 @@ OpenCode 以独立 CLI 分发，仍自行安装；管理界面只报告它是否
   - 安装会运行 npm，第三方包可执行安装脚本，不是沙箱。
   - 更新失败或取消时旧版本保持可用；半成品目录会被清理。
   - 凭据、会话历史、Agent 自己的配置都不受安装或卸载影响。
+
+服务后端（|ade-service|，且运行中的服务在 hello 里声明 install 特性）时，
+安装/更新/卸载由 nvim_ade_server 执行（PROTOCOL.md 第 16 节）：npm 在服务
+进程里运行，Neovim 退出后安装会继续；多个 Neovim 共用同一把 Agent 锁，
+其他前端发起的任务会在管理界面里显示为进行中，可用 `x` 取消自己发起的任务。
+直连后端（backend = "direct"）、Windows 或旧服务仍由 Neovim 自己运行 npm，
+此时没有取消机制，按 `x` 会提示当前后端不支持取消。
 
 启动来源： >lua
     require("ade").setup({

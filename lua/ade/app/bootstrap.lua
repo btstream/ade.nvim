@@ -555,6 +555,9 @@ function M.build(ctx, opts, action)
     store = rawget(ctx, "resolve_store") and rawget(ctx, "resolve_store")() or nil,
     locks = S.conn.locks,
     npm = rawget(ctx, "manager_npm") and rawget(ctx, "manager_npm")() or nil,
+    -- Service mode runs installs in the service when its hello offers the
+    -- `install` feature (PROTOCOL.md 16); the manager decides per operation.
+    service = S.conn.service,
     on_changed = function()
       if S.view.agent_manager and S.view.agent_manager:is_open() then
         S.view.agent_manager:refresh()

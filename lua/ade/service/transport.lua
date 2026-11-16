@@ -116,8 +116,7 @@ function M.spawn(opts)
     self:on_service_lost(payload)
   end)
 
-  local started = vim.uv.hrtime()
-  connection:request("agent.attach", {
+  local params = {
     key = {
       agent = self.agent_id,
       command = opts.command,
@@ -126,7 +125,26 @@ function M.spawn(opts)
     },
     client_capabilities = opts.client_capabilities or {},
     env = M.child_env(opts.env),
-  }, function(ok, value)
+  }
+  -- A managed release the service runs needs its own lease (PROTOCOL.md 16.4).
+  -- The service writes it before spawning, and keeps it while the instance
+  -- lives, so the release survives Neovim exiting (which the Lua lease does
+  -- not). `launch` is not part of the instance identity.
+  local launch = opts.launch
+  if
+    type(launch) == "table"
+    and launch.source == "managed"
+    and type(launch.install_id) == "string"
+    and type(opts.manager_root) == "string"
+  then
+    params.launch = {
+      root = opts.manager_root,
+      agent = self.agent_id,
+      installId = launch.install_id,
+    }
+  end
+  local started = vim.uv.hrtime()
+  connection:request("agent.attach", params, function(ok, value)
     if not self.alive or self.stopping then
       return
     end
