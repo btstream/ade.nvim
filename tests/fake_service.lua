@@ -30,6 +30,7 @@ Server.__index = Server
 ---  spawn_agent?: fun(instance: table): boolean|nil, exit_code?: integer,
 ---  stop_delay_ms?: integer, shutdown_delay_ms?: integer, shutdown_closes?: boolean,
 ---  shutdown_eof?: boolean, shutdown_error?: table, hello_delay_ms?: integer,
+---  stop_agents_on_shutdown?: boolean,
 ---  features?: string[], install_version?: string, latest_version?: string,
 ---  install_fail?: boolean, install_log?: string, install_delay_ms?: integer,
 ---  install_busy?: boolean, uninstall_busy?: boolean, resolve_delay_ms?: integer,
@@ -64,6 +65,9 @@ function M.new(opts)
     shutdown_eof = opts.shutdown_eof == true,
     -- An error response: the service refuses to stop and stays usable.
     shutdown_error = opts.shutdown_error,
+    -- The real service stops its agents before exiting and announces each as
+    -- `agent.exited`; a front end must not call that a disconnect.
+    stop_agents_on_shutdown = opts.stop_agents_on_shutdown == true,
     -- Delay the hello reply, so a test can run a command while `ensure()` is
     -- blocked inside the handshake (`Connection.connecting` is true).
     hello_delay_ms = opts.hello_delay_ms,
@@ -262,6 +266,20 @@ function Server:dispatch(message, client)
     end
     if self.shutdown_error then
       return { jsonrpc = "2.0", id = ident, error = self.shutdown_error }
+    end
+    if self.stop_agents_on_shutdown then
+      -- The real service stops every agent while shutting down and tells the
+      -- attached front ends before the stop reply.
+      for instance_id, record in pairs(self.instances) do
+        for attached in pairs(record.attached) do
+          self:emit(attached, "agent.exited", {
+            instance = instance_id,
+            code = self.exit_code or 0,
+            signal = nil,
+            stderr_tail = "",
+          })
+        end
+      end
     end
     local reply = { jsonrpc = "2.0", id = ident, result = {} }
     if self.shutdown_delay_ms and self.shutdown_delay_ms > 0 then

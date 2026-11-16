@@ -13,7 +13,7 @@ ade.nvim 是一个 Neovim 原生的 Agent Client Protocol 客户端。
     :Ade login     " 首次使用；执行 Agent 自己提供的登录方式
 
 默认布局为原生左右分屏；edgy.nvim 是可选依赖，使用时显式配置 external。
-需要 Neovim 0.10+，推荐 0.12+。代码块语法高亮需对应语言的 Tree-sitter parser
+需要 Neovim 0.13+（0.13 尚未正式发布时使用 nightly）。代码块语法高亮需对应语言的 Tree-sitter parser
 与 highlights query；缺失时保留纯文本。界面文字为英文，默认使用 Nerd Font 图标。
 
 ==============================================================================

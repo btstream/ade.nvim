@@ -19,7 +19,7 @@ nvim = pynvim.attach(
 )
 
 
-def phase(label, setup):
+def phase(label, setup, ready=None, timeout_ms=5000):
     seen = set()
     result = []
     expired = threading.Event()
@@ -39,20 +39,41 @@ def phase(label, setup):
         expired.set()
         nvim.async_call(nvim.stop_loop)
 
+    # Poll for the phase's own success condition instead of sleeping a fixed
+    # 500 ms: a loaded machine may need longer for the frames to reach the UI,
+    # while an idle one should not pay the full delay. The condition is
+    # evaluated in the editor, and the existing assertions still run on the
+    # collected diagnostics, so a genuine failure names what is missing.
+    baseline = nvim.exec_lua("return _G.spinner_test:diagnostics().frame_changes")
+    # A frame change does not guarantee the UI redraw carried a *distinct*
+    # spinner glyph (redraws can coalesce frames), so wait for enough animation
+    # to make the three-distinct-frames assertion reliable. This is still a
+    # condition, not a delay: it passes as soon as the spinner has advanced.
+    condition = ready or f"_G.spinner_test:diagnostics().frame_changes >= {baseline + 8}"
     nvim.exec_lua(
         setup
         + f"""
-        vim.defer_fn(function()
+        local deadline = vim.uv.hrtime() + {timeout_ms} * 1e6
+        local function report()
           local stats = _G.spinner_test:diagnostics()
           stats.focused_win = vim.api.nvim_get_current_win()
           stats.stress_complete = _G.stress_complete
           stats.stress_frames = _G.stress_frames and vim.tbl_count(_G.stress_frames)
           stats.stress_readonly = _G.stress_readonly
           vim.rpcnotify({nvim.channel_id}, 'ade_spinner_done', stats)
-        end, 500)
+        end
+        local function poll()
+          local ok, ready_now = pcall(function() return {condition} end)
+          if (ok and ready_now == true) or vim.uv.hrtime() >= deadline then
+            report()
+            return
+          end
+          vim.defer_fn(poll, 10)
+        end
+        poll()
         """,
     )
-    deadline = threading.Timer(5, timeout)
+    deadline = threading.Timer((timeout_ms / 1000) + 5, timeout)
     deadline.start()
     try:
         nvim.run_loop(None, notification)
@@ -150,6 +171,9 @@ try:
         end
         finish()
         """,
+        # The phase is done only after the commit settled *and* the spinner
+        # animated during it; waiting for a fixed delay could report earlier.
+        ready="_G.stress_complete == true and vim.tbl_count(_G.stress_frames or {}) >= 3",
     )
     assert stress["stress_complete"], "chunked transcript did not finish correctly"
     assert stress["stress_readonly"], "yielded transcript became editable"

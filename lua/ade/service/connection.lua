@@ -66,6 +66,10 @@ function M.new(opts)
     client_factory = opts.client_factory,
     idle_timeout = opts.idle_timeout,
     closed = false,
+    -- Set by `:Ade service stop` and kept until a new client is established.
+    -- The agents the service stops while shutting down exit *before* the stop
+    -- reply, so checking only the live client would race that reply.
+    stop_intent = false,
     -- Per-channel callbacks run after a successful hello. One slot per channel
     -- so a reconfiguration cannot stack stale handlers on the shared object.
     hello_listeners = {},
@@ -82,6 +86,16 @@ function M.shared()
   if not shared then
     shared = M.new()
   end
+  return shared
+end
+
+---The shared connection when one already exists; never creates one.
+---
+---The agent-exit handler only asks whether a service client has a stop intent
+---while the editor is leaving; constructing a connection there would create
+---state nobody asked for.
+---@return AdeServiceConnection|nil
+function M.current()
   return shared
 end
 
@@ -103,6 +117,18 @@ end
 ---@return boolean
 function Connection:is_connected()
   return self.client ~= nil and self.client:is_ready()
+end
+
+---Whether the live client carries an explicit `:Ade service stop` intent.
+---
+---The service signals every attached front end that its agent exits while it
+---shuts down. That is not a disconnect to report: the user (or an exit hook)
+---asked for it. The intent outlives the client object because those exits
+---arrive before the stop reply that clears `self.client`; a newly established
+---connection resets it, so a later real drop still reports normally.
+---@return boolean
+function Connection:stop_requested()
+  return self.stop_intent == true or (self.client ~= nil and self.client.shutdown_requested == true)
 end
 
 ---Register a listener for one notification name.
@@ -285,6 +311,9 @@ function Connection:ensure(cb)
     dispatch_budget_ms = self.opts.dispatch_budget_ms,
   })
   self.client = client
+  -- A fresh connection is not a stopped one; an exit announcement from it is a
+  -- real disconnect again.
+  self.stop_intent = false
   self:install_handlers(client)
   local ok, info
   client:connect(function(connected, value)
@@ -728,6 +757,7 @@ end
 function Connection:shutdown(cb, timeout)
   -- Tell the panel before asking: a slow or unanswered shutdown produces no
   -- EOF, and the retry loop must not keep starting services in the background.
+  self.stop_intent = true
   self:stopped_intent()
   if not self:is_connected() then
     if cb then
@@ -741,6 +771,11 @@ function Connection:shutdown(cb, timeout)
       -- The service confirmed; `Client:shutdown` closes the socket next, and
       -- the close carries this client's stop intent.
       self.client = nil
+    elseif not ok and self.client == client and not (type(value) == "table" and value.pending) then
+      -- A refusal keeps the service usable, so its later agent exits are real
+      -- disconnects again. A timeout keeps the intent: the stop is still in
+      -- flight.
+      self.stop_intent = false
     end
     -- On refusal/timeout the client stays: it is the live socket, and closing
     -- it here would report a drop nobody asked for. `Client:shutdown` already
