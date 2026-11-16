@@ -35,7 +35,7 @@ Adoption.__index = Adoption
 ---  notify: fun(message: string, level: integer|nil)}
 ---@return AdeTurnAdoption
 function M.new(deps)
-  return setmetatable({ deps = deps, adopted = {}, pending = {}, pending_order = {} }, Adoption)
+  return setmetatable({ deps = deps, adopted = {}, pending = {} }, Adoption)
 end
 
 ---The session a notification refers to, or nil.
@@ -49,17 +49,11 @@ function Adoption:session(session_id)
 end
 
 ---Whether a replay for this id is in flight.
----
----`Runtime:stage` keeps the previously committed object in `sessions[id]` until
----`commit`, so a lookup by id is not enough: during a reload the visible object
----is the *old* one, and an adoption applied to it would be lost when `commit`
----replaces it with the replayed session. `replays` is the authoritative "this
----id is being loaded" mark.
 ---@param session_id string
 ---@return boolean
 function Adoption:replaying(session_id)
   local runtime = self.deps.state().sess.runtime
-  return runtime ~= nil and type(runtime.replays) == "table" and runtime.replays[session_id] ~= nil
+  return runtime ~= nil and type(runtime.is_staged) == "function" and runtime:is_staged(session_id) == true
 end
 
 ---Handle `_ade/turn_adopted`.
@@ -71,13 +65,9 @@ function Adoption:adopted_turn(payload)
     return
   end
   if self:replaying(session_id) then
-    -- PROTOCOL.md 13: the notification follows the `session/load` reply on the
-    -- same connection, but the reply resolves the load coroutine on a later
-    -- tick. The replay has not been committed to the runtime yet, so the
-    -- session is not visible; remember the adoption and apply it once
-    -- `session_ready` sees the committed session. A reload of an already
-    -- committed session is the same case: `sess.all` still holds the old
-    -- object, which commit is about to replace.
+    -- PROTOCOL.md 13: the notification can arrive before the load reply resolves
+    -- the coroutine that commits the replay. A reload is the same case: the
+    -- visible object is the old one, which commit is about to replace.
     self:pending_adoption(session_id)
     return
   end
@@ -92,22 +82,27 @@ end
 ---Remember a `_ade/turn_adopted` that arrived before its session was committed.
 ---@param session_id string
 function Adoption:pending_adoption(session_id)
-  if not self.pending[session_id] then
-    -- An adoption marker on the currently visible object belongs to the object
-    -- `commit` is about to replace. Clear it so `adopt` cannot answer
-    -- "repeated" for the new object. Remember it instead: if the load fails or
-    -- is rolled back the old object stays current and must keep its marker so
-    -- `turn_finished` can still settle it.
-    self.pending[session_id] = { finished = nil, previous_adopted = self.adopted[session_id] == true }
-    self.adopted[session_id] = nil
-    self.pending_order[#self.pending_order + 1] = session_id
-    -- Oldest first: a load that never commits must not keep the rest forever.
-    while #self.pending_order > MAX_PENDING do
-      local oldest = table.remove(self.pending_order, 1)
-      self.pending[oldest] = nil
-    end
-    log.debug("turn_adopted for %s before its load committed; deferring", session_id)
+  if self.pending[session_id] then
+    return
   end
+  local count = 0
+  for _ in pairs(self.pending) do
+    count = count + 1
+  end
+  if count >= MAX_PENDING then
+    -- Misbehaving service: drop the whole set instead of growing without bound.
+    log.warn("dropping %d deferred turn adoptions; too many loads never committed", count)
+    self.pending = {}
+  end
+  -- Clear the marker on the object commit will replace (`adopt` must not call it
+  -- "repeated"), but remember the object: `forget_pending` restores the marker
+  -- if the load fails and that object is still current.
+  self.pending[session_id] = {
+    finished = nil,
+    previous_session = self.adopted[session_id] and self:session(session_id) or nil,
+  }
+  self.adopted[session_id] = nil
+  log.debug("turn_adopted for %s before its load committed; deferring", session_id)
 end
 
 ---Take a pending adoption out of the bookkeeping.
@@ -115,16 +110,7 @@ end
 ---@return table|nil pending
 function Adoption:take_pending(session_id)
   local pending = self.pending[session_id]
-  if not pending then
-    return nil
-  end
   self.pending[session_id] = nil
-  for index, id in ipairs(self.pending_order) do
-    if id == session_id then
-      table.remove(self.pending_order, index)
-      break
-    end
-  end
   return pending
 end
 
@@ -153,14 +139,10 @@ function Adoption:adopt(session_id, session)
   end
 end
 
----Drop a deferred adoption that will never be applied.
----
----A failed or rolled-back replay has no session to attach it to. Keeping it would
----make a later, successful load of the same id adopt a turn the service never
----announced for that load.
+---Drop a deferred adoption that will never be applied, restoring the old
+---object's marker when the replay never replaced it.
 ---@param session_id string|nil
----@param restore boolean|nil put back an adoption marker the pending entry cleared
-function Adoption:forget_pending(session_id, restore)
+function Adoption:forget_pending(session_id)
   if type(session_id) ~= "string" then
     return
   end
@@ -168,23 +150,18 @@ function Adoption:forget_pending(session_id, restore)
   if not pending then
     return
   end
-  if restore and pending.previous_adopted then
-    -- The load never replaced the session, so the old object is still current
-    -- and its adopted turn must keep being tracked until `turn_finished`.
-    self.adopted[session_id] = true
+  local session = self:session(session_id)
+  if not session or session ~= pending.previous_session then
+    return
   end
-  if restore and pending.finished then
-    -- The turn ended while the load was in flight and the load then failed or
-    -- was cancelled. The old object is still current, so consume the finish here:
-    -- leaving a running status whose finish event has already been handled would
-    -- be a spinner nothing can stop.
-    local session = self:session(session_id)
-    if session and session.status ~= "idle" then
+  if pending.finished then
+    -- The finish arrived while the load was in flight and the load then failed:
+    -- consume it now, or the old object keeps running with no event left.
+    if session.status ~= "idle" then
       if pending.finished.error ~= nil then
         self:adopted_error(pending.finished.error)
       end
       session:finish_turn(pending.finished.stop_reason or "end_turn")
-      self.adopted[session_id] = nil
       self.deps.refresh_chrome()
       if self.deps.schedule_render then
         self.deps.schedule_render()
@@ -194,7 +171,10 @@ function Adoption:forget_pending(session_id, restore)
       end
       log.debug("settled the adopted turn for %s after its load ended", session_id)
     end
+    self.adopted[session_id] = nil
+    return
   end
+  self.adopted[session_id] = true
 end
 
 ---Report an adopted turn that ended with an error, exactly like a live finish.
@@ -220,12 +200,10 @@ function Adoption:session_ready(session)
   if not pending then
     return
   end
-  -- The marker belonged to the object this commit replaced (it was already
-  -- cleared when the pending entry was made; this is defensive).
+  -- Defensive: `pending_adoption` already cleared it.
   self.adopted[session_id] = nil
   if pending.finished then
-    -- The turn ended while the replay was still being committed. There is
-    -- nothing left to watch; report an error the way a live finish would.
+    -- The turn ended before commit: report an error as a live finish would.
     if pending.finished.error ~= nil then
       self:adopted_error(pending.finished.error)
     end
@@ -241,11 +219,8 @@ function Adoption:finished_turn(payload)
   local session_id = payload and payload.session_id
   local pending = self.pending[session_id]
   if pending then
-    -- The visible object may be the old one commit is about to replace, and it
-    -- may even be adopted (`adopted[id]` true). The finish belongs to the turn
-    -- the pending adoption described: record it there so `session_ready` does
-    -- not start a spinner for a turn that is already over, and drop the
-    -- obsolete marker.
+    -- A finish that arrives before commit belongs to the turn the pending
+    -- adoption described (the visible object may still be the old, adopted one).
     if not pending.finished then
       pending.finished = payload
     end
@@ -298,7 +273,6 @@ function Adoption:reset(reason)
   end
   self.adopted = {}
   self.pending = {}
-  self.pending_order = {}
   for _, session_id in ipairs(ids) do
     local session = self:session(session_id)
     if session and session.status ~= "idle" then

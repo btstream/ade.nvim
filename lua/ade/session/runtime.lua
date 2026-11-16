@@ -169,6 +169,15 @@ function Runtime:rollback(session)
   end
 end
 
+---Whether a replay for this id is staging and has not committed yet (the
+---authoritative "a load is in flight" mark; `sessions[id]` still holds the old
+---object until commit).
+---@param id string
+---@return boolean
+function Runtime:is_staged(id)
+  return self.replays[id] ~= nil
+end
+
 function Runtime:remove(id)
   self.replays[id], self.sessions[id] = nil, nil
 end

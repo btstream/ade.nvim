@@ -5,6 +5,7 @@
 -- callbacks, so it never touches the panel or the composer directly.
 local presenter = require("ade.app.presenter")
 local capabilities = require("ade.protocol.capabilities")
+local log = require("ade.log")
 
 local Sessions = {}
 Sessions.__index = Sessions
@@ -252,7 +253,8 @@ function Sessions:replay(session_id, opts)
     local ok, result = task:call("load_session", session_id, cwd)
     if not ok then
       task.status = "failed"
-      runtime:rollback(entry)
+      -- No rollback here: `on_finally` always runs and is the single cleanup
+      -- point, including when the auth retry returns early.
       local auth = self.get_auth and self.get_auth()
       if
         auth
@@ -296,7 +298,16 @@ function Sessions:replay(session_id, opts)
     -- and the session is visible. `Adoption` keeps it pending; hand it the
     -- committed session now so the adopted turn shows as running.
     if self.on_session_ready then
-      pcall(self.on_session_ready, entry)
+      local applied, apply_err = pcall(self.on_session_ready, entry)
+      if not applied then
+        -- Do not leave the deferred adoption behind: a later load of this id
+        -- would apply it to the wrong session. The commit already replaced the
+        -- object, so `forget_pending` only drops the pending entry.
+        log.error("applying the deferred turn adoption to %s failed: %s", entry.id, tostring(apply_err))
+        if self.on_session_forget then
+          pcall(self.on_session_forget, entry.id)
+        end
+      end
     end
     if self.catalog:apply_title(entry) then
       self.on_changed()
@@ -312,26 +323,19 @@ function Sessions:replay(session_id, opts)
       pcall(opts.on_restored)
     end
   end, function(err)
-    runtime:rollback(entry)
+    -- `on_finally` owns the rollback and the pending cleanup for every ending.
     self.notify("unable to load the session: " .. tostring(err), vim.log.levels.ERROR)
     if opts.on_failed then
       pcall(opts.on_failed, tostring(err))
     end
   end, function(_, owned)
-    -- The replay is over however it ended. Staging/cleanup is per id: a newer
-    -- attempt for a *different* session must not keep this id's `replays` record
-    -- alive, and a newer attempt for the *same* id owns the bookkeeping now.
+    -- Cleanup is per id: a newer attempt for the same id owns the bookkeeping;
+    -- one for a different id must not keep this id's staging record alive.
     local newer_same_id = runtime.replays[entry.id]
     if not newer_same_id or newer_same_id.session == entry then
-      -- A deferred adoption belongs to this attempt only: success already
-      -- applied it, and a failure, rollback or unowned (cancelled) replay must
-      -- not leave a stale one behind for the next load of the same id.
       if self.on_session_forget then
         pcall(self.on_session_forget, entry.id)
       end
-      -- A cancelled or failed replay used to leave `replays[id]` behind, which
-      -- made `Adoption:replaying(id)` true forever and sent every later
-      -- adoption for that id into a pending entry nobody would consume.
       runtime:rollback(entry)
     end
     -- The `replaying` flag is global: only the newest attempt may clear it.

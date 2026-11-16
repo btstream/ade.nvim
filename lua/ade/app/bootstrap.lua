@@ -349,9 +349,10 @@ function M.build(ctx, opts, action)
     end,
     session_forget = function(session_id)
       if S.conn.adoption then
-        -- The replay ended without committing this id: keep an adoption marker
-        -- the pending entry had to clear, because the old object is still current.
-        pcall(S.conn.adoption.forget_pending, S.conn.adoption, session_id, true)
+        -- The replay ended without committing this id: drop the deferred
+        -- adoption (and, when the old object is still current, restore its
+        -- marker), so no stale adoption survives to the next load.
+        pcall(S.conn.adoption.forget_pending, S.conn.adoption, session_id)
       end
     end,
     auth = function()
