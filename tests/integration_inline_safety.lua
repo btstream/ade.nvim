@@ -140,26 +140,25 @@ end)
 check("a delete is refused unless allow_kinds lists it", function()
   settle()
   reset_file()
-  -- The inline policy answers through the interaction broker, not through
-  -- `client:resolve_permission`, so the decision is observed on the wire: the
-  -- mock reports the option it received.
-  local answered
-  local original_answer = st.interactions.answer
-  st.interactions.answer = function(interactions, id, response)
-    local interaction = interactions:get(id)
-    if interaction and interaction.type == "permission" then
-      answered = response
+  -- Observe what the *agent* received, not the front end's interaction broker:
+  -- in service mode the service answers the request itself and never creates a
+  -- local interaction, so the mock's report is the backend-independent proof.
+  -- It reports `{"inline_delete": <optionId>}` as an agent message.
+  local function reported()
+    local parts = {}
+    for _, block in ipairs(st.session and st.session.blocks or {}) do
+      if block.kind == "agent" and type(block.text) == "string" then
+        parts[#parts + 1] = block.text
+      end
     end
-    return original_answer(interactions, id, response)
+    return table.concat(parts, "\n")
   end
   start("INLINE_DELETE replace the marker")
   wait(function()
-    return answered ~= nil
-  end, 10000, "delete permission decision")
-  st.interactions.answer = original_answer
-  local outcome = answered and answered.outcome or {}
-  assert(outcome.outcome == "selected", "expected an explicit option: " .. vim.inspect(answered))
-  assert(outcome.optionId == "reject", "a delete was allowed by allow_commands: " .. tostring(outcome.optionId))
+    return reported():find("inline_delete", 1, true) ~= nil
+  end, 15000, "the agent's received delete decision")
+  local text = reported()
+  assert(text:find('"inline_delete": "reject"', 1, true), "a delete was allowed by allow_commands: " .. text)
 end)
 
 -- 3. A question mid-turn reaches the user -------------------------------------

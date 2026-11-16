@@ -101,12 +101,41 @@ return function(t)
       t.eq(nil, err)
       t.eq(1, #notified)
       t.match("direct backend", notified[1].message)
-      t.eq(vim.log.levels.WARN, notified[1].level)
+      t.eq(vim.log.levels.INFO, notified[1].level)
 
       -- A reconnect must not repeat the same warning every time.
       local second = conn:use_service(cfg)
       t.eq(false, second)
       t.eq(1, #notified, "the auto fallback notice is a one-off")
+    end)
+
+    t.it("waits for a pending ensure instead of treating it as unavailable", function()
+      -- A version restart resolves the handshake later; `auto` must not fall
+      -- back while the service is still connecting.
+      local conn = harness({
+        ensure = function(_, cb)
+          vim.defer_fn(function()
+            cb(true, nil)
+          end, 50)
+        end,
+        idle_timeout = nil,
+      })
+      local use_service, err = conn:use_service({ backend = "auto", service = { start_timeout = 1000 } })
+      t.eq(true, use_service, tostring(err))
+      t.eq(nil, err)
+    end)
+
+    t.it("notifies once per shared connection across rebuilt connections", function()
+      local service = service_that(false, "nvim_ade_server is not installed")
+      local first, first_notified = harness(service)
+      t.eq(false, first:use_service({ backend = "auto", service = {} }))
+      t.eq(1, #first_notified)
+      t.eq(vim.log.levels.INFO, first_notified[1].level)
+
+      -- A reconfiguration builds a new Connection around the same socket.
+      local second, second_notified = harness(service)
+      t.eq(false, second:use_service({ backend = "auto", service = {} }))
+      t.eq(0, #second_notified, "the fallback notice must not repeat after a rebuild")
     end)
 
     t.it("reuses the shared connection across selections", function()

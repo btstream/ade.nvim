@@ -67,6 +67,17 @@ local function release(inv)
   -- and cancellation/reconfiguration paths reach here without M.finish.
   lock.unlock(inv.selection.bufnr)
   copy.remove(inv.copy)
+  -- The service-side inline rule set is turn-scoped; if the prompt never went
+  -- out (cancelled between policy.set and session/prompt) it would otherwise
+  -- bind to the next prompt for this session. Clearing a set the service
+  -- already removed is a no-op.
+  if inv.policy_set or inv.policy_requested then
+    local policy = state().conn and state().conn.policy
+    if policy and policy.clear_inline then
+      pcall(policy.clear_inline, policy, inv.session and inv.session.id or nil)
+    end
+    inv.policy_set, inv.policy_requested, inv.policy_connection = nil, nil, nil
+  end
   if inv.group then
     pcall(vim.api.nvim_del_augroup_by_id, inv.group)
     inv.group = nil
@@ -179,11 +190,13 @@ end
 ---would let the agent pick its own answer, which is the opposite of asking.
 ---@param interaction table
 ---@return table|nil response
----Whether this interaction belongs to an inline turn whose service policy
----could not be installed, so the Lua policy must answer it instead.
+---Whether the service owns this inline turn's permissions right now.
+---
+---Only true when the set was actually installed for this turn *and* the
+---connection that holds it is still the live one; otherwise Lua must answer.
 ---@param interaction table
 ---@return boolean
-function M.fallback_for(interaction)
+function M.service_owned(interaction)
   local inv = current
   if not inv or inv.phase ~= "running" or not interaction then
     return false
@@ -191,7 +204,16 @@ function M.fallback_for(interaction)
   if interaction.session_id ~= inv.session.id or inv.session.turn ~= inv.turn then
     return false
   end
-  return inv.policy_fallback == true
+  if inv.policy_set ~= true or not inv.policy_connection then
+    return false
+  end
+  local S = state()
+  local app = S.conn and S.conn.service
+  if not app or type(app.service_connection) ~= "function" then
+    return false
+  end
+  local ok, raw = pcall(app.service_connection, app)
+  return ok and raw == inv.policy_connection and raw:is_connected()
 end
 
 function M.policy(interaction)

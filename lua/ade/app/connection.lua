@@ -12,6 +12,13 @@ local service_transport = require("ade.service.transport")
 local Connection = {}
 Connection.__index = Connection
 
+---One auto-fallback notice per shared service connection (editor session).
+---
+---Keyed weakly by the shared object: a reconfiguration builds a new app
+---`Connection` around the same socket and must not repeat the notice, while a
+---test that injects a fresh stand-in gets its own.
+local auto_notice_shown = setmetatable({}, { __mode = "k" })
+
 ---@param opts {config: fun(): table, resolve_cwd: fun(): string,
 ---  state: fun(): table, generation: fun(): integer, reset_operations: fun(),
 ---  on_event: fun(name: string, payload: any, client: table),
@@ -163,6 +170,18 @@ function Connection:use_service(cfg)
   connection:ensure(function(result, reason)
     ok, err = result, reason
   end)
+  if ok == nil then
+    -- `ensure()` can still be waiting on the handshake (a version restart does
+    -- not finish synchronously). Treating nil as failure made `auto` fall back
+    -- to direct while the service was already connecting.
+    local timeout = type(cfg.service) == "table" and cfg.service.start_timeout or nil
+    vim.wait(timeout or 5000, function()
+      return ok ~= nil
+    end, 10)
+    if ok == nil then
+      ok, err = false, err or "the service did not finish connecting"
+    end
+  end
   if ok then
     return true, nil
   end
@@ -172,11 +191,12 @@ function Connection:use_service(cfg)
         .. tostring(err)
         .. '. Run :Ade service install, or set backend = "direct".'
   end
-  if not self.auto_notified then
+  if not self.auto_notified and not auto_notice_shown[connection] then
     self.auto_notified = true
+    auto_notice_shown[connection] = true
     self.notify(
       "ade.nvim: the service is unavailable (" .. tostring(err) .. "); using the direct backend",
-      vim.log.levels.WARN
+      vim.log.levels.INFO
     )
   end
   return false, nil

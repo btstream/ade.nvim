@@ -717,6 +717,28 @@ local function reduce(session, update, tx)
     else
       label = "auto-rejected"
     end
+    local set_name = type(update.set) == "table" and update.set.name or update.set
+    local key = table.concat({
+      tostring(set_name or ""),
+      tostring(tool.toolCallId or ""),
+      tostring(update.outcome or ""),
+      tostring(update.optionId or ""),
+    }, "|")
+    local seen = session.policy_seen
+    if not seen then
+      seen = { map = {}, order = {} }
+      session.policy_seen = seen
+    end
+    if seen.map[key] then
+      -- The same decision arrives live (policy.applied) and again through a
+      -- replay of the event log; render it once.
+      return false
+    end
+    seen.map[key] = true
+    seen.order[#seen.order + 1] = key
+    if #seen.order > 512 then
+      seen.map[table.remove(seen.order, 1)] = nil
+    end
     local kind_name = update.kind or tool.kind or "permission"
     local title = type(tool.title) == "string" and tool.title or ""
     local text = label .. " " .. tostring(kind_name)

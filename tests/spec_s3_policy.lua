@@ -100,7 +100,7 @@ return function(t)
       agents = { opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } } },
       service = { keep_alive = true, idle_timeout = 60 },
       manager = { root = dir .. "/agents" },
-      permissions = { auto_allow = { "allow_once", "allow_always" } },
+      permissions = { auto_allow = { "allow_once", "allow_always" }, prompt = "native" },
       ui = {},
       layout = { input_height = 6 },
     }, overrides or {}))
@@ -228,9 +228,12 @@ return function(t)
     t.it("installs the inline set with 17.6 ordering", function()
       local service, dir = start_service(t, "inline-set", { install_version = "0.4.0" })
       local connection = setup(t, "inline-set", service, dir, {
-        inline = { allow_writes = true, allow_commands = true, allow_kinds = { "delete" } },
+        inline = { allow_writes = true, allow_commands = true, allow_kinds = { "delete", "edit" } },
       })
       ensure(connection)
+      ade.open()
+      controller.connect()
+      wait_ready()
       local S = state()
       local inv = {
         session = { id = "sess-1", cwd = "/tmp/work" },
@@ -269,6 +272,7 @@ return function(t)
         seen[kind] = true
       end
       t.truthy(seen.read and seen.search and seen.think and seen.fetch and seen.delete and seen.execute)
+      t.falsy(seen.edit, "allow_kinds must never authorise edits (the Lua policy does not)")
       -- 4. everything else is refused
       t.eq({ "reject_once" }, set.rules[4].choose)
       t.eq(nil, set.rules[4].kinds)
@@ -278,6 +282,9 @@ return function(t)
       local service, dir = start_service(t, "inline-nowrites", { install_version = "0.4.0" })
       local connection = setup(t, "inline-nowrites", service, dir)
       ensure(connection)
+      ade.open()
+      controller.connect()
+      wait_ready()
       local S = state()
       local inv = {
         session = { id = "sess-2", cwd = "/tmp/work" },
@@ -394,6 +401,9 @@ return function(t)
       })
       local connection = setup(t, "inline-fail", service, dir)
       ensure(connection)
+      ade.open()
+      controller.connect()
+      wait_ready()
       local S = state()
       local inv = {
         session = { id = "sess-3", cwd = "/tmp/work" },
@@ -417,6 +427,9 @@ return function(t)
       local service, dir = start_service(t, "gate", { install_version = "0.4.0" })
       local connection = setup(t, "gate", service, dir)
       ensure(connection)
+      ade.open()
+      controller.connect()
+      wait_ready()
       local interaction = {
         type = "permission",
         session_id = "sess-gate",
@@ -463,6 +476,20 @@ return function(t)
         return transcript():find("auto%-allowed read") ~= nil
       end, 5000, "the live policy notice")
       t.match("Read notes%.txt", transcript())
+
+      -- The same decision replayed must not render twice.
+      local live = {
+        sessionUpdate = "_ade_policy",
+        set = { name = "config" },
+        outcome = "selected",
+        optionId = "allow_once",
+        kind = "read",
+        toolCall = { toolCallId = "tool-1", kind = "read", title = "Read notes.txt" },
+      }
+      local before_live = #session.blocks
+      local _, duplicate = S.sess.runtime:apply(session.id, live)
+      t.eq(false, duplicate, "a replayed policy.applied must be deduplicated")
+      t.eq(before_live, #session.blocks)
 
       local before = #session.blocks
       local applied = { sessionUpdate = "_ade_policy", set = { name = "inline:" .. session.id }, outcome = "cancelled" }
@@ -520,6 +547,186 @@ return function(t)
       t.eq("turn_end", set["until"])
       t.eq(100, set.priority)
       t.eq({ "reject_once" }, set.rules[#set.rules].choose)
+    end)
+
+    t.it("keeps the Lua policy when auto fell back to a direct agent", function()
+      local service, dir = start_service(t, "auto-fallback", { install_version = "0.4.0" })
+      local connection = setup(t, "auto-fallback", service, dir, { backend = "auto" })
+      -- Make the agent connection choose direct while the shared service
+      -- connection is later connected by another path.
+      connection.ensure_service = function()
+        return false, "nvim_ade_server is not installed"
+      end
+      controller.connect()
+      wait(function()
+        return state().conn.phase == "ready"
+      end, 20000, "the direct fallback")
+      t.eq(false, state().conn.service.backend_service, "the agent client must be direct")
+
+      connection.ensure_service = function()
+        return true
+      end
+      local ready = false
+      connection:ensure(function(ok)
+        ready = ok == true
+      end)
+      t.truthy(ready)
+      t.eq(true, connection:has_feature("policy"))
+
+      local interaction = {
+        type = "permission",
+        session_id = "sess-fallback",
+        request = {
+          options = { { kind = "allow_once", optionId = "a" }, { kind = "reject_once", optionId = "r" } },
+          toolCall = { kind = "read" },
+        },
+      }
+      local response = state().view.interactions.policies[2](interaction)
+      t.truthy(response, "a direct agent must keep the Lua auto policy even when the service is connected")
+      t.eq("selected", response.outcome.outcome)
+    end)
+
+    t.it("clears an inline set whose prompt never went out", function()
+      local service, dir = start_service(t, "inline-cancel", {
+        install_version = "0.4.0",
+        policy_delay_ms = 800,
+      })
+      setup(t, "inline-cancel", service, dir)
+      ade.open()
+      controller.connect()
+      wait_ready()
+      local file = dir .. "/cancel.lua"
+      local handle = assert(io.open(file, "wb"))
+      handle:write("local marker = 1\n")
+      handle:close()
+      vim.cmd("tabnew " .. vim.fn.fnameescape(file))
+      local buf = vim.api.nvim_get_current_buf()
+      t.cleanup(function()
+        pcall(function()
+          require("ade.inline").stop()
+        end)
+        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+      end)
+      local session = state().sess.current
+      vim.api.nvim_win_set_cursor(0, { 1, 0 })
+      require("ade.inline").open({
+        review = "write",
+        mode = "V",
+        pos1 = { 0, 1, 1, 0 },
+        pos2 = { 0, 1, 1, 0 },
+      })
+      wait(function()
+        return vim.bo[vim.api.nvim_get_current_buf()].filetype == "ade_inline"
+      end, 5000, "the inline prompt")
+      vim.api.nvim_buf_set_lines(vim.api.nvim_get_current_buf(), 0, -1, false, { "replace the marker" })
+      vim.api.nvim_feedkeys(vim.keycode("<CR>"), "x", false)
+
+      local name = "inline:" .. session.id
+      wait(function()
+        return service.policy_sets[name] ~= nil
+      end, 5000, "the inline set")
+      -- Cancel while policy.set is still unanswered: the prompt is never sent.
+      require("ade.inline").stop(session)
+      wait(function()
+        return service.policy_sets[name] == nil
+      end, 5000, "the stale inline set to be cleared")
+      t.eq(nil, service.policy_before_prompt, "session/prompt must not have been sent")
+      local cleared = false
+      for _, call in ipairs(service.calls) do
+        if call.method == "policy.clear" and call.params.name == name then
+          cleared = true
+        end
+      end
+      t.truthy(cleared, "the cancelled inline turn must clear its turn_end set")
+
+      -- With the set gone, the next ordinary prompt is not subject to the
+      -- inline rules; the normal prompt path is covered by integration_inline.
+      t.eq(nil, service.policy_sets[name])
+    end)
+
+    t.it("filters unknown auto_allow kinds and warns once", function()
+      local service, dir = start_service(t, "unknown-kind", { install_version = "0.4.0" })
+      local connection = setup(t, "unknown-kind", service, dir, {
+        permissions = { auto_allow = { "allow_once", "bogus" } },
+      })
+      local notes, text = capture(t)
+      ensure(connection)
+      wait(function()
+        return set_for(service, "config") ~= nil
+      end, 5000, "the filtered config set")
+      t.eq({ "allow_once" }, set_for(service, "config").rules[1].choose)
+      t.match("bogus", text())
+      t.eq(false, set_for(service, "config").allow_always)
+      t.eq(#notes > 0, true)
+    end)
+
+    t.it("warns once when the config set is refused", function()
+      local service, dir = start_service(t, "config-refused", {
+        install_version = "0.4.0",
+        policy_error = { code = -32050, message = "invalid rule set: rules[1].choose" },
+      })
+      local connection = setup(t, "config-refused", service, dir)
+      local _, text = capture(t)
+      ensure(connection)
+      wait(function()
+        return text():find("could not be installed", 1, true) ~= nil
+      end, 5000, "the config failure notice")
+      t.match("invalid rule set", text())
+    end)
+
+    t.it("a connection swap between policy.set and the prompt falls back to Lua", function()
+      local ServicePolicy = require("ade.service.policy")
+      local raw_a = {
+        on_hello = function() end,
+        subscribe = function() end,
+        is_connected = function()
+          return true
+        end,
+        has_feature = function()
+          return true
+        end,
+        request_tracked = function(_, _, _, cb)
+          vim.defer_fn(function()
+            cb(true, {})
+          end, 20)
+          return { id = 1 }
+        end,
+      }
+      local raw_b = { is_connected = function() end, has_feature = function() end }
+      local current_raw = raw_a
+      local policy = ServicePolicy.new({
+        config = function()
+          return Config.defaults
+        end,
+        connection = function()
+          return {
+            backend_service = true,
+            service_connection = function()
+              return current_raw
+            end,
+          }
+        end,
+        notify = function() end,
+      })
+      local inv = {
+        session = { id = "sess-swap", cwd = "/tmp" },
+        copy = "/tmp/.ade-inline-swap.lua",
+        config = Config.defaults,
+      }
+      local done, ok = false, true
+      async.run(function()
+        ok = policy:prepare_inline(inv)
+        done = true
+      end)
+      -- The service reconnects while the reply is in flight.
+      vim.defer_fn(function()
+        current_raw = raw_b
+      end, 10)
+      wait(function()
+        return done
+      end, 5000, "prepare_inline after the swap")
+      t.eq(false, ok)
+      t.eq(true, inv.policy_fallback)
     end)
 
     t.it("defaults the backend to auto and falls back to direct", function()

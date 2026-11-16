@@ -877,10 +877,10 @@ def handle(msg):
             slot.event.set()
             return
         # Response to our permission request.
-        if msg_id in (9001,) and "result" in msg:
+        if msg_id in (9001, 9002) and "result" in msg:
             outcome = (msg["result"] or {}).get("outcome") or {}
             with permissions_lock:
-                pending = permissions.get(9001)
+                pending = permissions.get(msg_id)
             if pending:
                 if outcome.get("outcome") == "selected":
                     pending.option = outcome.get("optionId")

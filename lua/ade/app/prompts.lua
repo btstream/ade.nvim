@@ -3,6 +3,7 @@
 -- Only the scoped prompt task settles its turn and advances the outbox. The
 -- controller keeps composer ownership: it decides whether a draft is cleared
 -- after this module reports that the message was accepted.
+local async = require("ade.async")
 local context = require("ade.context")
 local capabilities = require("ade.protocol.capabilities")
 
@@ -180,15 +181,35 @@ function Prompts:send(session, text, attachments, hooks, retrying)
     -- the service binds a turn_end set to the next prompt on this connection,
     -- so the two frames must be ordered (PROTOCOL.md 17.3/17.6). A failed set
     -- marks the turn for the Lua fallback and the prompt still goes out.
+    local prompt_sent = false
+    local inline_policy = nil
     if hooks and hooks.inline and self.get_policy then
-      local policy = self.get_policy()
-      if policy then
+      inline_policy = self.get_policy()
+      if inline_policy then
+        -- Single exit for a cancelled/failed turn: a turn_end set that never
+        -- saw its prompt would otherwise bind to the next prompt for this
+        -- session and apply the inline rules to an ordinary chat turn.
+        async.finally(function()
+          if not prompt_sent and hooks.inline then
+            inline_policy:clear_inline(hooks.inline.session and hooks.inline.session.id or nil)
+          end
+        end)
         task:check()
-        policy:prepare_inline(hooks.inline)
+        if hooks.inline.cancelled then
+          return
+        end
+        inline_policy:prepare_inline(hooks.inline)
         task:check()
+        if hooks.inline.cancelled then
+          return
+        end
       end
     end
+    prompt_sent = true
     local ok, result = task:call("prompt", session.id, blocks, turn)
+    if not ok and inline_policy then
+      inline_policy:clear_inline(hooks.inline.session and hooks.inline.session.id or nil)
+    end
     if session.turn ~= turn then
       return
     end
