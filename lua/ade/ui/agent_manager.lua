@@ -229,6 +229,7 @@ local HELP = {
   { "U", "update every outdated managed agent" },
   { "X", "uninstall the managed copy" },
   { "C", "check npm for newer versions" },
+  { "x", "cancel the running install (service backend)" },
   { "<CR>", "expand / collapse details" },
   { "s", "switch the chat to this agent" },
   { "r", "refresh" },
@@ -259,6 +260,8 @@ function M.render(rows, opts)
     { " uninstall  " },
     { "C", "AdeAgentsKey" },
     { " check  " },
+    { "x", "AdeAgentsKey" },
+    { " cancel  " },
     { "s", "AdeAgentsKey" },
     { " use  " },
     { "g?", "AdeAgentsKey" },
@@ -541,6 +544,27 @@ function M:open()
       self:refresh()
     end
   end)
+  self:map(
+    "x",
+    self:on_agent(function(id)
+      local running = (manager.task_of and manager:task_of(id)) or (manager.busy and manager:busy(id))
+      if not running then
+        return
+      end
+      if manager.cancel and manager:cancel(id) then
+        return
+      end
+      if not (manager.can_cancel and manager:can_cancel()) then
+        -- The direct backend has no way to stop a running npm (PROTOCOL 16.3
+        -- moves cancellation into the service).
+        manager.notify("cancelling is not supported by the current backend", vim.log.levels.WARN)
+      else
+        -- A job another Neovim started; the service answers only the front
+        -- end that sent the request.
+        manager.notify(id .. ": this task was started by another Neovim", vim.log.levels.WARN)
+      end
+    end)
+  )
   self:map(
     "<CR>",
     self:on_agent(function(id)

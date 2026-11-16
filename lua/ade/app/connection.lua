@@ -42,6 +42,9 @@ function Connection.new(opts)
     locks = opts.locks,
     service = opts.service,
     lease = nil,
+    -- Set per connection attempt: the service holds leases for the agents it
+    -- runs, so this object must not take one of its own (PROTOCOL.md 16.4).
+    backend_service = false,
     pending_reload = nil,
   }, Connection)
 end
@@ -184,6 +187,12 @@ end
 ---see that the release is live.
 ---@param launch table|nil
 function Connection:hold_lease(launch)
+  if self.backend_service then
+    -- The agent runs in the service, whose own lease protects the release
+    -- (PROTOCOL.md 16.4). A Neovim lease would vanish on exit while the agent
+    -- keeps running, which is exactly when another instance could prune it.
+    return
+  end
   if not launch or launch.source ~= "managed" or not launch.install_id then
     return
   end
@@ -242,10 +251,6 @@ function Connection:connect()
       self.on_start_failed({ message = launch_err })
       return
     end
-    -- Pin the release before the process exists: initialize can take seconds,
-    -- and a prune in another instance would otherwise delete the files while
-    -- they are being loaded. A failed start releases it again below.
-    self:hold_lease(launch)
     local use_service, backend_err = self:use_service(cfg)
     if use_service == nil then
       -- An explicit service backend that is unusable: report it and stay
@@ -257,6 +262,19 @@ function Connection:connect()
       self.on_start_failed({ message = backend_err or "the service is unavailable" })
       return
     end
+    -- Whether this connection is running inside the service decides who holds
+    -- the lease: the service writes its own lease when it creates the instance
+    -- (PROTOCOL.md 16.4), and a second Neovim-owned lease would keep the
+    -- release alive after the editor exits for no reason.
+    self.backend_service = use_service == true
+    if self.backend_service then
+      self:release_lease()
+    else
+      -- Pin the release before the process exists: initialize can take seconds,
+      -- and a prune in another instance would otherwise delete the files while
+      -- they are being loaded. A failed start releases it again below.
+      self:hold_lease(launch)
+    end
     client = client_mod.new({
       agent = vim.tbl_extend("force", {}, cfg.agents[cfg.agent], {
         command = launch.command,
@@ -264,6 +282,9 @@ function Connection:connect()
         env = launch.env or cfg.agents[cfg.agent].env,
       }),
       launch = launch,
+      -- The service needs the store root to write the lease for a managed
+      -- release in `agent.attach.launch` (PROTOCOL.md 16.4).
+      manager_root = self.backend_service and Resolve.manager_root(cfg) or nil,
       cwd = self.resolve_cwd(),
       client_capabilities = build_client_capabilities(cfg),
       mcp_servers = cfg.mcp_servers,

@@ -96,6 +96,21 @@ function Installer:prepare(id, action)
   return entry
 end
 
+---Resolve the latest published version, without installing anything.
+---
+---The service installer answers this through `install.resolve`; keeping the
+---method on both implementations lets `Manager:check_outdated` stay one loop.
+---@param package string
+---@param cb fun(ok: boolean, version_or_err: any)
+function Installer:latest(package, cb)
+  local manager_cfg = (self.config() or {}).manager or {}
+  self.npm:resolve_version(package, "latest", {
+    cwd = self.store:root(),
+    timeout = math.min(manager_cfg.install_timeout or 300000, 60000),
+    max_log_bytes = 64 * 1024,
+  }, cb)
+end
+
 ---Install or update one agent.
 ---
 ---`opts.confirm` is the user's decision. It receives a description of what will

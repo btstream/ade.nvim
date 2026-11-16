@@ -13,6 +13,7 @@ local Lock = require("ade.manager.lock")
 local Resolve = require("ade.manager.resolve")
 local Registry = require("ade.manager.registry")
 local Installer = require("ade.manager.install")
+local ServiceInstaller = require("ade.service.installer")
 local npm_mod = require("ade.manager.npm")
 
 local M = {}
@@ -22,7 +23,7 @@ Manager.__index = Manager
 
 ---@param opts {config: fun(): table, notify: fun(message: string, level: integer|nil),
 ---  presenter: table, store?: table, locks?: table, npm?: table,
----  confirm?: fun(details: table, cb: fun(accepted: boolean)),
+---  service?: table, confirm?: fun(details: table, cb: fun(accepted: boolean)),
 ---  on_changed: fun()|nil}
 ---@return table
 function M.new(opts)
@@ -32,6 +33,9 @@ function M.new(opts)
     presenter = opts.presenter,
     on_changed = opts.on_changed,
     injected = { store = opts.store, locks = opts.locks, npm = opts.npm },
+    -- The application connection. In service mode the installs run in the
+    -- service; the manager only decides which implementation to use.
+    service = opts.service,
     confirm = opts.confirm,
     -- Per-agent state, Mason-style: several agents may install at once, each
     -- with its own phase and live log. `progress` is the latest event overall.
@@ -40,6 +44,9 @@ function M.new(opts)
     logs = {},
     latest = {},
     checking = {},
+    -- Jobs another front end started. They are not ours to conclude, but the
+    -- window must show the agent as busy and keep refreshing.
+    foreign = {},
   }, Manager)
   return self
 end
@@ -50,7 +57,7 @@ end
 ---still finishes through its own callbacks and must show up here.
 ---@param previous table
 function Manager:adopt(previous)
-  for _, key in ipairs({ "tasks", "outcome", "logs", "latest", "checking" }) do
+  for _, key in ipairs({ "tasks", "outcome", "logs", "latest", "checking", "foreign" }) do
     if type(previous[key]) == "table" then
       self[key] = previous[key]
     end
@@ -213,9 +220,66 @@ function Manager:_spawn(argv, opts, cb)
   end
 end
 
+---The live service connection, when installs belong in the service.
+---
+---Only `backend = "service"|"auto"`, on unix, with a reachable service whose
+---hello lists `install` (PROTOCOL.md 16). Everything else — direct mode,
+---Windows, an older service, an unreachable one — keeps the Lua installer.
+---@return table|nil
+function Manager:service_connection()
+  if not self.service or type(self.service.service_connection) ~= "function" then
+    return nil
+  end
+  local cfg = self.config() or {}
+  local backend = cfg.backend
+  if backend ~= "service" and backend ~= "auto" then
+    return nil
+  end
+  if jit and jit.os == "Windows" then
+    return nil
+  end
+  local ok, connection = pcall(self.service.service_connection, self.service)
+  if not ok or type(connection) ~= "table" then
+    return nil
+  end
+  local ready = false
+  connection:ensure(function(result)
+    ready = result == true
+  end)
+  if not ready or not connection:has_feature("install") then
+    return nil
+  end
+  return connection
+end
+
 ---Build the installer for the current config.
+---
+---The choice is per operation, not per setup: whether the service can install
+---depends on the running service's hello (a feature and an api_version), which
+---is only known once the connection exists.
 ---@return table
 function Manager:installer()
+  local connection = self:service_connection()
+  if connection then
+    if not self._service_installer then
+      self._service_installer = ServiceInstaller.new({
+        config = self.config,
+        connection = connection,
+        store = self:store(),
+        notify = self.notify,
+        on_progress = function(event)
+          self:record(event)
+        end,
+        on_foreign = function(event)
+          self:record_foreign(event)
+        end,
+        on_changed = function()
+          self:changed()
+        end,
+      })
+    end
+    return self._service_installer
+  end
   local cfg = self.config()
   return Installer.new({
     store = self:store(),
@@ -264,14 +328,42 @@ function Manager:record(event)
   self:changed()
 end
 
+---Record another front end's job from its `install.progress` events.
+---
+---The service broadcasts progress to every connection so a second Neovim can
+---show the agent as busy; the job itself belongs to the other front end, which
+---gets the response and concludes it. The terminal event clears it.
+---@param event table
+function Manager:record_foreign(event)
+  local id = event.id
+  if not id then
+    return
+  end
+  local phase = event.phase
+  local terminal = phase == "committed" or phase == "failed" or phase == "cancelled" or phase == "removed"
+  if terminal then
+    self.foreign[id] = nil
+    self.progress = event
+  else
+    self.foreign[id] = {
+      id = id,
+      job = event.job,
+      action = event.action,
+      phase = phase,
+      foreign = true,
+    }
+  end
+  self:changed()
+end
+
 ---Whether an operation is in flight, for one agent or for any.
 ---@param id string|nil
 ---@return boolean
 function Manager:busy(id)
   if id then
-    return self.tasks[id] ~= nil
+    return self.tasks[id] ~= nil or self.foreign[id] ~= nil
   end
-  return next(self.tasks) ~= nil
+  return next(self.tasks) ~= nil or next(self.foreign) ~= nil
 end
 
 ---The in-flight task for one agent, if any.
@@ -340,7 +432,7 @@ function Manager:list()
       available = description.available,
       resolve_error = description.error,
       current = cfg.agent == id,
-      task = self.tasks[id],
+      task = self.tasks[id] or self.foreign[id],
       outcome = self.outcome[id],
       log = self.logs[id],
       latest = self.latest[id],
@@ -491,7 +583,12 @@ end
 function Manager:update_all()
   local started = 0
   for _, row in ipairs(self:list()) do
-    if row.status == "installed" and (row.latest == nil or row.outdated) and not self.tasks[row.id] then
+    if
+      row.status == "installed"
+      and (row.latest == nil or row.outdated)
+      and not self.tasks[row.id]
+      and not self.foreign[row.id]
+    then
       if self:update(row.id) then
         started = started + 1
       end
@@ -520,25 +617,26 @@ function Manager:check_outdated(cb)
       end
     end
   end
-  local cfg = self.config()
-  local manager_cfg = cfg.manager or {}
+  -- The resolver follows the backend: `install.resolve` in service mode, the
+  -- local `npm view` otherwise (PROTOCOL.md 16.3; timeout 60 s either way).
+  local installer = self:installer()
+  local ids = {}
   for _, id in ipairs(Registry.ids()) do
     local package = Registry.package_of(id)
     if package and store:state(id).status == "installed" and not self.checking[id] then
-      pending = pending + 1
-      self.checking[id] = true
-      self:npm():resolve_version(package, "latest", {
-        cwd = store:root(),
-        timeout = math.min(manager_cfg.install_timeout or 300000, 60000),
-        max_log_bytes = 64 * 1024,
-      }, function(ok, version)
-        self.checking[id] = nil
-        if ok then
-          self.latest[id] = version
-        end
-        done()
-      end)
+      ids[#ids + 1] = { id = id, package = package }
     end
+  end
+  for _, item in ipairs(ids) do
+    pending = pending + 1
+    self.checking[item.id] = true
+    installer:latest(item.package, function(ok, version)
+      self.checking[item.id] = nil
+      if ok then
+        self.latest[item.id] = version
+      end
+      done()
+    end)
   end
   self.checked_at = vim.uv.now()
   if pending == 0 and cb then
@@ -594,6 +692,27 @@ function Manager:uninstall(id)
     end
   end)
   return true
+end
+
+---Cancel the running task for one agent, when the backend can.
+---
+---Only the service installer supports this (`$/cancel_request`, PROTOCOL.md
+---16.3). The direct backend has no way to stop a running npm, so the window
+---tells the user instead of pretending.
+---@param id string
+---@return boolean started
+function Manager:cancel(id)
+  local installer = self._service_installer
+  if not installer then
+    return false
+  end
+  return installer:cancel(id)
+end
+
+---Whether the current backend can cancel a running install.
+---@return boolean
+function Manager:can_cancel()
+  return self._service_installer ~= nil
 end
 
 ---Toolchain facts for the UI and health check. Never installs.

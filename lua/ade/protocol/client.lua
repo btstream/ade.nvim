@@ -63,7 +63,7 @@ local function attached_created(proc)
   return proc.created == true
 end
 
----@param opts {agent: table, cwd: string, client_capabilities: table, limits?: table, scheduler?: table, interactions?: table, mcp_servers?: table[], launch?: table, transport?: table, connection?: table, agent_id?: string, keep_alive?: boolean, on_event: fun(name: string, payload: any)}
+---@param opts {agent: table, cwd: string, client_capabilities: table, limits?: table, scheduler?: table, interactions?: table, mcp_servers?: table[], launch?: table, manager_root?: string, transport?: table, connection?: table, agent_id?: string, keep_alive?: boolean, on_event: fun(name: string, payload: any)}
 ---@return AdeClient
 function M.new(opts)
   local self = setmetatable({
@@ -79,6 +79,8 @@ function M.new(opts)
     -- so it runs the same release as the conversation, even if a newer one was
     -- installed in between.
     launch = opts.launch,
+    -- Store root for the service's own lease on a managed release (16.4).
+    manager_root = opts.manager_root,
     cwd = opts.cwd,
     limits = opts.limits,
     declared_mcp_servers = opts.mcp_servers,
@@ -185,6 +187,8 @@ function Client:do_start(generation)
     agent_id = self.agent_id,
     client_capabilities = self.client_capabilities,
     connection = self.connection,
+    launch = self.launch,
+    manager_root = self.manager_root,
     keep_alive = self.keep_alive,
     on_line = function(line)
       return self:on_line(line)
