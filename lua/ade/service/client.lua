@@ -103,6 +103,11 @@ function M.new(opts)
     handlers = {},
     ready = false,
     closed = false,
+    -- The user asked this service to stop. The intent belongs to this client
+    -- object: every later disconnect it reports is deliberate, and a new client
+    -- (a later connection) starts without it. `Connection:on_disconnect` is the
+    -- single place that turns it into the `intentional` payload flag.
+    shutdown_requested = false,
   }, Client)
 end
 
@@ -436,8 +441,10 @@ function Client:on_disconnect(reason)
   end
   -- `on_disconnect_cb`, not `on_disconnect`: the latter is this method, and a
   -- field with the same name would either shadow it or call itself forever.
+  -- The second argument is this client's own stop intent, so the connection can
+  -- classify the loss without a global flag that a later client would inherit.
   if self.on_disconnect_cb then
-    pcall(self.on_disconnect_cb, tostring(reason))
+    pcall(self.on_disconnect_cb, tostring(reason), self.shutdown_requested == true)
   end
 end
 
@@ -481,20 +488,54 @@ function Client:shutdown(cb, timeout)
     cb(false, { code = -32000, message = "not connected to the service" })
     return
   end
-  local answered = false
+  -- The user asked for a stop from now on: every disconnect this client reports
+  -- (the reply's close, EOF while the service exits) is deliberate.
+  self.shutdown_requested = true
+  -- The reply can arrive after the timeout below, and the request callback
+  -- must not report a second result to the caller: exactly one callback per
+  -- shutdown, whichever result comes first.
+  local answered, called = false, false
+  local function finish(ok, value)
+    if called then
+      return
+    end
+    called = true
+    cb(ok, value)
+  end
   self.rpc:request("shutdown", {}, function(ok, value)
     answered = true
-    cb(ok, value)
-    self:close()
+    if ok then
+      finish(true, value)
+      -- The service is exiting; the close is part of the stop and carries the
+      -- intent from `shutdown_requested`.
+      self:close()
+      return
+    end
+    if self.closed and self.shutdown_requested then
+      -- The socket went away while we waited. That is the stop taking effect
+      -- (the service exited), not a refusal: report success and let the
+      -- disconnect stay deliberate.
+      finish(true, value)
+      return
+    end
+    -- An error reply is the service refusing to stop. Keep the client usable
+    -- and revoke the intent, so a later, genuine drop still reconnects.
+    self.shutdown_requested = false
+    finish(false, value)
   end)
   local wait_ms = timeout or self.timeout
   vim.wait(wait_ms, function()
     return answered
   end, 5)
   if not answered then
-    cb(false, {
+    -- No confirmation *yet*. The intent stays with this client: if the service
+    -- exits later, that disconnect is still deliberate and must not reconnect.
+    -- The caller reports "requested, not yet confirmed" rather than failure
+    -- followed by a fresh retry loop.
+    finish(false, {
       code = -32000,
-      message = string.format("the service did not answer shutdown within %.1f seconds", wait_ms / 1000),
+      pending = true,
+      message = string.format("the service did not confirm shutdown within %.1f seconds", wait_ms / 1000),
     })
   end
 end

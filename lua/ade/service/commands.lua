@@ -183,6 +183,63 @@ function M.stop(opts)
   opts = opts or {}
   local show = opts.notify or notify
   local timeout = opts.timeout or M.DEFAULT_TIMEOUT
+  -- The panel holds the same service through the shared connection. Stopping
+  -- with a second client leaves that one to discover EOF with no intent, so
+  -- the automatic reconnect loop starts again against the user's wish. When the
+  -- shared connection is live, stop through it: `Connection:shutdown` marks the
+  -- loss deliberate and closes the client the panel is actually using.
+  local shared
+  if not opts.client then
+    shared = opts.connection or require("ade.service.connection").shared()
+  end
+  if type(shared) == "table" and type(shared.is_connected) == "function" then
+    -- Cancel the retry loop first, including the case where no socket exists
+    -- (between attempts), where no EOF can carry the intent.
+    if type(shared.stopped_intent) == "function" then
+      local ok, err = pcall(shared.stopped_intent, shared)
+      if not ok then
+        log.warn("could not cancel the reconnect loop for :Ade service stop: %s", tostring(err))
+      end
+    end
+    -- An attempt may be inside `ensure()` right now (`connecting` is true and
+    -- the new client does not exist yet). Cancelling the loop does not stop
+    -- that attempt, so wait for it and then stop through the client it created:
+    -- the intent is attached to that client, and the EOF it produces is
+    -- deliberate.
+    if shared.connecting then
+      vim.wait(timeout, function()
+        return not shared.connecting
+      end, 10)
+    end
+    if shared:is_connected() then
+      local answered, err = false, nil
+      shared:shutdown(function(ok, value)
+        answered = ok
+        if not ok then
+          err = value
+        end
+      end, timeout)
+      if answered then
+        show("service stopped")
+        if opts.on_done then
+          pcall(opts.on_done, true)
+        end
+        return true
+      end
+      local reason = type(err) == "table" and (err.message or vim.inspect(err)) or tostring(err)
+      if type(err) == "table" and err.pending then
+        -- Not a failure to retry: the request is still with the service, and
+        -- the intent stays on that client so its eventual exit is deliberate.
+        show("service stop requested; the service has not confirmed it yet (" .. reason .. ")", vim.log.levels.WARN)
+      else
+        show("unable to stop the service: " .. reason, vim.log.levels.WARN)
+      end
+      if opts.on_done then
+        pcall(opts.on_done, false)
+      end
+      return false
+    end
+  end
   local Client = opts.client or require("ade.service.client")
   local client = Client.new({ timeout = timeout })
   local connected, info = false, nil

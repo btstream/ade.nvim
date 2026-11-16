@@ -673,6 +673,48 @@ return function(t)
       t.match("reconnecting %(1/", record.statuses[1])
       t.eq("<cleared>", record.statuses[#record.statuses])
     end)
+
+    t.it("shows the badge while the first retry is still waiting", function()
+      -- The ladder waits 0.5s before the first attempt. A fast service comes
+      -- back so quickly that the status written by `attempt_once` can be gone
+      -- before any observer notices; the user must see the retry start as soon
+      -- as the drop is known, not only when the attempt happens to run.
+      local instance, record, step = harness({ config = config_with({ service = { reconnect_attempts = 3 } }) })
+      instance:lost()
+      t.eq(
+        "reconnecting (1/3)",
+        record.statuses[#record.statuses],
+        "the badge must appear when the drop is known, before the backoff elapses"
+      )
+      step()
+      -- The attempt itself writes the same progress text again; the clear only
+      -- comes with the result.
+      t.eq("<cleared>", record.statuses[#record.statuses], "the badge goes away once the attempt succeeds")
+    end)
+
+    t.it("clears the badge when the loop is cancelled", function()
+      local instance, record = harness()
+      instance:lost()
+      t.match("reconnecting %(1/", record.statuses[#record.statuses])
+      instance:cancel("user disconnected")
+      t.eq("<cleared>", record.statuses[#record.statuses], "a cancelled loop must not leave a badge behind")
+    end)
+
+    t.it("does not leave a badge when the previous incident used every attempt", function()
+      local instance, record, step = harness({
+        config = config_with({ service = { reconnect_attempts = 1 } }),
+      })
+      instance:lost()
+      step()
+      t.eq("<cleared>", record.statuses[#record.statuses])
+      -- A second loss inside the 60 s stability window happens after the only
+      -- attempt was used: it gives up immediately, and must not show a retry
+      -- badge for an attempt it will never make.
+      instance:lost()
+      t.falsy(instance:is_running())
+      t.eq("<cleared>", record.statuses[#record.statuses], "the give-up path must not leave a stale badge")
+      t.match("keeps disconnecting", record.notes[#record.notes].message)
+    end)
   end)
 
   t.describe("version reconciliation", function()

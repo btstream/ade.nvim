@@ -28,7 +28,9 @@ Server.__index = Server
 ---@param opts {dir: string, token?: string, api_version?: number, server_version?: string,
 ---  wrong_token?: boolean, require_hello?: boolean, on_hello?: fun(params: table),
 ---  spawn_agent?: fun(instance: table): boolean|nil, exit_code?: integer,
----  stop_delay_ms?: integer, canned_agent?: boolean}|nil
+---  stop_delay_ms?: integer, shutdown_delay_ms?: integer, shutdown_closes?: boolean,
+---  shutdown_eof?: boolean, shutdown_error?: table, hello_delay_ms?: integer,
+---  canned_agent?: boolean}|nil
 ---@return FakeService
 function M.new(opts)
   opts = opts or {}
@@ -47,6 +49,20 @@ function M.new(opts)
     exit_code = opts.exit_code,
     -- Tests use this to prove `stop` does not block on the reply.
     stop_delay_ms = opts.stop_delay_ms,
+    -- A `shutdown` answer that arrives after the caller's timeout. Proves the
+    -- caller reports once and copes with the late reply.
+    shutdown_delay_ms = opts.shutdown_delay_ms,
+    -- The service really exits when asked: after the (possibly delayed) reply
+    -- every socket closes, like a real `shutdown`.
+    shutdown_closes = opts.shutdown_closes == true,
+    -- A service that exits *without* replying: the caller sees EOF while it
+    -- waits and must treat it as the stop taking effect, not as a failure.
+    shutdown_eof = opts.shutdown_eof == true,
+    -- An error response: the service refuses to stop and stays usable.
+    shutdown_error = opts.shutdown_error,
+    -- Delay the hello reply, so a test can run a command while `ensure()` is
+    -- blocked inside the handshake (`Connection.connecting` is true).
+    hello_delay_ms = opts.hello_delay_ms,
     -- Answer ACP requests with canned replies instead of spawning a child. Used
     -- by tests about notifications, where a real agent would only add noise.
     canned_agent = opts.canned_agent == true,
@@ -184,7 +200,7 @@ function Server:dispatch(message, client)
     if self.on_hello then
       pcall(self.on_hello, params)
     end
-    return {
+    local reply = {
       jsonrpc = "2.0",
       id = ident,
       result = {
@@ -193,6 +209,13 @@ function Server:dispatch(message, client)
         features = { "tunnel" },
       },
     }
+    if self.hello_delay_ms and self.hello_delay_ms > 0 then
+      vim.defer_fn(function()
+        self:send(client, reply)
+      end, self.hello_delay_ms)
+      return nil
+    end
+    return reply
   end
   if not client.greeted and self.require_hello then
     return error_reply(ident, -32003, "hello required")
@@ -201,7 +224,36 @@ function Server:dispatch(message, client)
     return { jsonrpc = "2.0", id = ident, result = {} }
   end
   if method == "shutdown" then
-    return { jsonrpc = "2.0", id = ident, result = {} }
+    if self.shutdown_eof then
+      -- Exit without answering: the caller sees EOF while it waits.
+      self:close()
+      return nil
+    end
+    if self.shutdown_error then
+      return { jsonrpc = "2.0", id = ident, error = self.shutdown_error }
+    end
+    local reply = { jsonrpc = "2.0", id = ident, result = {} }
+    if self.shutdown_delay_ms and self.shutdown_delay_ms > 0 then
+      -- Deliberately late: the caller's timeout has already been reported.
+      vim.defer_fn(function()
+        self:send(client, reply)
+        if self.shutdown_closes then
+          -- Give the queued write one tick to flush before the peer closes.
+          vim.defer_fn(function()
+            self:close()
+          end, 20)
+        end
+      end, self.shutdown_delay_ms)
+      return nil
+    end
+    if self.shutdown_closes then
+      -- Close after this reply has been written, so the caller sees the
+      -- success answer and then the socket going away.
+      vim.defer_fn(function()
+        self:close()
+      end, 20)
+    end
+    return reply
   end
 
   if method == "agent.attach" then
@@ -636,6 +688,14 @@ end
 ---@param client table
 function Server:detach_all(client)
   client.closed = true
+  -- Keep `clients` to the live sockets: a test that wants "the connection the
+  -- editor is using" must not pick a dead one left over from a reconnect.
+  for index, entry in ipairs(self.clients) do
+    if entry == client then
+      table.remove(self.clients, index)
+      break
+    end
+  end
   for id in pairs(client.attached or {}) do
     local instance = self.instances[id]
     if instance then
@@ -649,6 +709,17 @@ end
 ---@return integer
 function Server:instance_count()
   return vim.tbl_count(self.instances)
+end
+
+---Close one client's socket, as a service dying mid-conversation would.
+---@param client table
+function Server:drop(client)
+  client.closed = true
+  if client.peer then
+    pcall(function()
+      client.peer:close()
+    end)
+  end
 end
 
 ---Drop every client and stop listening.
