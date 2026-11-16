@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, watch, Notify};
 
 #[cfg(unix)]
 use crate::install::{self, lock as install_lock, store as install_store, Progress};
+use crate::policy::{self, Policy};
 use crate::protocol::{
     failure, success, FRAME_REJECTED, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
     NOT_ATTACHED, SPAWN_FAILED, UNKNOWN_INSTANCE,
@@ -402,6 +403,8 @@ pub struct Hub {
     install_events: mpsc::UnboundedReceiver<InstallEvent>,
     #[cfg(unix)]
     install_event_sender: mpsc::UnboundedSender<InstallEvent>,
+    /// Permission rules installed by front ends (PROTOCOL.md 17).
+    policy: Policy,
 }
 
 impl Hub {
@@ -447,6 +450,7 @@ impl Hub {
             install_events,
             #[cfg(unix)]
             install_event_sender,
+            policy: Policy::new(),
         }
     }
 
@@ -523,6 +527,7 @@ impl Hub {
                 // disappears with the connection.
                 #[cfg(unix)]
                 self.install_requests.retain(|(owner, _), _| *owner != conn);
+                self.policy.connection_closed(conn);
                 self.detach_everywhere(conn);
             }
             Command::Frame { conn, frame } => {
@@ -722,6 +727,21 @@ impl Hub {
                 }
             }
             "tunnel.send" => self.tunnel_send(conn, &params),
+            "policy.set" => {
+                if is_request {
+                    self.policy_set(conn, &id, &params);
+                }
+            }
+            "policy.clear" => {
+                if is_request {
+                    self.policy_clear(conn, &id, &params);
+                }
+            }
+            "policy.list" => {
+                if is_request {
+                    self.send_to(conn, &success(&id, json!({ "sets": self.policy.list() })));
+                }
+            }
             _ => {
                 #[cfg(unix)]
                 if self.handle_install(conn, &method, &params, &id, is_request) {
@@ -1070,6 +1090,54 @@ impl Hub {
                 self.update_busy();
             }
         }
+    }
+
+    /// `policy.set`: validate, install, and bind a turn_end set to a prompt that
+    /// is already running (PROTOCOL.md 17.1/17.3).
+    fn policy_set(&mut self, conn: u64, id: &Value, params: &Value) {
+        let Some(set) = params.get("set") else {
+            self.send_to(
+                conn,
+                &failure(id, policy::INVALID_RULE_SET, "set is required"),
+            );
+            return;
+        };
+        let name = set.get("name").and_then(Value::as_str).map(str::to_string);
+        if let Err(error) = self.policy.install(set, conn, now_ms() as i64) {
+            self.send_to(conn, &failure(id, policy::INVALID_RULE_SET, &error));
+            return;
+        }
+        if let Some(name) = name {
+            if let Some((session, agent)) = self.policy.pending_binding(&name) {
+                let running = self
+                    .instances
+                    .iter()
+                    .find(|(_, instance)| {
+                        agent
+                            .as_deref()
+                            .is_none_or(|filter| filter == instance.key.agent)
+                            && instance.relay.prompt_active(conn, &session)
+                    })
+                    .map(|(id, _)| id.clone());
+                if let Some(instance_id) = running {
+                    self.policy.bind(&name, conn, &instance_id, &session);
+                }
+            }
+        }
+        self.send_to(conn, &success(id, json!({})));
+    }
+
+    /// `policy.clear`.
+    fn policy_clear(&mut self, conn: u64, id: &Value, params: &Value) {
+        let Some(name) = params.get("name").and_then(Value::as_str) else {
+            self.send_to(
+                conn,
+                &failure(id, policy::INVALID_RULE_SET, "name is required"),
+            );
+            return;
+        };
+        let removed = self.policy.clear(name);
+        self.send_to(conn, &success(id, json!({ "removed": removed })));
     }
 
     /// Attach `conn` to the instance for `params`. Returns the reply and the
@@ -1426,10 +1494,40 @@ impl Hub {
             return;
         }
 
+        let agent = self
+            .instances
+            .get(instance_id)
+            .map(|instance| instance.key.agent.clone())
+            .unwrap_or_default();
+        let method = object
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let session = object
+            .get("params")
+            .and_then(|params| params.get("sessionId"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let action = {
             let handle = self.instances.get_mut(instance_id).expect("checked above");
             handle.relay.frontend_message(conn, &message)
         };
+        // Turn-scoped policy sets bind to the prompt from the installing
+        // connection; a forwarded cancel makes them cancelling (17.3). A frame
+        // the relay drops never becomes an in-flight prompt, so it must not
+        // bind anything that nothing would later remove.
+        let forwarded = frontend_forwarded(&action);
+        if forwarded {
+            if let Some(session) = &session {
+                match method.as_deref() {
+                    Some("session/prompt") => {
+                        self.policy.on_prompt(conn, instance_id, session, &agent)
+                    }
+                    Some("session/cancel") => self.policy.on_cancel(session),
+                    _ => {}
+                }
+            }
+        }
         // A front-end prompt (and any synthetic event) is recorded even when
         // the frame is answered locally (PROTOCOL.md 10).
         let events = action.events().to_vec();
@@ -1750,6 +1848,64 @@ impl Hub {
             );
             return;
         }
+        // Permission policy first (PROTOCOL.md 17.2): a decided request is
+        // answered here, never added to the pending set and never relayed.
+        let is_permission = value.get("method").and_then(Value::as_str)
+            == Some("session/request_permission")
+            && value.get("id").is_some();
+        if is_permission {
+            let Some(instance) = self.instances.get(instance_id) else {
+                return;
+            };
+            let agent = instance.key.agent.clone();
+            let attached = instance.attached.clone();
+            let params = value.get("params").cloned().unwrap_or_else(|| json!({}));
+            let session_id = params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if let Some(decision) = self
+                .policy
+                .decide(&params, &agent, instance_id, cfg!(windows))
+            {
+                let tool_call = params.get("toolCall").cloned().unwrap_or(Value::Null);
+                let response = json!({
+                    "jsonrpc": "2.0",
+                    "id": value.get("id").cloned().unwrap_or(Value::Null),
+                    "result": decision.result(),
+                });
+                if let Some(instance) = self.instances.get_mut(instance_id) {
+                    instance.control.send_frame(response);
+                }
+                if !session_id.is_empty() {
+                    let update = policy::log_update(&decision, &tool_call);
+                    let event = self
+                        .instances
+                        .get_mut(instance_id)
+                        .and_then(|instance| instance.relay.policy_event(&session_id, update));
+                    if let Some(event) = event {
+                        self.record_events(instance_id, vec![event]);
+                    }
+                }
+                let applied = json!({
+                    "jsonrpc": "2.0",
+                    "method": "policy.applied",
+                    "params": policy::applied_params(
+                        instance_id,
+                        &session_id,
+                        &decision,
+                        &tool_call,
+                    ),
+                });
+                for conn in attached {
+                    self.send_to(conn, &applied);
+                }
+                self.update_busy();
+                return;
+            }
+        }
+
         let Some(instance) = self.instances.get_mut(instance_id) else {
             return;
         };
@@ -1800,6 +1956,10 @@ impl Hub {
             }
         }
 
+        if let Some(finished) = &outcome.prompt_finished {
+            self.policy
+                .prompt_finished(finished.conn, &finished.session_id);
+        }
         // A prompt that finished while adopted: the adopters hear it and the
         // turn stops counting (PROTOCOL.md 13).
         if let Some(finished) = outcome.finished_turn {
@@ -1825,6 +1985,9 @@ impl Hub {
         let Some(instance) = self.instances.remove(instance_id) else {
             return;
         };
+        // A bound turn_end set's prompt can never be answered now (17.3); a
+        // later instance with the same session id must not inherit it.
+        self.policy.instance_exited(instance_id);
         // A stopped instance was already removed from the identity table, so a
         // newer instance with the same key may be registered there. Only delete
         // an entry that still points at this instance.
@@ -2003,6 +2166,14 @@ fn stop_reply(info: &crate::runtime::ExitInfo) -> Value {
 
 fn request_id(frame: &Value) -> Value {
     frame.get("id").cloned().unwrap_or(Value::Null)
+}
+
+/// Whether a front-end frame really goes to the agent.
+fn frontend_forwarded(action: &FrontendAction) -> bool {
+    matches!(
+        action,
+        FrontendAction::Forward(_) | FrontendAction::ForwardWith { .. }
+    )
 }
 
 /// Canonical key for one JSON-RPC id, used to find a running request.
@@ -2384,6 +2555,18 @@ mod tests {
         touch_attached(&mut attached, 1);
         assert_eq!(attached, vec![2, 1]);
         assert_eq!(attached.len(), 2, "a connection is attached only once");
+    }
+
+    #[test]
+    fn only_forwarded_frames_trigger_policy_turn_hooks() {
+        assert!(frontend_forwarded(&FrontendAction::Forward(json!({}))));
+        assert!(frontend_forwarded(&FrontendAction::ForwardWith {
+            frame: json!({}),
+            retractions: Vec::new(),
+            events: Vec::new(),
+        }));
+        assert!(!frontend_forwarded(&FrontendAction::Drop));
+        assert!(!frontend_forwarded(&FrontendAction::Reply(json!({}), 1)));
     }
 
     #[test]

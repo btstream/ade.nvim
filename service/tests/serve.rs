@@ -26,7 +26,7 @@ fn version_prints_one_json_line() {
     assert_eq!(lines.len(), 1, "exactly one line of stdout: {stdout:?}");
     let value: serde_json::Value = serde_json::from_str(lines[0]).expect("JSON output");
     assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(value["api_version"], 3);
+    assert_eq!(value["api_version"], 4);
 }
 
 #[test]
@@ -53,11 +53,11 @@ fn hello_then_ping() {
     let server = TestServer::start("hello-ping");
     let mut client = server.connect();
 
-    let hello = client.hello(&server.token(), 3);
+    let hello = client.hello(&server.token(), 4);
     assert_eq!(hello["jsonrpc"], "2.0");
     assert_eq!(hello["id"], 1);
     assert_eq!(hello["result"]["server_version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(hello["result"]["api_version"], 3);
+    assert_eq!(hello["result"]["api_version"], 4);
     assert_eq!(
         hello["result"]["features"],
         json!(nvim_ade_server::protocol::features(true))
@@ -108,7 +108,7 @@ fn the_token_is_reused_across_restarts() {
         );
         let token = server.token();
         let mut client = server.connect();
-        client.hello(&token, 3);
+        client.hello(&token, 4);
         client.call(2, "shutdown");
         assert_eq!(
             server.wait_for_exit(Duration::from_secs(10)),
@@ -126,7 +126,7 @@ fn the_token_is_reused_across_restarts() {
     );
     assert_eq!(server.token(), first_token, "the token file is reused");
     let mut client = server.connect();
-    client.hello(&first_token, 3);
+    client.hello(&first_token, 4);
     assert_eq!(client.call(2, "ping")["result"], json!({}));
 }
 
@@ -142,7 +142,7 @@ fn a_weak_token_file_is_replaced_at_start_up() {
     assert_ne!(token, "abc");
 
     let mut client = server.connect();
-    client.hello(&token, 3);
+    client.hello(&token, 4);
     assert_eq!(client.call(2, "ping")["result"], json!({}));
 
     // The stderr reader runs until the process exits, so stop the server
@@ -208,7 +208,7 @@ fn wrong_token_is_rejected_and_the_connection_closes() {
     let server = TestServer::start("bad-token");
     let mut client = server.connect();
 
-    let response = client.hello("deadbeef", 3);
+    let response = client.hello("deadbeef", 4);
     assert_eq!(response["error"]["code"], -32001);
     assert_eq!(response["error"]["message"], "invalid token");
     assert!(client.is_closed(), "the server closes after a bad token");
@@ -218,7 +218,7 @@ fn wrong_token_is_rejected_and_the_connection_closes() {
 fn wrong_token_of_the_right_shape_is_rejected() {
     let server = TestServer::start("bad-token-shape");
     let mut client = server.connect();
-    let response = client.hello(&"a".repeat(64), 3);
+    let response = client.hello(&"a".repeat(64), 4);
     assert_eq!(response["error"]["code"], -32001);
     assert!(client.is_closed());
 }
@@ -230,7 +230,7 @@ fn a_missing_token_is_rejected() {
     let response = client.hello_raw(json!({
         "client": "ade.nvim",
         "client_version": "test",
-        "api_version": 3,
+        "api_version": 4,
     }));
     assert_eq!(response["error"]["code"], -32001);
     assert!(client.is_closed());
@@ -243,10 +243,10 @@ fn incompatible_api_version_is_reported() {
 
     let response = client.hello(&server.token(), 999);
     assert_eq!(response["error"]["code"], -32002);
-    assert_eq!(response["error"]["data"]["server_api_version"], 3);
+    assert_eq!(response["error"]["data"]["server_api_version"], 4);
     // The connection is still usable for a correct hello.
-    let hello = client.hello(&server.token(), 3);
-    assert_eq!(hello["result"]["api_version"], 3);
+    let hello = client.hello(&server.token(), 4);
+    assert_eq!(hello["result"]["api_version"], 4);
 }
 
 #[test]
@@ -261,7 +261,7 @@ fn methods_before_hello_are_refused() {
     assert_eq!(response["error"]["code"], -32003);
 
     // Still running, and still usable after a proper hello.
-    let hello = client.hello(&server.token(), 3);
+    let hello = client.hello(&server.token(), 4);
     assert!(hello["result"].is_object());
     assert_eq!(client.call(3, "ping")["result"], json!({}));
 }
@@ -270,7 +270,7 @@ fn methods_before_hello_are_refused() {
 fn unknown_methods_are_method_not_found() {
     let server = TestServer::start("unknown-method");
     let mut client = server.connect();
-    client.hello(&server.token(), 3);
+    client.hello(&server.token(), 4);
 
     let response = client.call(2, "team.create");
     assert_eq!(response["error"]["code"], -32601);
@@ -287,7 +287,7 @@ fn malformed_json_is_a_parse_error_and_keeps_the_connection() {
     assert_eq!(response["error"]["code"], -32700);
     assert_eq!(response["id"], serde_json::Value::Null);
 
-    client.hello(&server.token(), 3);
+    client.hello(&server.token(), 4);
     assert_eq!(client.call(2, "ping")["result"], json!({}));
 }
 
@@ -296,8 +296,8 @@ fn clients_are_independent() {
     let server = TestServer::start("multi-client");
     let mut first = server.connect();
     let mut second = server.connect();
-    first.hello(&server.token(), 3);
-    second.hello(&server.token(), 3);
+    first.hello(&server.token(), 4);
+    second.hello(&server.token(), 4);
     assert_eq!(first.call(2, "ping")["result"], json!({}));
     assert_eq!(second.call(2, "ping")["result"], json!({}));
 
@@ -310,7 +310,7 @@ fn clients_are_independent() {
 fn shutdown_replies_then_exits_and_removes_the_socket() {
     let mut server = TestServer::start("shutdown");
     let mut client = server.connect();
-    client.hello(&server.token(), 3);
+    client.hello(&server.token(), 4);
 
     let response = client.call(2, "shutdown");
     assert_eq!(response["result"], json!({}));
@@ -339,7 +339,7 @@ fn a_second_instance_reports_the_first_and_exits_zero() {
 
     // The first instance is unaffected.
     let mut client = server.connect();
-    client.hello(&server.token(), 3);
+    client.hello(&server.token(), 4);
     assert_eq!(client.call(2, "ping")["result"], json!({}));
 }
 
@@ -376,7 +376,7 @@ fn a_stale_socket_file_is_cleaned_up() {
     assert_eq!(server.ready()["status"], "ready");
 
     let mut client = server.connect();
-    client.hello(&server.token(), 3);
+    client.hello(&server.token(), 4);
     assert_eq!(client.call(2, "ping")["result"], json!({}));
 }
 
@@ -414,7 +414,7 @@ fn the_idle_timeout_can_come_from_the_environment() {
 fn an_open_client_prevents_the_idle_exit() {
     let mut server = TestServer::start_with("idle-busy", &["--idle-timeout", "0.5"], &[]);
     let mut client = server.connect();
-    client.hello(&server.token(), 3);
+    client.hello(&server.token(), 4);
     assert_eq!(
         server.wait_for_exit(Duration::from_millis(1500)),
         None,
@@ -513,12 +513,12 @@ fn two_servers_in_different_directories_do_not_collide() {
     assert_ne!(first.socket(), second.socket());
 
     let mut client = second.connect();
-    client.hello(&second.token(), 3);
+    client.hello(&second.token(), 4);
     assert_eq!(client.call(2, "ping")["result"], json!({}));
 
     // The second server's token must not work on the first server.
     let mut other = first.connect();
-    let response = other.hello(&second.token(), 3);
+    let response = other.hello(&second.token(), 4);
     assert_eq!(response["error"]["code"], -32001);
 }
 
@@ -570,7 +570,7 @@ fn an_invalid_event_log_value_is_rejected_by_the_parser() {
 fn features_follow_the_event_log_flag() {
     let on = TestServer::start("event-log-on");
     let mut client = on.connect();
-    let hello = client.hello(&on.token(), 3);
+    let hello = client.hello(&on.token(), 4);
     assert_eq!(
         hello["result"]["features"],
         json!(nvim_ade_server::protocol::features(true))
@@ -582,7 +582,7 @@ fn features_follow_the_event_log_flag() {
         &[],
     );
     let mut client = off.connect();
-    let hello = client.hello(&off.token(), 3);
+    let hello = client.hello(&off.token(), 4);
     assert_eq!(
         hello["result"]["features"],
         json!(nvim_ade_server::protocol::features(false))

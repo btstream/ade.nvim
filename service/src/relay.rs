@@ -434,6 +434,13 @@ pub struct LoadCandidate {
     pub frame: Value,
 }
 
+/// A `session/prompt` response: its turn_end policy sets are removed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromptFinished {
+    pub conn: ConnId,
+    pub session_id: String,
+}
+
 /// One agent request delivered to a connection (the hub tracks these for
 /// retraction, PROTOCOL.md 14).
 #[derive(Debug, Clone, PartialEq)]
@@ -451,6 +458,9 @@ pub struct AgentOutcome {
     pub retractions: Vec<Retracted>,
     /// Set when the frame answered a `session/prompt` of an adopted session.
     pub finished_turn: Option<FinishedTurn>,
+    /// The connection whose `session/prompt` this frame answered (policy turn
+    /// bookkeeping, PROTOCOL.md 17.3).
+    pub prompt_finished: Option<PromptFinished>,
     /// Events to record for this frame (PROTOCOL.md 10).
     pub events: Vec<PendingEvent>,
     /// The same requests the action delivers, so the hub can remember them.
@@ -657,6 +667,37 @@ impl Relay {
             !(outgoing.method == "session/prompt"
                 && outgoing.session_id.as_deref() == Some(session_id))
         });
+    }
+
+    /// Whether `conn` has a `session/prompt` in flight for this session.
+    pub fn prompt_active(&self, conn: ConnId, session_id: &str) -> bool {
+        self.outgoing.values().any(|outgoing| {
+            outgoing.conn == conn
+                && outgoing.method == "session/prompt"
+                && outgoing.session_id.as_deref() == Some(session_id)
+        })
+    }
+
+    /// Record one synthetic `_ade_policy` event (PROTOCOL.md 17.4). The `seq`
+    /// is allocated even when the log is off, so agent-frame numbering stays
+    /// monotonic; `None` means there is nothing to record.
+    pub fn policy_event(&mut self, session_id: &str, update: Value) -> Option<PendingEvent> {
+        self.seq += 1;
+        let seq = self.seq;
+        self.touch_session(session_id);
+        if !self.log_enabled {
+            return None;
+        }
+        Some(PendingEvent {
+            seq,
+            session_id: Some(session_id.to_string()),
+            synthetic: true,
+            message: json!({
+                "sessionId": session_id,
+                "update": update,
+            })
+            .to_string(),
+        })
     }
 
     fn session_running(&self, session_id: &str) -> bool {
@@ -1216,6 +1257,10 @@ impl Relay {
         // its requester is still there (PROTOCOL.md 13).
         if outgoing.method == "session/prompt" {
             if let Some(session_id) = &outgoing.session_id {
+                outcome.prompt_finished = Some(PromptFinished {
+                    conn: outgoing.conn,
+                    session_id: session_id.clone(),
+                });
                 if let Some(adopters) = self.adopters.remove(session_id) {
                     outcome.finished_turn = Some(FinishedTurn {
                         session_id: session_id.clone(),

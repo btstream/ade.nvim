@@ -113,7 +113,7 @@ fn resolve_params(root: &Path, spec: &str, env: &[(&str, &str)]) -> Value {
 
 fn connect(server: &TestServer) -> Client {
     let mut client = server.connect();
-    let hello = client.hello(&server.token(), 3);
+    let hello = client.hello(&server.token(), 4);
     assert!(hello["result"].is_object(), "hello failed: {hello}");
     client
 }

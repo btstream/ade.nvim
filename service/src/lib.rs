@@ -18,6 +18,7 @@ pub mod hub;
 pub mod install;
 pub mod output;
 pub mod paths;
+pub mod policy;
 pub mod protocol;
 pub mod recorder;
 pub mod relay;
@@ -29,7 +30,7 @@ pub mod transport;
 
 /// Version of the front-end (Neovim) <-> service protocol. Integer, bumped on
 /// incompatible changes.
-pub const API_VERSION: i64 = 3;
+pub const API_VERSION: i64 = 4;
 
 /// Version of this service, taken from `Cargo.toml`.
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");

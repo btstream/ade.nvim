@@ -32,15 +32,15 @@ pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Features advertised by `hello` with the event log disabled.
 #[cfg(unix)]
-pub const FEATURES: &[&str] = &["tunnel", "install"];
+pub const FEATURES: &[&str] = &["tunnel", "install", "policy"];
 #[cfg(not(unix))]
-pub const FEATURES: &[&str] = &["tunnel"];
+pub const FEATURES: &[&str] = &["tunnel", "policy"];
 /// Features advertised by `hello` with the event log enabled (PROTOCOL.md 3.1
 /// and 10).
 #[cfg(unix)]
-pub const FEATURES_WITH_LOG: &[&str] = &["tunnel", "install", "log"];
+pub const FEATURES_WITH_LOG: &[&str] = &["tunnel", "install", "policy", "log"];
 #[cfg(not(unix))]
-pub const FEATURES_WITH_LOG: &[&str] = &["tunnel", "log"];
+pub const FEATURES_WITH_LOG: &[&str] = &["tunnel", "policy", "log"];
 
 /// The `features` list for one service configuration.
 pub fn features(log_enabled: bool) -> &'static [&'static str] {

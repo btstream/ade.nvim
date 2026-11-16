@@ -734,6 +734,8 @@ rule = {
 }
 ```
 
+Unknown fields in a set or rule are ignored (forward compatibility).
+
 - `policy.set {set}` `<- {}` installs a set, replacing a set with the same
   name. `policy.clear {name}` `<- {removed}`. `policy.list {}` `<- {sets}` where
   each set also carries `owner` (connection id or `null`), `installed_at` and
@@ -774,16 +776,21 @@ empty object):
      entry without a string path, an empty string, a NUL byte, or a request
      with no paths does not match. A relative path resolves against the set's
      `cwd`; without `cwd` a relative path does not match. Paths are normalised
-     lexically (`\` becomes `/` on Windows, `.` and `..` collapsed); on Windows a
-     drive letter compares case-insensitively and UNC or `\\?\` paths never
-     match.
-     - `paths`: the path equals a listed path, **and** `lstat` reports a regular
-       file with one link, **and** its `realpath` equals the listed path's
-       `realpath`. (This is the inline private copy: a symlink or hard link
-       placed there by the agent does not pass.)
+     lexically (`\` becomes `/` on Windows; `.` is dropped) **but a path with a
+     `..` component never matches**, whether it is a request path or a listed
+     path: lexical `..` before a symlink is not what the kernel resolves. On
+     Windows a drive letter compares case-insensitively, a canonical path's
+     `\\?\` prefix is ignored, and UNC or `\\?\` paths never match.
+     - `paths`: equality is by `realpath` (like the Lua `is_copy_path`);
+       additionally `lstat` reports a regular file with one link and its
+       `realpath` equals the listed path's `realpath`. (This is the inline
+       private copy: a symlink or hard link placed there by the agent does not
+       pass.)
      - `paths_under`: the `realpath` of the path, or of its nearest existing
-       ancestor for a file not created yet, is inside (component-wise) the
-       `realpath` of a listed directory.
+       ancestor for a file not created yet, is inside the `realpath` of a
+       listed directory, component-wise and **strictly** (the directory itself
+       is not inside). A dangling symlink encountered while walking up does not
+       match; only components that really do not exist are skipped.
      When a rule has both, a path may pass either.
    A rule without conditions matches every non-question request.
 4. A matching rule decides when one of its `choose` kinds is offered:
@@ -819,7 +826,14 @@ When the service forwards a `session/cancel` for a session, every active
 `turn_end` set of that session becomes **cancelling**: from then until its
 prompt is answered it decides every non-question request with
 `{"outcome": {"outcome": "cancelled"}}`, whatever its rules say. (A cancelled
-turn must not keep acting on the rules it was given.)
+turn must not keep acting on the rules it was given.) If several sets are
+cancelling, `policy.applied.set` is the first one in the candidate order above.
+
+A permission request carries no prompt identifier, only `sessionId`. A bound
+`turn_end` set therefore applies to every non-question request for its session
+**on its bound instance** while that prompt runs; the same session id on another
+instance is unaffected. If the bound instance exits, its turn_end sets are
+removed: their prompt can never be answered, so nothing may inherit them.
 
 `turn_end` sets are not re-installed after a reconnect; their prompt either
 still runs (and the set is still there) or is gone.
@@ -830,6 +844,9 @@ still runs (and the set is still there) or is gone.
 instance) `{instance, sessionId, set, outcome, optionId, kind, toolCall}`:
 `outcome` is `"selected"` or `"cancelled"`, `optionId` and `kind` are `null`
 for `cancelled`, `toolCall` is the request's `toolCall` unchanged.
+
+A request without `sessionId` can still be decided by a set without a
+`session`; there is no session to attach the event to, so it is not recorded.
 
 With the event log enabled the decision is recorded as a synthetic `policy`
 event for the session and replayed (section 12) as a `session/update` with

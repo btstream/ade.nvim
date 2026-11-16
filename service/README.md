@@ -5,7 +5,7 @@ Neovim, one process per user, and holds ACP agent processes so they outlive the
 front end. It relays raw ACP JSON-RPC between an agent and whichever front end
 is attached; it is not an ACP client itself.
 
-The protocol (api_version 3) is specified in [`PROTOCOL.md`](PROTOCOL.md). That
+The protocol (api_version 4) is specified in [`PROTOCOL.md`](PROTOCOL.md). That
 document is the contract: socket and token paths are in "Where things live"
 below, everything else is there.
 
@@ -14,7 +14,7 @@ below, everything else is there.
 | Command | What it does |
 |---|---|
 | `nvim_ade_server serve [--socket <path>] [--idle-timeout <secs>] [--print-paths] [--event-log on\|off] [--event-log-max-mb <n>]` | Run the service. `--idle-timeout` overrides `NVIM_ADE_SERVER_IDLE_TIMEOUT_SECS` (default 1800); `--print-paths` prints the resolved paths and exits without binding. `--event-log` (default `on`) and `--event-log-max-mb` (default 256, 16–4096) are the event log flags of PROTOCOL.md section 15. |
-| `nvim_ade_server version` | Print `{"version":"0.4.0","api_version":3}` on one line. |
+| `nvim_ade_server version` | Print `{"version":"0.5.0","api_version":4}` on one line. |
 | `nvim_ade_server mcp --token <t>` | Placeholder for the per-agent MCP server; prints "not implemented yet" to stderr and exits 3. |
 
 `serve` prints exactly one line on stdout:
@@ -136,8 +136,8 @@ is kept for `agent.exited`.
 [`PROTOCOL.md`](PROTOCOL.md) is normative; this is a short orientation.
 
 JSON-RPC 2.0, one UTF-8 JSON object per line, terminated by `\n`, max 64 MiB.
-The current `api_version` is **3** and `hello` reports `features: ["tunnel",
-"install", "log"]` on unix (`"install"` is absent on Windows; with
+The current `api_version` is **4** and `hello` reports `features: ["tunnel",
+"install", "policy", "log"]` on unix (`"install"` is absent on Windows; with
 `--event-log off` `"log"` is absent too).
 
 | Method | Direction | Purpose |
@@ -145,6 +145,8 @@ The current `api_version` is **3** and `hello` reports `features: ["tunnel",
 | `hello`, `ping`, `shutdown` | front end → service | handshake and lifecycle (shutdown stops every agent) |
 | `agent.attach / detach / stop / list` | front end → service | agent instances (`attach` takes an optional managed `launch`) |
 | `install.resolve / run / uninstall` | front end → service | managed npm installs, unix only (PROTOCOL.md 16) |
+| `policy.set / clear / list` | front end → service | permission rule sets (PROTOCOL.md 17) |
+| `policy.applied` (notification) | service → attached front ends | a request the policy answered itself |
 | `install.progress` (notification) | service → every front end | install/uninstall progress |
 | `$/cancel_request` (notification) | front end → service | cancel that connection's running install request |
 | `tunnel.send` (notification) | front end → service | one ACP message for an instance |
@@ -226,6 +228,23 @@ and is removed with it.
 On Windows the feature is absent and the front end keeps its Lua
 implementation.
 
+## Permission policy
+
+With the `"policy"` feature the service answers `session/request_permission`
+itself when a rule set installed through `policy.set` decides the request,
+whether or not a front end is attached. A request no rule decides is relayed
+exactly as before. Rules are data (kinds, exact paths, directory prefixes,
+option kinds and the two pick orders); questions are never auto-answered, a
+`turn_end` set is bound to one prompt and removed when it is answered, and a
+forwarded `session/cancel` makes the bound set answer `cancelled`. Decisions
+are broadcast as `policy.applied` and recorded in the event log as synthetic
+`_ade_policy` updates. PROTOCOL.md section 17 is the contract.
+
+Path rules call `lstat`/`realpath` on the hub task, and only when the matched
+rule has `paths` or `paths_under`. A stalled filesystem (NFS/FUSE, a hung mount)
+therefore stalls the service for that request and for other work on the same
+hub; keep path rules on local filesystems.
+
 ## Nightly features
 
 The crate uses `#![feature(...)]` for a few small things instead of adding
@@ -237,7 +256,7 @@ dependencies. Each one is listed here as required:
 
 ## Known limitations
 
-Behaviour that is deliberately not implemented in api_version 3 (or not
+Behaviour that is deliberately not implemented in api_version 4 (or not
 verified on every platform). None of these break the contract in
 [`PROTOCOL.md`](PROTOCOL.md); they are the places where the front end or a later
 stage has to compensate.
