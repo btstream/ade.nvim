@@ -14,3 +14,6 @@ tests/preview.txt
 
 # Local plugin manager lockfiles (if this repo is used as a config)
 lazy-lock.json
+
+# Python bytecode from the integration scripts
+__pycache__/
