@@ -38,7 +38,14 @@ Connection.__index = Connection
 ---`install.progress` is in the list so the client subscribes to it: a
 ---notification with no handler on the JSON-RPC object is dropped before it can
 ---reach the manager (PROTOCOL.md 16.3 broadcasts it to every connection).
-local NAMES = { "tunnel.recv", "agent.exited", "tunnel.error", "install.progress" }
+local NAMES = {
+  "tunnel.recv",
+  "agent.exited",
+  "tunnel.error",
+  "install.progress",
+  -- PROTOCOL.md 17.4: a policy the service applied instead of relaying.
+  "policy.applied",
+}
 
 ---@param opts {paths?: table, timeout?: integer, resolve_binary?: fun(): table|nil,string|nil,
 ---  ensure_service?: fun(): boolean,string|nil, client?: table, idle_timeout?: integer}|nil
@@ -59,6 +66,9 @@ function M.new(opts)
     client_factory = opts.client_factory,
     idle_timeout = opts.idle_timeout,
     closed = false,
+    -- Per-channel callbacks run after a successful hello. One slot per channel
+    -- so a reconfiguration cannot stack stale handlers on the shared object.
+    hello_listeners = {},
   }, Connection)
 end
 
@@ -102,6 +112,17 @@ end
 function Connection:subscribe(channel_id, method, fn)
   self.listeners[method] = self.listeners[method] or {}
   self.listeners[method][channel_id] = fn
+end
+
+---Run `fn` after every successful hello.
+---
+---The service forgets every `keep = "service"` policy set when it exits, so
+---the front end re-installs its sets after each handshake (PROTOCOL.md 17.1).
+---Keyed by channel id: registering again replaces the previous handler.
+---@param channel_id string
+---@param fn fun(info: table)
+function Connection:on_hello(channel_id, fn)
+  self.hello_listeners[channel_id] = fn
 end
 
 ---@param channel_id string
@@ -332,6 +353,7 @@ function Connection:ensure(cb)
       return
     end
     self.version_info = info
+    self:announce_hello(info)
     self:finish(true, nil)
   end)
   if usable == "pending" then
@@ -345,7 +367,15 @@ function Connection:ensure(cb)
     return
   end
   self.version_info = info
+  self:announce_hello(info)
   self:finish(true, nil)
+end
+
+---@param info table
+function Connection:announce_hello(info)
+  for _, fn in pairs(self.hello_listeners or {}) do
+    pcall(fn, info)
+  end
 end
 
 ---Retry the handshake after `-32002`, using the version the service reports.

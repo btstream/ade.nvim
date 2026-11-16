@@ -200,6 +200,64 @@ check("managed installs go through the service store (PROTOCOL 16)", function()
   client:close()
 end)
 
+check("permission policy sets round-trip through the service (PROTOCOL 17)", function()
+  local client = Client.new({ timeout = 5000 })
+  local connected = false
+  client:connect(function(ok)
+    connected = ok
+  end)
+  assert(connected, "the client did not connect")
+
+  local set = {
+    name = "config",
+    keep = "service",
+    priority = 0,
+    allow_always = false,
+    rules = { { choose = { "allow_once" }, pick = "offered" } },
+  }
+  local installed, install_err = nil, nil
+  client:request("policy.set", { set = set }, function(ok, value)
+    if ok then
+      installed = value
+    else
+      install_err = value
+    end
+  end)
+  wait(function()
+    return installed ~= nil or install_err ~= nil
+  end, 5000, "policy.set")
+  assert(installed, vim.inspect(install_err))
+
+  local listed, list_err = nil, nil
+  client:request("policy.list", {}, function(ok, value)
+    if ok then
+      listed = value.sets
+    else
+      list_err = value
+    end
+  end)
+  wait(function()
+    return listed ~= nil or list_err ~= nil
+  end, 5000, "policy.list")
+  assert(listed, vim.inspect(list_err))
+  assert(#listed == 1 and listed[1].name == "config", vim.inspect(listed))
+  assert(listed[1].keep == "service", vim.inspect(listed[1]))
+
+  local removed, clear_err = nil, nil
+  client:request("policy.clear", { name = "config" }, function(ok, value)
+    if ok then
+      removed = value.removed
+    else
+      clear_err = value
+    end
+  end)
+  wait(function()
+    return removed ~= nil or clear_err ~= nil
+  end, 5000, "policy.clear")
+  assert(removed == true, vim.inspect(clear_err))
+  client:close()
+end)
+
 check(":Ade service stop asks the service to exit", function()
   local messages = {}
   local stopped = require("ade.service.commands").stop({

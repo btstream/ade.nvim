@@ -703,6 +703,43 @@ local function reduce(session, update, tx)
     return true
   end
 
+  if kind == "_ade_policy" then
+    -- PROTOCOL.md 17.4: a decision the service made instead of relaying the
+    -- request. Live (`policy.applied`) and replayed events use this shape, so
+    -- one branch renders both.
+    local tool = type(update.toolCall) == "table" and update.toolCall or {}
+    local option = tostring(update.optionId or "")
+    local label
+    if update.outcome == "cancelled" then
+      label = "auto-cancelled"
+    elseif option:find("allow", 1, true) then
+      label = "auto-allowed"
+    else
+      label = "auto-rejected"
+    end
+    local kind_name = update.kind or tool.kind or "permission"
+    local title = type(tool.title) == "string" and tool.title or ""
+    local text = label .. " " .. tostring(kind_name)
+    if title ~= "" then
+      text = text .. " · " .. title
+    end
+    local block = session:append({
+      id = "policy:" .. tostring(tool.toolCallId or state.next_id("policy")),
+      kind = "notice",
+      text = text,
+      severity = "info",
+      tool_call_id = tool.toolCallId,
+      policy = {
+        set = update.set,
+        outcome = update.outcome,
+        optionId = update.optionId,
+        kind = update.kind,
+      },
+    }, tx)
+    tx:block(block)
+    return true
+  end
+
   Log.debug("unhandled session update kind: %s", kind)
   return false
 end

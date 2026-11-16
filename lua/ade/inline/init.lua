@@ -179,6 +179,21 @@ end
 ---would let the agent pick its own answer, which is the opposite of asking.
 ---@param interaction table
 ---@return table|nil response
+---Whether this interaction belongs to an inline turn whose service policy
+---could not be installed, so the Lua policy must answer it instead.
+---@param interaction table
+---@return boolean
+function M.fallback_for(interaction)
+  local inv = current
+  if not inv or inv.phase ~= "running" or not interaction then
+    return false
+  end
+  if interaction.session_id ~= inv.session.id or inv.session.turn ~= inv.turn then
+    return false
+  end
+  return inv.policy_fallback == true
+end
+
 function M.policy(interaction)
   local inv = current
   if
@@ -501,6 +516,9 @@ function M.submit(inv, prompt)
   -- The hook lives inside the existing scoped prompt task. It is never an
   -- independent coroutine which can outlive cancellation or reconfiguration.
   local accepted = deps.send(inv.session, request, {
+    -- The prompt service installs the service-side rule set for this turn
+    -- before sending `session/prompt` (PROTOCOL.md 17.6).
+    inline = inv,
     -- A generated inline prompt is mostly instructions; the transcript shows
     -- the user's request, not the whole envelope.
     local_user = { display_text = "inline: " .. (prompt ~= "" and prompt or "edit request") },

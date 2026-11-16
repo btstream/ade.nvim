@@ -36,6 +36,7 @@ function Prompts.new(opts)
     end,
     retry = opts.retry,
     run = opts.run,
+    get_policy = opts.policy,
     selected = opts.selected,
     on_turn_start = opts.on_turn_start,
     on_turn_end = opts.on_turn_end,
@@ -174,6 +175,18 @@ function Prompts:send(session, text, attachments, hooks, retrying)
     session.prompt_task = task
     local function add_error(message)
       self.add_block(message, "error", session)
+    end
+    -- An inline turn installs its rule set first and waits for the answer:
+    -- the service binds a turn_end set to the next prompt on this connection,
+    -- so the two frames must be ordered (PROTOCOL.md 17.3/17.6). A failed set
+    -- marks the turn for the Lua fallback and the prompt still goes out.
+    if hooks and hooks.inline and self.get_policy then
+      local policy = self.get_policy()
+      if policy then
+        task:check()
+        policy:prepare_inline(hooks.inline)
+        task:check()
+      end
     end
     local ok, result = task:call("prompt", session.id, blocks, turn)
     if session.turn ~= turn then

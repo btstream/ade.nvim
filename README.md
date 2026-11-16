@@ -729,14 +729,22 @@ require("ade").setup({
 ## 服务后端（nvim_ade_server）
 
 Agent 可以交给 Rust 后台服务 `nvim_ade_server` 持有，这样 Neovim 退出后 agent 继续工作，
-重新打开时按同一个 key 附着回同一个实例。默认仍是 Lua 直连（`backend = "direct"`），
-不装服务也能照常使用：
+重新打开时按同一个 key 附着回同一个实例。默认 `backend = "auto"`：服务可用就用它，
+没有安装服务则安静回退 Lua 直连（只提示一次），不装服务也能照常使用：
 
 | `backend` | 行为 |
 |---|---|
-| `"direct"`（默认） | Neovim 自己启动并持有 agent，与旧行为完全一致 |
+| `"direct"` | Neovim 自己启动并持有 agent，与旧行为完全一致 |
 | `"service"` | 通过服务通道收发 ACP；服务不可用时明确报错，**不回退** |
-| `"auto"` | 服务可用就用服务，不可用只提示一次然后回退直连 |
+| `"auto"`（默认） | 服务可用就用服务，不可用只提示一次然后回退直连 |
+
+服务提供 `policy` 能力（0.5.0+）时，权限的自动允许由**服务**执行：`permissions.auto_allow`
+会以规则集下发给服务，所以即使 Neovim 退出、没有前端附着，agent 的权限请求仍按你的策略
+自动回答（无人值守时依然生效）；需要人工决定的问题仍然转发给用户。inline 回合会在发送
+`session/prompt` 之前单独下发只作用于该回合的规则（只能改私有副本，按 `inline.allow_writes`
+/ `inline.allow_commands` / `inline.allow_kinds` 放开，其余拒绝，回合结束自动删除）。服务
+做了决定时，聊天里会显示 “auto-allowed / auto-rejected / auto-cancelled” 提示，重放的历史
+也会保留这些记录。旧服务或直连模式下仍由 Neovim 自己的 Lua 策略执行，行为不变。
 
 ### 安装
 
@@ -779,7 +787,7 @@ require("ade").setup({
     restore = true,                        -- 打开时恢复上次在这个目录里的会话
     reconnect_attempts = 8,                -- 意外断线后的自动重连次数（0 关闭）
   },
-  backend = "direct",                      -- "direct" | "service" | "auto"
+  backend = "auto",                        -- "direct" | "service" | "auto"（默认 auto）
 })
 ```
 

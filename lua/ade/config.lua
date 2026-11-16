@@ -17,7 +17,7 @@ M.defaults = {
   -- Direct stays the default: the service backend is new, and a user who never
   -- installs the binary should keep working exactly as before.
   ---@type "direct"|"service"|"auto"
-  backend = "direct",
+  backend = "auto",
 
   -- nvim_ade_server installation and startup.
   service = {
