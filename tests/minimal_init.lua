@@ -110,3 +110,39 @@ if backend == "service" or backend == "auto" then
     end,
   })
 end
+
+---------------------------------------------------------------------------
+-- Test-isolation cleanup (kept as its own final section so concurrent edits to
+-- the backend wiring above merge cleanly).
+--
+-- Every test process owns exactly one tree named after its pid. Delete that
+-- tree on the way out; never touch a sibling's. A SIGKILL cannot run this, but
+-- the path is per-pid, so a later process that recycles the pid deletes it at
+-- its own exit.
+--
+-- `VimLeave`, not `VimLeavePre`: the plugin and the harness still log while the
+-- pre-leave hooks run, and removing the log directory under them would print a
+-- spurious "unable to write log file" warning.
+vim.api.nvim_create_autocmd("VimLeave", {
+  callback = function()
+    local pid = vim.uv.os_getpid()
+    local own = string.format("/tmp/opencode/ade-test-%d", pid)
+    if isolated == own then
+      pcall(vim.fn.delete, own, "rf")
+    end
+    -- Individual specs also build `/tmp/opencode/ade-*` trees keyed by this
+    -- pid (wiring, s1b, manager, service, ...). Remove only names carrying this
+    -- pid as a whole token; fixed names such as `ade-inline-guard` and every
+    -- other process's directory are left alone.
+    for _, pattern in ipairs({
+      string.format("/tmp/opencode/ade-*-%d-*", pid),
+      string.format("/tmp/opencode/ade-*-%d", pid),
+      string.format("/tmp/opencode/ade-*-%d.json", pid),
+      string.format("/tmp/opencode/ade-*-%d.log", pid),
+    }) do
+      for _, path in ipairs(vim.fn.glob(pattern, false, true)) do
+        pcall(vim.fn.delete, path, "rf")
+      end
+    end
+  end,
+})

@@ -789,6 +789,63 @@ return function(t)
       controller.hide()
     end)
 
+    t.it("does not report an agent exit while VimLeavePre stops the service", function()
+      -- The reported case: a VimLeavePre hook stops the service before the
+      -- panel's own leave hook detaches. The service stops its agents and tells
+      -- the still-attached front end, which must not print "Agent disconnected
+      -- :Ade reconnect" during shutdown. `tests/minimal_init.lua` registers
+      -- exactly this stop hook, in this order.
+      local service, dir = start_service("exit-stop", {
+        stop_agents_on_shutdown = true,
+        shutdown_closes = true,
+      })
+      setup("exit-stop", service, dir)
+      ade.open()
+      wait_ready()
+      local S = state()
+      local session = assert(S.sess.current, "no session to inspect")
+      local before = #session.blocks
+      local _, joined = capture(t)
+
+      local group = vim.api.nvim_create_augroup("AdeWiringExitStop", { clear = true })
+      t.cleanup(function()
+        pcall(vim.api.nvim_del_augroup_by_id, group)
+      end)
+      vim.api.nvim_create_autocmd("VimLeavePre", {
+        group = group,
+        callback = function()
+          require("ade.service.commands").stop({ notify = function() end, timeout = 2000 })
+        end,
+      })
+      vim.api.nvim_exec_autocmds("VimLeavePre", { group = group })
+
+      wait(function()
+        return S.conn.phase == "disconnected" or S.conn.client == nil
+      end, 5000, "the service's agent-exit announcement")
+      -- A wrong notification may arrive from a scheduled callback after the
+      -- synchronous handler returned; give it a chance to show up.
+      vim.wait(200)
+
+      local stopped = false
+      for _, call in ipairs(service.calls) do
+        if call.method == "shutdown" then
+          stopped = true
+          break
+        end
+      end
+      t.truthy(stopped, "the test must actually reach the service stop path")
+      t.eq(nil, joined():find("Agent disconnected", 1, true), "leaving must not report a disconnect: " .. joined())
+      local added = {}
+      for index = before + 1, #session.blocks do
+        added[#added + 1] = session.blocks[index].text or ""
+      end
+      t.eq(
+        nil,
+        table.concat(added, "\n"):find("Agent disconnected", 1, true),
+        "leaving must not add a disconnect block to the transcript"
+      )
+    end)
+
     t.it("adopts a turn announced before the load reply is committed", function()
       local service, dir = start_service("adoptrace")
       setup("adoptrace", service, dir)

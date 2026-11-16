@@ -149,7 +149,25 @@ function M:install_defaults()
   end
 
   self.handlers.exit = function(payload)
-    if deps.on_exit(payload) then
+    -- An agent exit during editor shutdown is expected: Vim is leaving, and a
+    -- VimLeavePre hook (the test harness, a user config or :Ade service stop)
+    -- may stop the service first, whose agents then exit. "Agent disconnected"
+    -- with ":Ade reconnect" is advice for a live editor, not for `:qa!`.
+    -- `v:exiting` is a number (0) while Vim is exiting and v:null otherwise.
+    -- A deliberate `:Ade service stop` while the editor stays up is also not a
+    -- disconnect to report; the service client carries that intent.
+    local leaving = vim.v.exiting ~= vim.NIL
+    if not leaving then
+      local module = package.loaded["ade.service.connection"]
+      local shared = type(module) == "table" and type(module.current) == "function" and module.current() or nil
+      leaving = shared ~= nil and type(shared.stop_requested) == "function" and shared:stop_requested() == true
+    end
+    local interrupted = deps.on_exit(payload)
+    if leaving then
+      log.debug("agent exited while the editor was leaving; not reporting a disconnect")
+      return
+    end
+    if interrupted then
       deps.add_block("Agent disconnected" .. "  :Ade reconnect", "error")
     end
     deps.notify("Agent disconnected" .. "  :Ade reconnect", vim.log.levels.WARN)

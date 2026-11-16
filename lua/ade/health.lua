@@ -6,10 +6,10 @@ local health = vim.health or require("vim.health")
 function M.check()
   health.start("ade.nvim")
 
-  if vim.fn.has("nvim-0.10") == 1 then
+  if vim.fn.has("nvim-0.13") == 1 then
     health.ok("Neovim " .. tostring(vim.version()))
   else
-    health.error("Neovim >= 0.10 is required")
+    health.error("Neovim >= 0.13 is required")
   end
 
   local ok, config = pcall(require, "ade.config")

@@ -67,7 +67,7 @@ Neovim 原生的 [Agent Client Protocol](https://agentclientprotocol.com) 客户
 
 ## 依赖
 
-- Neovim 0.10 或更新（推荐 0.12+；0.10/0.11 使用兼容高亮语法）
+- Neovim 0.13 或更新（0.13 尚未正式发布时请使用 nightly）
 - 代码块语法高亮可选依赖对应语言的 Tree-sitter parser 与 highlights query；缺失时显示纯文本，不影响对话。
 - 一个已登录的 ACP Agent。默认是 OpenCode；首次使用可以打开 `:Ade` 后运行 `:Ade login`，
   插件会执行 Agent 自己提供的登录方式：
