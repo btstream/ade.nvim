@@ -18,6 +18,7 @@ Version numbers are **not** hardcoded here: `--server-version` and
 """
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -122,6 +123,8 @@ class Server:
         self.install_jobs = {}
         self.install_locks = {}
         self.pending_installs = {}
+        # PROTOCOL.md 17: rule sets installed by front ends, keyed by name.
+        self.policy_sets = {}
         self.install_version = args.install_version
         self.latest_version = args.latest_version or args.install_version
 
@@ -289,6 +292,12 @@ class Server:
                 ]
             instances.sort(key=lambda item: item["instance"])
             return self.result(ident, {"instances": instances})
+        if method == "policy.set":
+            return self.policy_set(params, conn, ident)
+        if method == "policy.clear":
+            return self.policy_clear(params, conn, ident)
+        if method == "policy.list":
+            return self.result(ident, {"sets": list(self.policy_sets.values())})
         if method == "$/cancel_request":
             job = self.pending_installs.get(params.get("id"))
             if job:
@@ -305,6 +314,33 @@ class Server:
             self.tunnel_send(params, conn, attached)
             return None
         return self.error(ident, -32601, "Method not found: " + str(method))
+
+    # --- permission policy (PROTOCOL.md 17) --------------------------------
+
+    def policy_set(self, params, conn, ident):
+        rule_set = params.get("set")
+        if not isinstance(rule_set, dict) or not isinstance(rule_set.get("name"), str):
+            return self.error(ident, -32050, "set.name is required")
+        stored = copy.deepcopy(rule_set)
+        stored["owner"] = "conn-%d" % id(conn)
+        stored["installed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self.policy_sets[stored["name"]] = stored
+        threading.Thread(target=self.later_result, args=(conn, ident, {}), daemon=True).start()
+        return None
+
+    def policy_clear(self, params, conn, ident):
+        removed = self.policy_sets.pop(params.get("name"), None) is not None
+        threading.Thread(
+            target=self.later_result, args=(conn, ident, {"removed": removed}), daemon=True
+        ).start()
+        return None
+
+    def later_result(self, conn, ident, value):
+        time.sleep(0.02)
+        self.send(conn, self.result(ident, value))
+
+    def policy_applied(self, payload):
+        self.broadcast("policy.applied", payload)
 
     # --- managed installs (PROTOCOL.md 16) -------------------------------
 

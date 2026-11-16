@@ -33,6 +33,7 @@ Server.__index = Server
 ---  features?: string[], install_version?: string, latest_version?: string,
 ---  install_fail?: boolean, install_log?: string, install_delay_ms?: integer,
 ---  install_busy?: boolean, uninstall_busy?: boolean, resolve_delay_ms?: integer,
+---  policy_delay_ms?: integer, policy_error?: table,
 ---  run_error?: table, uninstall_error?: table, canned_agent?: boolean}|nil
 ---@return FakeService
 function M.new(opts)
@@ -77,6 +78,10 @@ function M.new(opts)
     install_log = opts.install_log or "npm error boom",
     install_delay_ms = opts.install_delay_ms or 10,
     resolve_delay_ms = opts.resolve_delay_ms or opts.install_delay_ms or 10,
+    -- How long `policy.set` waits before answering: the inline turn must wait
+    -- for the reply before sending its prompt (PROTOCOL.md 17.3).
+    policy_delay_ms = opts.policy_delay_ms or 20,
+    policy_error = opts.policy_error,
     install_busy = opts.install_busy == true,
     uninstall_busy = opts.uninstall_busy == true,
     -- Scripted JSON-RPC errors, for the code-to-message mapping tests.
@@ -85,6 +90,10 @@ function M.new(opts)
     install_jobs = {},
     install_locks = {},
     pending_installs = {},
+    -- PROTOCOL.md 17: recorded rule sets, keyed by name.
+    policy_sets = {},
+    policy_responses = 0,
+    policy_before_prompt = nil,
     -- Answer ACP requests with canned replies instead of spawning a child. Used
     -- by tests about notifications, where a real agent would only add noise.
     canned_agent = opts.canned_agent == true,
@@ -278,6 +287,39 @@ function Server:dispatch(message, client)
     return reply
   end
 
+  if method == "policy.set" then
+    if self.policy_error then
+      return error_reply(ident, self.policy_error.code or -32050, self.policy_error.message or "invalid rule set")
+    end
+    local set = params.set
+    if type(set) ~= "table" or type(set.name) ~= "string" then
+      return error_reply(ident, -32050, "set.name is required")
+    end
+    set = vim.deepcopy(set)
+    set.owner = tostring(client)
+    set.installed_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
+    self.policy_sets[set.name] = set
+    vim.defer_fn(function()
+      self.policy_responses = self.policy_responses + 1
+      self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
+    end, self.policy_delay_ms or 20)
+    return nil
+  end
+  if method == "policy.clear" then
+    local removed = self.policy_sets[params.name] ~= nil
+    self.policy_sets[params.name] = nil
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = { removed = removed } })
+    end, self.policy_delay_ms or 20)
+    return nil
+  end
+  if method == "policy.list" then
+    local sets = {}
+    for _, set in pairs(self.policy_sets) do
+      sets[#sets + 1] = set
+    end
+    return { jsonrpc = "2.0", id = ident, result = { sets = sets } }
+  end
   if method == "$/cancel_request" then
     -- This runs in the socket callback (a fast event context), where
     -- `vim.fn.delete` and friends are forbidden. Cleanup belongs on the main
@@ -476,6 +518,9 @@ function Server:on_tunnel_send(params, client)
     return
   end
   self.sent[#self.sent + 1] = { instance = params.instance, message = vim.deepcopy(message) }
+  if type(message) == "table" and message.method == "session/prompt" then
+    self.policy_before_prompt = self.policy_responses
+  end
   -- A response from a front end answers a relayed agent request: forget it, so
   -- `agent.list` reports the same pending set the service would (PROTOCOL 5.1).
   if message.method == nil and message.id ~= nil and instance.pending then
@@ -774,6 +819,12 @@ function Server:drop(client)
       client.peer:close()
     end)
   end
+end
+
+---Announce a policy decision the way the service does (PROTOCOL.md 17.4).
+---@param payload table
+function Server:policy_applied(payload)
+  self:broadcast("policy.applied", payload)
 end
 
 ---Broadcast one notification to every live connection.

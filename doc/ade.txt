@@ -1014,12 +1014,20 @@ follow_cursor = false 让输入框停在打开时的位置。审查内容随窗�
 24. 服务后端（nvim_ade_server）                          *ade-service*
 
 Agent 可以交给 Rust 后台服务 nvim_ade_server 持有，这样 Neovim 退出后 agent 继续运行，
-重新打开时按同一个实例 key 附着回去。默认仍是 Lua 直连（backend = "direct"），不装服务
-也能照常使用：
+重新打开时按同一个实例 key 附着回去。默认 backend = "auto"：服务可用就用服务，没装
+服务则安静回退 Lua 直连（只提示一次），不装服务也能照常使用：
 
-    backend = "direct"    Neovim 自己启动并持有 agent（默认，与旧行为一致）
+    backend = "direct"    Neovim 自己启动并持有 agent（与旧行为一致）
     backend = "service"   通过服务通道收发 ACP；服务不可用时明确报错，不回退
-    backend = "auto"      服务可用就用服务，不可用只提示一次再回退直连
+    backend = "auto"      服务可用就用服务，不可用只提示一次再回退直连（默认）
+
+服务提供 policy 能力（0.5.0+）时，permissions.auto_allow 以规则集下发给服务，由服务
+替 agent 回答权限请求：Neovim 退出、没有前端附着时自动允许依然生效（无人值守），需要
+人工判断的问题照常转发。inline 回合会在 session/prompt 之前下发只作用于该回合的规则：
+只能编辑私有副本（inline.allow_writes 可放开全部编辑，inline.allow_commands 放开 execute，
+inline.allow_kinds 追加其它 kind），其余拒绝，回合结束自动删除。服务做出的决定会在聊天
+里显示 auto-allowed / auto-rejected / auto-cancelled，重放历史也保留。旧服务与直连模式
+仍由 Lua 策略执行，行为不变。
 
 安装（lazy.nvim 的 build 钩子）：
 
@@ -1047,7 +1055,7 @@ service/rust-toolchain.toml 锁定日期的 nightly 工具链，**建议安装 r
       restore = true,                 -- 打开时恢复上次在这个目录里的会话
       reconnect_attempts = 8,         -- 意外断线后的自动重连次数（0 关闭）
     },
-    backend = "direct",               -- "direct" | "service" | "auto"
+    backend = "auto",                 -- "direct" | "service" | "auto"（默认 auto）
 
 keep_alive = false 让每次退出（关闭 Neovim、切换 agent）都停掉 agent，等价于直连模式。
 

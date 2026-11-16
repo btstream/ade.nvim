@@ -23,6 +23,7 @@ local AgentManager = require("ade.app.agent_manager")
 local AgentManagerUI = require("ade.ui.agent_manager")
 local Sessions = require("ade.app.sessions")
 local Prompts = require("ade.app.prompts")
+local PermissionPolicy = require("ade.service.policy")
 local Auth = require("ade.app.auth")
 local Connection = require("ade.app.connection")
 local Panel = require("ade.ui.panel")
@@ -207,6 +208,37 @@ function M.build(ctx, opts, action)
     end,
     notify = notify,
   })
+  -- The service-side rule sets (PROTOCOL.md 17). Created before the policy
+  -- chain because the chain asks it whether Lua may answer at all; it resolves
+  -- the connection lazily, so the order of construction does not matter.
+  S.conn.policy = PermissionPolicy.new({
+    config = function()
+      return S.config or merged
+    end,
+    connection = function()
+      return S.conn.service
+    end,
+    notify = notify,
+    on_applied = function(payload)
+      if not payload or type(payload.sessionId) ~= "string" then
+        return
+      end
+      -- The same shape the replay uses, so live and restored turns render
+      -- through one reducer branch (PROTOCOL.md 17.4).
+      local update = {
+        sessionUpdate = "_ade_policy",
+        set = payload.set,
+        outcome = payload.outcome,
+        optionId = payload.optionId,
+        kind = payload.kind,
+        toolCall = payload.toolCall,
+      }
+      local session, changed = S.sess.runtime:apply(payload.sessionId, update)
+      if session and changed and session == S.sess.current and S.view.chat then
+        S.view.chat:schedule_render()
+      end
+    end,
+  })
   S.view.interactions = Interactions.new({
     on_open = function(interaction)
       local session = interaction.session_id and S.sess.all[interaction.session_id] or nil
@@ -234,11 +266,20 @@ function M.build(ctx, opts, action)
       end
     end,
     policies = {
-      -- Only the current inline turn may answer without the user.
+      -- When the service provides `policy`, it answers these itself; the Lua
+      -- policies must stay out of the way, including the inline turn policy,
+      -- unless installing that turn's set failed (then the Lua policy is the
+      -- fallback).
       function(interaction)
+        if S.conn.policy and S.conn.policy:active() and not require("ade.inline").fallback_for(interaction) then
+          return nil
+        end
         return require("ade.inline").policy(interaction)
       end,
       function(interaction)
+        if S.conn.policy and S.conn.policy:active() then
+          return nil
+        end
         return S.view.permissions:auto(interaction)
       end,
     },
@@ -373,6 +414,9 @@ function M.build(ctx, opts, action)
     end,
     run = function(key, client, session, fn, on_error, on_finally)
       return ctx.Operations:run(key, client, session, fn, on_error, on_finally)
+    end,
+    policy = function()
+      return S.conn.policy
     end,
     auth = function()
       return S.view.auth
@@ -578,6 +622,14 @@ function M.build(ctx, opts, action)
       end
     end)
   end
+  -- The configuration (auto_allow, manager settings) may have changed; the
+  -- service keeps `config` as a keep = "service" set, so reconcile after every
+  -- rebuild. Scheduled so the connection object from this build exists first.
+  vim.schedule(function()
+    if S.conn.policy then
+      pcall(S.conn.policy.reconcile, S.conn.policy, true)
+    end
+  end)
   S.view.agent_manager = AgentManagerUI.new({
     manager = S.view.agent_manager_service,
     config = cfg,
