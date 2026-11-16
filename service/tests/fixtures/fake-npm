@@ -32,6 +32,13 @@ def fail_exit(default=7):
 def main():
     args = sys.argv[1:]
     mode = os.environ.get("FAKE_NPM_MODE", "ok")
+    mode_file = os.environ.get("FAKE_NPM_MODE_FILE")
+    if mode_file:
+        try:
+            with open(mode_file, encoding="utf-8") as handle:
+                mode = handle.read().strip() or mode
+        except OSError:
+            pass
     record(args)
 
     if args and args[0] == "view":
@@ -40,7 +47,12 @@ def main():
             return 0
         if mode == "view-empty":
             return 0
-        print(json.dumps(os.environ.get("FAKE_NPM_VIEW_VERSION", "1.2.3")))
+        requested = args[1] if len(args) > 1 else ""
+        spec = requested.rsplit("@", 1)[-1] if "@" in requested else "latest"
+        if spec != "latest" and spec[:1].isdigit():
+            print(json.dumps(spec))
+        else:
+            print(json.dumps(os.environ.get("FAKE_NPM_VIEW_VERSION", "1.2.3")))
         return 0
 
     if not args or args[0] != "install":
@@ -95,7 +107,14 @@ def main():
         entry = os.environ.get("FAKE_NPM_ENTRY", "dist/index.js")
         entry_path = package_dir / entry
         entry_path.parent.mkdir(parents=True, exist_ok=True)
-        entry_path.write_text("// fake entrypoint\n", encoding="utf-8")
+        source = os.environ.get("FAKE_NPM_ENTRY_SOURCE")
+        if source:
+            # Let the E2E test install a real ACP agent without Node: `manager.node`
+            # is python3 and the entry file is tests/mock_agent.py.
+            with open(source, "rb") as handle:
+                entry_path.write_bytes(handle.read())
+        else:
+            entry_path.write_text("// fake entrypoint\n", encoding="utf-8")
     return 0
 
 

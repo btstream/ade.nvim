@@ -24,11 +24,41 @@ Usage (the test does this; it is not a script to run by hand):
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def _lua_constants():
+    """Read the plugin's service version and api_version (single source)."""
+    text = (ROOT / "lua" / "ade" / "service" / "version.lua").read_text(encoding="utf-8")
+    version = re.search(r'M\.VERSION\s*=\s*"([^"]+)"', text)
+    api = re.search(r"M\.API_VERSION\s*=\s*(\d+)", text)
+    if not version or not api:
+        raise RuntimeError("lua/ade/service/version.lua has no VERSION/API_VERSION")
+    return version.group(1), int(api.group(1))
+
+
+VERSION, API_VERSION = _lua_constants()
+# A genuinely older release, but on the current protocol version: the proxy
+# must exercise the version restart, never an api_version handshake failure.
 OLD_VERSION = "0.2.0"
+
+
+def _version_tuple(value):
+    parts = []
+    for part in re.split(r"[.+-]", value):
+        if part.isdigit():
+            parts.append(int(part))
+        elif parts:
+            break
+    return tuple(parts)
+
+
+assert _version_tuple(OLD_VERSION) < _version_tuple(VERSION), (OLD_VERSION, VERSION)
 
 SCRIPT = r'''#!{python}
 """A service.path wrapper that runs the real nvim_ade_server behind a relay.
@@ -109,7 +139,7 @@ def main():
     if argv and argv[0] == "version":
         # Before the first serve the "installed" binary is still the old build.
         version = OLD if serves_so_far() == 0 else NEW
-        print(json.dumps({{"version": version, "api_version": 2}}))
+        print(json.dumps({{"version": version, "api_version": {api}}}))
         return 0
 
     if not DIR:
@@ -217,6 +247,7 @@ def write_version_proxy(directory, binary, old_version=OLD_VERSION):
             state=str(state),
             old=old_version,
             new=real_server_version(binary),
+            api=API_VERSION,
         ),
         encoding="utf-8",
     )

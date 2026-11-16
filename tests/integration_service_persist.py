@@ -53,6 +53,7 @@ MOCK_AGENT = str(Path(ROOT) / "tests" / "mock_agent.py")
 # Imported by path so the script works when invoked from any directory.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import persist_helpers as helpers  # noqa: E402
+from persist_helpers import API_VERSION
 MINIMAL_INIT = str(Path(ROOT) / "tests" / "minimal_init.lua")
 WAIT = 20.0
 
@@ -279,7 +280,7 @@ class RawService:
                 "token": token,
                 "client": "ade.nvim",
                 "client_version": "0.1.0",
-                "api_version": 2,
+                "api_version": API_VERSION,
             },
         )
         return reply
@@ -2363,7 +2364,7 @@ def relay(src, dst):
 def main():
     argv = sys.argv[1:]
     if argv and argv[0] == "version":
-        print(json.dumps({{"version": "0.3.0", "api_version": 2}}))
+        print(json.dumps({{"version": {helpers.VERSION!r}, "api_version": {helpers.API_VERSION}}}))
         return 0
     if not DIR:
         return 1
