@@ -21,17 +21,28 @@ local Store = require("ade.manager.store")
 
 local M = {}
 
+---Every `install.run` / `install.uninstall` ends with exactly one of these
+---(PROTOCOL.md 16.3), including early refusals. Shared with the manager so a
+---job another front end ran cannot stay "busy" forever — `unchanged` was the
+---one that used to be missed.
+M.TERMINAL_PHASES = {
+  committed = true,
+  unchanged = true,
+  removed = true,
+  failed = true,
+  cancelled = true,
+}
+
+local TERMINAL = M.TERMINAL_PHASES
+
 local Installer = {}
 Installer.__index = Installer
-
-local job_counter = 0
 
 ---A job id the service accepts: `[A-Za-z0-9_-]{1,64}`, unique among the jobs it
 ---runs. The hrtime suffix separates two front ends that start at the same time.
 ---@param id string
 ---@return string
 local function new_job(id)
-  job_counter = job_counter + 1
   local stamp = string.format("%d", vim.uv.hrtime() % 1e12)
   local suffix = string.format("%d", math.random(1000, 9999))
   return string.format("%s-%s-%s", id:sub(1, 32), stamp, suffix):sub(1, 64)
@@ -41,6 +52,7 @@ end
 ---  notify?: fun(message: string, level: integer|nil),
 ---  on_progress?: fun(event: table),
 ---  on_foreign?: fun(event: table),
+---  on_reset?: fun(),
 ---  on_changed?: fun()|nil}
 ---@return table
 function M.new(opts)
@@ -51,6 +63,7 @@ function M.new(opts)
     notify = opts.notify or function() end,
     on_progress = opts.on_progress,
     on_foreign = opts.on_foreign,
+    on_reset = opts.on_reset,
     on_changed = opts.on_changed,
     -- Per-agent in-flight operation: job id, phase and the JSON-RPC handle to
     -- cancel. One at a time, like the Lua installer.
@@ -61,6 +74,16 @@ function M.new(opts)
   }, Installer)
   pcall(self.connection.subscribe, self.connection, "manager-install", "install.progress", function(payload)
     self:on_service_progress(payload)
+  end)
+  -- A lost connection ends every foreign job from this front end's point of
+  -- view: no terminal event can arrive for them any more, and leaving the
+  -- agents window spinning forever would be worse than clearing the badge.
+  pcall(self.connection.subscribe, self.connection, "manager-install", "__disconnected", function()
+    self.foreign = {}
+    if self.on_reset then
+      pcall(self.on_reset)
+    end
+    self:changed()
   end)
   return self
 end
@@ -205,11 +228,7 @@ function Installer:on_service_progress(payload)
   end
   -- Another front end's job: show the agent as busy and refresh, but never
   -- touch this front end's task state (that job's response is not ours).
-  local terminal = payload.phase == "committed"
-    or payload.phase == "failed"
-    or payload.phase == "cancelled"
-    or payload.phase == "removed"
-  if terminal then
+  if TERMINAL[payload.phase] then
     if not self.foreign[id] or self.foreign[id].job == payload.job then
       self.foreign[id] = nil
     end
@@ -228,20 +247,45 @@ function Installer:on_service_progress(payload)
   self:changed()
 end
 
+---Send a tracked request for one job.
+---
+---`job.handle` is only installed while the job is still in the phase that sent
+---the request: the reply may arrive synchronously (a fake or an already-dead
+---connection), and writing the old handle back then would leave a stale id for
+---cancellation, or overwrite the handle of the next phase.
+---@param job table
+---@param method string
+---@param params table
+---@param phase string the phase that owns this request
+---@param cb fun(ok: boolean, value: any)
+function Installer:send(job, method, params, phase, cb)
+  local handle = self.connection:request_tracked(method, params, function(ok, value)
+    if job.handle == handle then
+      job.handle = nil
+    end
+    cb(ok, value)
+  end)
+  if self.jobs[job.id] == job and job.phase == phase then
+    job.handle = handle
+    if job.cancel_requested then
+      self.connection:cancel_request(handle)
+    end
+  end
+end
+
 ---@param id string
+---@param spec string
 ---@param cb fun(ok: boolean, value: any)
 function Installer:resolve(id, spec, cb)
   local entry = assert(Registry.get(id))
-  local root = self:root()
-  local handle = self.connection:request_tracked("install.resolve", {
-    root = root,
+  self.connection:request_tracked("install.resolve", {
+    root = self:root(),
     package = entry.package,
     spec = spec,
     npm = self:npm_path(),
     env = self:env(),
     timeout_ms = 60000,
   }, cb)
-  return handle
 end
 
 ---The latest version, for `Manager:check_outdated` (read-only, no lock).
@@ -302,59 +346,70 @@ function Installer:install(id, opts, cb)
     self.jobs[id] = nil
     cb(ok, value)
   end
+  job.finish = finish
   self:progress({ id = id, phase = "checking", action = action })
-  job.handle = self:resolve(id, requested, function(ok, value)
-    job.handle = nil
-    if job.cancel_requested then
-      finish(false, { cancelled = true })
-      return
-    end
-    if not ok then
-      finish(false, self:map_error(id, action, value))
-      return
-    end
-    local version = type(value) == "table" and value.version or nil
-    if type(version) ~= "string" then
-      finish(false, { message = "the service returned no version" })
-      return
-    end
-    if action == "update" then
-      local state = self.store:state(id)
-      if state.status == "installed" and state.install and state.install.version == version then
-        finish(true, { id = id, version = version, unchanged = true })
-        return
-      end
-    end
-    local details = {
-      id = id,
-      action = action,
-      package = entry.package,
-      version = version,
+  self:send(
+    job,
+    "install.resolve",
+    {
       root = self:root(),
-      homepage = entry.homepage,
-      requires = entry.requires,
-      notes = entry.notes,
-    }
-    local answered = false
-    local function answer(accepted)
-      if answered then
-        return
-      end
-      answered = true
-      if not accepted or job.cancel_requested then
+      package = entry.package,
+      spec = requested,
+      npm = self:npm_path(),
+      env = self:env(),
+      timeout_ms = 60000,
+    },
+    "checking",
+    function(ok, value)
+      if job.cancel_requested then
         finish(false, { cancelled = true })
         return
       end
-      self:run(id, entry, version, action, job, finish)
+      if not ok then
+        finish(false, self:map_error(id, action, value))
+        return
+      end
+      local version = type(value) == "table" and value.version or nil
+      if type(version) ~= "string" then
+        finish(false, { message = "the service returned no version" })
+        return
+      end
+      if action == "update" then
+        local state = self.store:state(id)
+        if state.status == "installed" and state.install and state.install.version == version then
+          finish(true, { id = id, version = version, unchanged = true })
+          return
+        end
+      end
+      local details = {
+        id = id,
+        action = action,
+        package = entry.package,
+        version = version,
+        root = self:root(),
+        homepage = entry.homepage,
+        requires = entry.requires,
+        notes = entry.notes,
+      }
+      job.phase = "confirming"
+      local answered = false
+      local function answer(accepted)
+        if answered then
+          return
+        end
+        answered = true
+        if not accepted or job.cancel_requested then
+          finish(false, { cancelled = true })
+          return
+        end
+        self:run(id, entry, version, action, job, finish)
+      end
+      local asked, ask_err = pcall(opts.confirm, details, answer)
+      if not asked then
+        finish(false, { message = "confirmation failed: " .. tostring(ask_err) })
+      end
     end
-    local asked, ask_err = pcall(opts.confirm, details, answer)
-    if not asked then
-      finish(false, { message = "confirmation failed: " .. tostring(ask_err) })
-    end
-  end)
-  if job.cancel_requested and job.handle then
-    self.connection:cancel_request(job.handle.id)
-  end
+  )
 end
 
 ---Send `install.run` for the version the user confirmed.
@@ -372,41 +427,46 @@ function Installer:run(id, entry, version, action, job, finish)
   local cfg = self.config() or {}
   local manager_cfg = type(cfg.manager) == "table" and cfg.manager or {}
   job.phase = "installing"
-  job.handle = self.connection:request_tracked("install.run", {
-    job = job.job,
-    root = self:root(),
-    agent = id,
-    action = action,
-    package = entry.package,
-    entry = entry.entry,
-    bin = entry.bin,
-    version = version,
-    npm = self:npm_path(),
-    env = self:env(),
-    timeout_ms = manager_cfg.install_timeout or 300000,
-    max_log_bytes = manager_cfg.max_log_bytes or 1024 * 1024,
-  }, function(ok, value)
-    job.handle = nil
-    if not ok then
-      finish(false, self:map_error(id, action, value))
-      return
+  self:send(
+    job,
+    "install.run",
+    {
+      job = job.job,
+      root = self:root(),
+      agent = id,
+      action = action,
+      package = entry.package,
+      entry = entry.entry,
+      bin = entry.bin,
+      version = version,
+      npm = self:npm_path(),
+      env = self:env(),
+      timeout_ms = manager_cfg.install_timeout or 300000,
+      max_log_bytes = manager_cfg.max_log_bytes or 1024 * 1024,
+    },
+    "installing",
+    function(ok, value)
+      if not ok then
+        finish(false, self:map_error(id, action, value))
+        return
+      end
+      local status = type(value) == "table" and value.status or nil
+      if status == "unchanged" then
+        finish(true, { id = id, version = (type(value) == "table" and value.version) or version, unchanged = true })
+        return
+      end
+      if status ~= "committed" then
+        finish(false, { message = "the service returned no install status" })
+        return
+      end
+      finish(true, {
+        id = id,
+        version = value.version or version,
+        install_id = value.installId,
+        dir = value.dir,
+      })
     end
-    local status = type(value) == "table" and value.status or nil
-    if status == "unchanged" then
-      finish(true, { id = id, version = (type(value) == "table" and value.version) or version, unchanged = true })
-      return
-    end
-    if status ~= "committed" then
-      finish(false, { message = "the service returned no install status" })
-      return
-    end
-    finish(true, {
-      id = id,
-      version = value.version or version,
-      install_id = value.installId,
-      dir = value.dir,
-    })
-  end)
+  )
   if job.cancel_requested and job.handle then
     self.connection:cancel_request(job.handle.id)
   end
@@ -448,6 +508,7 @@ function Installer:uninstall(id, opts, cb)
     self.jobs[id] = nil
     cb(ok, value)
   end
+  job.finish = finish
   local details = {
     id = id,
     action = "uninstall",
@@ -467,22 +528,25 @@ function Installer:uninstall(id, opts, cb)
       finish(false, { cancelled = true })
       return
     end
-    job.handle = self.connection:request_tracked("install.uninstall", {
-      job = job.job,
-      root = self:root(),
-      agent = id,
-      installId = state.install_id,
-    }, function(ok, value)
-      job.handle = nil
-      if not ok then
-        finish(false, self:map_error(id, "uninstall", value))
-        return
+    job.phase = "removing"
+    self:send(
+      job,
+      "install.uninstall",
+      {
+        job = job.job,
+        root = self:root(),
+        agent = id,
+        installId = state.install_id,
+      },
+      "removing",
+      function(ok, value)
+        if not ok then
+          finish(false, self:map_error(id, "uninstall", value))
+          return
+        end
+        finish(true, { id = id })
       end
-      finish(true, { id = id })
-    end)
-    if job.cancel_requested and job.handle then
-      self.connection:cancel_request(job.handle.id)
-    end
+    )
   end
   local asked, ask_err = pcall(opts.confirm, details, answer)
   if not asked then
@@ -491,6 +555,12 @@ function Installer:uninstall(id, opts, cb)
 end
 
 ---Cancel the running operation for one agent, if this backend can.
+---
+---While the confirmation is open there is no request the service could cancel:
+---end the task here, which tells the manager to close the picker. While a
+---request is in flight the intent is handed to the service (`$/cancel_request`);
+---`request_tracked` holds it until the id exists if `ensure()` was still
+---connecting.
 ---@param id string
 ---@return boolean
 function Installer:cancel(id)
@@ -499,8 +569,14 @@ function Installer:cancel(id)
     return false
   end
   job.cancel_requested = true
+  if job.phase == "confirming" then
+    if job.finish then
+      job.finish(false, { cancelled = true })
+    end
+    return true
+  end
   if job.handle then
-    self.connection:cancel_request(job.handle.id)
+    self.connection:cancel_request(job.handle)
   end
   return true
 end

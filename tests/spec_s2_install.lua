@@ -476,5 +476,282 @@ return function(t)
       t.eq(true, m:cancel("pi"))
       wait_idle(m)
     end)
+
+    t.it("clears another front end's busy state on an unchanged update", function()
+      local service, dir = start_service(t, "foreign-unchanged", { install_version = "0.4.0" })
+      setup(t, "foreign-unchanged", service, dir)
+      local m = manager()
+      m:installer()
+
+      service:broadcast("install.progress", {
+        job = "other-front-end-2",
+        agent = "pi",
+        action = "update",
+        phase = "checking",
+      })
+      wait(function()
+        return m:busy("pi")
+      end, 5000, "the foreign update to show as busy")
+
+      -- `unchanged` is a terminal phase too (PROTOCOL.md 16.3):
+      -- the other front end never gets a "committed" event for it.
+      service:broadcast("install.progress", {
+        job = "other-front-end-2",
+        agent = "pi",
+        action = "update",
+        phase = "unchanged",
+        version = "0.4.0",
+      })
+      wait(function()
+        return not m:busy("pi")
+      end, 5000, "the unchanged event to clear the busy state")
+      t.eq(nil, m.foreign.pi)
+    end)
+
+    t.it("clears another front end's busy state when the service disconnects", function()
+      local service, dir = start_service(t, "foreign-disconnect", { install_version = "0.4.0" })
+      local connection = setup(t, "foreign-disconnect", service, dir)
+      local m = manager()
+      m:installer()
+
+      service:broadcast("install.progress", {
+        job = "other-front-end-3",
+        agent = "pi",
+        action = "install",
+        phase = "installing",
+      })
+      wait(function()
+        return m:busy("pi")
+      end, 5000, "the foreign job to show as busy")
+
+      -- A deliberate disconnect so the panel's own reconnect loop stays out of
+      -- the way; no terminal event can arrive for the other front end's job.
+      connection:on_disconnect("socket lost", true)
+      wait(function()
+        return not m:busy("pi")
+      end, 5000, "the disconnect to clear the foreign job")
+      t.eq(nil, m.foreign.pi)
+      t.eq(nil, m._service_installer and m._service_installer.foreign.pi)
+    end)
+
+    t.it("cancels during resolve", function()
+      local service, dir = start_service(t, "cancel-resolve", {
+        install_version = "0.4.0",
+        resolve_delay_ms = 2000,
+      })
+      setup(t, "cancel-resolve", service, dir)
+      local m = manager()
+
+      t.eq(true, controller.install_agent("pi"))
+      wait(function()
+        return m.tasks.pi ~= nil
+      end, 5000, "the task to start")
+      t.eq(true, m:cancel("pi"))
+      wait_idle(m)
+      t.eq("cancelled", row_for(m, "pi").outcome.phase)
+      local cancel_requests = 0
+      for _, call in ipairs(service.calls) do
+        if call.method == "$/cancel_request" then
+          cancel_requests = cancel_requests + 1
+        end
+      end
+      t.truthy(cancel_requests >= 1, "cancelling during resolve must send $/cancel_request")
+    end)
+
+    t.it("cancels during confirmation and closes the picker", function()
+      local service, dir = start_service(t, "cancel-confirm", { install_version = "0.4.0" })
+      setup(t, "cancel-confirm", service, dir, { manager = { confirm = true } })
+      local m = manager()
+
+      local opened, closed = nil, false
+      m.presenter = {
+        select = function(opts)
+          opened = opts
+          return {
+            close = function()
+              closed = true
+              if opts.on_cancel then
+                opts.on_cancel()
+              end
+            end,
+          }
+        end,
+      }
+
+      t.eq(true, controller.install_agent("pi"))
+      wait(function()
+        return m.asking == 1 and opened ~= nil
+      end, 10000, "the confirmation picker")
+      t.eq(true, m:cancel("pi"))
+      wait_idle(m)
+      t.eq("cancelled", row_for(m, "pi").outcome.phase)
+      t.eq(0, m.asking, "the asking counter must drop in the same tick")
+      t.eq(true, closed, "the picker must be closed")
+      t.eq(nil, m.pending_ask)
+    end)
+
+    t.it("remembers a cancel issued while ensure() is still connecting", function()
+      local ServiceConnection = require("ade.service.connection")
+      local sent, cancelled = nil, nil
+      local connection = ServiceConnection.new()
+      connection.client = {
+        request = function(_, method, params)
+          sent = { method = method, params = params }
+          return 7
+        end,
+        notify = function(_, method, params)
+          cancelled = { method = method, params = params }
+          return true
+        end,
+        is_ready = function()
+          return true
+        end,
+      }
+      local resume
+      connection.ensure = function(_, cb)
+        resume = cb
+      end
+
+      local handle = connection:request_tracked("install.run", { job = "queued" }, function() end)
+      t.eq(nil, handle.id)
+      t.eq(true, connection:cancel_request(handle), "the intent is accepted before the id exists")
+      t.eq(nil, cancelled)
+      assert(resume, "ensure() was never called")
+      resume(true)
+      t.eq(7, handle.id)
+      t.truthy(sent, "the request must still be sent")
+      t.eq("$/cancel_request", cancelled and cancelled.method)
+      t.eq(7, cancelled and cancelled.params.id)
+    end)
+
+    t.it("keeps a running install cancellable and logged after adopt()", function()
+      local service, dir = start_service(t, "adopt", {
+        install_version = "0.4.0",
+        install_delay_ms = 1200,
+      })
+      setup(t, "adopt", service, dir)
+      local m = manager()
+      t.eq(true, controller.install_agent("pi"))
+      wait(function()
+        return next(service.install_jobs) ~= nil and m.logs.pi and #m.logs.pi > 0
+      end, 15000, "the install to produce output")
+      local logged = #m.logs.pi
+
+      -- Reconfiguration builds a new Manager; the install is still running in
+      -- the service under the same connection.
+      local copy = vim.deepcopy(state().config)
+      copy.agent = "opencode"
+      controller.setup(copy, { discard_queued = true })
+      local m2 = manager()
+      t.truthy(m2._service_installer, "the new manager did not adopt the running installer")
+      t.eq(true, m2:can_cancel("pi"), "the adopted task must still be cancellable")
+      t.eq(logged, #m2.logs.pi, "the shared log must survive the reconfiguration")
+
+      t.eq(true, m2:cancel("pi"))
+      wait_idle(m2)
+      t.eq("cancelled", row_for(m2, "pi").outcome.phase)
+    end)
+
+    t.it("the auto backend does not start the service to check versions", function()
+      local service, dir = start_service(t, "auto", { install_version = "0.4.0" })
+      local connection = setup(t, "auto", service, dir, { backend = "auto" })
+      local m = manager()
+      t.falsy(connection:is_connected(), "setup must not connect a service by itself")
+      local done = false
+      m:check_outdated(function()
+        done = true
+      end)
+      wait(function()
+        return done
+      end, 5000, "the outdated check")
+      t.falsy(connection:is_connected(), "check_outdated must not start the service in auto mode")
+      t.eq(nil, m._service_installer)
+      t.eq(0, #service.calls)
+    end)
+
+    t.it("keeps the Lua lease and sends no launch when the feature is missing", function()
+      local service, dir = start_service(t, "no-feature", {
+        features = { "tunnel" },
+        install_version = "0.4.0",
+      })
+      local connection = setup(t, "no-feature", service, dir, { agent = "pi" })
+      local m = manager()
+      local runner = fake_npm.new({ version = "0.4.0" })
+      m.injected.npm = npm_mod.new({
+        run = runner.run,
+        node = function()
+          return "node"
+        end,
+        npm = function()
+          return "npm"
+        end,
+      })
+      t.eq(true, controller.install_agent("pi"))
+      wait_idle(m)
+      t.eq("installed", row_for(m, "pi").status)
+
+      local lease_calls = 0
+      local locks = state().conn.locks
+      local original_lease = locks.lease
+      locks.lease = function(...)
+        lease_calls = lease_calls + 1
+        return original_lease(...)
+      end
+      t.cleanup(function()
+        locks.lease = original_lease
+      end)
+
+      controller.connect()
+      wait(function()
+        return #service.attach_results > 0
+      end, 10000, "agent.attach")
+      local attach = service.attach_results[#service.attach_results]
+      t.eq(nil, attach.launch, "a service without install must not receive launch")
+      t.truthy(lease_calls >= 1, "Neovim must keep its own lease when the service cannot write one")
+      t.truthy(connection:is_connected())
+    end)
+
+    t.it("generates a distinct job id per installer", function()
+      local Config = require("ade.config")
+      local Resolve = require("ade.manager.resolve")
+      local JobInstaller = require("ade.service.installer")
+      local cfg = Config.validate(Config.merge(Config.defaults, { manager = { root = tmpdir("jobs") } }))
+      local jobs = {}
+      local function installer()
+        local connection = {
+          subscribe = function() end,
+          request_tracked = function(_, method, params, cb)
+            if method == "install.resolve" then
+              cb(true, { version = "0.4.0" })
+              return { id = 0 }
+            end
+            jobs[#jobs + 1] = params.job
+            return { id = #jobs }
+          end,
+          cancel_request = function() end,
+        }
+        return JobInstaller.new({
+          config = function()
+            return cfg
+          end,
+          connection = connection,
+          store = Resolve.new_store(cfg),
+        })
+      end
+      installer():install("pi", {
+        confirm = function(_, answer)
+          answer(true)
+        end,
+      }, function() end)
+      installer():install("pi", {
+        confirm = function(_, answer)
+          answer(true)
+        end,
+      }, function() end)
+      t.eq(2, #jobs)
+      t.truthy(jobs[1] and jobs[2] and jobs[1] ~= jobs[2], "two installers must not generate the same job id")
+      t.match("^[A-Za-z0-9_%-]+$", jobs[1])
+      t.truthy(#jobs[1] <= 64 and #jobs[2] <= 64)
+    end)
   end)
 end

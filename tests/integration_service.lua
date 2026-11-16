@@ -146,7 +146,7 @@ check("managed installs go through the service store (PROTOCOL 16)", function()
   assert(type(resolved) == "string" and resolved ~= "latest", tostring(resolved))
 
   local run, run_err = nil, nil
-  client:request("install.run", {
+  local run_id = client:request("install.run", {
     job = "it-install-1",
     root = install_root,
     agent = "pi",
@@ -171,6 +171,13 @@ check("managed installs go through the service store (PROTOCOL 16)", function()
   assert(vim.fn.filereadable(install_root .. "/pi/current.json") == 1, "no pointer was written")
   local entry = install_root .. "/pi/releases/" .. run.installId .. "/node_modules/@geohar/pi-acp/dist/index.js"
   assert(vim.fn.filereadable(entry) == 1, "the entrypoint was not installed: " .. entry)
+
+  -- A cancel after the commit is too late (PROTOCOL.md 16.3): nothing may be
+  -- removed for an id that has already finished.
+  assert(type(run_id) == "number", "install.run returned no request id")
+  client:notify("$/cancel_request", { id = run_id })
+  vim.wait(300)
+  assert(vim.fn.filereadable(install_root .. "/pi/current.json") == 1, "a late cancel removed the commit")
 
   local removed, remove_err = nil, nil
   client:request("install.uninstall", {

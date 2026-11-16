@@ -554,14 +554,14 @@ function M:open()
       if manager.cancel and manager:cancel(id) then
         return
       end
-      if not (manager.can_cancel and manager:can_cancel()) then
+      local task = manager.task_of and manager:task_of(id)
+      if task and task.foreign then
+        -- The service answers only the front end that sent the request.
+        manager.notify(id .. ": this task was started by another Neovim", vim.log.levels.WARN)
+      elseif not (manager.can_cancel and manager:can_cancel(id)) then
         -- The direct backend has no way to stop a running npm (PROTOCOL 16.3
         -- moves cancellation into the service).
         manager.notify("cancelling is not supported by the current backend", vim.log.levels.WARN)
-      else
-        -- A job another Neovim started; the service answers only the front
-        -- end that sent the request.
-        manager.notify(id .. ": this task was started by another Neovim", vim.log.levels.WARN)
       end
     end)
   )
