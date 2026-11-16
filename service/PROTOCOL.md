@@ -39,7 +39,7 @@ they do not change what is written here.
 `-> {token, client, client_version, api_version}`
 `<- {server_version, api_version, features}`
 
-`api_version` is `3`. `features` contains `"tunnel"` and `"install"`
+`api_version` is `3`. `features` contains `"tunnel"`, `"install"` on unix
 (section 16), and `"log"` when the event log is enabled (section 10). Errors are unchanged:
 `-32001` bad token (connection closed), `-32002` incompatible api_version with
 `data = {server_api_version}`, `-32003` hello required.
@@ -185,6 +185,7 @@ unsupported shape, agent line too long).
 | -32024 | connection not attached to the instance |
 | -32025 | frame rejected |
 | -32040 to -32045 | managed installs, section 16.5 |
+| -32800 | request cancelled (section 16.3) |
 | -32601, -32700, -32600, -32602 | standard JSON-RPC errors |
 
 ## 5. Relay rules (per instance)
@@ -278,6 +279,7 @@ The service exits when **all** hold for `idle_timeout` seconds (default 1800,
 - no client connection is open;
 - no instance has `turns_running > 0`;
 - no instance has `pending_requests > 0`.
+- no install job is running (section 16.3).
 
 On exit it stops all agents (section 6) and removes its socket.
 An instance with a running turn or a pending request keeps the service alive
@@ -454,144 +456,190 @@ entry point, notes) and the confirmation dialog. It sends the package
 description with every request; the service validates every field itself and
 never trusts a path it did not build.
 
-### 16.1 Store layout
+`"install"` is in `features` on unix only. On Windows (and whenever the
+feature is absent) the front end keeps using the Lua implementation.
 
-`root` is an absolute path chosen by the front end (`manager.root`, default
-`stdpath("data") .. "/ade/agents"`) and sent with every request; the service
-has no default root. It is rejected (`-32040`) when it is not absolute, is the
-filesystem root, the user's home directory, or the service's working
-directory.
+### 16.1 Validation and store layout
+
+All patterns in this section are **ASCII** (`\d` is `[0-9]`, `\w` is
+`[A-Za-z0-9_]`). A failure is `-32040` with a message naming the field.
+
+- `root`: absolute, after lexical normalisation not `/` and not the user's home
+  directory. The front end additionally refuses its own working directory (the
+  service's working directory means nothing). It is sent with every request;
+  the service has no default.
+- agent id: `^[a-z0-9][a-z0-9_-]*$`, at most 64 bytes.
+- `package`: at most 128 bytes, no leading `-`, `^@?[\w.-]+/?[\w.-]*$`, and no
+  path segment equal to `.` or `..`.
+- `entry`, `bin`: `^[A-Za-z0-9._@/-]+$`, not starting with `/`, every
+  `/`-separated segment non-empty and not `.` or `..`. `bin` may be absent.
+- version (`install.run`, a resolved version): `^\d+\.\d+\.\d+`, only
+  `[0-9A-Za-z.+-]`, no `..`, not starting with `-`, at most 64 bytes, not
+  `latest`. A spec (`install.resolve`) is such a version or exactly `"latest"`.
+- install id: at most 96 bytes, `^[a-z0-9][a-z0-9._-]*$`, no `..`. The service
+  generates `v<version>-<suffix>`: the version lowercased with every character
+  outside `[a-z0-9.-]` replaced by `_`, cut to 64 bytes; the suffix is
+  `[a-z0-9]{1,24}` and unique in `releases/`. Nothing parses an install id.
 
 ```
 <root>/
-  <id>/                         agent id: ^[a-z0-9][a-z0-9_-]*$, at most 64 bytes
+  <id>/
     current.json                the ONLY commit point (pointer)
     releases/<install-id>/      one release; npm installs straight into it
-      package.json              synthetic manifest (below)
+      package.json              synthetic manifest
       node_modules/...          produced by npm
       receipt.json              written after verification
   .locks/<id>/owner.json        exclusive per-agent lock (the directory is the lock)
   .leases/<id>/lease-*.json     shared "in use" records
 ```
 
-- `install-id`: at most 96 bytes, `^[a-z0-9][a-z0-9._-]*$`, no `..`. The
-  service generates `v<version lowercased, chars outside [a-z0-9.-] replaced by
-  _>-<unique suffix>`; the suffix only has to be unique in `releases/`. Nothing
-  parses an install id.
 - `current.json`: `{"schemaVersion":1, "installId", "updatedAt", "package",
   "version"}`; `updatedAt` is UTC `YYYY-MM-DDTHH:MM:SSZ`. Readers use only
-  `schemaVersion` and `installId`.
+  `schemaVersion` (must be the number 1) and `installId` (valid install id).
 - `receipt.json`: `{"schemaVersion":1, "agentId", "installId", "package",
-  "version", "entry", "bin", "runtime":"node", "installedAt", "platform",
-  "arch"}`. `entry` is relative to the release directory
-  (`node_modules/<package>/<entry>`) and must stay inside it. The service writes
-  `platform`/`arch` with the LuaJIT spellings (`Linux`, `OSX`, `Windows`; `x64`,
-  `arm64`) so both writers produce the same receipts.
+  "version", "entry", "bin"?, "runtime":"node", "installedAt", "platform",
+  "arch"}`. `agentId` equals the agent directory name, `installId` equals the
+  release directory name and the pointer's `installId`. `entry` is
+  `node_modules/<package>/<registry entry>`, relative to the release
+  directory. `platform`/`arch` use the LuaJIT spellings (`Linux`, `OSX`;
+  `x64`, `arm64`). Readers ignore unknown fields (Lua may add `nodeVersion`).
 - `package.json`: `{"name":"ade-nvim-managed", "private":true,
   "version":"0.0.0", "description":"Installed by ade.nvim; do not edit.",
   "dependencies":{"<package>":"<exact version>"}}`.
 - Every JSON file except `package.json` is written to `<path>.tmp-<unique>`
-  and renamed over the target. Files are compact JSON.
-- State of an agent (as the Lua `Store:state`): no `current.json` is
-  `not_installed`; an unreadable pointer, a bad receipt or a missing entry file
-  is `broken`; otherwise `installed`.
+  and renamed over the target; compact JSON.
+- State (as the Lua `Store:state`): no `current.json` is `not_installed`; an
+  unreadable or invalid pointer, a missing or invalid receipt, or an entry that
+  is not a regular file (symlinks followed) is `broken`; otherwise
+  `installed`. After writing a receipt and pointer the service checks the
+  release with these same rules before it reports success.
+- Releases are the entries of `releases/` that are real directories (not
+  symlinks) with a valid install id name; everything else there is ignored and
+  never deleted.
 
 ### 16.2 Locks and leases
 
 Constants (shared with `lua/ade/manager/lock.lua`): heartbeat every **15 s**;
 a record whose pid is gone is abandoned once its heartbeat is older than
 **120 s**; a record whose pid exists is abandoned once its heartbeat is older
-than **600 s**, or older than the current boot minus **60 s** (pid reuse). The
-heartbeat is wall-clock milliseconds since the epoch. `pid` is written as a
-**JSON string**. `host` is the hostname.
+than **600 s**, or older than the boot time minus **60 s** (pid reuse). Times
+are wall-clock milliseconds since the epoch; the boot time is now minus the
+system uptime (including suspend). `host` is `gethostname(2)`.
+
+Writers write `pid` as a JSON **string** and `heartbeat` as an integer.
+Readers accept a number or a numeric string for both; a pid that is not a
+positive integer counts as "no pid".
 
 - **Lock** (one per agent; install, update and uninstall take it): create
-  `<root>/.locks/<id>` with an atomic `mkdir` (mode 0700). If it exists, read
-  `owner.json` and apply the liveness rule below: live means fail at once with
-  `-32042`; abandoned means remove the directory and `mkdir` again once.
-  `owner.json` = `{"host", "pid", "acquiredAt", "heartbeat", "action"}`.
-  The heartbeat rewrites the file only while `host`, `pid` and `acquiredAt`
-  are still ours; otherwise the lock is lost (the operation fails with
-  `-32043`). Release removes the directory only while the record is ours.
+  `<root>/.locks/<id>` with an atomic `mkdir` (mode 0700; parents with
+  `mkdir -p`). If it exists, read `owner.json` and apply the liveness rule:
+  live means fail at once with `-32042`; abandoned means read `owner.json`
+  again, and only if it is unchanged remove the directory and `mkdir` once
+  more (`-32042` if that fails). `owner.json` = `{"host", "pid",
+  "acquiredAt", "heartbeat", "action"}`. The heartbeat rewrites the file only
+  while `host`, `pid` and `acquiredAt` are still ours; otherwise the lock is
+  lost. Release removes the directory only while the record is ours.
 - **Lease** (one file per running release): `<root>/.leases/<id>/lease-<pid>-
-  <instance>.json` = `{"host", "pid", "installId", "heartbeat", "startedAt"}`.
-  The service writes one for every agent instance it runs from a managed
-  release (16.4) and removes it when the instance exits. A lease deleted by
-  someone else is not recreated.
-- **Liveness** of a lock or lease record, in order: unreadable -> live; other
-  host -> live; no numeric pid -> live; pid exists (signal 0 succeeds or fails
-  with anything but "no such process") -> live unless the heartbeat is older
-  than the boot minus 60 s or older than 600 s (a heartbeat <= 0 or in the
-  future is live); pid gone -> abandoned only when `0 < heartbeat` and it is
-  older than 120 s.
+  <instance>.json` with `<instance>` in `[A-Za-z0-9_-]+`, content `{"host",
+  "pid", "installId", "heartbeat", "startedAt"}`. A lease deleted by someone
+  else is not recreated.
+- **Liveness** of a record, in order: unreadable or empty -> live; other host
+  -> live; no pid -> live; pid exists (signal 0 succeeds or fails with anything
+  but "no such process") -> live unless the heartbeat is older than the boot
+  time minus 60 s or older than 600 s (a heartbeat <= 0 or in the future is
+  live); pid gone -> abandoned only when `0 < heartbeat` and it is older than
+  120 s, otherwise live.
 - **In use**: a release is in use when a live lease names its `installId`. A
-  live lease **without** `installId`, or one whose pid cannot be signalled,
-  makes every release of that agent in use. Abandoned lease files are deleted
-  while scanning.
+  live lease **without** `installId`, or one whose pid exists but cannot be
+  signalled, makes every release of that agent in use. Abandoned lease files
+  are deleted while scanning.
+- A lock directory whose `owner.json` was never written (a crash between
+  `mkdir` and the write) is unreadable and therefore live forever; it has to
+  be removed by hand. The error message says so.
 
 ### 16.3 Methods
 
-All four are requests; `root` is required in each. Validation failures are
-`-32040` with a message naming the field.
+`install.*` requests run **outside the request order** of their connection:
+the service answers other requests on that connection (and on every other)
+while an install runs. `job` is a front-end-chosen string
+(`[A-Za-z0-9_-]{1,64}`), unique among the jobs running in the service
+(`-32040` otherwise); it ties the progress notifications to the request.
 
 `install.resolve`
-`-> {root, package, spec, npm, env}` `<- {version}`
-Runs `<npm> view <package>@<spec> version --json` with `cwd = root` and returns
-the exact version. `spec` is `"latest"` or an exact version (`^\d+\.\d+\.\d+`,
-characters `[0-9A-Za-z.+-]`, no `..`, not starting with `-`, at most 64 bytes);
-ranges and tags are refused before npm runs. `package`: at most 128 bytes, no
-leading `-`, `^@?[\w.-]+/?[\w.-]*$`. The exit code is ignored; stdout must
-decode to a version string (or an array whose first element is one), else
-`-32041`. Takes no lock and writes nothing.
+`-> {root, package, spec, npm, env, timeout_ms?}` `<- {version}`
+Runs `<npm> view <package>@<spec> version --json` with `cwd` = `root`, or its
+nearest existing ancestor when `root` does not exist yet. The exit code is
+ignored; stdout must decode to a version string (or an array whose first
+element is one) that passes the version rule, else `-32041`. `timeout_ms`
+defaults to 60000. Takes no lock and writes nothing.
 
 `install.run`
-`-> {root, agent, action, package, entry, bin, version, npm, env, timeout_ms?,
-max_log_bytes?}`
+`-> {job, root, agent, action, package, entry, bin?, version, npm, env,
+timeout_ms?, max_log_bytes?}`
 `<- {status: "committed", installId, version, dir}` or
 `<- {status: "unchanged", installId, version}`
-- `action` is `"install"` or `"update"`; `version` must be exact (`"latest"` is
-  refused: resolve first). `update` of an agent that is `not_installed` is
-  `-32045`; `update` to the version already installed returns `unchanged`
-  without touching anything. `install` of the installed version reinstalls
+- `action` is `"install"` or `"update"`; `version` is exact. `update` of an
+  agent that is `not_installed` is `-32045`. `update` when the state is
+  `installed` with the same version returns `unchanged` and touches nothing;
+  a `broken` agent is reinstalled. `install` always builds a new release
   (this is how a broken release is repaired).
-- Steps: take the lock; create a new release directory; write `package.json`;
+- Steps: take the lock; create the release directory; write `package.json`;
   run `<npm> install --no-audit --no-fund --omit=dev --loglevel=notice
   --progress=false` with `cwd` = the release directory; verify that
   `node_modules/<package>/package.json` has `name == package` and
-  `version == version`, and that the entry file exists inside the release;
-  write `receipt.json`; write `current.json` (commit); prune; release the lock.
+  `version == version`, and that the entry is a regular file inside the
+  release; write `receipt.json`; **check that the lock is still ours**; write
+  `current.json` (commit); prune; release the lock.
 - Any failure before the commit removes only the directory this request
   created, never touches `current.json`, and is `-32043` with
-  `data = {log}` (the last 4000 bytes of npm's stderr, else stdout).
-- Prune: after the commit delete every other directory in `releases/` that is
-  not in use (16.2). Releases in use are kept for a later install to prune.
-- `timeout_ms` defaults to 300000 and kills npm's process group when it
-  expires; `max_log_bytes` (default 1 MiB) caps the output kept and forwarded.
-- **Cancellation**: `$/cancel_request {id}` for this request kills npm's
-  process group, removes the release directory, releases the lock and answers
-  the request with `-32800`. After the commit it is too late and is ignored.
+  `data = {log}` (the last 4000 bytes of the kept output, cut at a UTF-8
+  boundary). A lost lock is such a failure.
+- Prune: after the commit delete every other release (16.1) that is not in use
+  (16.2). Releases in use are kept for a later install to prune.
+- `timeout_ms` defaults to 300000; `max_log_bytes` (default 1 MiB) caps the
+  output kept, keeping the **end**. An `output` line longer than 4096 bytes is
+  cut.
 
 `install.uninstall`
-`-> {root, agent}` `<- {installId}`
-Takes the lock, checks that the current release is not in use (`-32044` with
-the reason), removes `current.json` **first** and then the release directory.
-`not_installed` is `-32045`; an unreadable `current.json` is `-32043` and
-removes nothing. Other releases, `.leases`, credentials and the agent's own
+`-> {job, root, agent, installId?}` `<- {installId}`
+Takes the lock. `not_installed` is `-32045`; an unreadable or invalid
+`current.json` is `-32043` and removes nothing. When `installId` is given and
+the current release is a different one, `-32042` with `reason = "changed"`
+(the person confirmed something else). A release in use is `-32044` with the
+reason. Otherwise remove `current.json` **first**, then the release
+directory; when the directory cannot be removed completely the answer is
+`-32043` with `data = {installId}` (the leftovers are pruned by a later
+install). Other releases, `.leases`, credentials and the agent's own
 configuration are not touched.
 
-`install.progress` (notification, `<-`, sent to **every** connection)
+`install.progress` (notification, `<-`, sent to **every** connection, so other
+front ends can show the agent as busy)
 `{job, agent, action, phase, line?, version?, dir?, message?}`
-`job` is unique per `install.run`/`install.uninstall` request in this service.
-`phase` is, in order, `checking`, `installing`, `verifying`, `committed` for a
-run (`output` events with one npm output `line` each, carriage returns
-stripped, empty lines skipped, in between), `removed` for an uninstall, and
-`failed` (with `message`) or `cancelled` for either. The command line itself
-is sent first as an `output` line `"$ npm install ..."`.
+`phase` for a run: `checking`, then `installing` (with `version`, `dir`), then
+`output` events (one npm output `line` each, carriage returns stripped, empty
+lines skipped; the first is the command line `"$ npm install ..."`), then
+`verifying`, then `committed`. For an uninstall: `removed`. Either can end
+with `failed` (with `message`) or `cancelled`. The final event is sent before
+the response.
 
-`npm` is an executable the front end resolved (an absolute path, or a bare
-name looked up in `env.PATH`); it is run directly, never through a shell.
-`env` is the complete environment for npm (as in `agent.attach`), so npm sees
-the user's `PATH`, `npm_config_*` variables and home directory.
+**Cancellation**: the front end sends `$/cancel_request {id}` where `id` is the
+JSON-RPC id of its own running `install.resolve`, `install.run` or
+`install.uninstall` request on that connection; unknown or finished ids are
+ignored. npm's process group gets SIGTERM, then SIGKILL after 5 s; once it has
+exited the release directory is removed, the lock released, and the request
+answered with `-32800`. Once `current.json` has been renamed it is too late
+and the cancel is ignored.
+
+A job keeps running when the connection that started it closes (its progress
+still goes to the other connections). `shutdown` cancels every job first. The
+idle exit (section 8) waits while any job runs.
+
+`npm` is an executable the front end resolved: a name containing `/` must be
+absolute; a bare name is looked up in `env.PATH`. It is run directly, never
+through a shell, in its own process group. `env` is required and is the
+complete environment for npm (as in `agent.attach`); the front end sends its
+whole environment so npm sees the user's `PATH`, `HOME` and `npm_config_*`.
+An npm that cannot be started is `-32043` with the reason.
 
 A second `install.run` or `install.uninstall` for the same agent while one is
 running, in this service or in any other process holding the lock, is
@@ -606,18 +654,35 @@ under the lock.
 ### 16.4 Leases for agents the service runs
 
 `agent.attach` accepts an optional `launch = {root, agent, installId}` next to
-`key`. It is not part of the identity. When an instance is **created** with
-`launch`, the service writes the lease of 16.2 for that release and keeps its
-heartbeat until the instance exits; then it removes the file. The front end
-does not hold its own lease for agents that run in the service.
+`key` (validated as in 16.1, `-32040` otherwise). It is not part of the
+identity. When an instance is **created** with `launch`, the service first
+writes the lease of 16.2 for that release, then checks that the release is
+still `installed` (receipt valid, entry a regular file), and only then spawns
+the agent; if the lease cannot be written or the release is gone, the attach
+fails with `-32022` and the lease is removed. The lease keeps its heartbeat
+until the instance exits; then the file is removed. The front end does not
+hold its own lease for agents that run in the service.
 
 ### 16.5 Error codes
 
 | Code | Meaning |
 |---|---|
-| -32040 | invalid parameter (root, agent id, package, version, entry, npm) |
+| -32040 | invalid parameter (root, agent id, package, version, entry, npm, job, launch) |
 | -32041 | npm could not resolve the version |
-| -32042 | another operation holds this agent (`data.reason`) |
+| -32042 | another operation holds this agent, or the release changed (`data.reason`) |
 | -32043 | install or uninstall failed (`data.log` when npm ran) |
 | -32044 | the release is in use (`data.reason`) |
 | -32045 | nothing to do: not installed |
+| -32800 | the request was cancelled (`$/cancel_request`) |
+
+### 16.6 Deliberate differences from the Lua implementation
+
+- No lock is held while the person confirms; two front ends that both confirm
+  find out at `install.run` (`-32042`).
+- npm can be cancelled while it runs, and is stopped as a process group.
+- A lock lost during an install fails the install instead of committing.
+- npm gets exactly the environment the front end sends.
+- Leases of service-run agents belong to the service and survive Neovim
+  exiting (in the Lua code they belonged to Neovim and disappeared with it).
+- `install.uninstall` reports a corrupt pointer as `-32043` instead of a
+  separate pre-check.
