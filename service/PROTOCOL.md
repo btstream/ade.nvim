@@ -700,89 +700,162 @@ decides is relayed exactly as before (section 5.4). The rules are data; the
 service runs no front-end code. Sessions, prompts and everything else stay in
 the front end's `Client`.
 
+Trust boundary: the service, like the Lua policies it replaces, trusts the
+`toolCall.kind`, locations and diff paths **the agent declares**. A rule is a
+statement about declared requests, not a sandbox.
+
+When the service offers `"policy"`, the front end installs its rules here and
+does **not** run its own automatic answers (`permissions.auto_allow`, the inline
+turn policy) for that connection. Without the feature (an older service) the
+front end keeps its Lua policies.
+
 ### 17.1 Rule sets
 
 ```
 rule_set = {
-  "name":    string,            // [A-Za-z0-9_.:-]{1,128}, unique in the service
-  "session": string?,           // only requests with this params.sessionId
-  "agent":   string?,           // only instances whose key.agent is this
-  "until":   "turn_end"?,       // drop the set when the session's prompt turn ends
-  "rules":   rule[]             // at most 64
+  "name":         string,          // [A-Za-z0-9_.:-]{1,128}
+  "priority":     integer?,        // default 0; higher is consulted first
+  "session":      string?,         // only requests with this params.sessionId
+  "agent":        string?,         // only instances whose key.agent is this
+  "until":        "turn_end"?,     // see 17.3; requires "session"
+  "keep":         "connection" | "service"?,  // default "connection"
+  "fallback":     "cancelled"?,    // see 17.2 step 5
+  "allow_always": boolean?,        // default false; required for allow_always in choose
+  "cwd":          string?,         // absolute; resolves relative request paths
+  "rules":        rule[]           // 0..64 entries
 }
 rule = {
-  "kinds":       string[]?,     // toolCall.kind must be one of these
-  "paths_under": string[]?,     // absolute directories (see 17.2)
-  "paths":       string[]?,     // absolute files (see 17.2)
-  "choose":      string[]       // option kinds in order of preference, non-empty
+  "kinds":       string[]?,        // non-empty; toolCall.kind must be one of these
+  "paths":       string[]?,        // non-empty; absolute files (17.2)
+  "paths_under": string[]?,        // non-empty; absolute directories (17.2)
+  "choose":      string[],         // non-empty; option kinds: allow_once,
+                                   //   allow_always, reject_once, reject_always
+  "pick":        "choose" | "offered"?   // default "choose"
 }
 ```
 
-- `policy.set {set: rule_set}` `<- {}` installs a set, replacing any set with
-  the same name. `policy.clear {name}` `<- {removed: bool}` removes one.
-  `policy.list {}` `<- {sets: rule_set[]}`. Invalid input is `-32050` with a
-  message naming the field; nothing is installed.
-- A set with `session` and `until: "turn_end"` is removed when the
-  `session/prompt` of that session that was running when the set was installed
-  is answered (section 13's turn bookkeeping). A `turn_end` set installed while
-  no prompt of that session runs applies to the next prompt and is removed when
-  that one ends. `until` without `session` is `-32050`.
-- Sets live in memory only. A front end installs its sets after every `hello`
-  (they are lost when the service restarts). Two front ends writing the same
-  name: the last write wins.
+- `policy.set {set}` `<- {}` installs a set, replacing a set with the same
+  name. `policy.clear {name}` `<- {removed}`. `policy.list {}` `<- {sets}` where
+  each set also carries `owner` (connection id or `null`), `installed_at` and
+  `bound` (17.3). Invalid input is `-32050` with a message naming the field and
+  nothing is installed: an empty list, an unknown option kind, `allow_always` in
+  `choose` without `"allow_always": true`, `until` without `session`, a
+  relative `cwd`/path, more than 256 sets in the service.
+- Ownership: a set with `keep = "connection"` belongs to the connection that
+  installed it and is removed when that connection closes, **except** a
+  `turn_end` set whose prompt is running, which lives until that prompt ends
+  (an adopted turn keeps its rules, section 13). `keep = "service"` sets live
+  until they are cleared or the service exits. Sets are never written to disk;
+  a front end installs its `keep = "service"` sets again after every `hello`.
+  Any authenticated front end may replace or clear any set (one user, one trust
+  domain).
 
 ### 17.2 Deciding a request
 
-When an agent sends `session/request_permission`:
+When an agent sends `session/request_permission` (a missing `toolCall` is an
+empty object):
 
 1. **Questions are never answered by policy.** The request is a question when
    any holds: `toolCall.kind == "switch_mode"`; `toolCall.rawInput.method` is
    `"select"` or `"confirm"`; it has at least two `options` and all of them have
-   the same `kind`. (This is the generic part of the front end's
-   `Permissions.question`; a front end may recognise more questions, which only
-   matters for what it shows.)
-2. Candidate sets, in order: sets with `session` equal to the request's
-   `sessionId` (most recently installed first), then sets without `session`
-   (most recently installed first). A set whose `agent` differs from the
-   instance's `key.agent` is skipped.
+   the same `kind` (a missing kind counts as the empty string). A question is
+   relayed.
+2. Candidate sets: those whose `session` (if any) equals the request's
+   `sessionId`, whose `agent` (if any) equals the instance's `key.agent`, and
+   which are **active** (a `turn_end` set only while its bound prompt runs,
+   17.3). Order: higher `priority` first; at equal priority, sets with `session`
+   before sets without; then the most recently installed first.
 3. In each set, rules in order. A rule **matches** when every condition it has
    holds:
-   - `kinds`: `toolCall.kind` is in the list (a missing kind never matches);
-   - `paths_under` / `paths`: the request names at least one path — every
-     `toolCall.locations[].path` and every `toolCall.content[]` entry with
-     `type == "diff"` contributes its `path` — and **every** named path is
-     inside one of `paths_under` (component-wise, after lexical normalisation;
-     relative paths resolve against the instance's `cwd`) or equal to one of
-     `paths`. An entry without a string path, or a request with no paths, does
-     not match. When both lists are given a path may satisfy either.
+   - `kinds`: `toolCall.kind` is a string in the list;
+   - `paths` / `paths_under`: the request names at least one path — each
+     `toolCall.locations[].path` and each `toolCall.content[]` entry with
+     `type == "diff"` contributes its `path` — and every named path passes. An
+     entry without a string path, an empty string, a NUL byte, or a request
+     with no paths does not match. A relative path resolves against the set's
+     `cwd`; without `cwd` a relative path does not match. Paths are normalised
+     lexically (`\` becomes `/` on Windows, `.` and `..` collapsed); on Windows a
+     drive letter compares case-insensitively and UNC or `\\?\` paths never
+     match.
+     - `paths`: the path equals a listed path, **and** `lstat` reports a regular
+       file with one link, **and** its `realpath` equals the listed path's
+       `realpath`. (This is the inline private copy: a symlink or hard link
+       placed there by the agent does not pass.)
+     - `paths_under`: the `realpath` of the path, or of its nearest existing
+       ancestor for a file not created yet, is inside (component-wise) the
+       `realpath` of a listed directory.
+     When a rule has both, a path may pass either.
    A rule without conditions matches every non-question request.
-4. The first matching rule whose `choose` names a kind present in `options`
-   decides: the first such kind in `choose` order, and the first option of that
-   kind. A matching rule none of whose kinds is offered does not decide; the
-   search continues.
-5. Decided: the service answers the agent with
-   `{"outcome": {"outcome": "selected", "optionId": <id>}}`, does **not** add the
-   request to the pending set and sends every attached connection
-   `policy.applied` (17.3). Not decided: relay as in section 5.4.
+4. A matching rule decides when one of its `choose` kinds is offered:
+   - `pick = "choose"`: the first kind in `choose` order that is offered, and
+     the first option of that kind;
+   - `pick = "offered"`: the first option in the agent's order whose kind is in
+     `choose` (this is how `permissions.auto_allow` has always behaved).
+   A matching rule none of whose kinds is offered does not decide.
+5. If no rule of a set decided and the set has `fallback = "cancelled"`, the set
+   decides with `{"outcome": {"outcome": "cancelled"}}`. Otherwise the search
+   continues with the next set.
+6. Decided: the service answers the agent, does **not** add the request to the
+   pending set, and sends `policy.applied` (17.4). Not decided: relay as in
+   section 5.4.
 
-The decision is made once, when the request arrives. Installing a set later does
-not answer requests already pending.
+The decision is made once, when the request arrives; installing a set later
+does not answer requests already pending. A front end that receives a request
+the service already answered (a redelivery race) gets nothing to answer: the
+service drops responses for ids that are not pending (section 5.1).
 
-### 17.3 Notification and log
+### 17.3 Turn-scoped sets (`until = "turn_end"`)
+
+A `turn_end` set is **bound** to one prompt: the next `session/prompt` for its
+`session` that arrives **on the connection that installed the set**, or the
+prompt from that connection for that session that is already running when the
+set is installed. Until then it is inactive (it decides nothing). It is active
+while the bound prompt runs and is removed when that prompt is answered
+(section 13). The front end sends `policy.set` and waits for its response
+before it sends the prompt; the service handles one connection's frames in
+order, so the set is in place before the agent sees the prompt.
+
+When the service forwards a `session/cancel` for a session, every active
+`turn_end` set of that session becomes **cancelling**: from then until its
+prompt is answered it decides every non-question request with
+`{"outcome": {"outcome": "cancelled"}}`, whatever its rules say. (A cancelled
+turn must not keep acting on the rules it was given.)
+
+`turn_end` sets are not re-installed after a reconnect; their prompt either
+still runs (and the set is still there) or is gone.
+
+### 17.4 Notification and log
 
 `policy.applied` (notification, `<-`, to every connection attached to the
-instance) `{instance, sessionId, set, optionId, kind, toolCall}` where `set` is
-the deciding set's name, `kind` the chosen option kind and `toolCall` the
-request's `toolCall` unchanged.
+instance) `{instance, sessionId, set, outcome, optionId, kind, toolCall}`:
+`outcome` is `"selected"` or `"cancelled"`, `optionId` and `kind` are `null`
+for `cancelled`, `toolCall` is the request's `toolCall` unchanged.
 
 With the event log enabled the decision is recorded as a synthetic `policy`
 event for the session and replayed (section 12) as a `session/update` with
-`update = {"sessionUpdate": "_ade_policy", "set", "optionId", "kind",
-"toolCall"}`. Front ends that do not know `_ade_policy` ignore it (ACP allows
-unknown session updates to be ignored).
+`update = {"sessionUpdate": "_ade_policy", "set", "outcome", "optionId",
+"kind", "toolCall"}`, where `toolCall.rawInput` and `toolCall.content` are
+replaced by `"[omitted]"` when the encoded `toolCall` exceeds 64 KiB. A front
+end with the `"policy"` feature must accept `_ade_policy` (it may show it);
+ACP lets clients ignore unknown session updates.
 
-### 17.4 Error codes
+### 17.5 Error codes
 
 | Code | Meaning |
 |---|---|
 | -32050 | invalid rule set (`message` names the field) |
+
+### 17.6 Expressing the front end's existing policies
+
+- `permissions.auto_allow = {k1, k2, ...}` (non-empty): one set
+  `{name = "config", keep = "service", priority = 0,
+  allow_always = <k contains allow_always>, rules = {{choose = {k1, k2, ...},
+  pick = "offered"}}}`; an empty `auto_allow` means `policy.clear {"config"}`.
+- An inline turn: `{name = "inline:<session>", session, until = "turn_end",
+  priority = 100, fallback = "cancelled", cwd = <session cwd>, rules = ...}`
+  with, in order: edits of the private copy (`kinds = {"edit"}`,
+  `paths = {<copy>}`, `choose = {"allow_once", "reject_once"}`); when
+  `inline.allow_writes`, all edits (`kinds = {"edit"}`, same `choose`); the
+  always-allowed kinds and the configured extra kinds (`kinds = {...}`, same
+  `choose`); finally everything else (`choose = {"reject_once"}`). An offered
+  `allow_always` is never a substitute for `allow_once`.
