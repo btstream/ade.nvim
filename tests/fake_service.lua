@@ -295,6 +295,43 @@ function Server:dispatch(message, client)
     if type(set) ~= "table" or type(set.name) ~= "string" then
       return error_reply(ident, -32050, "set.name is required")
     end
+    -- Minimal validation from section 17.1: enough for the front-end tests to
+    -- catch malformed sets instead of silently accepting them.
+    local kinds = {
+      allow_once = true,
+      allow_always = true,
+      reject_once = true,
+      reject_always = true,
+    }
+    local function absolute(path)
+      return type(path) == "string" and (path:sub(1, 1) == "/" or path:match("^%a:[/\\]") ~= nil)
+    end
+    if set["until"] and not set.session then
+      return error_reply(ident, -32050, "until requires session")
+    end
+    if set.cwd ~= nil and not absolute(set.cwd) then
+      return error_reply(ident, -32050, "cwd must be absolute")
+    end
+    for index, rule in ipairs(set.rules or {}) do
+      if type(rule.choose) ~= "table" or #rule.choose == 0 then
+        return error_reply(ident, -32050, "rules[" .. index .. "].choose is empty")
+      end
+      for _, kind in ipairs(rule.choose) do
+        if not kinds[kind] then
+          return error_reply(ident, -32050, "rules[" .. index .. "].choose has unknown kind " .. tostring(kind))
+        end
+        if kind == "allow_always" and set.allow_always ~= true then
+          return error_reply(ident, -32050, "allow_always in choose requires allow_always = true")
+        end
+      end
+      for _, list in ipairs({ rule.paths or {}, rule.paths_under or {} }) do
+        for _, path in ipairs(list) do
+          if not absolute(path) then
+            return error_reply(ident, -32050, "rules[" .. index .. "] paths must be absolute")
+          end
+        end
+      end
+    end
     set = vim.deepcopy(set)
     set.owner = tostring(client)
     set.installed_at = os.date("!%Y-%m-%dT%H:%M:%SZ")

@@ -271,7 +271,7 @@ function M.build(ctx, opts, action)
       -- unless installing that turn's set failed (then the Lua policy is the
       -- fallback).
       function(interaction)
-        if S.conn.policy and S.conn.policy:active() and not require("ade.inline").fallback_for(interaction) then
+        if S.conn.policy and S.conn.policy:active() and require("ade.inline").service_owned(interaction) then
           return nil
         end
         return require("ade.inline").policy(interaction)
@@ -515,6 +515,12 @@ function M.build(ctx, opts, action)
     notify = notify,
     on_changed = ctx.refresh_chrome,
     on_ready = function()
+      -- `backend_service` is fixed when the client is created, which is after
+      -- the hello; install the config set now that the connection is really
+      -- carrying this agent.
+      if S.conn.policy then
+        pcall(S.conn.policy.reconcile, S.conn.policy, true)
+      end
       local reload_id = S.conn.service:take_pending_reload()
       if reload_id then
         ctx.reload_session(reload_id)
