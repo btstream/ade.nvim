@@ -18,8 +18,45 @@ local npm_mod = require("ade.manager.npm")
 
 local M = {}
 
+---Mutable state that survives a reconfiguration.
+---
+---`adopt` replaces the manager object, not the installs: a running task, its
+---log, the confirmation picker and another front end's job all have to keep
+---working under the new manager. Keeping them in one table that both managers
+---reference is what makes that true; copying the tables (or copying `asking`
+---as a number) left the old object's closures updating stale fields.
+local SHARED = {
+  tasks = true,
+  outcome = true,
+  logs = true,
+  latest = true,
+  checking = true,
+  foreign = true,
+  progress = true,
+  checked_at = true,
+  asking = true,
+  pending_ask = true,
+}
+
 local Manager = {}
-Manager.__index = Manager
+
+---Shared fields resolve through `state`; methods and wiring stay per instance.
+Manager.__index = function(self, key)
+  local state = rawget(self, "state")
+  if state and SHARED[key] then
+    return state[key]
+  end
+  return Manager[key]
+end
+
+Manager.__newindex = function(self, key, value)
+  local state = rawget(self, "state")
+  if state and SHARED[key] then
+    state[key] = value
+    return
+  end
+  rawset(self, key, value)
+end
 
 ---@param opts {config: fun(): table, notify: fun(message: string, level: integer|nil),
 ---  presenter: table, store?: table, locks?: table, npm?: table,
@@ -39,35 +76,34 @@ function M.new(opts)
     confirm = opts.confirm,
     -- Per-agent state, Mason-style: several agents may install at once, each
     -- with its own phase and live log. `progress` is the latest event overall.
-    tasks = {},
-    outcome = {},
-    logs = {},
-    latest = {},
-    checking = {},
-    -- Jobs another front end started. They are not ours to conclude, but the
-    -- window must show the agent as busy and keep refreshing.
-    foreign = {},
+    state = {
+      tasks = {},
+      outcome = {},
+      logs = {},
+      latest = {},
+      checking = {},
+      -- Jobs another front end started. They are not ours to conclude, but
+      -- the window must show the agent as busy and keep refreshing.
+      foreign = {},
+      asking = 0,
+      pending_ask = nil,
+      progress = nil,
+      checked_at = nil,
+    },
   }, Manager)
   return self
 end
 
----Take over the per-agent state of a service replaced by a reconfiguration.
+---Take over the state and installs of a manager replaced by a reconfiguration.
 ---
----The tables are shared, not copied: an install started by the old service
----still finishes through its own callbacks and must show up here.
+---The state table is shared by reference, so callbacks that still run through
+---the old manager write the same `tasks`/`logs`/`asking` the new one reads.
+---The service installer is reused when the connection is the same object, and
+---its callbacks are rebound to this manager so they do not need the old one.
 ---@param previous table
 function Manager:adopt(previous)
-  for _, key in ipairs({ "tasks", "outcome", "logs", "latest", "checking", "foreign" }) do
-    if type(previous[key]) == "table" then
-      self[key] = previous[key]
-    end
-  end
-  self.checked_at = previous.checked_at
-  -- An install the previous manager started keeps running (the service owns
-  -- it). Reuse its installer only when the connection is the same object:
-  -- progress then keeps landing in the shared tables and `x` still cancels it.
-  -- Its callbacks close over `previous`, whose state tables are now shared and
-  -- whose `on_changed` is repointed to this manager below.
+  self.state = previous.state
+  local installer = previous._service_installer
   local current
   if self.service and type(self.service.service_connection) == "function" then
     local ok, connection = pcall(self.service.service_connection, self.service)
@@ -75,15 +111,24 @@ function Manager:adopt(previous)
       current = connection
     end
   end
-  if previous._service_installer and previous._service_installer.connection == current then
-    self._service_installer = previous._service_installer
+  if installer and installer.connection == current then
+    self._service_installer = installer
+    -- Retarget the installer at this manager: the old object is being
+    -- discarded, and its callbacks must not keep writing through it.
+    local manager = self
+    installer.on_progress = function(event)
+      manager:record(event)
+    end
+    installer.on_foreign = function(event)
+      manager:record_foreign(event)
+    end
+    installer.on_reset = function()
+      manager:reset_foreign()
+    end
+    installer.on_changed = function()
+      manager:changed()
+    end
   end
-  -- A confirmation picker opened before the reconfiguration belongs to the
-  -- same task; keep it cancellable from here.
-  self.pending_ask = previous.pending_ask
-  self.asking = previous.asking
-  local old_changed = previous.on_changed
-  previous.on_changed = self.on_changed or old_changed
 end
 
 ---The store for the current config, rebuilt after a reconfiguration.
@@ -304,9 +349,7 @@ function Manager:installer()
           self:record_foreign(event)
         end,
         on_reset = function()
-          -- The service connection dropped: no terminal event can arrive for a
-          -- job another front end started, so stop showing it as busy.
-          self.foreign = {}
+          self:reset_foreign()
         end,
         on_changed = function()
           self:changed()
@@ -368,6 +411,15 @@ end
 ---The service broadcasts progress to every connection so a second Neovim can
 ---show the agent as busy; the job itself belongs to the other front end, which
 ---gets the response and concludes it. The terminal event clears it.
+---@param event table
+function Manager:reset_foreign()
+  local foreign = self.foreign
+  for id in pairs(foreign) do
+    foreign[id] = nil
+  end
+  self:changed()
+end
+
 ---@param event table
 function Manager:record_foreign(event)
   local id = event.id
@@ -550,6 +602,11 @@ function Manager:ask(details, cb)
   record.answer = function()
     answer(false)
   end
+  -- Record it before asking: a presenter may answer synchronously (a test
+  -- picker, or a scripted confirm), and `answer()` clears this field itself.
+  -- Setting it afterwards would resurrect a finished record and make `x` a
+  -- no-op for the next task.
+  self.pending_ask = record
   record.handle = self.presenter.select({
     title = table.concat(lines, "\n"),
     items = items,
@@ -560,7 +617,6 @@ function Manager:ask(details, cb)
       answer(false)
     end,
   })
-  self.pending_ask = record
 end
 
 ---Close the confirmation picker for one agent, answering "no".

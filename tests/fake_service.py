@@ -361,6 +361,10 @@ class Server:
         self.send(job["conn"], reply)
 
     def install_run(self, params, conn, ident):
+        if params.get("job") in self.install_jobs:
+            # A validation failure emits no terminal event (16.3); the id
+            # already belongs to the running job.
+            return self.error(ident, -32040, "job is already running")
         agent = params.get("agent")
         if agent in self.install_locks:
             return self.refuse_install(params, ident, -32042, "another instance is using this agent", {"reason": "pid 4242 is running"})
@@ -472,6 +476,8 @@ class Server:
         }))
 
     def install_uninstall(self, params, conn, ident):
+        if params.get("job") in self.install_jobs:
+            return self.error(ident, -32040, "job is already running")
         agent = params.get("agent")
         if agent in self.install_locks:
             return self.refuse_install(params, ident, -32042, "another instance is using this agent", {"reason": "pid 4242 is running"})

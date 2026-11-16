@@ -753,5 +753,145 @@ return function(t)
       t.match("^[A-Za-z0-9_%-]+$", jobs[1])
       t.truthy(#jobs[1] <= 64 and #jobs[2] <= 64)
     end)
+
+    t.it("adopting while a confirmation is open keeps asking and cancellation in sync", function()
+      local service, dir = start_service(t, "adopt-ask", { install_version = "0.4.0" })
+      setup(t, "adopt-ask", service, dir, { manager = { confirm = true } })
+      local m = manager()
+      local opened = nil
+      m.presenter = {
+        select = function(opts)
+          opened = opts
+          return { close = function() end }
+        end,
+      }
+
+      t.eq(true, controller.install_agent("pi"))
+      wait(function()
+        return m.asking == 1 and opened ~= nil
+      end, 10000, "the confirmation picker")
+
+      -- Reconfiguration replaces the manager while the picker is open. The
+      -- answer closure and the counter now live in the shared state.
+      local copy = vim.deepcopy(state().config)
+      copy.agent = "opencode"
+      controller.setup(copy, { discard_queued = true })
+      local m2 = manager()
+      t.eq(1, m2.asking, "the open confirmation must be visible to the new manager")
+      t.truthy(m2.pending_ask, "the new manager must own the pending confirmation")
+
+      opened.on_choice(true)
+      wait_idle(m2)
+      t.eq(0, m2.asking, "answering must decrement the shared counter")
+      t.eq(nil, m2.pending_ask, "the finished confirmation must be cleared")
+      t.eq("done", row_for(m2, "pi").outcome.phase)
+
+      -- `x` after the adopt must still cancel a real task (not be swallowed by
+      -- a stale confirmation record).
+      m2.confirm = function()
+        return true
+      end
+      service.install_delay_ms = 3000
+      t.eq(true, controller.install_agent("pi"))
+      wait(function()
+        return next(service.install_jobs) ~= nil
+      end, 15000, "the second install job")
+      t.eq(true, m2:cancel("pi"))
+      wait_idle(m2)
+      t.eq("cancelled", row_for(m2, "pi").outcome.phase)
+    end)
+
+    t.it("clears foreign busy state after adopt and disconnect", function()
+      local service, dir = start_service(t, "adopt-disconnect", { install_version = "0.4.0" })
+      local connection = setup(t, "adopt-disconnect", service, dir)
+      local m = manager()
+      m:installer()
+
+      local copy = vim.deepcopy(state().config)
+      copy.agent = "opencode"
+      controller.setup(copy, { discard_queued = true })
+      local m2 = manager()
+      t.truthy(m2._service_installer)
+      t.truthy(rawequal(m.state, m2.state), "the two managers must share the state table")
+
+      service:broadcast("install.progress", {
+        job = "other-front-end-4",
+        agent = "pi",
+        action = "install",
+        phase = "installing",
+      })
+      wait(function()
+        return m2:busy("pi")
+      end, 5000, "the foreign job on the adopted manager")
+      t.truthy(m2.foreign.pi)
+      local foreign = m2.foreign
+      m2.foreign = foreign
+
+      connection:on_disconnect("lost after adopt", true)
+      wait(function()
+        return not m2:busy("pi")
+      end, 5000, "the disconnect to clear the adopted foreign job")
+      t.eq(nil, m2.foreign.pi)
+      t.truthy(rawequal(foreign, m2.foreign), "foreign must be cleared in place, not replaced")
+    end)
+
+    t.it("a presenter that answers synchronously leaves no pending confirmation", function()
+      local service, dir = start_service(t, "sync-presenter", { install_version = "0.4.0" })
+      setup(t, "sync-presenter", service, dir, { manager = { confirm = true } })
+      local m = manager()
+      m.presenter = {
+        select = function(opts)
+          opts.on_choice(true)
+          return nil
+        end,
+      }
+
+      t.eq(true, controller.install_agent("pi"))
+      wait_idle(m)
+      t.eq(0, m.asking)
+      t.eq(nil, m.pending_ask, "a synchronous answer must not leave a finished record behind")
+
+      service.install_delay_ms = 3000
+      t.eq(true, controller.install_agent("pi"))
+      wait(function()
+        return next(service.install_jobs) ~= nil
+      end, 15000, "the second install job")
+      t.eq(true, m:cancel("pi"))
+      wait_idle(m)
+      t.eq("cancelled", row_for(m, "pi").outcome.phase)
+    end)
+
+    t.it("the installer itself can cancel during an uninstall confirmation", function()
+      local service, dir = start_service(t, "uninstall-confirm", { install_version = "0.4.0" })
+      setup(t, "uninstall-confirm", service, dir, { manager = { confirm = true } })
+      local m = manager()
+      m.confirm = function()
+        return true
+      end
+      t.eq(true, controller.install_agent("pi"))
+      wait_idle(m)
+      t.eq("installed", row_for(m, "pi").status)
+
+      local opened = nil
+      m.confirm = nil
+      m.presenter = {
+        select = function(opts)
+          opened = opts
+          return { close = function() end }
+        end,
+      }
+      t.eq(true, controller.uninstall_agent("pi"))
+      wait(function()
+        return m.asking == 1 and opened ~= nil
+      end, 10000, "the uninstall confirmation")
+      -- `x` goes through Manager:close_ask first; this covers the installer's
+      -- own confirming branch, which must end the task without a request.
+      t.eq(true, m._service_installer:cancel("pi"))
+      wait_idle(m)
+      t.eq("cancelled", row_for(m, "pi").outcome.phase)
+      t.eq("installed", row_for(m, "pi").status, "cancelling the confirmation must not uninstall")
+      t.eq(true, m:close_ask("pi"))
+      t.eq(0, m.asking)
+    end)
   end)
 end

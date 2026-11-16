@@ -72,14 +72,22 @@ function M.new(opts)
     -- show the agent as busy; the service owns their outcome.
     foreign = {},
   }, Installer)
-  pcall(self.connection.subscribe, self.connection, "manager-install", "install.progress", function(payload)
+  -- One connection can carry several installers across a reconfiguration; a
+  -- fixed channel id would make the newest subscription silently replace the
+  -- previous one.
+  self.channel_id = "manager-install-" .. tostring(vim.uv.hrtime())
+  pcall(self.connection.subscribe, self.connection, self.channel_id, "install.progress", function(payload)
     self:on_service_progress(payload)
   end)
   -- A lost connection ends every foreign job from this front end's point of
   -- view: no terminal event can arrive for them any more, and leaving the
   -- agents window spinning forever would be worse than clearing the badge.
-  pcall(self.connection.subscribe, self.connection, "manager-install", "__disconnected", function()
-    self.foreign = {}
+  pcall(self.connection.subscribe, self.connection, self.channel_id, "__disconnected", function()
+    -- Clear in place: a new table here would leave the manager (or an adopted
+    -- successor) reading the old one.
+    for id in pairs(self.foreign) do
+      self.foreign[id] = nil
+    end
     if self.on_reset then
       pcall(self.on_reset)
     end
@@ -467,9 +475,6 @@ function Installer:run(id, entry, version, action, job, finish)
       })
     end
   )
-  if job.cancel_requested and job.handle then
-    self.connection:cancel_request(job.handle.id)
-  end
 end
 
 ---Remove the manager-owned copy of one agent.
@@ -509,6 +514,7 @@ function Installer:uninstall(id, opts, cb)
     cb(ok, value)
   end
   job.finish = finish
+  job.phase = "confirming"
   local details = {
     id = id,
     action = "uninstall",

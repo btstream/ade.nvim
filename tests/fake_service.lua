@@ -887,7 +887,10 @@ function Server:install_run(params, client, ident)
     )
   end
   if self.install_jobs[params.job] then
-    return self:install_refuse(params, ident, -32040, "job is already running")
+    -- -32040 is a validation failure: the request never passed validation, so
+    -- it must not emit a terminal event (which would belong to the running job
+    -- that already owns this id; PROTOCOL.md 16.3).
+    return error_reply(ident, -32040, "job is already running")
   end
   local root = params.root
   local agent_dir = root .. "/" .. agent
