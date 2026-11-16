@@ -620,10 +620,26 @@ function M.build(ctx, opts, action)
     reconnect = function()
       S.conn.service:reconnect()
     end,
-    notify = notify,
+    -- `lost()` runs in the socket EOF callback (a libuv fast event context)
+    -- when the service dies, and `vim.notify` raises E5560 there; the give-up
+    -- notice would be swallowed by the `pcall` around it. Defer only in that
+    -- case: the loop's timer callbacks already run on the main loop, and
+    -- scheduling those too would let "reconnected" drift behind the notices
+    -- the reconnect itself produces right after it (e.g. the session restore).
+    notify = function(message, level)
+      if vim.in_fast_event() then
+        vim.schedule(function()
+          notify(message, level)
+        end)
+      else
+        notify(message, level)
+      end
+    end,
     set_status = function(text)
       S.conn.reconnect_status = text
-      ctx.refresh_chrome()
+      -- Same fast-context problem: the chrome refresh reaches window APIs. The
+      -- repaint is asynchronous anyway, so schedule it.
+      vim.schedule(ctx.refresh_chrome)
     end,
   })
 
@@ -657,8 +673,14 @@ function M.build(ctx, opts, action)
     pcall(notify, message, vim.log.levels.ERROR)
   else
     local ok, err = pcall(S.conn.service.subscribe, S.conn.service, "panel", "__disconnected", on_service_lost)
+    if ok then
+      -- `:Ade service stop` while the loop is between attempts has no live
+      -- socket and therefore no EOF to carry the intent; the command announces
+      -- it separately so the retry loop still stops.
+      ok, err = pcall(S.conn.service.subscribe, S.conn.service, "panel", "__stopped", on_service_lost)
+    end
     if not ok then
-      log.error("subscribing to __disconnected failed: %s", tostring(err))
+      log.error("subscribing to service stop/loss failed: %s", tostring(err))
       pcall(notify, "ade.nvim: automatic reconnection is disabled: " .. tostring(err), vim.log.levels.ERROR)
     end
   end

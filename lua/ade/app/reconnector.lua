@@ -178,6 +178,14 @@ function Reconnector:lost()
     end
     return
   end
+  -- Show the badge as soon as the drop is known, not only when the attempt
+  -- starts: the first retry waits 0.5s, and without this the user sees a
+  -- disconnected panel with no sign that anything is being retried. A service
+  -- that was killed by the OS usually comes back at once, so the status set in
+  -- `attempt_once` alone can be too short to observe at all.
+  if self.deps.set_status then
+    pcall(self.deps.set_status, string.format("reconnecting (%d/%d)", self.attempt + 1, limit))
+  end
   -- First retry is almost immediate; a service that was killed by the OS
   -- usually comes back at once.
   self.timer = self:schedule(M.delay_for(self.attempt + 1))

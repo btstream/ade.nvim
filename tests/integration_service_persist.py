@@ -2048,25 +2048,36 @@ def scenario_crash_loop(case):
 
     # Wait for the loop to exhaust itself. The backoff is 0.5s, 1s, 2s, so this
     # needs a few seconds; polling keeps it as fast as the ladder allows.
+    #
+    # This scenario is specifically "connects, then dies again", so the give-up
+    # path is the stability guard in `Reconnector:lost()`: its wording is
+    # "the service keeps disconnecting (N attempts used)" (`reconnector.lua`,
+    # `tests/spec_s1b.lua` "keeps climbing through a crash loop",
+    # `tests/spec_s1b_wiring.lua` "stops after a crash loop"). The other wording
+    # ("could not reconnect after N attempts") belongs to `attempt_once`, where
+    # the service never came back at all; accepting it here would hide exactly
+    # that failure.
     gave_up = wait_until(
         lambda: [
-            line
-            for line in editor.notify_lines()
-            if "could not reconnect" in line or "keeps disconnecting" in line
+            line for line in editor.notify_lines() if "keeps disconnecting" in line
         ]
         or None,
         WAIT + 20,
         0.2,
         "the reconnect loop to give up",
     )
-    lines = editor.notify_lines()
-    assert_true(
-        any("could not reconnect" in line for line in lines),
-        f"the loop must explain that it gave up: {lines!r}",
-    )
     assert_true(
         any("3" in line for line in gave_up),
         f"the message must name the attempt limit: {gave_up!r}",
+    )
+    # The proxy bumps its state file on every service start. Four starts (the
+    # initial one plus the three retries) prove the attempts really reconnected
+    # rather than failing to launch the service at all.
+    starts = _proxy_starts(os.path.join(case.dir, "crash_proxy.state"))
+    assert_true(
+        starts == 4,
+        "the service must have been started 4 times (1 initial + 3 retries), "
+        f"got {starts!r}; gave_up={gave_up!r}, notifications={editor.notify_lines()!r}",
     )
     state = editor.reconnector_state()
     assert_true(
@@ -2331,7 +2342,11 @@ def main():
         real.kill()
         os._exit(1)
 
-    threading.Thread(target=killer, daemon=True).start()
+    # Arm the death timer on the first accepted connection, not when the
+    # launcher reports ready: a loaded machine can take longer than 0.4 s to
+    # complete the handshake, and "died before the first connection" would turn
+    # every retry into a failed launch instead of the crash loop under test.
+    armed = threading.Event()
 
     while True:
         try:
@@ -2340,6 +2355,9 @@ def main():
             break
 
         def serve(client=client):
+            if not armed.is_set():
+                armed.set()
+                threading.Thread(target=killer, daemon=True).start()
             upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
                 upstream.connect(REAL_SOCKET)
@@ -2360,6 +2378,15 @@ if __name__ == "__main__":
         handle.write(script)
     os.chmod(path, 0o755)
     return path
+
+
+def _proxy_starts(path):
+    """How many times the crash proxy started a service, or None if it never did."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return int(handle.read().strip() or "0")
+    except (OSError, ValueError):
+        return None
 
 
 def _shell_quote(path):

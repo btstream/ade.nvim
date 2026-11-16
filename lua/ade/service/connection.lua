@@ -446,8 +446,8 @@ function Connection:install_handlers(client)
       self:dispatch(method, payload)
     end)
   end
-  client.on_disconnect_cb = function(reason)
-    self:on_disconnect(type(reason) == "string" and reason or tostring(reason))
+  client.on_disconnect_cb = function(reason, intentional)
+    self:on_disconnect(type(reason) == "string" and reason or tostring(reason), intentional == true)
   end
 end
 
@@ -458,7 +458,8 @@ end
 ---their exit, and a later `ensure()` starts a new service and re-attaches. Only
 ---`close()` is permanent.
 ---@param reason string
-function Connection:on_disconnect(reason)
+---@param intentional boolean|nil the disconnecting client carried a stop intent
+function Connection:on_disconnect(reason, intentional)
   if self.closed then
     return
   end
@@ -467,10 +468,10 @@ function Connection:on_disconnect(reason)
   log.warn("service connection lost: %s", self.error)
   -- `intentional` tells the application whether automatic reconnection should
   -- kick in: a user-issued `:Ade service stop` or `:Ade disconnect` is not an
-  -- accident, and retrying would fight the user.
-  local payload = { reason = self.error, intentional = self.intentional_disconnect == true }
-  self.intentional_disconnect = false
-  self:dispatch("__disconnected", payload)
+  -- accident, and retrying would fight the user. The intent lives on the
+  -- client that is being lost, so a later client (a real connection) does not
+  -- inherit it.
+  self:dispatch("__disconnected", { reason = self.error, intentional = intentional == true })
 end
 
 ---Resolve the in-flight `ensure` callers.
@@ -591,7 +592,6 @@ end
 ---@param reason string|nil
 function Connection:close(reason)
   self.closed = true
-  self.intentional_disconnect = true
   local client = self.client
   self.client = nil
   if client then
@@ -600,27 +600,54 @@ function Connection:close(reason)
   self.error = reason or "closed"
 end
 
+---Tell the panel the user asked the service to stop.
+---
+---The EOF payload normally carries that intent, but `:Ade service stop` can run
+---while the socket is already gone — the reconnect loop is between backoff
+---attempts — and then no EOF ever arrives to cancel it. A dedicated
+---notification covers both cases; `bootstrap.lua` handles it like an
+---intentional `__disconnected`.
+function Connection:stopped_intent()
+  self:dispatch("__stopped", { intentional = true })
+end
+
 ---Stop the service itself (`:Ade service stop`).
+---
+---The stop intent lives on the client that carries the request
+---(`Client.shutdown_requested`), so every disconnect it later reports is
+---deliberate — a prompt close, a late success reply, an EOF while the service
+---exits. A new client starts without the intent, so a later real drop still
+---reconnects.
+---
+---A refusal (`ok == false`) keeps the client attached and usable; a timeout
+---(`value.pending`) keeps it attached too, because the user's stop is still in
+---flight. Reports exactly once.
 ---@param cb fun(ok: boolean, value: any)|nil
-function Connection:shutdown(cb)
+---@param timeout integer|nil
+function Connection:shutdown(cb, timeout)
+  -- Tell the panel before asking: a slow or unanswered shutdown produces no
+  -- EOF, and the retry loop must not keep starting services in the background.
+  self:stopped_intent()
   if not self:is_connected() then
     if cb then
       cb(false, "not connected")
     end
     return
   end
-  -- Mark this as deliberate before the socket closes, so the `__disconnected`
-  -- fan-out does not start an automatic reconnect against the user's wish.
-  self.intentional_disconnect = true
-  self.client:shutdown(function(ok, value)
-    -- The user stopped the service; they did not forbid using it later, so the
-    -- connection object stays reusable (`on_disconnect` already cleared the
-    -- client).
-    self.client = nil
+  local client = self.client
+  client:shutdown(function(ok, value)
+    if ok and self.client == client then
+      -- The service confirmed; `Client:shutdown` closes the socket next, and
+      -- the close carries this client's stop intent.
+      self.client = nil
+    end
+    -- On refusal/timeout the client stays: it is the live socket, and closing
+    -- it here would report a drop nobody asked for. `Client:shutdown` already
+    -- revoked the intent on a refusal and kept it on a timeout.
     if cb then
       cb(ok, value)
     end
-  end)
+  end, timeout)
 end
 
 return M
