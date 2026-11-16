@@ -315,10 +315,18 @@ class Server:
             self.emit(conn, method, params)
 
     def emit_install(self, job, event):
-        event["job"] = job["job"]
-        event["agent"] = job["agent"]
-        event["action"] = job["params"].get("action")
+        event["job"] = job.get("job")
+        event["agent"] = job.get("agent")
+        event["action"] = job.get("action") or job["params"].get("action") or "uninstall"
         self.broadcast("install.progress", event)
+
+    def refuse_install(self, params, ident, code, message, data=None):
+        """Early refusal: section 16.3 requires one terminal event first."""
+        self.emit_install(
+            {"job": params.get("job"), "agent": params.get("agent"), "params": params},
+            {"phase": "failed", "message": message},
+        )
+        return self.error(ident, code, message, data)
 
     def resolve_version(self, params, conn, ident):
         time.sleep(0.01)
@@ -355,12 +363,16 @@ class Server:
     def install_run(self, params, conn, ident):
         agent = params.get("agent")
         if agent in self.install_locks:
-            return self.error(ident, -32042, "another instance is using this agent", {"reason": "pid 4242 is running"})
+            return self.refuse_install(params, ident, -32042, "another instance is using this agent", {"reason": "pid 4242 is running"})
         root = params.get("root") or ""
         version = params.get("version")
         agent_dir = os.path.join(root, agent or "")
         current = self.read_json(os.path.join(agent_dir, "current.json"))
         if params.get("action") == "update" and current and current.get("version") == version:
+            self.emit_install(
+                {"job": params.get("job"), "agent": agent, "params": params},
+                {"phase": "unchanged", "version": version},
+            )
             return self.result(ident, {
                 "status": "unchanged",
                 "installId": current.get("installId"),
@@ -462,14 +474,14 @@ class Server:
     def install_uninstall(self, params, conn, ident):
         agent = params.get("agent")
         if agent in self.install_locks:
-            return self.error(ident, -32042, "another instance is using this agent", {"reason": "pid 4242 is running"})
+            return self.refuse_install(params, ident, -32042, "another instance is using this agent", {"reason": "pid 4242 is running"})
         root = params.get("root") or ""
         agent_dir = os.path.join(root, agent or "")
         current = self.read_json(os.path.join(agent_dir, "current.json"))
         if not current or not isinstance(current.get("installId"), str):
-            return self.error(ident, -32045, "this agent has no manager-owned install")
+            return self.refuse_install(params, ident, -32045, "this agent has no manager-owned install")
         if params.get("installId") and params["installId"] != current.get("installId"):
-            return self.error(ident, -32042, "the installed release changed", {"reason": "changed"})
+            return self.refuse_install(params, ident, -32042, "the installed release changed", {"reason": "changed"})
         self.install_locks[agent] = True
         job = {
             "id": ident,

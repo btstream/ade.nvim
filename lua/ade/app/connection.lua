@@ -42,9 +42,11 @@ function Connection.new(opts)
     locks = opts.locks,
     service = opts.service,
     lease = nil,
-    -- Set per connection attempt: the service holds leases for the agents it
-    -- runs, so this object must not take one of its own (PROTOCOL.md 16.4).
+    -- Set per connection attempt: a service that offers the `install` feature
+    -- holds the lease for the agents it runs, so this object must not take one
+    -- of its own (PROTOCOL.md 16.4).
     backend_service = false,
+    service_lease = false,
     pending_reload = nil,
   }, Connection)
 end
@@ -187,10 +189,10 @@ end
 ---see that the release is live.
 ---@param launch table|nil
 function Connection:hold_lease(launch)
-  if self.backend_service then
-    -- The agent runs in the service, whose own lease protects the release
-    -- (PROTOCOL.md 16.4). A Neovim lease would vanish on exit while the agent
-    -- keeps running, which is exactly when another instance could prune it.
+  if self.service_lease then
+    -- The agent runs in a service that writes its own lease (PROTOCOL.md
+    -- 16.4). A Neovim lease would vanish on exit while the agent keeps
+    -- running, which is exactly when another instance could prune it.
     return
   end
   if not launch or launch.source ~= "managed" or not launch.install_id then
@@ -262,12 +264,16 @@ function Connection:connect()
       self.on_start_failed({ message = backend_err or "the service is unavailable" })
       return
     end
-    -- Whether this connection is running inside the service decides who holds
-    -- the lease: the service writes its own lease when it creates the instance
-    -- (PROTOCOL.md 16.4), and a second Neovim-owned lease would keep the
-    -- release alive after the editor exits for no reason.
+    -- Who holds the lease depends on whether the *service* can write one. A
+    -- service backend without the `install` feature (an older service on any
+    -- platform, or Windows where the feature is absent) ignores `attach.launch`
+    -- and writes no lease, so Neovim has to keep its own. Only a service that
+    -- advertises `install` takes over (PROTOCOL.md 16.4).
     self.backend_service = use_service == true
-    if self.backend_service then
+    self.service_lease = self.backend_service
+      and type(self:service_connection().has_feature) == "function"
+      and self:service_connection():has_feature("install")
+    if self.service_lease then
       self:release_lease()
     else
       -- Pin the release before the process exists: initialize can take seconds,
@@ -283,8 +289,9 @@ function Connection:connect()
       }),
       launch = launch,
       -- The service needs the store root to write the lease for a managed
-      -- release in `agent.attach.launch` (PROTOCOL.md 16.4).
-      manager_root = self.backend_service and Resolve.manager_root(cfg) or nil,
+      -- release in `agent.attach.launch` (PROTOCOL.md 16.4). Without the
+      -- `install` feature it ignores launch, so it is not sent.
+      manager_root = self.service_lease and Resolve.manager_root(cfg) or nil,
       cwd = self.resolve_cwd(),
       client_capabilities = build_client_capabilities(cfg),
       mcp_servers = cfg.mcp_servers,

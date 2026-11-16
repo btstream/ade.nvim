@@ -63,6 +63,25 @@ function Manager:adopt(previous)
     end
   end
   self.checked_at = previous.checked_at
+  -- An install the previous manager started keeps running (the service owns
+  -- it). Reuse its installer only when the connection is the same object:
+  -- progress then keeps landing in the shared tables and `x` still cancels it.
+  -- Its callbacks close over `previous`, whose state tables are now shared and
+  -- whose `on_changed` is repointed to this manager below.
+  local current
+  if self.service and type(self.service.service_connection) == "function" then
+    local ok, connection = pcall(self.service.service_connection, self.service)
+    if ok then
+      current = connection
+    end
+  end
+  if previous._service_installer and previous._service_installer.connection == current then
+    self._service_installer = previous._service_installer
+  end
+  -- A confirmation picker opened before the reconfiguration belongs to the
+  -- same task; keep it cancellable from here.
+  self.pending_ask = previous.pending_ask
+  self.asking = previous.asking
   local old_changed = previous.on_changed
   previous.on_changed = self.on_changed or old_changed
 end
@@ -242,6 +261,17 @@ function Manager:service_connection()
   if not ok or type(connection) ~= "table" then
     return nil
   end
+  if backend == "auto" then
+    -- `auto` must not start the service just to list agents or check versions:
+    -- opening the window is not an install. A service that is already
+    -- connected is used; otherwise this run stays on the Lua path.
+    if not connection:is_connected() or not connection:has_feature("install") then
+      return nil
+    end
+    return connection
+  end
+  -- Explicit `backend = "service"`: an install is the user's request to use
+  -- the service, so connecting it here is expected.
   local ready = false
   connection:ensure(function(result)
     ready = result == true
@@ -272,6 +302,11 @@ function Manager:installer()
         end,
         on_foreign = function(event)
           self:record_foreign(event)
+        end,
+        on_reset = function()
+          -- The service connection dropped: no terminal event can arrive for a
+          -- job another front end started, so stop showing it as busy.
+          self.foreign = {}
         end,
         on_changed = function()
           self:changed()
@@ -340,8 +375,7 @@ function Manager:record_foreign(event)
     return
   end
   local phase = event.phase
-  local terminal = phase == "committed" or phase == "failed" or phase == "cancelled" or phase == "removed"
-  if terminal then
+  if ServiceInstaller.TERMINAL_PHASES[phase] then
     self.foreign[id] = nil
     self.progress = event
   else
@@ -370,7 +404,7 @@ end
 ---@param id string
 ---@return table|nil
 function Manager:task_of(id)
-  return self.tasks[id]
+  return self.tasks[id] or self.foreign[id]
 end
 
 ---Start a task, refusing a second one for the same agent.
@@ -500,16 +534,23 @@ function Manager:ask(details, cb)
   -- picker makes the agents float lose focus, which normally closes it.
   self.asking = (self.asking or 0) + 1
   local finished = false
+  local record = { id = details.id }
   local function answer(value)
     if finished then
       return
     end
     finished = true
     self.asking = math.max(0, (self.asking or 1) - 1)
+    if self.pending_ask == record then
+      self.pending_ask = nil
+    end
     cb(value)
     self:changed()
   end
-  self.presenter.select({
+  record.answer = function()
+    answer(false)
+  end
+  record.handle = self.presenter.select({
     title = table.concat(lines, "\n"),
     items = items,
     on_choice = function(value)
@@ -519,6 +560,27 @@ function Manager:ask(details, cb)
       answer(false)
     end,
   })
+  self.pending_ask = record
+end
+
+---Close the confirmation picker for one agent, answering "no".
+---
+---`x` during the confirmation has no service request to cancel yet; the task is
+---ended here so the spinner stops and `Manager.asking` drops in the same tick.
+---@param id string
+---@return boolean closed
+function Manager:close_ask(id)
+  local ask = self.pending_ask
+  if not ask or ask.id ~= id then
+    return false
+  end
+  self.pending_ask = nil
+  if ask.handle and type(ask.handle.close) == "function" then
+    pcall(ask.handle.close)
+  end
+  -- Idempotent: a picker that closed itself already answered.
+  ask.answer()
+  return true
 end
 
 ---Install or update one agent.
@@ -702,6 +764,10 @@ end
 ---@param id string
 ---@return boolean started
 function Manager:cancel(id)
+  -- The confirmation picker is part of the task: closing it answers "no".
+  if self:close_ask(id) then
+    return true
+  end
   local installer = self._service_installer
   if not installer then
     return false
@@ -709,10 +775,21 @@ function Manager:cancel(id)
   return installer:cancel(id)
 end
 
----Whether the current backend can cancel a running install.
+---Whether the task for one agent (or any task) runs in the service installer.
+---
+---Per task, not per backend: after a reconfiguration or a backend switch the
+---running task's implementation is what matters.
+---@param id string|nil
 ---@return boolean
-function Manager:can_cancel()
-  return self._service_installer ~= nil
+function Manager:can_cancel(id)
+  local installer = self._service_installer
+  if not installer then
+    return false
+  end
+  if id then
+    return installer:busy(id)
+  end
+  return installer:busy()
 end
 
 ---Toolchain facts for the UI and health check. Never installs.

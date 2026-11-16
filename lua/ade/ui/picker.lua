@@ -386,6 +386,7 @@ end
 ---the user's own picker plugin is used. Choosing nothing (or dismissing the
 ---prompt) invokes `on_cancel`, which is what permission handling relies on.
 ---@param opts {title: string, items: AdePickerItem[], on_choice: fun(value: any), on_cancel?: fun(), width?: integer, height?: integer, format?: fun(item: AdePickerItem): string, filter?: boolean}
+---@return {close: fun()}|nil handle when the picker can be closed from outside
 function M.select(opts)
   local items = opts.items or {}
   if #items == 0 then
@@ -394,8 +395,7 @@ function M.select(opts)
   end
 
   if backend() == "internal" then
-    internal_select(opts)
-    return
+    return internal_select(opts)
   end
 
   local format_item = make_formatter(items, opts)

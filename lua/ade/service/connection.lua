@@ -503,13 +503,18 @@ end
 ---@param cb fun(ok: boolean, value: any)
 ---@return {id: integer|nil}
 function Connection:request_tracked(method, params, cb)
-  local handle = { id = nil }
+  local handle = { id = nil, cancelled = false }
   self:ensure(function(ok, err)
     if not ok then
       cb(false, { code = -32000, message = err or "the service is unavailable" })
       return
     end
     handle.id = self.client:request(method, params, cb)
+    -- The caller may have cancelled while `ensure()` was still connecting; the
+    -- id did not exist then, so the request is cancelled here instead.
+    if handle.cancelled and handle.id ~= nil then
+      self:cancel_request(handle.id)
+    end
   end)
   return handle
 end
@@ -519,9 +524,19 @@ end
 ---A plain `$/cancel_request` notification, not `Rpc:cancel`: the service still
 ---answers the original request (with `-32800`), and that answer is what the
 ---caller is waiting for. `Rpc:cancel` would drop the pending callback.
----@param id integer|nil
+---Also accepts the handle returned by `request_tracked`: when its request has
+---not been written yet (a queued `ensure`), the intent is recorded and the
+---notification is sent as soon as the id exists.
+---@param id integer|table|nil
 ---@return boolean sent
 function Connection:cancel_request(id)
+  if type(id) == "table" then
+    id.cancelled = true
+    if type(id.id) ~= "number" then
+      return true
+    end
+    id = id.id
+  end
   if type(id) ~= "number" or not self.client or not self.client:is_ready() then
     return false
   end

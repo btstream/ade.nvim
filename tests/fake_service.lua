@@ -32,7 +32,7 @@ Server.__index = Server
 ---  shutdown_eof?: boolean, shutdown_error?: table, hello_delay_ms?: integer,
 ---  features?: string[], install_version?: string, latest_version?: string,
 ---  install_fail?: boolean, install_log?: string, install_delay_ms?: integer,
----  install_busy?: boolean, uninstall_busy?: boolean,
+---  install_busy?: boolean, uninstall_busy?: boolean, resolve_delay_ms?: integer,
 ---  run_error?: table, uninstall_error?: table, canned_agent?: boolean}|nil
 ---@return FakeService
 function M.new(opts)
@@ -76,6 +76,7 @@ function M.new(opts)
     install_fail = opts.install_fail == true,
     install_log = opts.install_log or "npm error boom",
     install_delay_ms = opts.install_delay_ms or 10,
+    resolve_delay_ms = opts.resolve_delay_ms or opts.install_delay_ms or 10,
     install_busy = opts.install_busy == true,
     uninstall_busy = opts.uninstall_busy == true,
     -- Scripted JSON-RPC errors, for the code-to-message mapping tests.
@@ -278,10 +279,15 @@ function Server:dispatch(message, client)
   end
 
   if method == "$/cancel_request" then
-    local job = self.pending_installs[params.id]
-    if job then
-      self:cancel_install(job)
-    end
+    -- This runs in the socket callback (a fast event context), where
+    -- `vim.fn.delete` and friends are forbidden. Cleanup belongs on the main
+    -- loop, like every other install step.
+    vim.schedule(function()
+      local job = self.pending_installs[params.id]
+      if job then
+        self:cancel_install(job)
+      end
+    end)
     return nil
   end
   if method == "install.resolve" then
@@ -292,7 +298,7 @@ function Server:dispatch(message, client)
         return
       end
       self:send(client, { jsonrpc = "2.0", id = ident, result = { version = version } })
-    end, self.install_delay_ms)
+    end, self.resolve_delay_ms)
     return nil
   end
   if method == "install.run" then
@@ -827,7 +833,7 @@ end
 function Server:emit_install(job, event)
   event.job = job.job
   event.agent = job.agent
-  event.action = job.params.action
+  event.action = job.action or job.params.action or "uninstall"
   self:broadcast("install.progress", event)
 end
 
@@ -848,22 +854,50 @@ end
 ---@param client table
 ---@param ident any
 ---@return table|nil
+---Refuse a run/uninstall before it starts, with the terminal event section
+---16.3 requires for early refusals.
+---@param params table
+---@param ident any
+---@param code integer
+---@param message string
+---@param data table|nil
+---@return table
+function Server:install_refuse(params, ident, code, message, data)
+  self:emit_install({
+    job = params.job,
+    agent = params.agent,
+    params = { action = params.action },
+  }, { phase = "failed", message = message })
+  return error_reply(ident, code, message, data)
+end
+
 function Server:install_run(params, client, ident)
   if self.run_error then
-    return error_reply(ident, self.run_error.code, self.run_error.message, self.run_error.data)
+    return self:install_refuse(params, ident, self.run_error.code, self.run_error.message, self.run_error.data)
   end
   local agent = params.agent
   local reason = "pid 4242 is running"
   if self.install_locks[agent] or self.install_busy then
-    return error_reply(ident, -32042, "another instance is using this agent: " .. reason, { reason = reason })
+    return self:install_refuse(
+      params,
+      ident,
+      -32042,
+      "another instance is using this agent: " .. reason,
+      { reason = reason }
+    )
   end
   if self.install_jobs[params.job] then
-    return error_reply(ident, -32040, "job is already running")
+    return self:install_refuse(params, ident, -32040, "job is already running")
   end
   local root = params.root
   local agent_dir = root .. "/" .. agent
   local current = read_json(agent_dir .. "/current.json")
   if params.action == "update" and current and current.version == params.version then
+    self:emit_install({
+      job = params.job,
+      agent = agent,
+      params = { action = params.action },
+    }, { phase = "unchanged", version = current.version })
     return {
       jsonrpc = "2.0",
       id = ident,
@@ -929,44 +963,51 @@ function Server:install_run(params, client, ident)
           return
         end
         self:emit_install(job, { phase = "output", line = "added 1 package in 1s" })
-        local package_dir = dir .. "/node_modules/" .. params.package
-        vim.fn.mkdir(package_dir .. "/" .. vim.fs.dirname(params.entry), "p")
-        write_json(package_dir .. "/package.json", { name = params.package, version = params.version })
-        local entry = assert(io.open(package_dir .. "/" .. params.entry, "wb"))
-        entry:write("#!/usr/bin/env node\n")
-        entry:close()
-        self:emit_install(job, { phase = "verifying", version = params.version })
-        write_json(dir .. "/receipt.json", {
-          schemaVersion = 1,
-          agentId = agent,
-          installId = install_id,
-          package = params.package,
-          version = params.version,
-          entry = "node_modules/" .. params.package .. "/" .. params.entry,
-          bin = params.bin,
-          runtime = "node",
-          installedAt = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-          platform = jit and jit.os or nil,
-          arch = jit and jit.arch or nil,
-        })
-        write_json(agent_dir .. "/current.json", {
-          schemaVersion = 1,
-          installId = install_id,
-          updatedAt = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-          package = params.package,
-          version = params.version,
-        })
-        self:emit_install(job, { phase = "committed", version = params.version })
-        self:finish_install(job, {
-          jsonrpc = "2.0",
-          id = ident,
-          result = {
-            status = "committed",
+        -- Verification and the commit happen on a later tick, like the real
+        -- service: a test can observe "output arrived, job still running".
+        vim.defer_fn(function()
+          if job.cancelled then
+            return
+          end
+          local package_dir = dir .. "/node_modules/" .. params.package
+          vim.fn.mkdir(package_dir .. "/" .. vim.fs.dirname(params.entry), "p")
+          write_json(package_dir .. "/package.json", { name = params.package, version = params.version })
+          local entry = assert(io.open(package_dir .. "/" .. params.entry, "wb"))
+          entry:write("#!/usr/bin/env node\n")
+          entry:close()
+          self:emit_install(job, { phase = "verifying", version = params.version })
+          write_json(dir .. "/receipt.json", {
+            schemaVersion = 1,
+            agentId = agent,
             installId = install_id,
+            package = params.package,
             version = params.version,
-            dir = dir,
-          },
-        })
+            entry = "node_modules/" .. params.package .. "/" .. params.entry,
+            bin = params.bin,
+            runtime = "node",
+            installedAt = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+            platform = jit and jit.os or nil,
+            arch = jit and jit.arch or nil,
+          })
+          write_json(agent_dir .. "/current.json", {
+            schemaVersion = 1,
+            installId = install_id,
+            updatedAt = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+            package = params.package,
+            version = params.version,
+          })
+          self:emit_install(job, { phase = "committed", version = params.version })
+          self:finish_install(job, {
+            jsonrpc = "2.0",
+            id = ident,
+            result = {
+              status = "committed",
+              installId = install_id,
+              version = params.version,
+              dir = dir,
+            },
+          })
+        end, delay)
       end, delay)
     end, delay)
   end, delay)
@@ -980,22 +1021,34 @@ end
 ---@return table|nil
 function Server:install_uninstall(params, client, ident)
   if self.uninstall_error then
-    return error_reply(ident, self.uninstall_error.code, self.uninstall_error.message, self.uninstall_error.data)
+    return self:install_refuse(
+      params,
+      ident,
+      self.uninstall_error.code,
+      self.uninstall_error.message,
+      self.uninstall_error.data
+    )
   end
   local agent = params.agent
   if self.install_locks[agent] then
-    return error_reply(ident, -32042, "another instance is using this agent", { reason = "pid 4242 is running" })
+    return self:install_refuse(
+      params,
+      ident,
+      -32042,
+      "another instance is using this agent",
+      { reason = "pid 4242 is running" }
+    )
   end
   local agent_dir = params.root .. "/" .. agent
   local current = read_json(agent_dir .. "/current.json")
   if not current or type(current.installId) ~= "string" then
-    return error_reply(ident, -32045, "this agent has no manager-owned install")
+    return self:install_refuse(params, ident, -32045, "this agent has no manager-owned install")
   end
   if params.installId and params.installId ~= current.installId then
-    return error_reply(ident, -32042, "the installed release changed", { reason = "changed" })
+    return self:install_refuse(params, ident, -32042, "the installed release changed", { reason = "changed" })
   end
   if self.uninstall_busy then
-    return error_reply(ident, -32044, "the release is in use", { reason = "in use by pid 4242" })
+    return self:install_refuse(params, ident, -32044, "the release is in use", { reason = "in use by pid 4242" })
   end
   self.install_locks[agent] = true
   local job = {
