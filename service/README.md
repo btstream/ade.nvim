@@ -5,7 +5,7 @@ Neovim, one process per user, and holds ACP agent processes so they outlive the
 front end. It relays raw ACP JSON-RPC between an agent and whichever front end
 is attached; it is not an ACP client itself.
 
-The protocol (api_version 2) is specified in [`PROTOCOL.md`](PROTOCOL.md). That
+The protocol (api_version 3) is specified in [`PROTOCOL.md`](PROTOCOL.md). That
 document is the contract: socket and token paths are in "Where things live"
 below, everything else is there.
 
@@ -14,7 +14,7 @@ below, everything else is there.
 | Command | What it does |
 |---|---|
 | `nvim_ade_server serve [--socket <path>] [--idle-timeout <secs>] [--print-paths] [--event-log on\|off] [--event-log-max-mb <n>]` | Run the service. `--idle-timeout` overrides `NVIM_ADE_SERVER_IDLE_TIMEOUT_SECS` (default 1800); `--print-paths` prints the resolved paths and exits without binding. `--event-log` (default `on`) and `--event-log-max-mb` (default 256, 16–4096) are the event log flags of PROTOCOL.md section 15. |
-| `nvim_ade_server version` | Print `{"version":"0.3.0","api_version":2}` on one line. |
+| `nvim_ade_server version` | Print `{"version":"0.4.0","api_version":3}` on one line. |
 | `nvim_ade_server mcp --token <t>` | Placeholder for the per-agent MCP server; prints "not implemented yet" to stderr and exits 3. |
 
 `serve` prints exactly one line on stdout:
@@ -81,7 +81,7 @@ The relay also tracks the sessions living in each agent (PROTOCOL.md 11):
 and `session/delete` forget it, and configuration/mode updates keep its state
 current. `agent.attach` reports them (`sessions`, newest activity first) and
 `agent.list` counts them (`sessions`, plus `log_bytes`). With `--event-log off`
-nothing is tracked, the list is empty and `hello` advertises only `"tunnel"`.
+nothing is tracked, the list is empty and `hello` advertises `"tunnel"` and (on unix) `"install"`.
 
 ## Event log and emulated `session/load`
 
@@ -136,13 +136,17 @@ is kept for `agent.exited`.
 [`PROTOCOL.md`](PROTOCOL.md) is normative; this is a short orientation.
 
 JSON-RPC 2.0, one UTF-8 JSON object per line, terminated by `\n`, max 64 MiB.
-The current `api_version` is **2** and `hello` reports `features: ["tunnel",
-"log"]` (only `["tunnel"]` with `--event-log off`).
+The current `api_version` is **3** and `hello` reports `features: ["tunnel",
+"install", "log"]` on unix (`"install"` is absent on Windows; with
+`--event-log off` `"log"` is absent too).
 
 | Method | Direction | Purpose |
 |---|---|---|
 | `hello`, `ping`, `shutdown` | front end → service | handshake and lifecycle (shutdown stops every agent) |
-| `agent.attach / detach / stop / list` | front end → service | agent instances |
+| `agent.attach / detach / stop / list` | front end → service | agent instances (`attach` takes an optional managed `launch`) |
+| `install.resolve / run / uninstall` | front end → service | managed npm installs, unix only (PROTOCOL.md 16) |
+| `install.progress` (notification) | service → every front end | install/uninstall progress |
+| `$/cancel_request` (notification) | front end → service | cancel that connection's running install request |
 | `tunnel.send` (notification) | front end → service | one ACP message for an instance |
 | `tunnel.recv`, `tunnel.error`, `agent.exited` (notifications) | service → front end | relayed ACP, rejected frames, process exit |
 
@@ -203,6 +207,25 @@ NVIM_ADE_SERVER_DIR=$TMPDIR_ADEY ./target/release/nvim_ade_server serve &
 # $TMPDIR_ADEY/nvim_ade_server.sock with one JSON-RPC object per line
 ```
 
+## Managed installs (unix)
+
+With the `"install"` feature the service installs, updates and removes the npm
+adapters into the same `<data>/ade/agents` store the Lua manager uses. The
+layout, lock and lease files are normative byte formats shared with
+`lua/ade/manager/`; PROTOCOL.md section 16 is the contract. npm runs in its own
+process group, its output is capped and its end is kept, it can be cancelled
+(SIGTERM, five seconds, SIGKILL) and a timeout kills the group. Installs run
+outside the connection's request order, so `ping` and `agent.list` keep being
+answered while npm runs; closing the connection does not stop the job.
+
+`agent.attach` accepts `launch = {root, agent, installId}` for a managed
+release: the service writes a lease first, re-checks that the release is still
+installed, then spawns; the lease heartbeat continues until the instance exits
+and is removed with it.
+
+On Windows the feature is absent and the front end keeps its Lua
+implementation.
+
 ## Nightly features
 
 The crate uses `#![feature(...)]` for a few small things instead of adding
@@ -214,7 +237,7 @@ dependencies. Each one is listed here as required:
 
 ## Known limitations
 
-Behaviour that is deliberately not implemented in api_version 2 (or not
+Behaviour that is deliberately not implemented in api_version 3 (or not
 verified on every platform). None of these break the contract in
 [`PROTOCOL.md`](PROTOCOL.md); they are the places where the front end or a later
 stage has to compensate.

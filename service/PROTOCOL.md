@@ -618,9 +618,12 @@ front ends can show the agent as busy)
 `phase` for a run: `checking`, then `installing` (with `version`, `dir`), then
 `output` events (one npm output `line` each, carriage returns stripped, empty
 lines skipped; the first is the command line `"$ npm install ..."`), then
-`verifying`, then `committed`. For an uninstall: `removed`. Either can end
-with `failed` (with `message`) or `cancelled`. The final event is sent before
-the response.
+`verifying`, then `committed`. For an uninstall: `removed`.
+
+Every `install.run` and `install.uninstall` that passed validation ends with
+exactly one terminal event: `committed`, `unchanged`, `removed`, `failed`
+(with `message`) or `cancelled`, sent before the response — including early
+refusals (`-32042`, `-32044`, `-32045`, `changed`).
 
 **Cancellation**: the front end sends `$/cancel_request {id}` where `id` is the
 JSON-RPC id of its own running `install.resolve`, `install.run` or

@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""A stand-in for npm used by service/tests/install.rs.
+
+The service invokes `<npm> view ...` and `<npm> install ...` with a complete
+environment. `FAKE_NPM_MODE` chooses the behaviour; `FAKE_NPM_LOG` appends one
+JSON line per invocation so tests can assert argv and order.
+"""
+
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+
+
+def record(args):
+    path = os.environ.get("FAKE_NPM_LOG")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"args": args, "cwd": os.getcwd()}) + "\n")
+
+
+def fail_exit(default=7):
+    try:
+        return int(os.environ.get("FAKE_NPM_EXIT", str(default)))
+    except ValueError:
+        return default
+
+
+def main():
+    args = sys.argv[1:]
+    mode = os.environ.get("FAKE_NPM_MODE", "ok")
+    record(args)
+
+    if args and args[0] == "view":
+        if mode == "view-fail":
+            print("this is not json")
+            return 0
+        if mode == "view-empty":
+            return 0
+        print(json.dumps(os.environ.get("FAKE_NPM_VIEW_VERSION", "1.2.3")))
+        return 0
+
+    if not args or args[0] != "install":
+        return 0
+
+    manifest = json.loads(pathlib.Path("package.json").read_text(encoding="utf-8"))
+    package, version = next(iter(manifest["dependencies"].items()))
+
+    if mode == "noisy-fail":
+        for index in range(400):
+            print("noisy line %d %s" % (index, "x" * 140), flush=True)
+        print("npm ERR! simulated failure", file=sys.stderr, flush=True)
+        return fail_exit()
+
+    if mode == "fail":
+        print("npm ERR! simulated failure", flush=True)
+        print("npm ERR! detail", file=sys.stderr, flush=True)
+        return fail_exit()
+
+    if mode in ("slow", "hang", "daemon"):
+        print("installing slowly", flush=True)
+        if mode == "daemon":
+            # A grandchild that ignores SIGTERM and inherits the stdout pipe: the
+            # leader dies on SIGTERM, but only a group SIGKILL removes it.
+            code = (
+                "import os, signal, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "open(os.environ['FAKE_NPM_CHILD_READY'], 'w').write('ready'); "
+                "time.sleep(120)"
+            )
+        else:
+            code = "import time; time.sleep(120)"
+        child = subprocess.Popen([sys.executable, "-c", code])
+        pid_path = os.environ.get("FAKE_NPM_CHILD_PID")
+        if pid_path:
+            with open(pid_path, "w", encoding="utf-8") as handle:
+                handle.write(str(child.pid))
+        time.sleep(float(os.environ.get("FAKE_NPM_SLEEP", "30")))
+        child.kill()
+        child.wait()
+
+    package_dir = pathlib.Path("node_modules") / package
+    package_dir.mkdir(parents=True, exist_ok=True)
+    print("added 1 package", flush=True)
+    installed = version
+    if mode == "wrong-version":
+        installed = "9.9.9"
+    (package_dir / "package.json").write_text(
+        json.dumps({"name": package, "version": installed}), encoding="utf-8"
+    )
+    if mode != "missing-entry":
+        entry = os.environ.get("FAKE_NPM_ENTRY", "dist/index.js")
+        entry_path = package_dir / entry
+        entry_path.parent.mkdir(parents=True, exist_ok=True)
+        entry_path.write_text("// fake entrypoint\n", encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

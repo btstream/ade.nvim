@@ -14,6 +14,8 @@
 #![feature(random)]
 
 pub mod hub;
+#[cfg(unix)]
+pub mod install;
 pub mod output;
 pub mod paths;
 pub mod protocol;
@@ -27,7 +29,7 @@ pub mod transport;
 
 /// Version of the front-end (Neovim) <-> service protocol. Integer, bumped on
 /// incompatible changes.
-pub const API_VERSION: i64 = 2;
+pub const API_VERSION: i64 = 3;
 
 /// Version of this service, taken from `Cargo.toml`.
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");

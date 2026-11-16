@@ -31,9 +31,15 @@ pub const FRAME_REJECTED: i64 = -32025;
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Features advertised by `hello` with the event log disabled.
+#[cfg(unix)]
+pub const FEATURES: &[&str] = &["tunnel", "install"];
+#[cfg(not(unix))]
 pub const FEATURES: &[&str] = &["tunnel"];
 /// Features advertised by `hello` with the event log enabled (PROTOCOL.md 3.1
 /// and 10).
+#[cfg(unix)]
+pub const FEATURES_WITH_LOG: &[&str] = &["tunnel", "install", "log"];
+#[cfg(not(unix))]
 pub const FEATURES_WITH_LOG: &[&str] = &["tunnel", "log"];
 
 /// The `features` list for one service configuration.
@@ -445,7 +451,7 @@ mod tests {
         let response = reply(&local);
         assert_eq!(response["result"]["server_version"], crate::SERVER_VERSION);
         assert_eq!(response["result"]["api_version"], crate::API_VERSION);
-        assert_eq!(response["result"]["features"], json!(["tunnel", "log"]));
+        assert_eq!(response["result"]["features"], json!(features(true)));
         assert_eq!(handshake.client(), Some("ade.nvim"));
     }
 
@@ -458,7 +464,7 @@ mod tests {
             &hello_frame(TOKEN, crate::API_VERSION),
             false,
         );
-        assert_eq!(reply(&local)["result"]["features"], json!(["tunnel"]));
+        assert_eq!(reply(&local)["result"]["features"], json!(features(false)));
 
         let mut handshake = Handshake::default();
         let local = handle_local_with(
@@ -467,10 +473,7 @@ mod tests {
             &hello_frame(TOKEN, crate::API_VERSION),
             true,
         );
-        assert_eq!(
-            reply(&local)["result"]["features"],
-            json!(["tunnel", "log"])
-        );
+        assert_eq!(reply(&local)["result"]["features"], json!(features(true)));
     }
 
     #[test]

@@ -1,0 +1,11 @@
+{
+  "agent": "pi",
+  "status": "installed",
+  "installId": "rel-1",
+  "package": "@geohar/pi-acp",
+  "version": "0.4.0",
+  "entry": "node_modules/@geohar/pi-acp/dist/index.js",
+  "live_lock": true,
+  "lease_install_id": "rel-1",
+  "in_use": true
+}

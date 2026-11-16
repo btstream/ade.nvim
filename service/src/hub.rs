@@ -14,6 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch, Notify};
 
+#[cfg(unix)]
+use crate::install::{self, lock as install_lock, store as install_store, Progress};
 use crate::protocol::{
     failure, success, FRAME_REJECTED, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
     NOT_ATTACHED, SPAWN_FAILED, UNKNOWN_INSTANCE,
@@ -164,6 +166,31 @@ pub enum Command {
 pub enum HubEvent {
     /// Whether any instance has a running turn or a pending request.
     Busy(bool),
+}
+
+/// Install work running outside the hub loop (16.3).
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum InstallEvent {
+    /// One `install.progress` payload, sent to every connection.
+    Progress(Value),
+    /// The request finished; the hub answers its connection.
+    Done {
+        key: String,
+        conn: u64,
+        request_id: Value,
+        outcome: install::Outcome,
+    },
+}
+
+/// One install job (or resolve request) the hub can cancel.
+#[cfg(unix)]
+struct InstallJob {
+    agent: String,
+    /// `"run"`, `"uninstall"` or `"resolve"`.
+    kind: &'static str,
+    cancel: watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<()>,
 }
 
 /// A `tunnel.recv` held back while a replay is read (PROTOCOL.md 12).
@@ -317,6 +344,9 @@ struct Instance {
     /// True once `agent.stop` was accepted; the instance stays reachable by id
     /// until the process exits (PROTOCOL.md 3.4).
     stopping: bool,
+    /// Lease for a managed release this instance runs (PROTOCOL.md 16.4).
+    #[cfg(unix)]
+    _lease: Option<install_lock::ReleaseLease>,
 }
 
 impl Instance {
@@ -362,6 +392,16 @@ pub struct Hub {
     /// Set when the shutdown sequence completed; the run loop then ends.
     finished: bool,
     load_results: mpsc::UnboundedReceiver<LoadResult>,
+    /// Install jobs and the requests they answer (PROTOCOL.md 16.3).
+    #[cfg(unix)]
+    install_jobs: HashMap<String, InstallJob>,
+    /// `(connection, serialized request id)` -> job key, for `$/cancel_request`.
+    #[cfg(unix)]
+    install_requests: HashMap<(u64, String), String>,
+    #[cfg(unix)]
+    install_events: mpsc::UnboundedReceiver<InstallEvent>,
+    #[cfg(unix)]
+    install_event_sender: mpsc::UnboundedSender<InstallEvent>,
 }
 
 impl Hub {
@@ -374,6 +414,8 @@ impl Hub {
     ) -> Self {
         let (runtime_sender, runtime_events) = mpsc::unbounded_channel::<RuntimeEvent>();
         let (load_sender, load_results) = mpsc::unbounded_channel::<LoadResult>();
+        #[cfg(unix)]
+        let (install_event_sender, install_events) = mpsc::unbounded_channel::<InstallEvent>();
         Self {
             commands,
             runtime_events,
@@ -397,6 +439,14 @@ impl Hub {
             pending_stop_replies: HashMap::new(),
             command_sender,
             finished: false,
+            #[cfg(unix)]
+            install_jobs: HashMap::new(),
+            #[cfg(unix)]
+            install_requests: HashMap::new(),
+            #[cfg(unix)]
+            install_events,
+            #[cfg(unix)]
+            install_event_sender,
         }
     }
 
@@ -417,7 +467,16 @@ impl Hub {
 
     /// Run until every sender is gone (the server drops them on exit).
     pub async fn run(mut self) {
+        // Held locally so the select arm borrows this receiver, not `self`
+        // (handler bodies take `&mut self`).
+        #[cfg(unix)]
+        let mut install_events =
+            std::mem::replace(&mut self.install_events, mpsc::unbounded_channel().1);
         loop {
+            #[cfg(unix)]
+            let install_event = install_events.recv();
+            #[cfg(not(unix))]
+            let install_event = std::future::pending::<Option<()>>();
             tokio::select! {
                 command = self.commands.recv() => {
                     let Some(command) = command else { return };
@@ -435,6 +494,17 @@ impl Hub {
                     self.finish_load(result);
                     self.update_busy();
                 }
+                event = install_event => {
+                    #[cfg(unix)]
+                    match event {
+                        Some(event) => self.handle_install_event(event),
+                        None => return,
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = event;
+                    }
+                }
             }
         }
     }
@@ -449,6 +519,10 @@ impl Hub {
                 // A connection that vanishes during a replay must not leave a
                 // gate behind (nothing would ever release it).
                 self.gates.remove(&conn);
+                // The install job keeps running (16.3); only its cancel handle
+                // disappears with the connection.
+                #[cfg(unix)]
+                self.install_requests.retain(|(owner, _), _| *owner != conn);
                 self.detach_everywhere(conn);
             }
             Command::Frame { conn, frame } => {
@@ -503,7 +577,23 @@ impl Hub {
                 let timeouts = self.timeouts;
                 let stopped = Arc::clone(&self.stopped);
                 let sender = self.command_sender.clone();
+                #[cfg(unix)]
+                let mut jobs: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+                #[cfg(unix)]
+                {
+                    for (_, job) in self.install_jobs.drain() {
+                        let _ = job.cancel.send(true);
+                        jobs.push(job.handle);
+                    }
+                    self.install_requests.clear();
+                }
                 tokio::spawn(async move {
+                    // `shutdown` cancels every job first and waits for it, so a
+                    // half-built release is gone before the process exits (16.3).
+                    #[cfg(unix)]
+                    for job in jobs {
+                        let _ = job.await;
+                    }
                     Self::stop_all(instances, timeouts).await;
                     stopped.notify_waiters();
                     // The hub holds a sender of its own, so it must be told to
@@ -633,9 +723,351 @@ impl Hub {
             }
             "tunnel.send" => self.tunnel_send(conn, &params),
             _ => {
+                #[cfg(unix)]
+                if self.handle_install(conn, &method, &params, &id, is_request) {
+                    return;
+                }
                 if is_request {
                     self.send_to(conn, &failure(&id, METHOD_NOT_FOUND, "method not found"));
                 }
+            }
+        }
+    }
+
+    /// Dispatch the `install.*` methods and cancellation (16.3).
+    ///
+    /// Returns whether the method belonged to this module. The work itself runs
+    /// in a task; the hub keeps answering other requests meanwhile.
+    #[cfg(unix)]
+    fn handle_install(
+        &mut self,
+        conn: u64,
+        method: &str,
+        params: &Value,
+        id: &Value,
+        is_request: bool,
+    ) -> bool {
+        match method {
+            "install.resolve" => {
+                if is_request {
+                    self.start_resolve(conn, id, params);
+                }
+                true
+            }
+            "install.run" => {
+                if is_request {
+                    self.start_run(conn, id, params);
+                }
+                true
+            }
+            "install.uninstall" => {
+                if is_request {
+                    self.start_uninstall(conn, id, params);
+                }
+                true
+            }
+            "$/cancel_request" => {
+                if !is_request {
+                    self.cancel_install(conn, params);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(unix)]
+    fn install_error(&self, conn: u64, id: &Value, code: i64, message: &str) {
+        self.send_to(conn, &failure(id, code, message));
+    }
+
+    /// Broadcast one terminal `install.progress` for an early refusal.
+    #[cfg(unix)]
+    fn install_terminal(
+        &self,
+        job: &str,
+        agent: &str,
+        action: &str,
+        phase: &str,
+        message: Option<&str>,
+    ) {
+        let mut params = json!({
+            "job": job,
+            "agent": agent,
+            "action": action,
+            "phase": phase,
+        });
+        if let Some(message) = message {
+            params["message"] = json!(message);
+        }
+        self.broadcast_progress(params);
+    }
+
+    #[cfg(unix)]
+    fn broadcast_progress(&self, params: Value) {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": "install.progress",
+            "params": params,
+        });
+        let conns: Vec<u64> = self.conns.keys().copied().collect();
+        for conn in conns {
+            self.send_to(conn, &frame);
+        }
+    }
+
+    #[cfg(unix)]
+    fn start_run(&mut self, conn: u64, id: &Value, params: &Value) {
+        let request = match parse_run(params) {
+            Ok(request) => request,
+            Err(message) => {
+                self.install_error(conn, id, install::INVALID_PARAMETER, &message);
+                return;
+            }
+        };
+        let key = format!("job:{}", request.job);
+        if self.install_jobs.contains_key(&key) {
+            self.install_error(
+                conn,
+                id,
+                install::INVALID_PARAMETER,
+                &format!("job {} is already running", request.job),
+            );
+            return;
+        }
+        if let Some(reason) = self.install_conflict(&request.agent) {
+            self.install_terminal(
+                &request.job,
+                &request.agent,
+                &request.action,
+                "failed",
+                Some(&reason),
+            );
+            self.send_to(
+                conn,
+                &install_failure(
+                    id,
+                    install::BUSY,
+                    &reason,
+                    Some(json!({ "reason": reason })),
+                ),
+            );
+            return;
+        }
+        let (sender, receiver) = watch::channel(false);
+        let progress_sender = self.install_event_sender.clone();
+        let progress = Progress::new(move |value| {
+            let _ = progress_sender.send(InstallEvent::Progress(value));
+        });
+        let events = self.install_event_sender.clone();
+        let task_key = key.clone();
+        let request_id = id.clone();
+        let agent = request.agent.clone();
+        let terminal_job = request.job.clone();
+        let terminal_agent = request.agent.clone();
+        let terminal_action = request.action.clone();
+        let handle = tokio::spawn(async move {
+            let inner =
+                tokio::spawn(async move { install::run(request, receiver, &progress).await });
+            let outcome = match inner.await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let message = format!("the install job failed: {error}");
+                    let _ = events.send(InstallEvent::Progress(json!({
+                        "job": terminal_job,
+                        "agent": terminal_agent,
+                        "action": terminal_action,
+                        "phase": "failed",
+                        "message": message,
+                    })));
+                    install::Outcome::failed(install::INSTALL_FAILED, message)
+                }
+            };
+            let _ = events.send(InstallEvent::Done {
+                key: task_key,
+                conn,
+                request_id,
+                outcome,
+            });
+        });
+        self.install_jobs.insert(
+            key.clone(),
+            InstallJob {
+                agent,
+                kind: "run",
+                cancel: sender,
+                handle,
+            },
+        );
+        self.install_requests.insert((conn, id_key(id)), key);
+        self.update_busy();
+    }
+
+    #[cfg(unix)]
+    fn start_uninstall(&mut self, conn: u64, id: &Value, params: &Value) {
+        let request = match parse_uninstall(params) {
+            Ok(request) => request,
+            Err(message) => {
+                self.install_error(conn, id, install::INVALID_PARAMETER, &message);
+                return;
+            }
+        };
+        let key = format!("job:{}", request.job);
+        if self.install_jobs.contains_key(&key) {
+            self.install_error(
+                conn,
+                id,
+                install::INVALID_PARAMETER,
+                &format!("job {} is already running", request.job),
+            );
+            return;
+        }
+        if let Some(reason) = self.install_conflict(&request.agent) {
+            self.install_terminal(
+                &request.job,
+                &request.agent,
+                "uninstall",
+                "failed",
+                Some(&reason),
+            );
+            self.send_to(
+                conn,
+                &install_failure(
+                    id,
+                    install::BUSY,
+                    &reason,
+                    Some(json!({ "reason": reason })),
+                ),
+            );
+            return;
+        }
+        let (sender, receiver) = watch::channel(false);
+        let progress_sender = self.install_event_sender.clone();
+        let progress = Progress::new(move |value| {
+            let _ = progress_sender.send(InstallEvent::Progress(value));
+        });
+        let events = self.install_event_sender.clone();
+        let task_key = key.clone();
+        let request_id = id.clone();
+        let agent = request.agent.clone();
+        let terminal_job = request.job.clone();
+        let terminal_agent = request.agent.clone();
+        let handle = tokio::spawn(async move {
+            let inner =
+                tokio::spawn(async move { install::uninstall(request, receiver, &progress).await });
+            let outcome = match inner.await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let message = format!("the uninstall job failed: {error}");
+                    let _ = events.send(InstallEvent::Progress(json!({
+                        "job": terminal_job,
+                        "agent": terminal_agent,
+                        "action": "uninstall",
+                        "phase": "failed",
+                        "message": message,
+                    })));
+                    install::Outcome::failed(install::INSTALL_FAILED, message)
+                }
+            };
+            let _ = events.send(InstallEvent::Done {
+                key: task_key,
+                conn,
+                request_id,
+                outcome,
+            });
+        });
+        self.install_jobs.insert(
+            key.clone(),
+            InstallJob {
+                agent,
+                kind: "uninstall",
+                cancel: sender,
+                handle,
+            },
+        );
+        self.install_requests.insert((conn, id_key(id)), key);
+        self.update_busy();
+    }
+
+    #[cfg(unix)]
+    fn start_resolve(&mut self, conn: u64, id: &Value, params: &Value) {
+        let request = match parse_resolve(params) {
+            Ok(request) => request,
+            Err(message) => {
+                self.install_error(conn, id, install::INVALID_PARAMETER, &message);
+                return;
+            }
+        };
+        let key = format!("resolve:{conn}:{}", id_key(id));
+        let (sender, receiver) = watch::channel(false);
+        let events = self.install_event_sender.clone();
+        let task_key = key.clone();
+        let request_id = id.clone();
+        let handle = tokio::spawn(async move {
+            let inner = tokio::spawn(async move { install::resolve(request, receiver).await });
+            let outcome = match inner.await {
+                Ok(outcome) => outcome,
+                Err(error) => install::Outcome::failed(
+                    install::INSTALL_FAILED,
+                    format!("the resolve job failed: {error}"),
+                ),
+            };
+            let _ = events.send(InstallEvent::Done {
+                key: task_key,
+                conn,
+                request_id,
+                outcome,
+            });
+        });
+        self.install_jobs.insert(
+            key.clone(),
+            InstallJob {
+                agent: String::new(),
+                kind: "resolve",
+                cancel: sender,
+                handle,
+            },
+        );
+        self.install_requests.insert((conn, id_key(id)), key);
+        self.update_busy();
+    }
+
+    #[cfg(unix)]
+    fn install_conflict(&self, agent: &str) -> Option<String> {
+        self.install_jobs
+            .values()
+            .find(|job| job.kind != "resolve" && job.agent == agent)
+            .map(|_| format!("another operation is already running for {agent}"))
+    }
+
+    #[cfg(unix)]
+    fn cancel_install(&mut self, conn: u64, params: &Value) {
+        let Some(target) = params.get("id") else {
+            return;
+        };
+        let Some(key) = self.install_requests.get(&(conn, id_key(target))) else {
+            return;
+        };
+        if let Some(job) = self.install_jobs.get(key) {
+            let _ = job.cancel.send(true);
+        }
+    }
+
+    #[cfg(unix)]
+    fn handle_install_event(&mut self, event: InstallEvent) {
+        match event {
+            InstallEvent::Progress(params) => self.broadcast_progress(params),
+            InstallEvent::Done {
+                key,
+                conn,
+                request_id,
+                outcome,
+            } => {
+                self.install_jobs.remove(&key);
+                self.install_requests.retain(|_, value| value != &key);
+                let response = install_outcome(&request_id, outcome);
+                self.send_to(conn, &response);
+                self.update_busy();
             }
         }
     }
@@ -647,15 +1079,25 @@ impl Hub {
         let key = InstanceKey::from_params(params)
             .map_err(|error| (INVALID_PARAMS, error.to_string()))?;
         let env = parse_env(params).map_err(|error| (INVALID_PARAMS, error.to_string()))?;
+        #[cfg(unix)]
+        let launch = match params.get("launch") {
+            Some(value) if !value.is_null() => Some(
+                install::parse_launch(value)
+                    .map_err(|error| (install::INVALID_PARAMETER, error))?,
+            ),
+            _ => None,
+        };
 
         let identity = key.identity();
         let (instance_id, created) = match self.by_identity.get(&identity).cloned() {
             Some(instance_id) => (instance_id, false),
-            None => (
-                self.spawn(identity, key, env)
-                    .map_err(|error| (SPAWN_FAILED, error))?,
-                true,
-            ),
+            None => {
+                #[cfg(unix)]
+                let spawned = self.spawn(identity, key, env, launch);
+                #[cfg(not(unix))]
+                let spawned = self.spawn(identity, key, env);
+                (spawned.map_err(|error| (SPAWN_FAILED, error))?, true)
+            }
         };
 
         let Some(instance) = self.instances.get_mut(&instance_id) else {
@@ -706,9 +1148,55 @@ impl Hub {
         identity: String,
         key: InstanceKey,
         env: Option<Vec<(String, String)>>,
+        #[cfg(unix)] launch: Option<install::Launch>,
     ) -> Result<String, String> {
         self.next_instance += 1;
         let instance_id = format!("i{}", self.next_instance);
+        // 16.4: write the lease first, then re-check the release, then spawn.
+        // The lease is dropped (and its file removed) on every failure below.
+        #[cfg(unix)]
+        let lease = match &launch {
+            Some(launch) => {
+                // A missing root means the release cannot exist; do not create
+                // the managed tree from a launch (16.4).
+                if !launch.root.is_dir() {
+                    return Err(format!(
+                        "the managed root {} does not exist",
+                        launch.root.display()
+                    ));
+                }
+                Some(
+                    install_lock::lease(
+                        &launch.root,
+                        &launch.agent,
+                        &launch.install_id,
+                        &instance_id,
+                    )
+                    .map_err(|error| format!("cannot lease the managed release: {error}"))?,
+                )
+            }
+            None => None,
+        };
+        #[cfg(unix)]
+        if let Some(launch) = &launch {
+            let installed = match install_store::state(&launch.root, &launch.agent).status {
+                install_store::Status::Installed {
+                    install_id,
+                    version,
+                    ..
+                } if install_id == launch.install_id => version,
+                _ => {
+                    return Err(format!(
+                        "{} is not installed at {}",
+                        launch.agent, launch.install_id
+                    ))
+                }
+            };
+            eprintln!(
+                "nvim_ade_server: leasing {} {} for {instance_id}",
+                launch.agent, installed
+            );
+        }
         let spec = SpawnSpec {
             command: key.command.clone(),
             args: key.args.clone(),
@@ -744,6 +1232,8 @@ impl Hub {
                 relay: Relay::with_log(key.capabilities, self.event_log),
                 attached: Vec::new(),
                 stopping: false,
+                #[cfg(unix)]
+                _lease: lease,
             },
         );
         Ok(instance_id)
@@ -1375,11 +1865,23 @@ impl Hub {
     fn update_busy(&mut self) {
         let busy = self.instances.values().any(|instance| {
             instance.relay.turns_running() > 0 || instance.relay.pending_requests() > 0
-        });
+        }) || self.install_busy();
         if busy != self.busy {
             self.busy = busy;
             let _ = self.events.send(HubEvent::Busy(busy));
         }
+    }
+
+    /// Whether an install job runs: the idle exit waits for it (PROTOCOL.md 8,
+    /// 16.3).
+    #[cfg(unix)]
+    fn install_busy(&self) -> bool {
+        !self.install_jobs.is_empty()
+    }
+
+    #[cfg(not(unix))]
+    fn install_busy(&self) -> bool {
+        false
     }
 
     fn send_to(&self, conn: u64, value: &Value) {
@@ -1501,6 +2003,201 @@ fn stop_reply(info: &crate::runtime::ExitInfo) -> Value {
 
 fn request_id(frame: &Value) -> Value {
     frame.get("id").cloned().unwrap_or(Value::Null)
+}
+
+/// Canonical key for one JSON-RPC id, used to find a running request.
+#[cfg(unix)]
+fn id_key(id: &Value) -> String {
+    serde_json::to_string(id).unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn required_string(params: &Value, field: &str) -> Result<String, String> {
+    params
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("{field} must be a string"))
+}
+
+#[cfg(unix)]
+fn install_env(params: &Value) -> Result<Vec<(String, String)>, String> {
+    let object = params
+        .get("env")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "env is required".to_string())?;
+    let mut env = Vec::with_capacity(object.len());
+    for (key, value) in object {
+        if key.is_empty() || key.contains('=') || key.contains('\0') {
+            return Err(format!("env key {key:?} is not a valid environment name"));
+        }
+        let value = value
+            .as_str()
+            .ok_or_else(|| format!("env.{key} must be a string"))?;
+        if value.contains('\0') {
+            return Err(format!("env.{key} must not contain NUL"));
+        }
+        env.push((key.clone(), value.to_string()));
+    }
+    Ok(env)
+}
+
+#[cfg(unix)]
+fn positive_option(params: &Value, field: &str) -> Result<Option<u64>, String> {
+    match params.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|value| *value > 0)
+            .map(Some)
+            .ok_or_else(|| format!("{field} must be a positive integer")),
+    }
+}
+
+#[cfg(unix)]
+fn parse_run(params: &Value) -> Result<install::RunRequest, String> {
+    let job = required_string(params, "job")?;
+    if !install::valid_job(&job) {
+        return Err("job is invalid".to_string());
+    }
+    let root = install::check_root(&required_string(params, "root")?)?;
+    let agent = required_string(params, "agent")?;
+    if !install::valid_agent_id(&agent) {
+        return Err("agent is invalid".to_string());
+    }
+    let action = required_string(params, "action")?;
+    if action != "install" && action != "update" {
+        return Err("action must be install or update".to_string());
+    }
+    let package = required_string(params, "package")?;
+    if !install::valid_package(&package) {
+        return Err("package is invalid".to_string());
+    }
+    let entry = required_string(params, "entry")?;
+    if !install::valid_relative(&entry) {
+        return Err("entry is invalid".to_string());
+    }
+    let bin = match params.get("bin") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let bin = value
+                .as_str()
+                .filter(|value| install::valid_relative(value))
+                .ok_or_else(|| "bin is invalid".to_string())?;
+            Some(bin.to_string())
+        }
+    };
+    let version = required_string(params, "version")?;
+    if !install::valid_version(&version) {
+        return Err("version must be an exact release".to_string());
+    }
+    let npm = required_string(params, "npm")?;
+    if !install::npm::valid_npm(&npm) {
+        return Err("npm must be a single executable".to_string());
+    }
+    let env = install_env(params)?;
+    let timeout = positive_option(params, "timeout_ms")?
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(install::DEFAULT_RUN_TIMEOUT_MS));
+    let max_log_bytes = positive_option(params, "max_log_bytes")?
+        .map(|value| value as usize)
+        .unwrap_or(install::DEFAULT_MAX_LOG_BYTES);
+    Ok(install::RunRequest {
+        job,
+        root,
+        agent,
+        action,
+        package,
+        entry,
+        bin,
+        version,
+        npm,
+        env,
+        timeout,
+        max_log_bytes,
+    })
+}
+
+#[cfg(unix)]
+fn parse_uninstall(params: &Value) -> Result<install::UninstallRequest, String> {
+    let job = required_string(params, "job")?;
+    if !install::valid_job(&job) {
+        return Err("job is invalid".to_string());
+    }
+    let root = install::check_root(&required_string(params, "root")?)?;
+    let agent = required_string(params, "agent")?;
+    if !install::valid_agent_id(&agent) {
+        return Err("agent is invalid".to_string());
+    }
+    let install_id = match params.get("installId") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let id = value
+                .as_str()
+                .filter(|value| install::valid_install_id(value))
+                .ok_or_else(|| "installId is invalid".to_string())?;
+            Some(id.to_string())
+        }
+    };
+    Ok(install::UninstallRequest {
+        job,
+        root,
+        agent,
+        install_id,
+    })
+}
+
+#[cfg(unix)]
+fn parse_resolve(params: &Value) -> Result<install::ResolveRequest, String> {
+    let root = install::check_root(&required_string(params, "root")?)?;
+    let package = required_string(params, "package")?;
+    if !install::valid_package(&package) {
+        return Err("package is invalid".to_string());
+    }
+    let spec = required_string(params, "spec")?;
+    if !install::valid_spec(&spec) {
+        return Err("spec must be an exact version or latest".to_string());
+    }
+    let npm = required_string(params, "npm")?;
+    if !install::npm::valid_npm(&npm) {
+        return Err("npm must be a single executable".to_string());
+    }
+    let env = install_env(params)?;
+    let timeout = positive_option(params, "timeout_ms")?
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(install::DEFAULT_RESOLVE_TIMEOUT_MS));
+    Ok(install::ResolveRequest {
+        root,
+        package,
+        spec,
+        npm,
+        env,
+        timeout,
+    })
+}
+
+#[cfg(unix)]
+fn install_failure(id: &Value, code: i64, message: &str, data: Option<Value>) -> Value {
+    let mut frame = failure(id, code, message);
+    if let Some(data) = data {
+        if let Some(error) = frame.get_mut("error").and_then(Value::as_object_mut) {
+            error.insert("data".to_string(), data);
+        }
+    }
+    frame
+}
+
+#[cfg(unix)]
+fn install_outcome(id: &Value, outcome: install::Outcome) -> Value {
+    match outcome {
+        install::Outcome::Success(value) => success(id, value),
+        install::Outcome::Failed {
+            code,
+            message,
+            data,
+        } => install_failure(id, code, &message, data),
+        install::Outcome::Cancelled => install_failure(id, install::CANCELLED, "cancelled", None),
+    }
 }
 
 fn instance_summary(instance: &Instance, log_bytes: u64) -> Value {
@@ -1707,6 +2404,8 @@ mod tests {
             relay: Relay::new(json!({})),
             attached: vec![1, 2],
             stopping: false,
+            #[cfg(unix)]
+            _lease: None,
         };
         let summary = instance_summary(&instance, 0);
         for field in [
