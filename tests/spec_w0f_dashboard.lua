@@ -622,6 +622,54 @@ return function(t)
       end, 5000, "the closed dashboard")
       t.truthy(#vim.api.nvim_list_wins() >= 1, "a normal window remains")
       t.truthy(vim.api.nvim_win_is_valid(vim.api.nvim_get_current_win()))
+      for _, win in ipairs(vim.api.nvim_list_wins()) do
+        t.falsy(vim.bo[vim.api.nvim_win_get_buf(win)].filetype:find("ade_team_", 1, true))
+      end
+      for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+        t.falsy(vim.bo[buf].filetype:find("ade_team_", 1, true))
+      end
+    end)
+
+    t.it("direct close and mounted last-tab close leave no dashboard buffers", function()
+      wide(t)
+      local service, dir = start_service(t, "last-tab-mounted")
+      setup(t, "last-tab-mounted", service, dir)
+      controller.connect()
+      wait_ready()
+      controller.open()
+      local chat = controller.state().view.chat
+      wait(function()
+        return chat.win ~= nil
+      end, 5000, "the main chat")
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      local leader_line
+      for index, id in pairs(UI.tab.ids.members or {}) do
+        if id == "t1|leader" then
+          leader_line = index
+        end
+      end
+      t.truthy(leader_line)
+      vim.api.nvim_set_current_win(UI.tab.panels.members)
+      vim.api.nvim_win_set_cursor(UI.tab.panels.members, { leader_line, 0 })
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+      wait(function()
+        return UI._impl.leader_mounted ~= nil
+      end, 5000, "the leader mount")
+      vim.cmd("tabonly")
+      UI._impl:close()
+      wait(function()
+        return UI.tab == nil
+      end, 5000, "the closed dashboard")
+      t.truthy(chat.win ~= nil and vim.api.nvim_win_is_valid(chat.win))
+      t.eq(chat.buf, vim.api.nvim_win_get_buf(chat.win))
+      for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+        t.falsy(vim.bo[buf].filetype:find("ade_team_", 1, true))
+      end
     end)
 
     t.it("closing one dashboard pane closes the whole dashboard", function()

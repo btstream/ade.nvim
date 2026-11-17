@@ -2,9 +2,7 @@
 local members = require("ade.ui.team.members")
 local M = {}
 
-local function one_line(text)
-  return (tostring(text or ""):gsub("[\r\n]+", " "))
-end
+local one_line = require("ade.ui.team.text").one_line
 
 local function time_text(ms)
   local value = tonumber(ms)

@@ -12,9 +12,7 @@ local ICONS = {
   request = "⚑",
 }
 
-local function one_line(text)
-  return (tostring(text or ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", ""))
-end
+local one_line = require("ade.ui.team.text").one_line
 
 local function numeric_id(id)
   return tonumber(tostring(id):match("(%d+)$")) or 0

@@ -3,9 +3,7 @@ local Board = require("ade.ui.team.board")
 
 local M = {}
 
-local function one_line(text)
-  return Board.one_line(text)
-end
+local one_line = require("ade.ui.team.text").one_line
 
 local ICONS = {
   working = "●",
@@ -71,14 +69,14 @@ function M.entry_lines(entry, limits, width)
   local parts = {
     string.format(
       "%-10s %s %s %s",
-      tostring(entry.name),
+      one_line(entry.name),
       M.state_icon(entry),
       M.state_label(entry),
       M.duration(entry.state_since)
     ),
     string.format(
       "task %s · 回合 %s/%s/%s",
-      task,
+      one_line(task),
       tostring(turns.task or 0),
       tostring(max_task),
       tostring(max_total)

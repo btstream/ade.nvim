@@ -1,9 +1,7 @@
 -- Board layout for the unified team dashboard (W0f, PROTOCOL.md 19.2).
 local M = {}
 
-local function one_line(text)
-  return (tostring(text or ""):gsub("[\r\n]+", " "))
-end
+local one_line = require("ade.ui.team.text").one_line
 
 local function display_width(text)
   local ok, width = pcall(vim.fn.strdisplaywidth, tostring(text or ""))

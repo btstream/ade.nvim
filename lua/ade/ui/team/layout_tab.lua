@@ -324,6 +324,7 @@ function Tab:close()
   local original = self.original_tab
   local tab = self.tab
   local panels = self.panels
+  self.ade_buffers = self.buffers
   self.closing = true
   self.tab, self.original_tab = nil, nil
   self.panels, self.buffers, self.meta, self.ids = {}, {}, {}, {}
@@ -334,25 +335,55 @@ function Tab:close()
     self.group = nil
   end
   local tabs = vim.api.nvim_list_tabpages()
+  local buffers = self.ade_buffers or {}
   if tab and vim.api.nvim_tabpage_is_valid(tab) then
     if #tabs > 1 then
       pcall(vim.cmd, "tabclose " .. vim.api.nvim_tabpage_get_number(tab))
     else
-      -- Closing the last tab is E784. Close only the dashboard windows and
-      -- keep one normal window alive.
-      local current = vim.api.nvim_get_current_win()
-      for _, win in ipairs(panels) do
-        if win and vim.api.nvim_win_is_valid(win) and #vim.api.nvim_list_wins() > 1 then
-          pcall(vim.api.nvim_win_close, win, true)
+      -- Closing the last tab is E784. Keep the normal chat/input windows when
+      -- they are present (leader mounted or panel restored); otherwise keep one
+      -- normal empty window. Dashboard windows are all closed.
+      local wins = vim.api.nvim_tabpage_list_wins(tab)
+      local keep = {}
+      for _, win in ipairs(wins) do
+        if vim.api.nvim_win_is_valid(win) then
+          local buf = vim.api.nvim_win_get_buf(win)
+          local ft = vim.bo[buf].filetype
+          if ft == "ade_chat" or ft == "ade_input" then
+            keep[win] = true
+          end
         end
       end
-      if current and vim.api.nvim_win_is_valid(current) then
-        pcall(vim.api.nvim_set_current_win, current)
+      local kept = 0
+      for _, win in ipairs(wins) do
+        if vim.api.nvim_win_is_valid(win) then
+          if keep[win] then
+            kept = kept + 1
+          else
+            pcall(vim.api.nvim_win_close, win, true)
+          end
+        end
+      end
+      if kept == 0 then
+        local remaining = vim.api.nvim_tabpage_list_wins(tab)
+        local win = remaining[1]
+        if win and vim.api.nvim_win_is_valid(win) then
+          local buf = vim.api.nvim_create_buf(true, false)
+          require("ade.layout").set_window_buffer(win, buf)
+          pcall(vim.api.nvim_set_current_win, win)
+        else
+          vim.cmd("enew")
+        end
       end
     end
   end
   if original and vim.api.nvim_tabpage_is_valid(original) then
     pcall(vim.api.nvim_set_current_tabpage, original)
+  end
+  for _, buf in pairs(buffers) do
+    if buf and vim.api.nvim_buf_is_valid(buf) then
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    end
   end
   if #vim.api.nvim_list_wins() == 0 then
     vim.cmd("enew")

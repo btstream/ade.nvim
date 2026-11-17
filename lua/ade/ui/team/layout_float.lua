@@ -182,6 +182,9 @@ function Panel:lines()
         ),
         team.id .. "|" .. tostring(entry.name)
       )
+      if entry.activity and type(entry.activity.text) == "string" and entry.activity.text ~= "" then
+        add("      ↳ " .. (entry.activity.text:gsub("[\r\n]+", " ")):sub(1, 100), nil)
+      end
     end
     -- Follow `team.inbox` (the notification stream), not the inbox snapshot
     -- that happened to be inside the last `team.changed`.
