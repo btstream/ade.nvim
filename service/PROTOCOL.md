@@ -1606,7 +1606,9 @@ for an archived card or a card without history; `-32060` for an unknown card.
   resolved one, sorted by name, with the configuration of the running team for
   `cwd` if there is one, else the stored configuration (18.2). Stored
   workflows whose templates no longer exist are still listed.
-- Stored workflows live in the service's database (19.9) and outlive teams.
+- At most 100 stored workflows per scope and project; `workflow_save` of a
+  new name beyond that is `-32061` (`"too many workflows"`).
+- Stored workflows live in the service's database (19.11) and outlive teams.
 
 ### 19.6 Spawning with a model and a role
 
@@ -1655,9 +1657,12 @@ in creation order; `-32063` when none is open.
 4. When the board has no `workflow_name`, the service writes `workflow_name`,
    `workflow` (the text), and `columns` (when the workflow has them and the
    board has none) as one write with `updated_by: "service"`.
-5. The leader receives one `notice` from `human` whose body is: the base
-   instructions (19.8), the workflow's name and text, the members (name,
-   template, agent, model, role), the columns, and `task` if given.
+5. The leader receives one `notice` from `human` whose body is, in this
+   order: the base instructions (19.8), `task` if given, the workflow's name,
+   summary and text, the members (name, template, agent, model, role), and the
+   columns. A body over 64 KiB is cut in the member roles and the text, never
+   in the instructions or `task`. If the notice cannot be sent the result is an
+   error (the members already started stay).
 
 The front end uses `team.start` for `:Ade team start` and for the automatic
 start of `teams.enabled` (instead of calling `team.spawn` per worker).
