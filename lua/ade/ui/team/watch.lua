@@ -99,9 +99,24 @@ end
 
 ---A display-only session for Chat: the source blocks grouped into turns.
 ---@param source table
+local function block_signature(block)
+  return table.concat({
+    tostring(block.id or ""),
+    tostring(block.kind or ""),
+    tostring(block.status or ""),
+    tostring(#(block.text or "")),
+    tostring(block._revision or ""),
+    tostring(block.title or ""),
+    tostring(#(type(block.raw_input) == "table" and vim.inspect(block.raw_input) or "")),
+    block.archived and "1" or "0",
+    block.toggled and "t" or "-",
+  }, "\1")
+end
+
 ---@param opts {collapsed: table<integer, boolean>, expanded: table<string, boolean>,
 ---  turn_times: table<string, {started_at: integer|nil, ended_at: integer|nil}>|nil,
----  supplement: table|nil, version: integer|nil, on_toggle: (fun(block: table)|nil)}
+---  supplement: table|nil, version: integer|nil, on_toggle: (fun(block: table)|nil),
+---  cache: table|nil, use_cache: boolean|nil}
 ---@return table session
 local function build_session(source, opts)
   local display = {
@@ -187,83 +202,112 @@ local function build_session(source, opts)
   for turn_index, group in ipairs(groups) do
     local prompt = group.prompt
     local bus = parse_bus(prompt.text or "")
-    local origin = (type(prompt.bus) == "table" and prompt.bus.origin) or (bus and "bus") or "prompt"
-    local timing = opts.turn_times and opts.turn_times[prompt.id] or nil
-    local started = timing and timing.started_at or nil
-    local ended = timing and timing.ended_at or nil
-    local label
-    if bus then
-      label = string.format(
-        "%s → %s%s",
-        bus.from or "?",
-        bus.kind or "message",
-        bus.task and bus.task ~= "" and (" " .. bus.task) or ""
-      )
-    else
-      label = origin
+    local body_sig = {}
+    for body_index, block in ipairs(group.body) do
+      body_sig[body_index] = block_signature(block)
     end
-    local tools = 0
-    for _, block in ipairs(group.body) do
-      if block.kind == "tool" then
-        tools = tools + 1
+    local timing_sig = opts.turn_times and opts.turn_times[prompt.id] or {}
+    local signature = table.concat({
+      tostring(turn_index),
+      tostring(prompt.id),
+      tostring(#(prompt.text or "")),
+      tostring(timing_sig.started_at or ""),
+      tostring(timing_sig.ended_at or ""),
+      opts.collapsed[turn_index] and "1" or "0",
+      opts.expanded["watch-role-" .. turn_index] and "1" or "0",
+      table.concat(body_sig, "\2"),
+    }, "\1")
+    if opts.cache and opts.use_cache and opts.cache[prompt.id] and opts.cache[prompt.id].sig == signature then
+      for _, cached in ipairs(opts.cache[prompt.id].blocks) do
+        blocks[#blocks + 1] = cached
       end
-    end
-    local parts = { string.format("── turn %d", turn_index), origin, label }
-    if tools > 0 then
-      parts[#parts + 1] = string.format("%d tool%s", tools, tools == 1 and "" or "s")
-    end
-    if started and ended and ended >= started then
-      parts[#parts + 1] = string.format("%.1fs", (ended - started) / 1000)
-    end
-    local collapsed = opts.collapsed[turn_index] == true
-    if collapsed then
-      parts[#parts + 1] = "(collapsed)"
-    end
-    add({
-      kind = "system",
-      text = table.concat(parts, " · "),
-      id = "watch-turn-" .. turn_index,
-    })
+    else
+      local turn_start = #blocks + 1
+      local origin = (type(prompt.bus) == "table" and prompt.bus.origin) or (bus and "bus") or "prompt"
+      local timing = opts.turn_times and opts.turn_times[prompt.id] or nil
+      local started = timing and timing.started_at or nil
+      local ended = timing and timing.ended_at or nil
+      local label
+      if bus then
+        label = string.format(
+          "%s → %s%s",
+          bus.from or "?",
+          bus.kind or "message",
+          bus.task and bus.task ~= "" and (" " .. bus.task) or ""
+        )
+      else
+        label = origin
+      end
+      local tools = 0
+      for _, block in ipairs(group.body) do
+        if block.kind == "tool" then
+          tools = tools + 1
+        end
+      end
+      local parts = { string.format("── turn %d", turn_index), origin, label }
+      if tools > 0 then
+        parts[#parts + 1] = string.format("%d tool%s", tools, tools == 1 and "" or "s")
+      end
+      if started and ended and ended >= started then
+        parts[#parts + 1] = string.format("%.1fs", (ended - started) / 1000)
+      end
+      local collapsed = opts.collapsed[turn_index] == true
+      if collapsed then
+        parts[#parts + 1] = "(collapsed)"
+      end
+      add({
+        kind = "system",
+        text = table.concat(parts, " · "),
+        id = "watch-turn-" .. turn_index,
+      })
 
-    local text = prompt.text or ""
-    -- The role card belongs to the first bus prompt only.
-    local role, message = nil, text
-    if turn_index == 1 and bus then
-      role, message = split_role(text)
-    end
-    if role then
-      local role_id = "watch-role-" .. turn_index
+      local text = prompt.text or ""
+      -- The role card belongs to the first bus prompt only.
+      local role, message = nil, text
+      if turn_index == 1 and bus then
+        role, message = split_role(text)
+      end
+      if role then
+        local role_id = "watch-role-" .. turn_index
+        add({
+          kind = "message",
+          title = "role card",
+          text = role,
+          collapsible = true,
+          expanded = opts.expanded[role_id] == true,
+          display_text = "",
+          id = role_id,
+        }, role_id)
+      end
+      local bus_message = parse_bus(message)
       add({
         kind = "message",
-        title = "role card",
-        text = role,
-        collapsible = true,
-        expanded = opts.expanded[role_id] == true,
-        display_text = "",
-        id = role_id,
-      }, role_id)
-    end
-    local bus_message = parse_bus(message)
-    add({
-      kind = "message",
-      title = label,
-      text = bus_message and bus_message.body or unescape(message),
-      id = "watch-prompt-" .. turn_index,
-    }, "watch-prompt-" .. turn_index)
+        title = label,
+        text = bus_message and bus_message.body or unescape(message),
+        id = "watch-prompt-" .. turn_index,
+      }, "watch-prompt-" .. turn_index)
 
-    if not collapsed then
-      for body_index, block in ipairs(group.body) do
-        local message_block = bus_tool(block)
-        if message_block then
-          add({
-            kind = "message",
-            title = message_block.title ~= "" and message_block.title or "bus",
-            text = message_block.text,
-            id = "watch-bus-" .. tostring(block.id or body_index) .. "-" .. body_index,
-          }, "watch-bus-" .. tostring(block.id or body_index) .. "-" .. body_index)
-        else
-          add(block)
+      if not collapsed then
+        for body_index, block in ipairs(group.body) do
+          local message_block = bus_tool(block)
+          if message_block then
+            add({
+              kind = "message",
+              title = message_block.title ~= "" and message_block.title or "bus",
+              text = message_block.text,
+              id = "watch-bus-" .. tostring(block.id or body_index) .. "-" .. body_index,
+            }, "watch-bus-" .. tostring(block.id or body_index) .. "-" .. body_index)
+          else
+            add(block)
+          end
         end
+      end
+      if opts.cache then
+        local cached = {}
+        for index = turn_start, #blocks do
+          cached[#cached + 1] = blocks[index]
+        end
+        opts.cache[prompt.id] = { sig = signature, blocks = cached }
       end
     end
   end
@@ -295,9 +339,16 @@ function M.new(opts)
     collapsed = {},
     expanded = {},
     turn_times = {},
+    turn_cache = nil,
     generation = 0,
     closing = false,
     leader_active = false,
+    host_win = nil,
+    keep_focus = false,
+    request_id = 0,
+    watch_inflight = false,
+    pending_target = nil,
+    active_target = nil,
   }, Watch)
 end
 
@@ -358,17 +409,29 @@ function Watch:ensure_window()
   vim.bo[self.buf].bufhidden = "wipe"
   vim.bo[self.buf].filetype = "ade_team_watch"
   vim.bo[self.buf].modifiable = false
-  pcall(vim.api.nvim_buf_set_name, self.buf, string.format("ade://watch/%s/%s", tostring(self.team_id), tostring(self.participant)))
+  pcall(
+    vim.api.nvim_buf_set_name,
+    self.buf,
+    string.format("ade://watch/%s/%s", tostring(self.team_id), tostring(self.participant))
+  )
 
   local previous = vim.api.nvim_get_current_win()
-  vim.cmd("botright vsplit")
-  self.win = vim.api.nvim_get_current_win()
-  vim.api.nvim_win_set_buf(self.win, self.buf)
+  local host = self.host_win
+  if host and vim.api.nvim_win_is_valid(host) then
+    self.win = host
+    vim.api.nvim_win_set_buf(self.win, self.buf)
+  else
+    vim.cmd("botright vsplit")
+    self.win = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(self.win, self.buf)
+  end
   self.chat.win = self.win
   vim.wo[self.win].number = false
   vim.wo[self.win].wrap = true
   self:map_keys()
-  vim.api.nvim_set_current_win(previous)
+  if not self.keep_focus then
+    vim.api.nvim_set_current_win(previous)
+  end
 
   local buf = self.buf
   local group = vim.api.nvim_create_augroup("AdeTeamWatch" .. tostring(buf), { clear = true })
@@ -433,9 +496,7 @@ function Watch:map_keys()
     end,
     on_help = function()
       if self.notify then
-        self.notify(
-          "watch: za/<Tab>/<CR> toggle · [[ / ]] previous/next turn · G follow · q close"
-        )
+        self.notify("watch: za/<Tab>/<CR> toggle · [[ / ]] previous/next turn · G follow · q close")
       end
     end,
   })
@@ -481,12 +542,28 @@ end
 function Watch:on_watch(session, title)
   if not session then
     self:destroy_view()
+    -- A queued `on_watch(nil)` belongs to the watch a switch just released;
+    -- keep the new target visible while its request is in flight.
+    if self.watch_inflight or self.pending_target then
+      self:changed()
+      return
+    end
     self.participant, self.team_id, self.title = nil, nil, nil
     self.leader_active = false
     self:changed()
     return
   end
+  if self.pending_target then
+    -- A newer target is queued; the old replay's frames must not reopen it.
+    return
+  end
   local watching = self.team.watching
+  if watching and not self.participant then
+    self.participant, self.team_id = watching.participant, watching.team_id
+  end
+  if not (watching and self.participant and watching.participant == self.participant) then
+    return
+  end
   if watching then
     self.team_id = watching.team_id or self.team_id
     self.participant = watching.participant or self.participant
@@ -506,6 +583,7 @@ function Watch:on_watch(session, title)
     self.collapsed = {}
     self.expanded = {}
     self.turn_times = (watching and watching.turn_times) or {}
+    self.turn_cache = {}
     self:ensure_window()
   elseif watching and watching.turn_times then
     self.turn_times = watching.turn_times
@@ -539,6 +617,8 @@ function Watch:refresh(first)
     turn_times = self.turn_times,
     supplement = self.supplement,
     version = self.display and self.display.version or 0,
+    cache = self.turn_cache,
+    use_cache = self.turn_cache ~= nil,
     on_toggle = function(block)
       self.expanded[block.id] = block.expanded
     end,
@@ -630,6 +710,8 @@ end
 ---Chat or input area.
 ---@return boolean
 function Watch:focus_leader()
+  self.request_id = self.request_id + 1
+  self.pending_target = nil
   self:destroy_view()
   self.team:unwatch()
   self.participant, self.team_id, self.title = "leader", nil, nil
@@ -670,27 +752,22 @@ end
 
 ---@param team string
 ---@param participant string
-function Watch:switch(team, participant)
-  self:destroy_view()
-  -- Release any current watch first: unwatch is idempotent and may clear the
-  -- participant through `on_watch(nil)`, so the new target is set afterwards.
+---Start the latest queued target. The service allows one replay per connection,
+---so a request made while another replay is still in flight is only remembered;
+---intermediate targets are skipped.
+function Watch:pump_watch()
+  local target = self.pending_target
+  if not target or self.watch_inflight then
+    return
+  end
+  self.pending_target = nil
+  self.active_target = target
   self.team:unwatch()
-  self.participant, self.team_id, self.title = participant, team, nil
-  self.replayed = true
-  self.supplement, self.supplement_for = nil, nil
-  self.collapsed = {}
-  self.expanded = {}
-  self.turn_times = {}
-  self.leader_active = false
-  self.generation = self.generation + 1
-  local generation = self.generation
-  self.team:watch(team, participant, true, function(ok, value)
-    if generation ~= self.generation then
-      -- The request was superseded or the view was closed while it was in
-      -- flight; its late failure must not clear the current watch.
-      return
-    end
-    if not ok then
+  self.watch_inflight = true
+  local request = self.request_id
+  self.team:watch(target.team, target.participant, true, function(ok, value)
+    self.watch_inflight = false
+    if request == self.request_id and not ok then
       if self.notify then
         local message = type(value) == "table" and (value.message or value.code) or tostring(value)
         self.notify(tostring(message))
@@ -698,11 +775,41 @@ function Watch:switch(team, participant)
       self.participant, self.team_id = nil, nil
       self:changed()
     end
+    if self.pending_target then
+      self:pump_watch()
+    end
   end)
+end
+
+function Watch:switch(team, participant)
+  self.request_id = self.request_id + 1
+  local target = { team = team, participant = participant }
+  if
+    self.watch_inflight
+    and self.active_target
+    and self.active_target.team == team
+    and self.active_target.participant == participant
+  then
+    -- A→B→A while A's replay is still running: keep A and skip B.
+    self.pending_target = nil
+  else
+    self.pending_target = target
+  end
+  self:destroy_view()
+  self.participant, self.team_id, self.title = participant, team, nil
+  self.replayed = true
+  self.supplement, self.supplement_for = nil, nil
+  self.collapsed = {}
+  self.expanded = {}
+  self.turn_times = {}
+  self.leader_active = false
+  self:pump_watch()
   self:changed()
 end
 
 function Watch:close()
+  self.request_id = self.request_id + 1
+  self.pending_target = nil
   self:destroy_view()
   -- Idempotent and unconditional: a switch may have cleared `participant`
   -- through `on_watch(nil)` while its new request is still in flight.

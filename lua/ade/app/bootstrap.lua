@@ -358,7 +358,7 @@ function M.build(ctx, opts, action)
     notify = notify,
     on_changed = function()
       if S.view.team_ui then
-        S.view.team_ui:refresh()
+        S.view.team_ui:schedule_refresh()
       end
       ctx.refresh_chrome()
     end,
@@ -866,6 +866,14 @@ function M.build(ctx, opts, action)
     -- second Chat or a second input area.
     leader_chat = function()
       return S.view.chat
+    end,
+    leader_input = function()
+      return S.view.input
+    end,
+    start_team = function(workflow)
+      if S.view.team_commands then
+        S.view.team_commands:start(workflow)
+      end
     end,
   })
 

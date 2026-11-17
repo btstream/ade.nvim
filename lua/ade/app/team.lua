@@ -600,6 +600,14 @@ function Team:refresh(cb)
       for _, team in ipairs(value.teams) do
         teams[team.id] = team
       end
+      -- Keep open items announced by `team.inbox` when an older snapshot does
+      -- not list them yet: the list and the notification stream race.
+      local announced = {}
+      for id, item in pairs(self.inbox) do
+        if item.state == "open" then
+          announced[id] = item
+        end
+      end
       self.teams = teams
       self.inbox = {}
       for id, team in pairs(teams) do
@@ -611,6 +619,11 @@ function Team:refresh(cb)
             -- service; do not notify them again after a reconnect.
             self.notified[item.id] = item.team
           end
+        end
+      end
+      for id, item in pairs(announced) do
+        if self.inbox[id] == nil and teams[item.team] ~= nil then
+          self.inbox[id] = item
         end
       end
       self:changed()
@@ -1132,7 +1145,9 @@ end
 function Team:turn_finished(payload)
   payload = type(payload) == "table" and payload or {}
   local session = self:session_of(payload.sessionId or payload.session_id)
-  if session and session.bus_turn and M.apply_turn_finished(session, payload) then
+  if session and session.bus_turn then
+    -- Even without a bus block to attach the finish to, the turn still ended.
+    M.apply_turn_finished(session, payload)
     self:changed()
     self:_watch_rendered()
     if self.on_turn then

@@ -551,10 +551,14 @@ return function(t)
       end, 5000, "the bus turn to finish")
     end)
 
-    t.it("shows the panel only with teams and renders participants and inbox", function()
+    t.it("shows the empty dashboard without teams and renders participants and inbox", function()
       local service, dir = start_service(t, "panel")
       setup(t, "panel", service, dir)
-      t.eq(false, controller.open_team(), "no team means no panel")
+      -- W0f: the dashboard is also the empty state (workflow list).
+      t.eq(true, controller.open_team(), "the empty dashboard opens")
+      local ui = state().view.team_ui
+      t.truthy(ui.buf, "the empty dashboard buffer")
+      ui:close()
       local ready = false
       controller.connect()
       wait_ready()
@@ -811,6 +815,64 @@ return function(t)
       t.match("replay line", text())
       t.match("live line", text())
       m:unwatch()
+    end)
+
+    t.it("reports a failure of the newly selected watch", function()
+      local service, dir = start_service(t, "watch-b-fail", {
+        team_watch = { instance = "inst-w", sessionId = "sess-w", delays = { 10, 30 }, errors = { "", "B failed" } },
+      })
+      setup(t, "watch-b-fail", service, dir)
+      local notices = capture(t)
+      controller.connect()
+      wait_ready()
+      local ui = state().view.team_ui
+      ui.watcher:open("t1", "w1")
+      wait(function()
+        return ui.watch_buf ~= nil and team().watching and team().watching.participant == "w1"
+      end, 5000, "the first watch")
+      ui.watcher:open("t1", "w2")
+      wait(function()
+        for _, note in ipairs(notices) do
+          if note.message:find("B failed", 1, true) then
+            return true
+          end
+        end
+        return false
+      end, 5000, "the B failure notice")
+      t.eq(nil, team().watching)
+      t.eq(nil, ui.watch_buf)
+    end)
+
+    t.it("serializes replays and skips intermediate watch targets", function()
+      local service, dir = start_service(t, "watch-serialize", {
+        team_watch = {
+          instance = "inst-w",
+          sessionId = "sess-w",
+          delays = { 150, 10, 10 },
+          replay = { { sessionUpdate = "agent_message_chunk", content = { type = "text", text = "replay" } } },
+        },
+      })
+      setup(t, "watch-serialize", service, dir)
+      local notices = capture(t)
+      controller.connect()
+      wait_ready()
+      local ui = state().view.team_ui
+      ui.watcher:open("t1", "w1")
+      vim.wait(20)
+      ui.watcher:open("t1", "w2")
+      ui.watcher:open("t1", "w3")
+      wait(function()
+        return team().watching and team().watching.participant == "w3" and ui.watch_buf ~= nil
+      end, 5000, "the last target")
+      vim.wait(200)
+      t.eq("w3", team().watching.participant, "the intermediate target is skipped")
+      for _, note in ipairs(notices) do
+        t.falsy(
+          note.message:find("replay is already in progress", 1, true),
+          "the front end must not ask for two replays at once"
+        )
+      end
+      ui.watcher:close()
     end)
 
     t.it("does not inject anything when no template is configured", function()
@@ -1665,7 +1727,7 @@ return function(t)
               sessionUpdate = "user_message_chunk",
               content = {
                 type = "text",
-                text = "You are w1, a worker in team t1.\n<team_role>\nROLE TEXT</team_role><bus from=\"leader\" kind=\"task\" task=\"T4\">do work</bus>",
+                text = 'You are w1, a worker in team t1.\n<team_role>\nROLE TEXT</team_role><bus from="leader" kind="task" task="T4">do work</bus>',
               },
             },
             {
@@ -1808,8 +1870,7 @@ return function(t)
       vim.api.nvim_win_set_cursor(ui.watch_win, { heading2, 0 })
       vim.api.nvim_feedkeys("za", "x", false)
       wait(function()
-        return not text():find("(collapsed)", 1, true)
-          and text():find("补 reconnect 的回归测试", 1, true)
+        return not text():find("(collapsed)", 1, true) and text():find("补 reconnect 的回归测试", 1, true)
       end, 5000, "the expanded turn")
 
       -- ]] / [[ go to the next / previous turn heading.
@@ -1907,7 +1968,7 @@ return function(t)
           unwatches = unwatches + 1
         end
       end
-      t.eq(1, unwatches, "the late A response must not unwind the new A watch")
+      t.eq(0, unwatches, "A stays current, so B is skipped and A is never unwatched")
       ui.watcher:close()
     end)
 
@@ -1928,9 +1989,7 @@ return function(t)
       vim.wait(20)
       ui.watcher:open("t1", "w2")
       wait(function()
-        return team().watching
-          and team().watching.participant == "w2"
-          and ui.watch_buf ~= nil
+        return team().watching and team().watching.participant == "w2" and ui.watch_buf ~= nil
       end, 5000, "the current w2 watch")
       vim.wait(200)
       t.eq("w2", team().watching.participant)
@@ -2016,8 +2075,7 @@ return function(t)
 
       ui.watcher:open("t1", "w2")
       wait(function()
-        return ui.watch_buf ~= nil and ui.watch_buf ~= first and team().watching
-          and team().watching.participant == "w2"
+        return ui.watch_buf ~= nil and ui.watch_buf ~= first and team().watching and team().watching.participant == "w2"
       end, 5000, "the other worker")
       local found = false
       for _, call in ipairs(service.team_unwatch or {}) do
@@ -2211,8 +2269,13 @@ return function(t)
         local t1 = team():team("t1")
         return t1 ~= nil and t1.stale == true
       end, 5000, "the stale team")
-      local text = table.concat(vim.api.nvim_buf_get_lines(ui.buf, 0, -1, false), "\n")
-      t.match("connection lost", text)
+      local function panel_text()
+        return table.concat(vim.api.nvim_buf_get_lines(ui.buf, 0, -1, false), "\n")
+      end
+      wait(function()
+        return panel_text():find("connection lost", 1, true)
+      end, 5000, "the stale panel notice")
+      t.match("connection lost", panel_text())
 
       local sends = #service.team_sends
       local leader_line

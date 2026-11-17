@@ -112,6 +112,7 @@ function M.new(opts)
     team_answers = {},
     team_watch = opts.team_watch,
     team_read = opts.team_read,
+    replay_inflight = false,
     team_leader_error = opts.team_leader_error,
     team_bind_error = opts.team_bind_error,
     team_participants = opts.team_participants,
@@ -678,13 +679,16 @@ function Server:dispatch(message, client)
       return error_reply(ident, -32064, "suspended")
     end
     local watch = self.team_watch or {}
+    if params.replay and self.replay_inflight then
+      return error_reply(ident, -32061, "a replay is already in progress")
+    end
     local delay = 5
     if type(watch.delays) == "table" then
       delay = table.remove(watch.delays, 1) or delay
     end
     if type(watch.errors) == "table" then
       local message = table.remove(watch.errors, 1)
-      if message then
+      if message and message ~= "" then
         vim.defer_fn(function()
           self:send(client, { jsonrpc = "2.0", id = ident, error = { code = -32060, message = message } })
         end, delay)
@@ -719,7 +723,11 @@ function Server:dispatch(message, client)
         },
       })
     end
+    if params.replay then
+      self.replay_inflight = true
+    end
     vim.defer_fn(function()
+      self.replay_inflight = false
       self:send(client, {
         jsonrpc = "2.0",
         id = ident,
