@@ -81,6 +81,9 @@ function Panel:lines()
   end
   for _, team in ipairs(rows) do
     add(string.format(" %s  %s  [%s]", team.id, tostring(team.cwd), tostring(team.state)), "team:" .. tostring(team.id))
+    if team.stale then
+      add("   connection lost; waiting for the service to reconnect", nil)
+    end
     if team.state == "suspended" then
       local at = tonumber(team.suspended_at)
       local when = at and os.date("%Y-%m-%d %H:%M:%S", math.floor(at / 1000)) or "unknown"
@@ -238,7 +241,7 @@ function Panel:open()
   end)
   self:map("R", function()
     local team = self:team_of_current()
-    if team and not self:refuse_suspended(team) then
+    if team and not self:refuse_stale(team) then
       self.team:reset_limits(team, function(ok, value)
         self:report(ok, value)
         self.team:refresh()
@@ -247,7 +250,12 @@ function Panel:open()
   end)
   self:map("w", function()
     local kind, team, name = self:current()
-    if kind == "participant" and name ~= "leader" and not self:refuse_suspended(team) then
+    if
+      kind == "participant"
+      and name ~= "leader"
+      and not self:refuse_stale(team)
+      and not self:refuse_suspended(team)
+    then
       self.team:watch(team, name, true, function(ok, value)
         self:report(ok, value)
       end)
@@ -261,7 +269,7 @@ function Panel:open()
   end)
   self:map("x", function()
     local team = self:team_of_current()
-    if not team then
+    if not team or self:refuse_stale(team) then
       return
     end
     local function close_it()
@@ -394,6 +402,17 @@ function Panel:refuse_suspended(team)
   return false
 end
 
+---Refuse an operation on a team whose connection is gone.
+---@param team string|nil
+---@return boolean
+function Panel:refuse_stale(team)
+  if team and self.team:is_stale(team) then
+    self:notify("the connection to the service is lost; wait for it to reconnect")
+    return true
+  end
+  return false
+end
+
 ---Pause/resume/cancel the participant under the cursor.
 ---@param body string
 function Panel:control_current(body)
@@ -401,7 +420,7 @@ function Panel:control_current(body)
   if kind ~= "participant" or name == nil then
     return
   end
-  if name == "human" or self:refuse_suspended(team) then
+  if name == "human" or self:refuse_stale(team) or self:refuse_suspended(team) then
     return
   end
   self.team:control(team, name, body, function(ok, value)
@@ -413,7 +432,7 @@ end
 ---Send one message to the participant under the cursor.
 function Panel:send_current()
   local kind, team, name = self:current()
-  if kind ~= "participant" or name == nil or name == "human" then
+  if kind ~= "participant" or name == nil or name == "human" or self:refuse_stale(team) then
     return
   end
   -- `message` is an inbox kind, not a bus kind (PROTOCOL.md 18.1); control
@@ -451,7 +470,7 @@ function Panel:spawn_current()
     self:notify("put the cursor on a team or participant first")
     return
   end
-  if self:refuse_suspended(team) then
+  if self:refuse_stale(team) or self:refuse_suspended(team) then
     return
   end
   local cfg = self.config and self.config() or {}
@@ -522,6 +541,9 @@ function Panel:remove_worktree_current()
   if kind ~= "participant" or name == nil or name == "leader" or name == "human" then
     return
   end
+  if self:refuse_stale(team) then
+    return
+  end
   local entry = self.team:participant(team, name)
   if not entry then
     return
@@ -564,6 +586,9 @@ function Panel:answer_current()
   end
   local item = self.team:item(item_id)
   if not item or item.state ~= "open" then
+    return
+  end
+  if self:refuse_stale(item.team) then
     return
   end
   if

@@ -786,13 +786,12 @@ worktree（分支 `ade/<team>-<stamp>/<name>`），worker 在其中工作。work
 服务重启后，未关闭的团队会变成 **挂起（suspended）**：面板照常显示，标注挂起时间和
 “等待 leader 会话恢复”。恢复 leader 的会话后，团队自动继续，worker 会按存储的
 session/worktree 恢复；恢复 notice 会作为 bus 回合出现在 leader 的聊天里。挂起期间
-可以 `m` 发消息（排队）、回答 question/message/limit、`D` 删除已退出 worker 的
-worktree、`x` 关闭团队；`w`/`s`/`p`/`r`/`c` 会提示团队已挂起。leader 注入不再被挂起
+可以 `m` 发消息（排队）、回答 question/message/limit、`R` 重置回合上限、
+`D` 删除已退出 worker 的 worktree、`x` 关闭团队；`w`/`s`/`p`/`r`/`c` 会提示团队已挂起。leader 注入不再被挂起
 团队阻塞；如果恢复出的会话不是存储的 leader，团队保持挂起并提示按 `x` 关闭。
 
 团队的消息正文、队列和最近 200 条消息会写入服务的事件日志数据库（权限 0600）；
-未提交/未跟踪内容不会进入 worktree。挂起超过 7 天的团队会在服务启动时或每小时检查中
-删除，worktree 与分支仍然保留。
+挂起超过 7 天的团队会在服务启动时或每小时检查中删除，worktree 与分支仍然保留。
 
 服务版本与插件不同且服务里还有团队时，**不会自动重启服务**（挂起的团队除外）：
 先提示“有更新、稍后重启”，需要时用 `:Ade service stop` 手动重启。

@@ -113,8 +113,14 @@ function M.new(opts)
     team_spawn_error = opts.team_spawn_error,
     team_remove_result = opts.team_remove_result,
     team_remove_error = opts.team_remove_error,
+    team_configure_error = opts.team_configure_error,
+    team_configure_delay = opts.team_configure_delay,
+    team_list_error = opts.team_list_error,
+    team_resume_on_config = opts.team_resume_on_config == true,
+    pending_resume = nil,
     team_spawns = {},
     team_removals = {},
+    team_resets = {},
     team_counter = 0,
     policy_responses = 0,
     policy_before_prompt = nil,
@@ -234,6 +240,23 @@ local function error_reply(ident, code, message, data)
   return { jsonrpc = "2.0", id = ident, error = payload }
 end
 
+---Resume a stored team and publish the state/instance changes.
+---@param team table
+---@param instance string
+---@param session_id string
+function Server:resume_team(team, instance, session_id)
+  team.state = "active"
+  team.suspended_at = nil
+  team.leader = { instance = instance, sessionId = session_id }
+  self:broadcast("team.changed", { team = vim.deepcopy(team) })
+  for _, participant in ipairs(team.participants or {}) do
+    if participant.state ~= "exited" then
+      participant.instance = "inst-resumed-" .. tostring(participant.name)
+    end
+    self:broadcast("team.changed", { team = vim.deepcopy(team) })
+  end
+end
+
 ---@param message table
 ---@param client table
 ---@return table|nil
@@ -327,9 +350,22 @@ function Server:dispatch(message, client)
 
   if method == "team.configure" then
     self.team_configures[#self.team_configures + 1] = vim.deepcopy(params)
+    if self.team_configure_error then
+      return error_reply(
+        ident,
+        self.team_configure_error.code,
+        self.team_configure_error.message,
+        self.team_configure_error.data
+      )
+    end
     vim.defer_fn(function()
+      if self.pending_resume and self.pending_resume.team.cwd == params.cwd then
+        local pending = self.pending_resume
+        self.pending_resume = nil
+        self:resume_team(pending.team, pending.instance, pending.sessionId)
+      end
       self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
-    end, 5)
+    end, self.team_configure_delay or 5)
     return nil
   end
   if method == "team.leader_server" then
@@ -371,17 +407,16 @@ function Server:dispatch(message, client)
       if existing.leader and existing.leader.sessionId ~= params.sessionId then
         return error_reply(ident, -32061, "session does not match the suspended team")
       end
-      -- PROTOCOL.md 18.15: resume atomically at the matching bind, then one
-      -- team.changed for the team and one per participant as instances appear.
-      existing.state = "active"
-      existing.suspended_at = nil
-      existing.leader = { instance = params.instance, sessionId = params.sessionId }
-      self:emit(client, "team.changed", { team = vim.deepcopy(existing) })
-      for _, participant in ipairs(existing.participants or {}) do
-        if participant.state ~= "exited" then
-          participant.instance = "inst-resumed"
-        end
-        self:emit(client, "team.changed", { team = vim.deepcopy(existing) })
+      if self.team_resume_on_config then
+        -- Simulate a bind that arrives before the configuration: the team
+        -- stays suspended until team.configure reaches the service.
+        self.pending_resume = {
+          team = existing,
+          instance = params.instance,
+          sessionId = params.sessionId,
+        }
+      else
+        self:resume_team(existing, params.instance, params.sessionId)
       end
       vim.defer_fn(function()
         self:send(client, { jsonrpc = "2.0", id = ident, result = { team = self.teams.t1 } })
@@ -409,6 +444,9 @@ function Server:dispatch(message, client)
     return nil
   end
   if method == "team.list" then
+    if self.team_list_error then
+      return error_reply(ident, self.team_list_error.code, self.team_list_error.message)
+    end
     local teams = {}
     for _, team in pairs(self.teams) do
       if team.state ~= "closed" then
@@ -445,6 +483,10 @@ function Server:dispatch(message, client)
   end
   if method == "team.spawn" then
     self.team_spawns[#self.team_spawns + 1] = vim.deepcopy(params)
+    local spawn_team = self.teams[params.team]
+    if spawn_team and spawn_team.state == "suspended" then
+      return error_reply(ident, -32064, "suspended")
+    end
     if self.team_spawn_error then
       return error_reply(ident, self.team_spawn_error.code, self.team_spawn_error.message, self.team_spawn_error.data)
     end
@@ -506,6 +548,10 @@ function Server:dispatch(message, client)
     return nil
   end
   if method == "team.watch" then
+    local watched_team = self.teams[params.team]
+    if watched_team and watched_team.state == "suspended" then
+      return error_reply(ident, -32064, "suspended")
+    end
     local watch = self.team_watch or {}
     local instance = watch.instance or "inst-1"
     local session_id = watch.sessionId or "watch-session"
@@ -561,6 +607,7 @@ function Server:dispatch(message, client)
     return nil
   end
   if method == "team.reset_limits" then
+    self.team_resets[#self.team_resets + 1] = vim.deepcopy(params)
     vim.defer_fn(function()
       self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
     end, 5)

@@ -139,9 +139,20 @@ end
 
 ---Forget connection-scoped state; stored teams stay visible.
 function Team:forget_connection()
+  for _, team in pairs(self.teams) do
+    if type(team) == "table" then
+      team.stale = true
+    end
+  end
   self.leader_pending = {}
   self.leader_inflight = {}
+  local inflight_config = self.configure_inflight
   self.configure_inflight = {}
+  for _, entry in pairs(inflight_config or {}) do
+    for _, waiter in ipairs(entry.waiters or {}) do
+      pcall(waiter, false, "the service connection was lost")
+    end
+  end
   self.sent_config = {}
   self.bound = {}
   self.blocked = {}
@@ -176,6 +187,14 @@ end
 function Team:is_suspended(team_id)
   local team = type(team_id) == "string" and self.teams[team_id] or nil
   return type(team) == "table" and team.state == "suspended"
+end
+
+---Whether a team is from before a lost connection and not refreshed yet.
+---@param team_id string|nil
+---@return boolean
+function Team:is_stale(team_id)
+  local team = type(team_id) == "string" and self.teams[team_id] or nil
+  return type(team) == "table" and team.stale == true
 end
 
 ---The absolute directory the service creates worker worktrees under (18.12).
@@ -285,22 +304,30 @@ function Team:configure(cwd, force, cb)
     cb(true, nil)
     return
   end
-  if self.configure_inflight[cwd] then
-    -- Two hello listeners can race; one request is enough.
-    cb(true, nil)
+  local inflight = self.configure_inflight[cwd]
+  if inflight then
+    -- Two hello listeners can race, and a leader_server arriving while the
+    -- hello configure is still in flight must wait for its real result: it
+    -- cannot inject a leader before the service has the configuration.
+    inflight.waiters[#inflight.waiters + 1] = cb
     return
   end
-  self.configure_inflight[cwd] = true
+  inflight = { waiters = { cb } }
+  self.configure_inflight[cwd] = inflight
   local raw = self:_raw()
   raw:request_tracked("team.configure", { cwd = cwd, config = config }, function(ok, value)
-    self.configure_inflight[cwd] = nil
+    if self.configure_inflight[cwd] == inflight then
+      self.configure_inflight[cwd] = nil
+    end
     if ok then
       self.sent_config[cwd] = config
     else
       local message = type(value) == "table" and (value.message or value.code) or tostring(value)
       log.warn("team.configure failed: %s", tostring(message))
     end
-    cb(ok, value)
+    for _, waiter in ipairs(inflight.waiters) do
+      pcall(waiter, ok, value)
+    end
   end)
 end
 
@@ -488,6 +515,11 @@ function Team:start_defined_workers(team_id, entry)
   if type(definition) ~= "table" then
     return
   end
+  if type(entry) == "table" and entry.state == "suspended" then
+    -- A resume still waiting for its configuration cannot take spawns; do not
+    -- mark the team as reconciled so the active team.changed can try later.
+    return
+  end
   local started = self.started_workers[team_id]
   if started then
     -- This team's definition was already reconciled by this front end.
@@ -554,6 +586,11 @@ function Team:refresh(cb)
           end
         end
       end
+      self:changed()
+    else
+      -- A failed refresh means the stored list can no longer be trusted.
+      self.teams = {}
+      self.inbox = {}
       self:changed()
     end
     if cb then

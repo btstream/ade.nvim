@@ -307,6 +307,36 @@ return function(t)
       t.eq(nil, configured.templates.worker.token)
     end)
 
+    t.it("does not inject a leader when the hello configure fails", function()
+      local service, dir = start_service(t, "configure-failed", {
+        team_configure_error = { code = -32060, message = "invalid configuration" },
+      })
+      setup(t, "configure-failed", service, dir)
+      controller.connect()
+      wait_ready()
+      t.eq(0, #calls_of(service, "team.leader_server"), "a failed configure must stop injection")
+      t.eq(0, #calls_of(service, "team.bind_leader"))
+      local frames = sent_frames(service, "session/new")
+      t.eq(1, #frames)
+      t.eq(0, #frames[1].params.mcpServers)
+    end)
+
+    t.it("waits for an in-flight configure before asking for the leader server", function()
+      local service, dir = start_service(t, "configure-slow", { team_configure_delay = 300 })
+      setup(t, "configure-slow", service, dir)
+      controller.connect()
+      wait(function()
+        return #calls_of(service, "team.configure") >= 1
+      end, 5000, "the slow configure")
+      vim.wait(100)
+      t.eq(0, #calls_of(service, "team.leader_server"), "leader_server waits for configure")
+      wait_ready()
+      t.eq(1, #calls_of(service, "team.leader_server"))
+      wait(function()
+        return #calls_of(service, "team.bind_leader") == 1
+      end, 5000, "the bind after the slow configure")
+    end)
+
     t.it("injects the leader MCP server into session/load and session/resume", function()
       local service, dir = start_service(t, "load-resume")
       setup(t, "load-resume", service, dir)
@@ -1692,6 +1722,102 @@ return function(t)
       end, 10000, "the person's turn to finish")
     end)
 
+    t.it("marks teams stale on disconnect and refuses their operations", function()
+      local service, dir = start_service(t, "stale", {})
+      local connection = setup(t, "stale", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed({
+        id = "t1",
+        cwd = dir,
+        state = "active",
+        participants = { { name = "leader", state = "idle", task = "_", queued = 0, turns = {} } },
+        inbox = {},
+        limits = {},
+      })
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local ui = state().view.team_ui
+      local notices = capture(t)
+      connection:on_disconnect("lost", true)
+      wait(function()
+        local t1 = team():team("t1")
+        return t1 ~= nil and t1.stale == true
+      end, 5000, "the stale team")
+      local text = table.concat(vim.api.nvim_buf_get_lines(ui.buf, 0, -1, false), "\n")
+      t.match("connection lost", text)
+
+      local sends = #service.team_sends
+      local leader_line
+      for index, id in pairs(ui.ids) do
+        if id == "t1|leader" then
+          leader_line = index
+        end
+      end
+      vim.api.nvim_win_set_cursor(ui.win, { leader_line, 0 })
+      vim.api.nvim_feedkeys("m", "x", false)
+      vim.wait(100)
+      t.eq(sends, #service.team_sends, "a stale team sends nothing")
+      local hinted = false
+      for _, note in ipairs(notices) do
+        if note.message:find("connection to the service is lost", 1, true) then
+          hinted = true
+        end
+      end
+      t.truthy(hinted, "the panel explains the lost connection")
+      pcall(ui.close, ui)
+    end)
+
+    t.it("replaces stale teams on a successful refresh and clears them on failure", function()
+      local service, dir = start_service(t, "refresh-stale", {})
+      setup(t, "refresh-stale", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed({
+        id = "t1",
+        cwd = dir,
+        state = "active",
+        participants = {},
+        inbox = {},
+        limits = {},
+      })
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      team():team("t1").stale = true
+      team():refresh()
+      wait(function()
+        return team():team("t1") ~= nil and team():team("t1").stale ~= true
+      end, 5000, "the refreshed team")
+
+      service.team_list_error = { code = -32066, message = "team list failed" }
+      team():refresh()
+      wait(function()
+        return team():team("t1") == nil
+      end, 5000, "a failed refresh to clear the list")
+    end)
+
+    t.it("does not start configured workers when bind leaves the team suspended", function()
+      local service, dir = start_service(t, "suspended-bind", {})
+      setup(t, "suspended-bind", service, dir, { teams = defined_teams() })
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #service.team_spawns == 2
+      end, 10000, "the configured workers")
+      local before = #service.team_spawns
+      team():start_defined_workers("t-suspended", {
+        id = "t-suspended",
+        state = "suspended",
+        participants = {},
+      })
+      vim.wait(100)
+      t.eq(before, #service.team_spawns)
+      t.eq(nil, team().started_workers["t-suspended"])
+    end)
+
     t.it("keeps teams across a disconnect and shows suspended teams after hello", function()
       local service, dir = start_service(t, "reconnect", {})
       local connection = setup(t, "reconnect", service, dir)
@@ -1960,14 +2086,20 @@ return function(t)
         return #service.team_removals == 1
       end, 5000, "the worktree removal")
 
-      vim.ui.select = function(_, _, cb)
-        cb({ label = "Close the team", value = true })
-      end
       local team_line
       for index, id in pairs(ui.ids) do
         if id == "team:t1" then
           team_line = index
         end
+      end
+      vim.api.nvim_win_set_cursor(ui.win, { team_line, 0 })
+      vim.api.nvim_feedkeys("R", "x", false)
+      wait(function()
+        return #service.team_resets == 1
+      end, 5000, "reset_limits while suspended")
+
+      vim.ui.select = function(_, _, cb)
+        cb({ label = "Close the team", value = true })
       end
       vim.api.nvim_win_set_cursor(ui.win, { team_line, 0 })
       vim.api.nvim_feedkeys("x", "x", false)

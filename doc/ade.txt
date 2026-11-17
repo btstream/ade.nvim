@@ -1059,7 +1059,8 @@ enabled = true 时，leader 新建团队后按 default 定义调用 team.spawn�
 服务重启后未关闭的团队变为挂起（suspended）：面板照常显示，标注挂起时间和“等待
 leader 会话恢复”。恢复 leader 的会话后团队自动继续，worker 按存储的 session/worktree
 恢复，恢复 notice 作为 bus 回合显示在 leader 聊天里。挂起期间 m 可发消息（排队）、
-可回答 question/message/limit、D 删除已退出 worker 的 worktree、x 关闭团队；
+可回答 question/message/limit、R 重置回合上限、D 删除已退出 worker 的 worktree、
+x 关闭团队；
 w/s/p/r/c 提示团队已挂起。leader 注入不会被挂起团队阻塞；恢复出的会话不是存储的
 leader 时团队保持挂起，并提示按 x 关闭。
 
