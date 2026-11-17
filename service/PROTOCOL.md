@@ -1516,7 +1516,7 @@ whole:
 - `upsert: [partial card]`: by `id`. A new card needs `title` and `column`; an
   existing card takes the given fields only (`owner: null`, `stage: null`,
   `body: null` clear; `fields` merges by key and a `null` value deletes the
-  key). `archived`, `updated_by` and `updated_at` cannot be written here.
+  key; `fields: null` removes every key). `archived`, `updated_by` and `updated_at` cannot be written here.
   Upserting an archived card is `-32061`.
 - `archive: [id]`: sets `archived`; the card's history is deleted (19.4).
 - `remove: [id]`: deletes the card and its history.
@@ -1539,8 +1539,11 @@ writes take effect in memory at once (`team.board` and `bus.status` see them),
 but persistence and `team.board_changed` happen at most once per 10 s per
 team: the first worker write starts a 10 s timer, and when it fires the board
 is persisted and one notification with the current `rev` is sent. A leader
-write while the timer runs flushes it. Pending writes are flushed when the
-team ends or the service shuts down cleanly.
+write while the timer runs flushes it first: the front end then receives two
+`team.board_changed`, the flushed `rev` and then the leader's. Pending writes
+are flushed (and announced) when the team ends, before the expiry check of
+18.15, and when the service shuts down cleanly. The timer is
+`NVIM_ADE_SERVER_BOARD_FLUSH_MS` milliseconds (default 10000), for tests.
 
 **`team.board {team}`** `<- {board}` for front ends (`-32064` for an unknown
 team). **`team.board_changed {team, rev}`** is sent to front-end connections
