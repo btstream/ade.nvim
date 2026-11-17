@@ -911,7 +911,12 @@ function Chat:toggle_current()
   if not block then
     return false
   end
-  if block.kind == "tool" or block.kind == "compaction" or block.kind == "thought" then
+  if
+    block.kind == "tool"
+    or block.kind == "compaction"
+    or block.kind == "thought"
+    or (block.kind == "message" and block.collapsible)
+  then
     self.session:toggle(block)
     -- Expanding changes the transcript height. Without this the renderer would
     -- treat the view as "following output" and jump the cursor to the end of the

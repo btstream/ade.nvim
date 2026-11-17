@@ -861,6 +861,11 @@ function M.build(ctx, opts, action)
   S.view.team_ui = TeamUI.new({
     team = S.view.team,
     config = cfg,
+    -- The watch view reuses the leader's existing chat; it never creates a
+    -- second Chat or a second input area.
+    leader_chat = function()
+      return S.view.chat
+    end,
   })
 
   S.view.chat = Chat.new({ config = merged })

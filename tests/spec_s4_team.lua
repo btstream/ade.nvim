@@ -1590,6 +1590,252 @@ return function(t)
       ui:close()
     end)
 
+    t.it("renders watched tools, diffs, turns, plans and bus messages", function()
+      local service, dir = start_service(t, "watch-render", {
+        team_watch = {
+          instance = "inst-w",
+          sessionId = "sess-w",
+          replay = {
+            {
+              sessionUpdate = "user_message_chunk",
+              content = {
+                type = "text",
+                text = "You are w1, a worker in team t1.\n<team_role>\nROLE TEXT</team_role><bus from=\"leader\" kind=\"task\" task=\"T4\">do work</bus>",
+              },
+            },
+            {
+              sessionUpdate = "tool_call",
+              toolCallId = "call-edit",
+              title = "Edit src/a.rs",
+              kind = "edit",
+              status = "in_progress",
+              content = {
+                { type = "diff", path = "src/a.rs", oldText = "old line", newText = "new line" },
+              },
+            },
+            { sessionUpdate = "agent_message_chunk", content = { type = "text", text = "implemented" } },
+          },
+        },
+      })
+      setup(t, "watch-render", service, dir)
+      controller.connect()
+      wait_ready()
+      local m = team()
+      local ok = false
+      m:watch("t1", "w1", true, function(result)
+        ok = result
+      end)
+      wait(function()
+        return ok
+      end, 5000, "team.watch")
+      local ui = state().view.team_ui
+      ui:watch(m.watching.session, "t1/w1")
+      t.truthy(ui.watch_buf, "the watch view is open")
+      local function text()
+        return table.concat(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false), "\n")
+      end
+      wait(function()
+        return text():find("── turn 1", 1, true) and text():find("leader → task T4", 1, true)
+      end, 5000, "the first turn heading and bus message")
+      t.match("role card", text(), text())
+      t.falsy(text():find("ROLE TEXT", 1, true), "the role card starts collapsed")
+      t.match("src/a.rs", text())
+
+      -- A second live turn with a plan, a diff and a bus tool call.
+      service:turn_started("inst-w", {
+        sessionId = "sess-w",
+        origin = "bus",
+        prompt = {
+          { type = "text", text = '<bus from="leader" kind="task" task="T5">second task</bus>' },
+        },
+      })
+      service:watch_update("inst-w", "sess-w", {
+        sessionUpdate = "plan",
+        entries = {
+          { content = "补 reconnect 的回归测试", status = "in_progress", priority = "high" },
+        },
+      })
+      service:watch_update("inst-w", "sess-w", {
+        sessionUpdate = "tool_call",
+        toolCallId = "call-bus",
+        title = "bus_send",
+        status = "completed",
+        rawInput = { to = "leader", kind = "report", task = "T4", body = "tests pass" },
+      })
+      service:turn_finished("inst-w", { sessionId = "sess-w", stopReason = "end_turn" })
+      wait(function()
+        local body = text()
+        return body:find("── turn 2", 1, true)
+          and body:find("leader → task T5", 1, true)
+          and body:find("补 reconnect 的回归测试", 1, true)
+          and body:find("→ leader report T4：tests pass", 1, true)
+      end, 5000, "the second turn, plan and bus message")
+
+      -- The diff is rendered by the normal tool card, not flattened text.
+      local edit_line
+      for index, line in ipairs(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false)) do
+        if line:find("src/a.rs", 1, true) then
+          edit_line = index
+        end
+      end
+      t.truthy(edit_line)
+      vim.api.nvim_set_current_win(ui.watch_win)
+      vim.api.nvim_win_set_cursor(ui.watch_win, { edit_line, 0 })
+      vim.api.nvim_feedkeys("za", "x", false)
+      wait(function()
+        local body = text()
+        return body:find("old line", 1, true) or body:find("new line", 1, true)
+      end, 5000, "the expanded diff")
+
+      -- The watch window owns a read-only Chat and no composer.
+      t.truthy(ui.watcher.chat, "the watch view uses Chat")
+      t.eq("ade_team_watch", vim.bo[ui.watch_buf].filetype)
+      t.eq(1, #vim.fn.win_findbuf(ui.watch_buf), "one watch window")
+
+      -- za on a heading collapses the whole turn; a second za restores it.
+      local heading
+      for index, line in ipairs(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false)) do
+        if line:find("── turn 2", 1, true) then
+          heading = index
+        end
+      end
+      t.truthy(heading)
+      vim.api.nvim_set_current_win(ui.watch_win)
+      vim.api.nvim_win_set_cursor(ui.watch_win, { heading, 0 })
+      vim.api.nvim_feedkeys("za", "x", false)
+      wait(function()
+        return text():find("── turn 2 · bus · leader → task T5 ·", 1, true)
+          and text():find("(collapsed)", 1, true)
+          and not text():find("补 reconnect 的回归测试", 1, true)
+      end, 5000, "the collapsed turn")
+      local heading2
+      for index, line in ipairs(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false)) do
+        if line:find("── turn 2", 1, true) then
+          heading2 = index
+        end
+      end
+      t.truthy(heading2)
+      vim.api.nvim_set_current_win(ui.watch_win)
+      vim.api.nvim_win_set_cursor(ui.watch_win, { heading2, 0 })
+      vim.api.nvim_feedkeys("za", "x", false)
+      wait(function()
+        return not text():find("(collapsed)", 1, true)
+          and text():find("补 reconnect 的回归测试", 1, true)
+      end, 5000, "the expanded turn")
+
+      -- ]] / [[ go to the next / previous turn heading.
+      vim.api.nvim_set_current_win(ui.watch_win)
+      vim.api.nvim_win_set_cursor(ui.watch_win, { 1, 0 })
+      vim.api.nvim_feedkeys("]]", "x", false)
+      local cursor = vim.api.nvim_win_get_cursor(ui.watch_win)[1]
+      t.match("── turn 2", vim.api.nvim_buf_get_lines(ui.watch_buf, cursor - 1, cursor, false)[1] or "")
+      vim.api.nvim_feedkeys("[[", "x", false)
+      cursor = vim.api.nvim_win_get_cursor(ui.watch_win)[1]
+      t.match("── turn 1", vim.api.nvim_buf_get_lines(ui.watch_buf, cursor - 1, cursor, false)[1] or "")
+      m:unwatch()
+    end)
+
+    t.it("shows the replay fallback notice and supplements it from team.read", function()
+      local service, dir = start_service(t, "watch-fallback", {
+        team_watch = {
+          instance = "inst-w",
+          sessionId = "sess-w",
+          replayed = false,
+          replay = {
+            { sessionUpdate = "agent_message_chunk", content = { type = "text", text = "live only" } },
+          },
+        },
+        team_read = {
+          messages = {
+            { from = "leader", to = "w1", kind = "task", task = "T9", body = "earlier instruction" },
+          },
+          turns = { { at = 1, text = "earlier turn text" } },
+        },
+      })
+      setup(t, "watch-fallback", service, dir)
+      controller.connect()
+      wait_ready()
+      local m = team()
+      local ok = false
+      m:watch("t1", "w1", true, function(result)
+        ok = result
+      end)
+      wait(function()
+        return ok
+      end, 5000, "team.watch")
+      local ui = state().view.team_ui
+      ui:watch(m.watching.session, "t1/w1")
+      local function text()
+        return table.concat(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false), "\n")
+      end
+      wait(function()
+        local body = text()
+        return body:find("会话过长，只显示观察开始之后的内容", 1, true)
+          and body:find("earlier instruction", 1, true)
+          and body:find("earlier turn text", 1, true)
+      end, 5000, "the replay fallback and team.read supplement")
+      m:unwatch()
+    end)
+
+    t.it("watch open toggles the same participant and pairs unwatch/watch", function()
+      local service, dir = start_service(t, "watch-toggle", {
+        team_watch = { instance = "inst-w", sessionId = "sess-w" },
+      })
+      setup(t, "watch-toggle", service, dir)
+      controller.connect()
+      wait_ready()
+      local ui = state().view.team_ui
+      ui.watcher:open("t1", "w1")
+      wait(function()
+        return ui.watch_buf ~= nil and vim.api.nvim_buf_is_valid(ui.watch_buf)
+      end, 5000, "the first watch")
+      local first = ui.watch_buf
+      ui.watcher:open("t1", "w1")
+      wait(function()
+        return ui.watch_buf == nil and team().watching == nil
+      end, 5000, "the same participant to close the watch")
+
+      ui.watcher:open("t1", "w2")
+      wait(function()
+        return ui.watch_buf ~= nil and ui.watch_buf ~= first and team().watching
+          and team().watching.participant == "w2"
+      end, 5000, "the other worker")
+      local found = false
+      for _, call in ipairs(service.team_unwatch or {}) do
+        if call.participant == "w1" then
+          found = true
+        end
+      end
+      t.truthy(found, "switching away unwatches the previous worker")
+      ui.watcher:close()
+      wait(function()
+        return ui.watch_buf == nil and team().watching == nil
+      end, 5000, "the closed watch")
+    end)
+
+    t.it("selecting the leader reuses the existing chat window", function()
+      local service, dir = start_service(t, "watch-leader")
+      setup(t, "watch-leader", service, dir)
+      controller.connect()
+      wait_ready()
+      controller.open()
+      local chat = state().view.chat
+      wait(function()
+        return chat.win ~= nil and vim.api.nvim_win_is_valid(chat.win)
+      end, 5000, "the leader chat window")
+      local ui = state().view.team_ui
+      ui.watcher:open("t1", "w1")
+      wait(function()
+        return ui.watch_buf ~= nil
+      end, 5000, "the worker watch")
+      ui.watcher:open("t1", "leader")
+      wait(function()
+        return ui.watch_buf == nil and vim.api.nvim_get_current_win() == chat.win
+      end, 5000, "focus the leader's own chat")
+      t.eq(nil, ui.watcher.chat, "no second Chat is created for the leader")
+      t.eq(nil, team().watching, "the leader is not watched")
+    end)
+
     t.it("ends the watch when its window, the panel, or the team goes away", function()
       local service, dir = start_service(t, "watch-end")
       setup(t, "watch-end", service, dir)

@@ -123,6 +123,7 @@ local function render_block(block, ctx)
     agent = "_md_agent",
     thought = "_md_thought",
     tool = "_md_detail",
+    message = "_md_agent",
     compaction = "_md_compaction",
     error = "_md_error",
     system = "_md_system",
@@ -161,6 +162,8 @@ local function render_block(block, ctx)
     return render_tool(block, ctx)
   elseif kind == "plan" then
     return render_plan(block, ctx)
+  elseif kind == "message" then
+    return messages.render_message(block, ctx)
   elseif kind == "notice" then
     return render_notice(block, ctx)
   elseif kind == "compaction" then

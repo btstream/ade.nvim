@@ -3,6 +3,8 @@
 -- Deliberately small and reusable: the panel is one scratch buffer with a
 -- cursor-mapped list; the watch window renders a session from the ordinary
 -- reducer, so a watched worker looks like a chat without owning one.
+local Watch = require("ade.ui.team.watch")
+
 local M = {}
 
 local Panel = {}
@@ -11,7 +13,7 @@ Panel.__index = Panel
 ---@param opts {team: table, config: fun(): table}
 ---@return table
 function M.new(opts)
-  return setmetatable({
+  local panel = setmetatable({
     team = opts.team,
     config = opts.config,
     win = nil,
@@ -20,6 +22,18 @@ function M.new(opts)
     watch_buf = nil,
     help = false,
   }, Panel)
+  panel.watcher = Watch.new({
+    team = opts.team,
+    config = opts.config,
+    leader_chat = opts.leader_chat,
+    notify = function(message)
+      panel:notify(message)
+    end,
+    on_change = function(watch)
+      panel.watch_win, panel.watch_buf = watch.win, watch.buf
+    end,
+  })
+  return panel
 end
 
 function Panel:is_open()
@@ -66,7 +80,7 @@ function Panel:lines()
     for _, entry in ipairs({
       { "m", "send a message to a participant" },
       { "p / r / c", "pause / resume / cancel the participant" },
-      { "w", "watch the participant's transcript" },
+      { "<CR> / w", "watch the participant's transcript" },
       { "s", "start a worker from a template" },
       { "D", "remove an exited worker's worktree" },
       { "a", "answer the inbox item under the cursor" },
@@ -167,6 +181,9 @@ function Panel:refresh()
   if not self:is_open() then
     return
   end
+  if self.watcher then
+    self.watcher:update_header()
+  end
   local rows = self.team:list_rows()
   if #rows == 0 then
     self:close()
@@ -249,17 +266,10 @@ function Panel:open()
     end
   end)
   self:map("w", function()
-    local kind, team, name = self:current()
-    if
-      kind == "participant"
-      and name ~= "leader"
-      and not self:refuse_stale(team)
-      and not self:refuse_suspended(team)
-    then
-      self.team:watch(team, name, true, function(ok, value)
-        self:report(ok, value)
-      end)
-    end
+    self:open_watch_current()
+  end)
+  self:map("<CR>", function()
+    self:open_watch_current()
   end)
   self:map("s", function()
     self:spawn_current()
@@ -379,8 +389,12 @@ end
 function Panel:close()
   self.interacting = false
   self.watch_pending = false
-  self.team:unwatch()
-  self:watch(nil)
+  if self.watcher then
+    self.watcher:close()
+  else
+    self.team:unwatch()
+  end
+  self.watch_win, self.watch_buf = nil, nil
   if self.win and vim.api.nvim_win_is_valid(self.win) then
     pcall(vim.api.nvim_win_close, self.win, true)
   end
@@ -703,88 +717,31 @@ function Panel:answer_current()
   answer({})
 end
 
----Render a watched session into a read-only split.
+---Render a watched session in the read-only watch view.
+---
+---Kept as the app's `on_watch` callback; the view itself owns the window,
+---turn grouping and the read-only Chat instance.
 ---@param session table|nil
 ---@param title string|nil
 function Panel:watch(session, title)
-  if not session then
-    if self.watch_win and vim.api.nvim_win_is_valid(self.watch_win) then
-      pcall(vim.api.nvim_win_close, self.watch_win, true)
-    end
-    self.watch_win, self.watch_buf = nil, nil
-    return
+  self.watcher:on_watch(session, title)
+  self.watch_win, self.watch_buf = self.watcher.win, self.watcher.buf
+end
+
+---Open (or close) the cursor participant's watch view. `<CR>` and `w` both
+---use this.
+---@return boolean
+function Panel:open_watch_current()
+  local kind, team, name = self:current()
+  if kind ~= "participant" then
+    return false
   end
-  if self.watch_win and not vim.api.nvim_win_is_valid(self.watch_win) then
-    self.watch_win = nil
+  if self:refuse_stale(team) or self:refuse_suspended(team) then
+    return false
   end
-  if self.watch_buf and not vim.api.nvim_buf_is_valid(self.watch_buf) then
-    self.watch_buf = nil
-  end
-  if not self.watch_win then
-    self.watch_buf = nil
-  end
-  if not self.watch_buf or not vim.api.nvim_buf_is_valid(self.watch_buf) then
-    local previous = vim.api.nvim_get_current_win()
-    vim.cmd("botright vsplit")
-    self.watch_win = vim.api.nvim_get_current_win()
-    self.watch_buf = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_win_set_buf(self.watch_win, self.watch_buf)
-    vim.bo[self.watch_buf].filetype = "ade_team_watch"
-    vim.bo[self.watch_buf].bufhidden = "wipe"
-    vim.bo[self.watch_buf].modifiable = false
-    local group = vim.api.nvim_create_augroup("AdeTeamWatch", { clear = true })
-    -- `bufhidden=wipe` wipes this buffer when the user closes the window, so
-    -- BufWipeout is the reliable "watch window is gone" event (WinClosed has
-    -- no buffer-local meaning). Capture this view's session/buffer: switching
-    -- workers wipes the old buffer while a newer watch is already current.
-    local watched, wiped = session, self.watch_buf
-    vim.api.nvim_create_autocmd("BufWipeout", {
-      group = group,
-      buffer = wiped,
-      callback = function()
-        vim.schedule(function()
-          if self.watch_buf ~= wiped then
-            return
-          end
-          if not self.team.watching or self.team.watching.session ~= watched then
-            return
-          end
-          self.watch_win, self.watch_buf = nil, nil
-          self.team:unwatch()
-        end)
-      end,
-    })
-    vim.wo[self.watch_win].number = false
-    vim.wo[self.watch_win].wrap = true
-    vim.api.nvim_set_current_win(previous)
-  end
-  local lines = { " watching " .. tostring(title or session.id) .. " (read-only)" }
-  for _, block in ipairs(session.blocks or {}) do
-    local text = block.text
-    if block.kind == "tool" then
-      text = (block.status or "") .. " " .. tostring(block.title or block.name or "tool")
-    end
-    if type(text) == "string" and text ~= "" then
-      for _, line in ipairs(vim.split(text, "\n", { plain = true })) do
-        lines[#lines + 1] = (block.kind == "user" and "> " or "  ") .. line
-      end
-    end
-  end
-  if not self.watch_pending then
-    self.watch_pending = true
-    vim.schedule(function()
-      self.watch_pending = false
-      if not self.watch_buf or not vim.api.nvim_buf_is_valid(self.watch_buf) then
-        return
-      end
-      if self.watch_lines then
-        vim.bo[self.watch_buf].modifiable = true
-        vim.api.nvim_buf_set_lines(self.watch_buf, 0, -1, false, self.watch_lines)
-        vim.bo[self.watch_buf].modifiable = false
-      end
-    end)
-  end
-  self.watch_lines = lines
+  self.watcher:open(team, name)
+  self.watch_win, self.watch_buf = self.watcher.win, self.watcher.buf
+  return true
 end
 
 M.Panel = Panel

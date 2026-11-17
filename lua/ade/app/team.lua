@@ -836,6 +836,16 @@ local function prompt_text(payload)
   return table.concat(parts, "\n")
 end
 
+---Milliseconds for display-only turn durations.
+---@return integer
+local function now_ms()
+  if vim.uv and vim.uv.gettimeofday then
+    local seconds, micros = vim.uv.gettimeofday()
+    return seconds * 1000 + math.floor(micros / 1000)
+  end
+  return os.time() * 1000
+end
+
 ---Mark a bus turn on a session and render it as user-side content.
 ---@param session table|nil
 ---@param payload table
@@ -853,7 +863,8 @@ function M.apply_turn_started(session, payload)
     id = require("ade.session.state").next_id("bus"),
     kind = "user",
     text = "[" .. tostring(origin) .. "] " .. text,
-    bus = { origin = origin },
+    -- Display-only metadata for the watch view (not understood by the reducer).
+    bus = { origin = origin, started_at = now_ms() },
   })
   return true
 end
@@ -866,6 +877,15 @@ function M.apply_turn_finished(session, payload)
   end
   local bus_turn = session.bus_turn
   session.bus_turn = nil
+  local ended = now_ms()
+  for i = #session.blocks, 1, -1 do
+    local block = session.blocks[i]
+    if block.bus and block.bus.ended_at == nil then
+      block.bus.ended_at = ended
+      block.bus.stop_reason = type(payload) == "table" and payload.stopReason or nil
+      break
+    end
+  end
   -- A person's prompt may have replaced the bus turn while it was cancelling;
   -- its late finish must not end the user's (newer) turn.
   if session.turn == bus_turn then
@@ -1016,6 +1036,7 @@ function Team:watch(team, participant, replay, cb)
       end
       if type(value) == "table" then
         entry.instance = value.instance
+        entry.replayed = value.replayed ~= false
         if type(value.sessionId) == "string" then
           session.id = value.sessionId
         end

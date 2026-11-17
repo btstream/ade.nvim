@@ -35,7 +35,7 @@ Server.__index = Server
 ---  install_fail?: boolean, install_log?: string, install_delay_ms?: integer,
 ---  install_busy?: boolean, uninstall_busy?: boolean, resolve_delay_ms?: integer,
 ---  policy_delay_ms?: integer, policy_error?: table,
----  teams?: table, team_watch?: table, team_leader_error?: table,
+---  teams?: table, team_watch?: table, team_read?: table, team_leader_error?: table,
 ---  team_bind_error?: table, team_participants?: table, team_spawn_warning?: string,
 ---  team_spawn_error?: table, team_remove_result?: table, team_remove_error?: table,
 ---  run_error?: table, uninstall_error?: table, canned_agent?: boolean}|nil
@@ -106,6 +106,7 @@ function M.new(opts)
     team_sends = {},
     team_answers = {},
     team_watch = opts.team_watch,
+    team_read = opts.team_read,
     team_leader_error = opts.team_leader_error,
     team_bind_error = opts.team_bind_error,
     team_participants = opts.team_participants,
@@ -535,8 +536,9 @@ function Server:dispatch(message, client)
     return nil
   end
   if method == "team.read" then
+    local result = self.team_read or { messages = {}, turns = {} }
     vim.defer_fn(function()
-      self:send(client, { jsonrpc = "2.0", id = ident, result = { messages = {}, turns = {} } })
+      self:send(client, { jsonrpc = "2.0", id = ident, result = vim.deepcopy(result) })
     end, 5)
     return nil
   end
@@ -1217,6 +1219,17 @@ function Server:turn_started(instance, params)
     instance = instance,
     seq = 1,
     message = { jsonrpc = "2.0", method = "_ade/turn_started", params = params },
+  })
+end
+
+---Send one `_ade/turn_finished` to the attached connection of an instance.
+---@param instance string
+---@param params table
+function Server:turn_finished(instance, params)
+  self:broadcast("tunnel.recv", {
+    instance = instance,
+    seq = 1,
+    message = { jsonrpc = "2.0", method = "_ade/turn_finished", params = params },
   })
 end
 
