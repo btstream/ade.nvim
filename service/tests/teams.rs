@@ -1083,12 +1083,28 @@ fn activity_tracks_tools_plans_reports_and_leader_bus_calls() {
 }
 
 #[test]
+fn an_awaiting_spawn_activity_names_the_assigned_worker() {
+    let mut harness = Harness::new("team-activity-spawn", json!({}), None);
+    // No template name: the service assigns `w1`, and the activity line must
+    // show it instead of the template (`dev`).
+    let spawned = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template": "dev"}),
+    );
+    let text = mcp_text(&spawned);
+    assert!(text.contains("awaiting_approval"), "{text}");
+    harness.wait_activity("leader", "spawn w1");
+}
+
+#[test]
 fn activity_notifications_are_throttled_and_state_since_moves() {
     let mut harness = Harness::new_with_env(
         "team-activity-throttle",
         json!({"spawn_confirm": {"auto": ["dev"]}}),
         None,
-        &[("NVIM_ADE_SERVER_ACTIVITY_NOTIFY_MS", "800")],
+        &[("NVIM_ADE_SERVER_ACTIVITY_NOTIFY_MS", "1500")],
     );
     harness.spawn_worker("w1", "idle");
     // Wait for the spawn turn to finish: an idle participant right after spawn
@@ -1111,10 +1127,11 @@ fn activity_notifications_are_throttled_and_state_since_moves() {
     std::fs::write(harness.server.dir().join("team-agent.gate"), b"go").expect("gate");
 
     // The state change to Working already carried the current activity, so the
-    // two rapid updates stay inside the 800 ms window; the tick announces the
-    // last value once.
+    // two rapid updates stay inside the 1500 ms window; the tick announces the
+    // last value once. The agent stays busy for 4 s, so the window has a wide
+    // margin on both sides.
     let mut changes = 0;
-    let deadline = Instant::now() + Duration::from_millis(1400);
+    let deadline = Instant::now() + Duration::from_millis(2600);
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let Some(frame) = watcher.try_next_notification(remaining) else {

@@ -1664,3 +1664,71 @@ fn spawn_groups_continue_after_a_restart() {
     );
     Fixture::shutdown(&mut restarted);
 }
+
+#[test]
+fn a_database_error_loading_the_board_marks_it_unavailable() {
+    let fixture = Fixture::new("restart-board-load-error");
+    let mut server = fixture.start("a", &[]);
+    let mut client = fixture.connect(&server);
+    fixture.configure(&mut client, &fixture.work, &server, true);
+    let (_instance, leader_session, token, bound) =
+        fixture.attach_leader(&server, &mut client, &fixture.work, None);
+    let team = bound["result"]["team"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("bind: {bound}"))
+        .to_string();
+    board_update(&server, &token, "default");
+    Fixture::shutdown(&mut server);
+    drop(server);
+
+    // Break the table itself: reading a board now fails instead of returning
+    // an unreadable JSON row.
+    {
+        let conn = rusqlite::Connection::open(database_path(&fixture)).expect("database");
+        conn.execute_batch(
+            "DROP TABLE boards; CREATE TABLE boards (team_id TEXT PRIMARY KEY, wrong TEXT);",
+        )
+        .expect("replace the boards table");
+    }
+
+    let mut restarted = fixture.start("b", &[]);
+    let mut second = fixture.connect(&restarted);
+    wait_suspended(&mut second, &team);
+    let board = second.request(60, "team.board", json!({"team": team}));
+    assert_eq!(board["result"]["board"]["unavailable"], true, "{board}");
+    assert_eq!(
+        board["result"]["board"]["cards"].as_array().map(Vec::len),
+        Some(0),
+        "{board}"
+    );
+
+    fixture.configure(&mut second, &fixture.work, &restarted, true);
+    let (_instance, session, token, bound) = fixture.attach_leader(
+        &restarted,
+        &mut second,
+        &fixture.work,
+        Some(&leader_session),
+    );
+    assert_eq!(session, leader_session);
+    assert_eq!(bound["result"]["team"]["id"], team, "{bound}");
+    wait_active(&mut second, &team);
+
+    let refused = mcp_call(
+        &restarted,
+        &token,
+        "board_update",
+        json!({"workflow_name": "new"}),
+    );
+    assert_eq!(refused["isError"], true, "{refused}");
+    let message = mcp_text(&refused);
+    assert!(message.contains("board unavailable"), "{message}");
+
+    Fixture::shutdown(&mut restarted);
+    drop(second);
+    drop(restarted);
+    let conn = rusqlite::Connection::open(database_path(&fixture)).expect("database");
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM boards", [], |row| row.get(0))
+        .expect("board rows");
+    assert_eq!(rows, 0, "a refused write must not touch the database");
+}

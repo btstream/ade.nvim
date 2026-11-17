@@ -902,12 +902,18 @@ impl Hub {
         })();
         match result {
             Ok(Some((value, delivery))) => {
+                // An awaiting approval reply names the request, not the worker;
+                // the activity line still has to show the assigned name.
+                let mut noted = value.clone();
+                if let (Some(name), Some(object)) = (&assigned_name, noted.as_object_mut()) {
+                    object.entry("name").or_insert_with(|| json!(name));
+                }
                 self.teams.note_bus_call(
                     team,
                     "leader",
                     "bus.spawn",
                     params,
-                    &value,
+                    &noted,
                     crate::team::now_ms(),
                 );
                 self.drain_team_events();

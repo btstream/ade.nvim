@@ -426,7 +426,7 @@ def run_prompt(ident, text, session):
                 })
                 time.sleep(0.05)
             # Stay working while the test watches the notification window.
-            time.sleep(2)
+            time.sleep(4)
         elif "[activity-slow]" in text:
             for step in (1, 2):
                 send({
