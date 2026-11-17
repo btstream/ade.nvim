@@ -1121,8 +1121,8 @@ function M.validate(cfg)
     if template.model ~= nil and type(template.model) ~= "string" then
       fail("%s.model must be a string or nil", where)
     end
-    if type(template.role) ~= "string" then
-      fail("%s.role must be a string", where)
+    if type(template.role) ~= "string" or template.role == "" then
+      fail("%s.role must be a non-empty string", where)
     end
     if #template.role > 16 * 1024 then
       fail("%s.role is longer than 16 KiB", where)
@@ -1135,11 +1135,17 @@ function M.validate(cfg)
   if type(confirm.auto) ~= "table" or not vim.islist(confirm.auto) then
     fail("teams.spawn_confirm.auto must be a list")
   end
+  local auto, seen = {}, {}
   for _, name in ipairs(confirm.auto) do
     if type(name) ~= "string" or teams.templates[name] == nil then
       fail("teams.spawn_confirm.auto includes unknown template %s", vim.inspect(name))
     end
+    if not seen[name] then
+      seen[name] = true
+      auto[#auto + 1] = name
+    end
   end
+  teams.spawn_confirm.auto = auto
   local limits = teams.limits
   if type(limits) ~= "table" then
     fail("teams.limits must be a table")
@@ -1149,6 +1155,9 @@ function M.validate(cfg)
     if type(value) ~= "number" or value % 1 ~= 0 or value < 1 then
       fail("teams.limits.%s must be a positive integer", key)
     end
+  end
+  if limits.max_turns_per_task > limits.max_turns_total then
+    fail("teams.limits.max_turns_per_task must not exceed max_turns_total")
   end
 
   if type(cfg.permissions.auto_allow) ~= "table" or not vim.islist(cfg.permissions.auto_allow) then

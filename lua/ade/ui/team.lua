@@ -77,11 +77,21 @@ function Panel:lines()
   for _, team in ipairs(rows) do
     add(string.format(" %s  %s  [%s]", team.id, tostring(team.cwd), tostring(team.state)), nil)
     local limits = team.limits or {}
+    local cfg_teams = (self.config and self.config().teams) or {}
+    local live, total = 0, 0
+    for _, entry in ipairs(team.participants or {}) do
+      if entry.name ~= "leader" and entry.name ~= "human" then
+        total = total + 1
+        if entry.state ~= "exited" then
+          live = live + 1
+        end
+      end
+    end
     add(
       string.format(
         "   workers %s/%s · turns %s/%s",
-        tostring(#(team.participants or {}) - 1),
-        tostring(limits.max_workers or "?"),
+        tostring(live),
+        tostring(cfg_teams.max_workers or total),
         tostring(limits.turns_total or "?"),
         tostring(limits.max_turns_total or "?")
       ),
@@ -107,7 +117,18 @@ function Panel:lines()
         team.id .. "|" .. tostring(entry.name)
       )
     end
-    for _, item in ipairs(team.inbox or {}) do
+    -- Follow `team.inbox` (the notification stream), not the inbox snapshot
+    -- that happened to be inside the last `team.changed`.
+    local items = {}
+    for _, item in pairs(self.team.inbox) do
+      if item.team == team.id and item.state == "open" then
+        items[#items + 1] = item
+      end
+    end
+    table.sort(items, function(a, b)
+      return tostring(a.id) < tostring(b.id)
+    end)
+    for _, item in ipairs(items) do
       if item.state == "open" then
         add(
           string.format(
@@ -140,6 +161,20 @@ function Panel:refresh()
   vim.bo[self.buf].modifiable = true
   vim.api.nvim_buf_set_lines(self.buf, 0, -1, false, lines)
   vim.bo[self.buf].modifiable = false
+end
+
+---The team id for the cursor line, whether it is a participant or an item.
+---@return string|nil
+function Panel:team_of_current()
+  local kind, a, b = self:current()
+  if kind == "participant" then
+    return a
+  end
+  if kind == "item" then
+    local item = self.team:item(a)
+    return item and item.team or nil
+  end
+  return nil
 end
 
 function Panel:open()
@@ -188,9 +223,10 @@ function Panel:open()
     self:control_current("cancel")
   end)
   self:map("R", function()
-    local kind, team = self:current()
-    if kind then
-      self.team:reset_limits(team, function()
+    local team = self:team_of_current()
+    if team then
+      self.team:reset_limits(team, function(ok, value)
+        self:report(ok, value)
         self.team:refresh()
       end)
     end
@@ -198,16 +234,34 @@ function Panel:open()
   self:map("w", function()
     local kind, team, name = self:current()
     if kind == "participant" and name ~= "leader" then
-      self.team:watch(team, name, true)
+      self.team:watch(team, name, true, function(ok, value)
+        self:report(ok, value)
+      end)
     end
   end)
   self:map("x", function()
-    local kind, team = self:current()
-    if kind then
-      self.team:close(team, function()
+    local team = self:team_of_current()
+    if not team then
+      return
+    end
+    local function close_it()
+      self.team:close(team, function(ok, value)
+        self:report(ok, value)
         self.team:refresh()
       end)
     end
+    self.interacting = true
+    vim.ui.select({ { label = "Close the team", value = true }, { label = "Cancel", value = false } }, {
+      prompt = "close " .. team .. "?",
+      format_item = function(entry)
+        return entry.label
+      end,
+    }, function(choice)
+      self.interacting = false
+      if choice and choice.value then
+        close_it()
+      end
+    end)
   end)
   self:map("m", function()
     self:send_current()
@@ -231,9 +285,20 @@ function Panel:open()
     buffer = self.buf,
     callback = function()
       vim.schedule(function()
-        if self:is_open() then
-          self:close()
+        if self.interacting then
+          return
         end
+        if not self:is_open() then
+          return
+        end
+        -- A programmatic split or the watch window is a deliberate stop, not
+        -- the user leaving the panel; closing the panel would close the watch
+        -- right away.
+        local current = vim.api.nvim_get_current_win()
+        if current == self.win or (self.watch_win and current == self.watch_win) then
+          return
+        end
+        self:close()
       end)
     end,
   })
@@ -245,7 +310,26 @@ function Panel:map(lhs, fn)
   vim.keymap.set("n", lhs, fn, { buffer = self.buf, nowait = true, silent = true })
 end
 
+function Panel:notify(message, level)
+  vim.notify("ade.nvim: " .. tostring(message), level or vim.log.levels.WARN)
+end
+
+---Report a team call failure instead of silently dropping it.
+---@param ok boolean
+---@param value any
+---@return boolean ok
+function Panel:report(ok, value)
+  if ok then
+    return true
+  end
+  local message = type(value) == "table" and (value.message or value.code) or tostring(value)
+  self:notify(message)
+  return false
+end
+
 function Panel:close()
+  self.team:unwatch()
+  self:watch(nil)
   if self.win and vim.api.nvim_win_is_valid(self.win) then
     pcall(vim.api.nvim_win_close, self.win, true)
   end
@@ -262,7 +346,8 @@ function Panel:control_current(body)
   if name == "human" then
     return
   end
-  self.team:control(team, name, body, function()
+  self.team:control(team, name, body, function(ok, value)
+    self:report(ok, value)
     self.team:refresh()
   end)
 end
@@ -273,12 +358,28 @@ function Panel:send_current()
   if kind ~= "participant" or name == nil or name == "human" then
     return
   end
-  vim.ui.input({ prompt = "message to " .. name .. ": " }, function(body)
-    if not body or body == "" then
-      return
-    end
-    self.team:send(team, name, "message", body, nil, function()
-      self.team:refresh()
+  -- `message` is an inbox kind, not a bus kind (PROTOCOL.md 18.1); control
+  -- goes through p/r/c and the service refuses it from a normal send here.
+  local kinds = { "notice", "task", "question", "answer", "review" }
+  self.interacting = true
+  vim.ui.select(kinds, {
+    prompt = "kind for " .. name,
+    format_item = function(entry)
+      return entry
+    end,
+  }, function(choice)
+    self.interacting = false
+    choice = choice or "notice"
+    self.interacting = true
+    vim.ui.input({ prompt = choice .. " to " .. name .. ": " }, function(body)
+      self.interacting = false
+      if not body or body == "" then
+        return
+      end
+      self.team:send(team, name, choice, body, nil, function(ok, value)
+        self:report(ok, value)
+        self.team:refresh()
+      end)
     end)
   end)
 end
@@ -294,14 +395,35 @@ function Panel:answer_current()
     return
   end
   local function answer(fields)
-    self.team:answer(item_id, fields, function()
+    self.team:answer(item_id, fields, function(ok, value)
+      self:report(ok, value)
       self.team:refresh()
     end)
   end
+  local function select(opts, cb)
+    self.interacting = true
+    vim.ui.select(opts.items, opts, function(choice)
+      self.interacting = false
+      cb(choice)
+    end)
+  end
+  local function input(prompt, cb)
+    self.interacting = true
+    vim.ui.input({ prompt = prompt }, function(text)
+      self.interacting = false
+      cb(text)
+    end)
+  end
   if item.kind == "spawn" then
-    vim.ui.select({ "allow", "refuse" }, { prompt = "spawn " .. tostring(item.name or item.template) }, function(choice)
-      if choice then
-        answer({ allow = choice == "allow" })
+    select({
+      prompt = "spawn " .. tostring(item.name or item.template),
+      items = { { label = "allow", value = true }, { label = "refuse", value = false } },
+      format_item = function(entry)
+        return entry.label
+      end,
+    }, function(choice)
+      if choice ~= nil then
+        answer({ allow = choice.value == true })
       end
     end)
     return
@@ -312,36 +434,59 @@ function Panel:answer_current()
       items[#items + 1] = { label = option.name or option.optionId, value = option.optionId }
     end
     items[#items + 1] = { label = "Cancel", value = false }
-    vim.ui.select(items, {
+    select({
       prompt = "permission",
+      items = items,
       format_item = function(entry)
         return entry.label
       end,
     }, function(choice)
-      if choice ~= nil then
-        answer({ option = choice == false and nil or choice })
+      if choice == nil then
+        return
+      end
+      if choice.value == false then
+        -- Cancelled: the answer carries no option at all.
+        answer({})
+      else
+        answer({ option = choice.value })
       end
     end)
     return
   end
   if item.kind == "question" and type(item.options) == "table" and #item.options > 0 then
-    vim.ui.select(item.options, { prompt = item.body or "question" }, function(choice)
-      if choice then
+    select({
+      prompt = item.body or "question",
+      items = item.options,
+      format_item = function(entry)
+        return tostring(entry)
+      end,
+    }, function(choice)
+      if choice ~= nil then
         answer({ text = choice })
       end
     end)
     return
   end
   if item.kind == "request" then
-    vim.ui.input({ prompt = "JSON result: " }, function(text)
-      if text and text ~= "" then
-        answer({ text = text })
-      end
-    end)
+    local function ask()
+      input("JSON result: ", function(text)
+        if not text or text == "" then
+          return
+        end
+        local ok, parsed = pcall(vim.json.decode, text)
+        if not ok or type(parsed) ~= "table" then
+          self:notify("the result must be a JSON object or array")
+          ask()
+          return
+        end
+        answer({ text = vim.json.encode(parsed) })
+      end)
+    end
+    ask()
     return
   end
   if item.kind == "question" then
-    vim.ui.input({ prompt = item.body or "answer: " }, function(text)
+    input(item.body or "answer: ", function(text)
       if text and text ~= "" then
         answer({ text = text })
       end
@@ -363,6 +508,15 @@ function Panel:watch(session, title)
     self.watch_win, self.watch_buf = nil, nil
     return
   end
+  if self.watch_win and not vim.api.nvim_win_is_valid(self.watch_win) then
+    self.watch_win = nil
+  end
+  if self.watch_buf and not vim.api.nvim_buf_is_valid(self.watch_buf) then
+    self.watch_buf = nil
+  end
+  if not self.watch_win then
+    self.watch_buf = nil
+  end
   if not self.watch_buf or not vim.api.nvim_buf_is_valid(self.watch_buf) then
     local previous = vim.api.nvim_get_current_win()
     vim.cmd("botright vsplit")
@@ -370,7 +524,24 @@ function Panel:watch(session, title)
     self.watch_buf = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_win_set_buf(self.watch_win, self.watch_buf)
     vim.bo[self.watch_buf].filetype = "ade_team_watch"
+    vim.bo[self.watch_buf].bufhidden = "wipe"
     vim.bo[self.watch_buf].modifiable = false
+    local group = vim.api.nvim_create_augroup("AdeTeamWatch", { clear = true })
+    -- `bufhidden=wipe` wipes this buffer when the user closes the window, so
+    -- BufWipeout is the reliable "watch window is gone" event (WinClosed has
+    -- no buffer-local meaning).
+    vim.api.nvim_create_autocmd("BufWipeout", {
+      group = group,
+      buffer = self.watch_buf,
+      callback = function()
+        vim.schedule(function()
+          if not self.watch_buf or not vim.api.nvim_buf_is_valid(self.watch_buf) then
+            self.watch_win, self.watch_buf = nil, nil
+            self.team:unwatch()
+          end
+        end)
+      end,
+    })
     vim.wo[self.watch_win].number = false
     vim.wo[self.watch_win].wrap = true
     vim.api.nvim_set_current_win(previous)
@@ -387,9 +558,21 @@ function Panel:watch(session, title)
       end
     end
   end
-  vim.bo[self.watch_buf].modifiable = true
-  vim.api.nvim_buf_set_lines(self.watch_buf, 0, -1, false, lines)
-  vim.bo[self.watch_buf].modifiable = false
+  if not self.watch_pending then
+    self.watch_pending = true
+    vim.schedule(function()
+      self.watch_pending = false
+      if not self.watch_buf or not vim.api.nvim_buf_is_valid(self.watch_buf) then
+        return
+      end
+      if self.watch_lines then
+        vim.bo[self.watch_buf].modifiable = true
+        vim.api.nvim_buf_set_lines(self.watch_buf, 0, -1, false, self.watch_lines)
+        vim.bo[self.watch_buf].modifiable = false
+      end
+    end)
+  end
+  self.watch_lines = lines
 end
 
 M.Panel = Panel

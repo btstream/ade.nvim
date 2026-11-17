@@ -102,6 +102,9 @@ return function(t)
     end)
     ade.setup(vim.tbl_deep_extend("force", {
       backend = "service",
+      -- Pin the session cwd to this test's directory so team keys (bound,
+      -- blocked) and the fake's team.cwd agree with what the front end uses.
+      cwd = dir,
       agent = "opencode",
       agents = { opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } } },
       service = { keep_alive = true, idle_timeout = 60 },
@@ -183,6 +186,7 @@ return function(t)
         { teams = { templates = { worker = { agent = "opencode" } } } },
         { teams = teams_config({ spawn_confirm = { auto = { "nope" } } }) },
         { teams = teams_config({ limits = { max_turns_per_task = 0, max_turns_total = 10 } }) },
+        { teams = teams_config({ limits = { max_turns_per_task = 50, max_turns_total = 10 } }) },
       }
       for _, over in ipairs(bad) do
         t.raises(function()
@@ -246,6 +250,40 @@ return function(t)
       t.truthy(type(configured.templates.worker.role) == "string")
       -- No environment/secret leaks into what is logged by the front end.
       t.eq(nil, configured.templates.worker.token)
+    end)
+
+    t.it("injects the leader MCP server into session/load and session/resume", function()
+      local service, dir = start_service(t, "load-resume")
+      setup(t, "load-resume", service, dir)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return team().bound[dir] ~= nil
+      end, 5000, "the first bind")
+      -- Pretend this editor just reconnected: no binding and no live team.
+      local function forget_binding()
+        team().bound[dir] = nil
+        service.teams = {}
+      end
+      forget_binding()
+      state().sess.service:replay("sess_mock", {})
+      wait(function()
+        return #sent_frames(service, "session/load") == 1
+      end, 10000, "session/load")
+      local load = sent_frames(service, "session/load")[1].params.mcpServers
+      t.eq(1, #load)
+      t.eq("ade-team", load[1].name)
+      wait(function()
+        return state().sess.service.replaying ~= true
+      end, 10000, "the load to finish")
+      forget_binding()
+      state().sess.service:resume("sess_mock", {})
+      wait(function()
+        return #sent_frames(service, "session/resume") == 1
+      end, 10000, "session/resume")
+      local resume = sent_frames(service, "session/resume")[1].params.mcpServers
+      t.eq(1, #resume)
+      t.eq("ade-team", resume[1].name)
     end)
 
     t.it("does not inject without the feature, in direct mode, or when disabled", function()
@@ -352,14 +390,25 @@ return function(t)
             paused = true,
           },
         },
-        inbox = {
-          { id = "i1", team = "t1", kind = "question", from = "w1", body = "which one?", state = "open" },
-        },
+        inbox = {},
         limits = { max_workers = 3, turns_total = 2, max_turns_total = 200 },
       })
       wait(function()
         return team():team("t1") ~= nil
       end, 5000, "the team changed notification")
+      -- The inbox follows team.inbox notifications, not the snapshot in the
+      -- last team.changed.
+      service:team_inbox({
+        id = "i1",
+        team = "t1",
+        kind = "question",
+        from = "w1",
+        body = "which one?",
+        state = "open",
+      })
+      wait(function()
+        return team():item("i1") ~= nil
+      end, 5000, "the inbox notification")
       t.eq(true, controller.open_team())
       local ui = state().view.team_ui
       local text = table.concat(vim.api.nvim_buf_get_lines(ui.buf, 0, -1, false), "\n")
@@ -368,6 +417,19 @@ return function(t)
       t.match("w1", text)
       t.match("paused", text)
       t.match("which one%?", text)
+      -- Answered items disappear without another team.changed.
+      service:team_inbox({
+        id = "i1",
+        team = "t1",
+        kind = "question",
+        from = "w1",
+        body = "which one?",
+        state = "answered",
+      })
+      wait(function()
+        local line = table.concat(vim.api.nvim_buf_get_lines(ui.buf, 0, -1, false), "\n")
+        return not line:find("which one%?")
+      end, 5000, "the answered item to leave the panel")
       ui:close()
     end)
 
@@ -549,6 +611,464 @@ return function(t)
       t.match("replay line", text)
       t.match("live line", text, text)
       m:unwatch()
+    end)
+
+    t.it("does not inject anything when no template is configured", function()
+      local service, dir = start_service(t, "no-templates")
+      setup(t, "no-templates", service, dir, {
+        teams = { spawn_from_chat = true, templates = {} },
+      })
+      -- Deep-merging overrides keeps the default template; clear it so the
+      -- "no templates" shape is the one under test.
+      state().config.teams.templates = {}
+      controller.connect()
+      wait_ready()
+      local n = 0
+      for _, call in ipairs(service.calls) do
+        if type(call.method) == "string" and call.method:sub(1, 5) == "team." then
+          n = n + 1
+        end
+      end
+      t.eq(0, n, "no template means no team requests")
+      t.eq(0, #sent_frames(service, "session/new")[1].params.mcpServers)
+    end)
+
+    t.it("does not inject a leader when another instance already leads the cwd", function()
+      local service, dir = start_service(t, "other-leader")
+      service.teams.t1 = {
+        id = "t1",
+        cwd = dir,
+        state = "active",
+        leader = { instance = "someone-else", sessionId = "s-other" },
+        participants = {},
+        inbox = {},
+        limits = {},
+      }
+      setup(t, "other-leader", service, dir)
+      controller.connect()
+      wait_ready()
+      t.eq(0, #calls_of(service, "team.leader_server"))
+      t.eq(0, #sent_frames(service, "session/new")[1].params.mcpServers)
+      t.eq(true, team().blocked[dir])
+    end)
+
+    t.it("blocks a second leader after a -32061 bind failure", function()
+      local service, dir = start_service(t, "bind-blocked", {
+        team_bind_error = { code = -32061, message = "another session leads this team" },
+      })
+      setup(t, "bind-blocked", service, dir)
+      local notices = capture(t)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return team().blocked[dir] == true
+      end, 5000, "the blocked leader")
+      local joined = {}
+      for _, note in ipairs(notices) do
+        joined[#joined + 1] = note.message
+      end
+      t.match("another session already leads", table.concat(joined, "\n"))
+
+      -- A second session in the same instance must not ask again.
+      local before = #calls_of(service, "team.leader_server")
+      controller.new_session()
+      wait(function()
+        return #sent_frames(service, "session/new") == 2
+      end, 10000, "the second session")
+      t.eq(before, #calls_of(service, "team.leader_server"))
+      t.eq(0, #sent_frames(service, "session/new")[2].params.mcpServers)
+    end)
+
+    t.it("does not inject again for a second session of the bound leader", function()
+      local service, dir = start_service(t, "second-session")
+      setup(t, "second-session", service, dir)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        local bound = team().bound[dir]
+        return bound ~= nil and bound.instance ~= nil
+      end, 5000, "the bound leader")
+      t.eq(1, #calls_of(service, "team.leader_server"))
+      controller.new_session()
+      wait(function()
+        return #sent_frames(service, "session/new") == 2
+      end, 10000, "the second session")
+      t.eq(1, #calls_of(service, "team.leader_server"))
+      t.eq(1, #calls_of(service, "team.bind_leader"))
+      t.eq(0, #sent_frames(service, "session/new")[2].params.mcpServers)
+    end)
+
+    t.it("can lead again after the team is closed", function()
+      local service, dir = start_service(t, "close-rebuild")
+      setup(t, "close-rebuild", service, dir)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        local bound = team().bound[dir]
+        return bound ~= nil and bound.instance ~= nil
+      end, 5000, "the first bind")
+      local done = false
+      team():close("t1", function()
+        done = true
+      end)
+      wait(function()
+        return done
+      end, 5000, "team.close")
+      wait(function()
+        return team().bound[dir] == nil
+      end, 5000, "bound to clear on close")
+      controller.new_session()
+      wait(function()
+        return #sent_frames(service, "session/new") == 2
+      end, 10000, "the new session")
+      wait(function()
+        return #calls_of(service, "team.leader_server") == 2
+      end, 5000, "the new leader server")
+      t.eq(1, #sent_frames(service, "session/new")[2].params.mcpServers)
+      wait(function()
+        return #calls_of(service, "team.bind_leader") == 2
+      end, 5000, "the new bind")
+    end)
+
+    t.it("the panel's m sends a legal bus kind and reports failure", function()
+      local service, dir = start_service(t, "panel-send")
+      setup(t, "panel-send", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed({
+        id = "t1",
+        cwd = dir,
+        state = "active",
+        participants = {
+          { name = "leader", state = "idle", task = "_", queued = 0, turns = {} },
+          { name = "w1", state = "idle", task = "_", queued = 0, turns = {} },
+        },
+        inbox = {},
+        limits = { max_turns_total = 200, turns_total = 0 },
+      })
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local ui = state().view.team_ui
+      local lnum
+      for index, id in pairs(ui.ids) do
+        if id == "t1|w1" then
+          lnum = index
+        end
+      end
+      t.truthy(lnum, "the worker line")
+      vim.api.nvim_win_set_cursor(ui.win, { lnum, 0 })
+      local original_select, original_input = vim.ui.select, vim.ui.input
+      t.cleanup(function()
+        vim.ui.select, vim.ui.input = original_select, original_input
+      end)
+      vim.ui.select = function(_, _, cb)
+        cb("task")
+      end
+      vim.ui.input = function(_, cb)
+        cb("do the thing")
+      end
+      vim.api.nvim_feedkeys("m", "x", false)
+      wait(function()
+        return #service.team_sends == 1
+      end, 5000, "the panel message")
+      t.eq("task", service.team_sends[1].kind)
+      t.eq("do the thing", service.team_sends[1].body)
+      ui:close()
+    end)
+
+    t.it("the panel's permission answer sends the option id, or none on cancel", function()
+      local service, dir = start_service(t, "panel-permission")
+      setup(t, "panel-permission", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed({
+        id = "t1",
+        cwd = dir,
+        state = "active",
+        participants = {},
+        inbox = {},
+        limits = {},
+      })
+      service:team_inbox({
+        id = "i1",
+        team = "t1",
+        kind = "permission",
+        from = "w1",
+        body = "",
+        options = { { kind = "allow_once", optionId = "allow", name = "Allow" } },
+        state = "open",
+      })
+      wait(function()
+        return team():team("t1") ~= nil and team():item("i1") ~= nil
+      end, 5000, "the permission item")
+      t.eq(true, controller.open_team())
+      local ui = state().view.team_ui
+      local lnum
+      for index, id in pairs(ui.ids) do
+        if id == "item:i1" then
+          lnum = index
+        end
+      end
+      t.truthy(lnum)
+      vim.api.nvim_win_set_cursor(ui.win, { lnum, 0 })
+      local original_select = vim.ui.select
+      t.cleanup(function()
+        vim.ui.select = original_select
+      end)
+      vim.ui.select = function(_, _, cb)
+        cb({ label = "Allow", value = "allow" })
+      end
+      vim.api.nvim_feedkeys("a", "x", false)
+      wait(function()
+        return #service.team_answers == 1
+      end, 5000, "the permission answer")
+      t.eq("allow", service.team_answers[1].option)
+
+      service:team_inbox({
+        id = "i2",
+        team = "t1",
+        kind = "permission",
+        from = "w1",
+        body = "",
+        options = { { kind = "allow_once", optionId = "allow", name = "Allow" } },
+        state = "open",
+      })
+      wait(function()
+        local line
+        for index, id in pairs(ui.ids) do
+          if id == "item:i2" then
+            line = index
+          end
+        end
+        return line ~= nil
+      end, 5000, "the second item")
+      for index, id in pairs(ui.ids) do
+        if id == "item:i2" then
+          lnum = index
+        end
+      end
+      vim.api.nvim_win_set_cursor(ui.win, { lnum, 0 })
+      vim.ui.select = function(_, _, cb)
+        cb({ label = "Cancel", value = false })
+      end
+      vim.api.nvim_feedkeys("a", "x", false)
+      wait(function()
+        return #service.team_answers == 2
+      end, 5000, "the cancelled answer")
+      t.eq(nil, service.team_answers[2].option)
+      ui:close()
+    end)
+
+    t.it("buffers watch replay until the response names the instance", function()
+      local service, dir = start_service(t, "watch-buffer")
+      setup(t, "watch-buffer", service, dir)
+      controller.connect()
+      wait_ready()
+      local leader_session = state().sess.current.id
+      service.team_watch = {
+        instance = "inst-w",
+        sessionId = "sess-w",
+        replay = { { sessionUpdate = "agent_message_chunk", content = { type = "text", text = "worker replay" } } },
+        foreign = {
+          {
+            instance = state().conn.client.proc.instance,
+            sessionId = leader_session,
+            update = { sessionUpdate = "agent_message_chunk", content = { type = "text", text = "LEADER LEAK" } },
+          },
+        },
+      }
+      local m = team()
+      local ok = nil
+      m:watch("t1", "w1", true, function(result)
+        ok = result
+      end)
+      wait(function()
+        return ok ~= nil
+      end, 5000, "team.watch")
+      t.eq(true, ok)
+      t.eq("sess-w", m.watching.session.id)
+      local text = {}
+      for _, block in ipairs(m.watching.session.blocks) do
+        text[#text + 1] = block.text or ""
+      end
+      local joined = table.concat(text, "\n")
+      t.match("worker replay", joined)
+      t.falsy(joined:find("LEADER LEAK", 1, true), "the leader's updates leaked into the watch")
+      m:unwatch()
+    end)
+
+    t.it("unwatches the previous worker when switching", function()
+      local service, dir = start_service(t, "watch-switch")
+      setup(t, "watch-switch", service, dir)
+      controller.connect()
+      wait_ready()
+      local m = team()
+      local first = false
+      m:watch("t1", "w1", false, function()
+        first = true
+      end)
+      wait(function()
+        return first
+      end, 5000, "the first watch")
+      local second = false
+      m:watch("t1", "w2", false, function()
+        second = true
+      end)
+      wait(function()
+        return second
+      end, 5000, "the second watch")
+      wait(function()
+        return service.team_unwatch and #service.team_unwatch >= 1
+      end, 5000, "the unwatch of the first worker")
+      t.eq("w1", service.team_unwatch[1].participant)
+      m:unwatch()
+    end)
+
+    t.it("the panel's w opens the watch view, keeps the panel, and can reopen it", function()
+      local service, dir = start_service(t, "panel-watch")
+      setup(t, "panel-watch", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed({
+        id = "t1",
+        cwd = dir,
+        state = "active",
+        participants = {
+          { name = "leader", state = "idle", task = "_", queued = 0, turns = {} },
+          { name = "w1", state = "idle", task = "_", queued = 0, turns = {} },
+        },
+        inbox = {},
+        limits = {},
+      })
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local ui = state().view.team_ui
+      local lnum
+      for index, id in pairs(ui.ids) do
+        if id == "t1|w1" then
+          lnum = index
+        end
+      end
+      t.truthy(lnum)
+      vim.api.nvim_win_set_cursor(ui.win, { lnum, 0 })
+      vim.api.nvim_feedkeys("w", "x", false)
+      wait(function()
+        return ui.watch_buf ~= nil and vim.api.nvim_buf_is_valid(ui.watch_buf)
+      end, 5000, "the watch view")
+      local first = ui.watch_buf
+      -- Let the scheduled WinLeave callback run: the panel must survive its
+      -- own programmatic split, otherwise the watch would close immediately.
+      vim.wait(100)
+      t.eq(true, ui:is_open(), "the panel must stay open while watching")
+
+      vim.api.nvim_win_close(ui.watch_win, true)
+      wait(function()
+        return ui.watch_buf == nil
+      end, 5000, "the watch view to be wiped")
+      pcall(vim.api.nvim_set_current_win, ui.win)
+      vim.api.nvim_win_set_cursor(ui.win, { lnum, 0 })
+      vim.api.nvim_feedkeys("w", "x", false)
+      wait(function()
+        return ui.watch_buf ~= nil and ui.watch_buf ~= first and vim.api.nvim_buf_is_valid(ui.watch_buf)
+      end, 5000, "the reopened watch view")
+      ui:close()
+    end)
+
+    t.it("ends the watch when its window, the panel, or the team goes away", function()
+      local service, dir = start_service(t, "watch-end")
+      setup(t, "watch-end", service, dir)
+      controller.connect()
+      wait_ready()
+      local m = team()
+      local function watch(participant)
+        local ok = nil
+        m:watch("t1", participant, false, function(result)
+          ok = result
+        end)
+        wait(function()
+          return ok ~= nil and m.watching ~= nil
+        end, 5000, "watch " .. participant)
+      end
+      local function unwatches()
+        return service.team_unwatch and #service.team_unwatch or 0
+      end
+
+      -- Closing the read-only window ends the watch on the service.
+      watch("w1")
+      local ui = state().view.team_ui
+      ui:watch(m.watching.session, "t1/w1")
+      t.truthy(ui.watch_win, "the watch window")
+      local before = unwatches()
+      vim.api.nvim_win_close(ui.watch_win, true)
+      wait(function()
+        return m.watching == nil and unwatches() > before
+      end, 5000, "the window close to unwatch")
+
+      -- Closing the panel ends it too.
+      watch("w2")
+      before = unwatches()
+      ui:close()
+      wait(function()
+        return m.watching == nil and unwatches() > before
+      end, 5000, "the panel close to unwatch")
+
+      -- A closed team has nothing left to watch.
+      service:team_changed({
+        id = "t1",
+        cwd = dir,
+        state = "active",
+        participants = {},
+        inbox = {},
+        limits = {},
+      })
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      watch("w3")
+      service:team_changed({
+        id = "t1",
+        cwd = dir,
+        state = "closed",
+        participants = {},
+        inbox = {},
+        limits = {},
+      })
+      wait(function()
+        return m.watching == nil
+      end, 5000, "the closed team to unwatch")
+    end)
+
+    t.it("a cancelled bus turn finishes the session cleanly", function()
+      local service, dir = start_service(t, "turn-cancelled")
+      setup(t, "turn-cancelled", service, dir)
+      controller.connect()
+      wait_ready()
+      local session = state().sess.current
+      local instance = state().conn.client.proc.instance
+      service:turn_started(instance, {
+        sessionId = session.id,
+        origin = "bus",
+        prompt = { { type = "text", text = "cancel me" } },
+      })
+      wait(function()
+        return session.status == "running"
+      end, 5000, "the bus turn")
+      service:broadcast("tunnel.recv", {
+        instance = instance,
+        seq = 1,
+        message = {
+          jsonrpc = "2.0",
+          method = "_ade/turn_finished",
+          params = { sessionId = session.id, stopReason = "cancelled" },
+        },
+      })
+      wait(function()
+        return session.status == "idle"
+      end, 5000, "the cancelled bus turn to settle")
     end)
 
     t.it("treats a reconnect as the end of every team", function()
