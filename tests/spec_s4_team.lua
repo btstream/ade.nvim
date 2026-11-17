@@ -217,6 +217,27 @@ return function(t)
       t.match("teams.workflows", old_errors[1])
       t.match("teams.workflows", old_errors[2])
 
+      -- A workflow cannot ask for more workers than teams.max_workers (19.1):
+      -- team.start would refuse all of them, so setup fails early and names
+      -- the workflow and both numbers.
+      local ok, err = pcall(validate, {
+        teams = teams_config({
+          workflows = {
+            dev = {
+              summary = "x",
+              team = {
+                { name = "w1", template = "worker" },
+                { name = "w2", template = "worker" },
+                { name = "w3", template = "worker" },
+                { name = "w4", template = "worker" },
+              },
+            },
+          },
+        }),
+      })
+      t.eq(false, ok, "more members than max_workers must be refused")
+      t.match("teams.workflows.dev.team has 4 members but teams.max_workers is 3", tostring(err))
+
       local bad = {
         { teams = teams_config({ max_workers = 0 }) },
         { teams = teams_config({ max_workers = 9 }) },

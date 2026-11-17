@@ -1266,6 +1266,9 @@ function M.validate(cfg)
       if #members > 8 then
         fail("%s.team has more than 8 entries", where)
       end
+      if #members > teams.max_workers then
+        fail("%s.team has %d members but teams.max_workers is %d", where, #members, teams.max_workers)
+      end
       local seen = {}
       for index, member in ipairs(members) do
         local at = string.format("%s.team[%d]", where, index)

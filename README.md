@@ -111,6 +111,8 @@ require("ade").setup({})
 | `:Ade permission` | 重新打开待确认的权限请求 |
 | `:Ade file` | 附加当前文件 |
 | `:Ade diagnostics` | 附加当前 buffer 的诊断 |
+| `:Ade team` | 团队面板；`:Ade team start [流程]` / `:Ade team close`（见下文） |
+| `:Ade workflows` | 列出 / 查看 / 删除命名流程 |
 | `:AdeLog` | 打开日志 |
 | `:AdeDebug` | 打印控制器状态 |
 
@@ -737,12 +739,17 @@ require("ade").setup({
 团队有一块**看板**（列、卡片、负责人、阶段）：leader 管结构（列、建卡/删卡、挪列、
 指派负责人），worker 只写自己负责卡片的正文和键值。卡片是给你看的，不是 agent 之间
 的信息通道——agent 没有读取卡片的工具，看板变化也不会叫醒任何 agent。默认流程下，
-一个阶段的卡片都完成后 leader 汇总一次请你确认提交，不按卡片逐个问。
+一个阶段的卡片都完成后 leader 汇总一次请你确认提交，不按卡片逐个问。看板最多 16
+列、200 张未归档卡片、500 张已归档卡片（超出时丢弃最旧的），整块最多 256 KiB；卡片
+正文最多 8 KiB，`fields` 最多 12 个键、每个值最多 120 字符。超出时服务拒绝这次写入，
+看板保持不变。
 
 **命名流程**是一份“流程说明 + 团队组成”：内置 `default`、配置里的 `teams.workflows`、
 leader 保存到服务的项目级/用户级流程；同名时按 config > project > user > builtin
 解析。项目级流程按 git 仓库的公共目录区分，同一个仓库的 worktree 共用。默认流程的
-正文可以用 `teams.workflows.default` 整体替换。
+正文可以用 `teams.workflows.default` 整体替换。流程里的 `leader.agent` 必须是已配置的
+agent，`leader.role` 最多 4 KiB。每个项目或用户的已存流程最多 100 个；与配置里的流程
+同名时 `workflow_save` 被拒绝（配置的流程遮住它）。
 
 最小配置：
 
@@ -767,6 +774,7 @@ teams = {
   templates = {
     opencode = {
       agent = "opencode",      -- 必须是已配置的 agent
+      model = "xxx",           -- 默认模型；spawn 不带 model 时用它
       models = { "xxx", "yyy" }, -- 允许 leader 指定的模型；省略 = 不限
       worktree = true,         -- 独立 git worktree（默认 false）
     },
@@ -776,26 +784,53 @@ teams = {
 }
 ```
 
-旧的 `teams.definitions` 和 `teams.workflow` 已删除：配置里出现时 setup 直接报错，
-不做迁移。预定义团队改用 `teams.workflows`（原来的 `workers` 列表对应流程里的
-`team`），替换默认流程正文改用 `teams.workflows.default`。
+旧的 `teams.definitions` 和 `teams.workflow` 已删除：配置里出现时 setup 直接报错（错误
+里给出新写法），不做迁移。预定义团队改用 `teams.workflows`（原来的 `workers` 列表对应
+流程里的 `team`），替换默认流程正文改用 `teams.workflows.default`。流程必须有
+`summary` 或 `text` 之一：只写 `text` 时 `summary` 取正文第一行；只列成员、两者都不写
+时 setup 报错。所以旧写法改名时通常要补一行 `summary`：
+
+```lua
+-- 旧：teams.definitions.dev = { workers = { { name = "w1", template = "opencode" } } }
+teams = {
+  workflows = {
+    dev = {
+      summary = "一个 opencode worker",
+      team = { { name = "w1", template = "opencode" } },
+    },
+  },
+}
+```
+
+流程成员数不能超过 `teams.max_workers`（默认 3，范围 1..8）：配置校验会拒绝超过的流程
+（setup 报错，写明流程名和两个数字）；运行中剩余成员会超过上限时 `team.start` 整体拒绝
+（`-32061`），一个都不启动。
 
 启动团队的三种方式：
 
 | 方式 | 说明 |
 |---|---|
 | 对话 | 直接告诉 leader 要做什么；它复述计划、你确认后组队，每次 spawn 在收件箱确认（`A` 一次全部批准） |
-| `:Ade team start [流程]` | 按命名流程启动；没给名字时弹出流程选择器，已存在的名字跳过，不用逐个确认 |
+| `:Ade team start [流程]` | 按命名流程启动；没给名字时弹出流程选择器，已存在的名字跳过，不用逐个确认；成功后自动打开面板 |
 | `teams.enabled = true` | leader 建团队且还没有 worker 时，前端调用一次 `team.start` 按 `default` 流程启动；重连不会重复 |
 
 命令：
 
 | 命令 | 作用 |
 |---|---|
-| `:Ade team` | 打开统一面板（成员 / 收件箱 / 看板 / 详情）；没有团队时显示可用流程 |
+| `:Ade team` | 打开统一面板（成员 / 收件箱 / 看板 / 详情）；没有团队时显示可用流程（光标所在流程按 `S` 启动，`<CR>` 看全文） |
 | `:Ade team start [流程]` | 按流程启动团队 |
 | `:Ade team close` | 确认后结束当前 cwd 的团队 |
 | `:Ade workflows` | 列出/查看/删除命名流程（`<CR>` 全文，`d` 删除，`q` 关闭） |
+
+补全：`:Ade team <Tab>` 补全 `start` / `close`；`:Ade team start <Tab>` 补全配置里的
+流程名、已知的服务流程名和 `default`。
+
+`:Ade team start` 依次：选流程 → 是否切换 leader agent → 已有团队怎么处理 → 输入任务
+→ 确保 leader 会话 → `team.start` → 打开面板。取消任务输入时什么都不动：不关团队、
+不切换 agent、不新建会话。旧服务（api_version 5）上没有 team.start、看板和流程接口：
+前端提示“服务版本过旧；空闲后会自动更新，或用 `:Ade service stop` 手动重启”，不会
+反复重试看板。
 
 面板宽屏（`teams.dashboard.wide`，默认 160）在独立 tabpage 里分四个窗口，窄屏用居中
 浮窗。按键作用于光标下的对象：`<CR>` 打开/切换观察窗口（卡片/收件箱项显示详情），
@@ -809,7 +844,8 @@ teams = {
 **持久化**：团队、参与者、排队消息和每个团队最近 200 条消息正文、看板、卡片历史、
 命名流程写入服务的事件日志数据库（权限 0600）；看板与卡片历史随团队删除，命名流程
 不随团队删除。模板的 `key`/`env`/`launch` 不落盘，恢复时要由前端重新提供配置。
-挂起超过 7 天的团队会被删除（worktree/分支保留）。`--event-log off` 时 `teams` 特性
+挂起超过 7 天的团队会被删除（worktree/分支保留）。恢复出的会话不是存储的 leader
+时，团队保持挂起，在面板按 `x` 关闭；leader 注入不会被挂起团队阻塞。`--event-log off` 时 `teams` 特性
 不声明、`team.*` 返回 `-32601`，团队/看板/流程都不落盘也不恢复。
 
 `worktree = true` 的模板由服务在 `stdpath("data")/ade/worktrees/` 下创建 worktree
@@ -818,9 +854,10 @@ teams = {
 与分支都保留，用面板 `D` 删除（可选 force；未合并分支保留）。
 
 直连模式、旧服务或 `spawn_from_chat = false` 时不注入 team MCP server，单 agent 体验
-不变。leader 的组队说明书通过 MCP `initialize` 的 `instructions` 和组队时的 notice
-给出（claude/opencode 支持，pi 需要自己调 `mcp({instructions=…})` 且工具走 `mcp`
-代理）；不组队就不产生额外 token。
+不变。leader 的说明分两层：基础说明在每个可当 leader 的会话建立时随 MCP `initialize`
+的 `instructions` 下发（最多 2 KiB，约 300 token；claude/opencode 会放进上下文、可被
+提示缓存，pi 需要自己调 `mcp({instructions=…})` 且工具走 `mcp` 代理），不组队也有这份
+固定开销；流程全文、成员和任务只在组队时通过一条 notice 发一次。
 
 细节见 `:help ade-teams`。
 

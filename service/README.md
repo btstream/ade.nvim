@@ -353,7 +353,9 @@ Retention and deletion:
 
 Most of these exist for the integration tests; the defaults are the documented
 behaviour. Values are read when the service starts (or when a related document
-is written), and malformed values fall back to the default.
+is written), and malformed values fall back to the default, except
+`NVIM_ADE_SERVER_IDLE_TIMEOUT_SECS`: a malformed value there makes `serve`
+fail (only an empty value falls back to 1800).
 
 | Variable | Default | Purpose |
 |---|---|---|
