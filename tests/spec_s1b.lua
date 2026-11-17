@@ -735,6 +735,9 @@ return function(t)
             if opts.team_list == "unsupported" then
               return false, { code = -32601, message = "Method not found" }
             end
+            if opts.team_list == "malformed" then
+              return true, { teams = "not a list" }
+            end
             return true, { teams = opts.teams or {} }
           end
           if opts.list == "timeout" then
@@ -803,7 +806,7 @@ return function(t)
       t.eq(0, record.restarts, "a running turn must not be interrupted")
       t.eq(1, #record.notes)
       t.eq(vim.log.levels.WARN, record.notes[1].level)
-      t.match("restarts automatically", record.notes[1].message)
+      t.match("next connection", record.notes[1].message)
       -- A later ensure checks again but stays quiet.
       instance:check({ server_version = Version.VERSION .. "-old", api_version = Version.API_VERSION })
       t.eq(1, #record.notes, "the warning is once per Neovim")
@@ -833,7 +836,7 @@ return function(t)
       t.truthy(instance:check(info))
       t.eq(0, record.restarts, "a team must keep its service alive")
       t.eq(1, #record.notes)
-      t.match("restarts automatically", record.notes[1].message)
+      t.match("next connection", record.notes[1].message)
       t.eq(5000, record.team_list_timeout, "the team probe has its own 5 s timeout")
       instance:check(info)
       t.eq(1, #record.notes, "the warning is once per Neovim")
@@ -858,7 +861,19 @@ return function(t)
       }))
       t.eq(0, record.restarts)
       t.eq(1, #record.notes)
-      t.match("restarts automatically", record.notes[1].message)
+      t.match("next connection", record.notes[1].message)
+    end)
+
+    t.it("treats a malformed team.list as busy", function()
+      local instance, record = harness({ team_list = "malformed" })
+      t.truthy(instance:check({
+        server_version = Version.VERSION .. "-old",
+        api_version = Version.API_VERSION,
+        features = { "teams" },
+      }))
+      t.eq(0, record.restarts)
+      t.eq(1, #record.notes)
+      t.match("next connection", record.notes[1].message)
     end)
 
     t.it("treats -32601 from team.list as no teams", function()

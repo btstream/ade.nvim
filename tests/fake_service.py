@@ -357,7 +357,29 @@ class Server:
             return None
         if method == "team.spawn":
             self.team_spawns.append(copy.deepcopy(params))
-            name = params.get("name") or "w1"
+            team = self.teams.get(params.get("team"))
+            participants = team.get("participants", []) if isinstance(team, dict) else []
+            name = params.get("name")
+            if not name:
+                taken = {p.get("name") for p in participants if isinstance(p, dict)}
+                n = 1
+                while f"w{n}" in taken:
+                    n += 1
+                name = f"w{n}"
+            if isinstance(team, dict):
+                participants.append(
+                    {
+                        "name": name,
+                        "role": "worker",
+                        "state": "idle",
+                        "paused": False,
+                        "task": params.get("task") or "_",
+                        "queued": 0,
+                        "turns": {"task": 0, "total": 0},
+                    }
+                )
+                team["participants"] = participants
+                self.broadcast("team.changed", {"team": copy.deepcopy(team)})
             threading.Thread(
                 target=self.later_result, args=(conn, ident, {"name": name}), daemon=True
             ).start()

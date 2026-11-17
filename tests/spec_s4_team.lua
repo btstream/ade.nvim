@@ -810,6 +810,59 @@ return function(t)
       end, 10000, "one warning per failed worker")
     end)
 
+    t.it("shows git's stderr when a configured worker cannot start", function()
+      local service, dir = start_service(t, "defined-git-error", {
+        team_spawn_error = {
+          code = -32066,
+          message = "git worktree add failed",
+          data = { stderr = "fatal: invalid reference: HEAD" },
+        },
+      })
+      setup(t, "defined-git-error", service, dir, { teams = defined_teams() })
+      local notices = capture(t)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        for _, note in ipairs(notices) do
+          if note.message:find("fatal: invalid reference: HEAD", 1, true) then
+            return true
+          end
+        end
+        return false
+      end, 10000, "git's stderr in the auto-start warning")
+    end)
+
+    t.it("does not warn when a defined worker name was already taken", function()
+      local service, dir = start_service(t, "defined-duplicate", {
+        team_spawn_error = { code = -32060, message = "worker name is already used" },
+      })
+      setup(t, "defined-duplicate", service, dir, { teams = defined_teams() })
+      local notices = capture(t)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #service.team_spawns == 2
+      end, 10000, "the duplicate spawn attempts")
+      vim.wait(100)
+      for _, note in ipairs(notices) do
+        t.falsy(note.message:find("could not start worker", 1, true), "a duplicate start is only logged")
+      end
+    end)
+
+    t.it("does not start configured workers when binding the leader fails", function()
+      local service, dir = start_service(t, "defined-bind-failed", {
+        team_bind_error = { code = -32061, message = "another session leads this team" },
+      })
+      setup(t, "defined-bind-failed", service, dir, { teams = defined_teams() })
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return team().blocked[dir] == true
+      end, 5000, "the failed bind")
+      vim.wait(200)
+      t.eq(0, #service.team_spawns)
+    end)
+
     t.it("does not inject a leader when another instance already leads the cwd", function()
       local service, dir = start_service(t, "other-leader")
       service.teams.t1 = {
@@ -1089,6 +1142,7 @@ return function(t)
     t.it("the panel's s starts a worker from a template", function()
       local service, dir = start_service(t, "panel-spawn")
       setup(t, "panel-spawn", service, dir)
+      local notices = capture(t)
       controller.connect()
       wait_ready()
       service:team_changed({
@@ -1131,6 +1185,28 @@ return function(t)
       t.eq("worker", service.team_spawns[1].template)
       t.eq("w9", service.team_spawns[1].name)
       t.eq("task nine", service.team_spawns[1].task)
+
+      -- Invalid/reserved names are rejected before the request and re-asked.
+      for index, id in pairs(ui.ids) do
+        if id == "team:t1" then
+          lnum = index
+        end
+      end
+      vim.api.nvim_win_set_cursor(ui.win, { lnum, 0 })
+      answers = { "leader", "Bad", "w10", "" }
+      vim.api.nvim_feedkeys("s", "x", false)
+      wait(function()
+        return #service.team_spawns == 2
+      end, 5000, "the corrected worker name")
+      t.eq("w10", service.team_spawns[2].name)
+      t.eq(nil, service.team_spawns[2].task)
+      local warned = false
+      for _, note in ipairs(notices) do
+        if note.message:find("not be leader or human", 1, true) then
+          warned = true
+        end
+      end
+      t.truthy(warned, "the reserved-name hint is shown")
       ui:close()
     end)
 
