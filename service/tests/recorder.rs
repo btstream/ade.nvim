@@ -650,6 +650,64 @@ fn team_snapshots_in_one_batch_coalesce_to_the_last_one() {
 }
 
 #[test]
+fn a_team_delete_beats_a_failed_snapshot_retry() {
+    let runtime = runtime();
+    runtime.block_on(async {
+        let recorder = Recorder::in_memory(1024 * 1024);
+        recorder.with_failing_team_saves(1);
+        recorder.save_team("t1", r#"{"id":"t1","cwd":"/p"}"#.to_string(), 1, 1);
+        recorder.flush().await;
+        recorder.delete_team("t1");
+        recorder.flush().await;
+        // Let the idle retry tick run; the stale failed snapshot must not
+        // resurrect the deleted team.
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(recorder.load_teams().expect("load").is_empty());
+    });
+}
+
+#[test]
+fn a_failed_delete_is_retried_without_resurrecting_the_team() {
+    let runtime = runtime();
+    runtime.block_on(async {
+        let recorder = Recorder::in_memory(1024 * 1024);
+        recorder.save_team("t1", r#"{"id":"t1","cwd":"/p"}"#.to_string(), 1, 1);
+        recorder.flush().await;
+        recorder.with_failing_team_saves(1);
+        recorder.with_failing_team_deletes(1);
+        // A failed save and then a failed delete: both retries must be ordered
+        // so the team ends up deleted.
+        recorder.save_team("t1", r#"{"id":"t1","cwd":"/p"}"#.to_string(), 1, 1);
+        recorder.flush().await;
+        recorder.delete_team("t1");
+        recorder.flush().await;
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(recorder.load_teams().expect("load").is_empty());
+    });
+}
+
+#[test]
+fn coalesced_team_saves_release_their_backpressure_bytes() {
+    let runtime = runtime();
+    runtime.block_on(async {
+        let recorder = Recorder::in_memory_paused(1024 * 1024);
+        for value in 0..100 {
+            recorder.save_team(
+                "t1",
+                format!(r#"{{"id":"t1","cwd":"/p","value":{value}}}"#),
+                1,
+                1,
+            );
+        }
+        assert!(recorder.queued_bytes() > 0);
+        recorder.resume_writer();
+        recorder.flush().await;
+        assert_eq!(recorder.queued_bytes(), 0, "bytes are released");
+        assert_eq!(recorder.team_write_count(), 1);
+    });
+}
+
+#[test]
 fn record_after_flush_remains_ordered() {
     let runtime = runtime();
     runtime.block_on(async {

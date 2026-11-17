@@ -157,6 +157,9 @@ struct Inner {
     paused: Arc<(Mutex<bool>, std::sync::Condvar)>,
     /// Successful team snapshot transactions (coalescing test hook).
     team_writes: AtomicUsize,
+    /// Forced team write failures, for the retry test hooks.
+    fail_team_saves: AtomicUsize,
+    fail_team_deletes: AtomicUsize,
 }
 
 /// Handle to the asynchronous event log.
@@ -229,6 +232,8 @@ impl Recorder {
                 fail_batches: AtomicUsize::new(0),
                 paused: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
                 team_writes: AtomicUsize::new(0),
+                fail_team_saves: AtomicUsize::new(0),
+                fail_team_deletes: AtomicUsize::new(0),
             }),
             enabled: false,
             max_bytes_per_instance: 0,
@@ -454,6 +459,21 @@ impl Recorder {
         self.inner.team_writes.load(Ordering::Relaxed)
     }
 
+    /// Bytes currently queued for the writer (events and team snapshots).
+    pub fn queued_bytes(&self) -> usize {
+        self.inner.queued_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn with_failing_team_saves(&self, count: usize) -> &Self {
+        self.inner.fail_team_saves.store(count, Ordering::Relaxed);
+        self
+    }
+
+    pub fn with_failing_team_deletes(&self, count: usize) -> &Self {
+        self.inner.fail_team_deletes.store(count, Ordering::Relaxed);
+        self
+    }
+
     pub fn load_team_meta(&self, key: &str) -> Result<Option<String>> {
         if !self.enabled {
             return Ok(None);
@@ -478,6 +498,8 @@ impl Recorder {
             fail_batches: AtomicUsize::new(0),
             paused: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
             team_writes: AtomicUsize::new(0),
+            fail_team_saves: AtomicUsize::new(0),
+            fail_team_deletes: AtomicUsize::new(0),
         });
 
         let writer = Writer {
@@ -663,10 +685,13 @@ impl Writer {
                     } => {
                         // Coalesce per team within the batch; the last snapshot
                         // is the state that must win.
-                        self.team_saves
-                            .insert(id, (state_json, max_team, max_inbox, bytes));
-                        if self.team_saves.len() >= 64 {
-                            self.flush_team_saves();
+                        self.queue_team_save(id, state_json, max_team, max_inbox, bytes);
+                        if self.team_saves.len() < 64 {
+                            match receiver.recv_timeout(Duration::from_millis(1)) {
+                                Ok(job) => next = Some(job),
+                                Err(RecvTimeoutError::Timeout) => {}
+                                Err(RecvTimeoutError::Disconnected) => {}
+                            }
                         }
                     }
                     Job::TeamDelete(id) => {
@@ -684,6 +709,9 @@ impl Writer {
             }
 
             self.write(&mut batch);
+            self.flush_team_saves();
+            self.flush_team_deletes();
+            self.retry_teams();
             self.prune_oversized();
         }
     }
@@ -714,8 +742,7 @@ impl Writer {
                     max_inbox,
                     bytes,
                 } => {
-                    self.team_saves
-                        .insert(id, (state_json, max_team, max_inbox, bytes));
+                    self.queue_team_save(id, state_json, max_team, max_inbox, bytes);
                 }
                 Job::TeamDelete(id) => {
                     self.flush_team_saves();
@@ -867,9 +894,67 @@ impl Writer {
         // after the forget.
     }
 
+    fn queue_team_save(
+        &mut self,
+        id: String,
+        state_json: String,
+        max_team: u64,
+        max_inbox: u64,
+        bytes: usize,
+    ) {
+        if let Some((_, _, _, old)) = self
+            .team_saves
+            .insert(id, (state_json, max_team, max_inbox, bytes))
+        {
+            // The replaced snapshot's bytes are no longer queued.
+            self.inner.queued_bytes.fetch_sub(old, Ordering::Relaxed);
+        }
+    }
+
+    fn queue_failed_team(
+        &mut self,
+        id: String,
+        state_json: String,
+        max_team: u64,
+        max_inbox: u64,
+        bytes: usize,
+    ) {
+        if let Some((_, _, _, old)) = self
+            .failed_teams
+            .insert(id, (state_json, max_team, max_inbox, bytes))
+        {
+            self.inner.queued_bytes.fetch_sub(old, Ordering::Relaxed);
+        }
+    }
+
+    fn drop_pending_team(&mut self, id: &str) {
+        for (_, _, _, bytes) in [self.team_saves.remove(id), self.failed_teams.remove(id)]
+            .into_iter()
+            .flatten()
+        {
+            self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+
     fn flush_team_saves(&mut self) {
         let saves = std::mem::take(&mut self.team_saves);
         for (id, (state_json, max_team, max_inbox, bytes)) in saves {
+            if self
+                .inner
+                .fail_team_saves
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                self.report_team_failure(&anyhow::anyhow!("forced team save failure"));
+                if !self.failed_deletes.contains(&id) {
+                    self.queue_failed_team(id, state_json, max_team, max_inbox, bytes);
+                } else {
+                    self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                }
+                continue;
+            }
             match self.store.save_team(&id, &state_json, max_team, max_inbox) {
                 Ok(()) => {
                     self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
@@ -878,8 +963,11 @@ impl Writer {
                 }
                 Err(error) => {
                     self.report_team_failure(&error);
-                    self.failed_teams
-                        .insert(id, (state_json, max_team, max_inbox, bytes));
+                    if self.failed_deletes.contains(&id) {
+                        self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                    } else {
+                        self.queue_failed_team(id, state_json, max_team, max_inbox, bytes);
+                    }
                 }
             }
         }
@@ -900,11 +988,34 @@ impl Writer {
             return;
         }
         let retry = std::mem::take(&mut self.failed_teams);
-        for (id, value) in retry {
-            self.team_saves.insert(id, value);
+        for (id, (state_json, max_team, max_inbox, bytes)) in retry {
+            if self.failed_deletes.contains(&id) {
+                self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                continue;
+            }
+            if self.team_saves.contains_key(&id) {
+                // A newer snapshot is already queued; the failed one is stale.
+                self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                continue;
+            }
+            self.team_saves
+                .insert(id, (state_json, max_team, max_inbox, bytes));
         }
         let deletes = std::mem::take(&mut self.failed_deletes);
         for id in deletes {
+            self.drop_pending_team(&id);
+            if self
+                .inner
+                .fail_team_deletes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                self.report_team_failure(&anyhow::anyhow!("forced team delete failure"));
+                self.failed_deletes.insert(id);
+                continue;
+            }
             match self.store.delete_team(&id) {
                 Ok(()) => {}
                 Err(error) => {
@@ -917,6 +1028,21 @@ impl Writer {
     }
 
     fn delete_team(&mut self, id: &str) {
+        // A delete wins over any snapshot queued before/after it: the team is
+        // gone, so an old snapshot must never resurrect it on a retry.
+        self.drop_pending_team(id);
+        if self
+            .inner
+            .fail_team_deletes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            self.report_team_failure(&anyhow::anyhow!("forced team delete failure"));
+            self.failed_deletes.insert(id.to_string());
+            return;
+        }
         if let Err(error) = self.store.delete_team(id) {
             self.report_team_failure(&error);
             self.failed_deletes.insert(id.to_string());

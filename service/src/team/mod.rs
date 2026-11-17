@@ -433,8 +433,6 @@ pub struct Team {
     /// Loaded from disk after a service restart and not resumed yet (18.15).
     pub suspended: bool,
     pub suspended_at: Option<u64>,
-    /// The one resume triggered by bind/configure is in flight.
-    pub resuming: bool,
     /// A leader bound while suspended but no configuration had arrived yet.
     pub pending_resume: Option<(String, String)>,
     pub leader_instance: Option<String>,
@@ -872,7 +870,6 @@ impl Teams {
         if let Some(team) = self.teams.get_mut(team_id) {
             team.suspended = false;
             team.suspended_at = None;
-            team.resuming = true;
             team.pending_resume = None;
             team.leader_instance = Some(instance.to_string());
             team.leader_session = Some(session.to_string());
@@ -889,12 +886,6 @@ impl Teams {
         json!({ "team": team_entry(&self.teams[team_id]) })
     }
 
-    pub fn finish_resume(&mut self, team_id: &str) {
-        if let Some(team) = self.teams.get_mut(team_id) {
-            team.resuming = false;
-        }
-    }
-
     /// The token bound for a still-suspended team whose configure has just
     /// arrived.
     pub fn config_resume(&self, cwd: &str) -> Option<(String, String, String)> {
@@ -908,6 +899,24 @@ impl Teams {
             return None;
         }
         Some((team_id, instance, session))
+    }
+
+    pub fn clear_pending_resume(&mut self, team_id: &str) {
+        if let Some(team) = self.teams.get_mut(team_id) {
+            team.pending_resume = None;
+        }
+    }
+
+    pub fn clear_instance_pending(&mut self, instance: &str) {
+        for team in self.teams.values_mut() {
+            if team
+                .pending_resume
+                .as_ref()
+                .is_some_and(|(bound, _)| bound == instance)
+            {
+                team.pending_resume = None;
+            }
+        }
     }
 
     pub fn bind_leader(
@@ -941,9 +950,7 @@ impl Teams {
                     // A bind before configure is accepted: the token is bound
                     // and the team stays suspended until configure arrives.
                     if let Some(team) = self.teams.get_mut(&team_id) {
-                        if !team.resuming {
-                            team.pending_resume = Some((instance.to_string(), session.to_string()));
-                        }
+                        team.pending_resume = Some((instance.to_string(), session.to_string()));
                     }
                     if let Some(record) = self.token_records.get_mut(token_id) {
                         record.bound = true;
@@ -998,7 +1005,6 @@ impl Teams {
             closed: false,
             suspended: false,
             suspended_at: None,
-            resuming: false,
             pending_resume: None,
             leader_instance: Some(instance.to_string()),
             leader_session: Some(session.to_string()),
@@ -3038,7 +3044,6 @@ impl Teams {
                 closed: false,
                 suspended: true,
                 suspended_at: Some(suspended_at),
-                resuming: false,
                 pending_resume: None,
                 leader_instance: None,
                 leader_session: snapshot.leader_session.clone(),
@@ -4031,9 +4036,6 @@ mod tests {
         let (_server, token) = restored.leader_server("i1", "/p", "/p").unwrap();
         let first = restored.bind_leader("i1", "s1", &token).unwrap();
         assert!(matches!(first, BindOutcome::Resume { .. }), "{first:?}");
-        assert!(restored.team(&team).unwrap().resuming);
-        restored.finish_resume(&team);
-        assert!(!restored.team(&team).unwrap().resuming);
         let second = restored.bind_leader("i1", "s1", &token).unwrap();
         assert!(
             matches!(second, BindOutcome::Active(_)),

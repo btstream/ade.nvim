@@ -231,9 +231,14 @@ impl Hub {
             .ok_or_else(|| TeamError::invalid("config is required"))?;
         self.teams.configure(&cwd, config)?;
         if let Some((team, instance, session)) = self.teams.config_resume(&cwd) {
-            self.teams.start_resume(&team, &instance, &session);
-            self.resume_team(&team);
-            self.teams.finish_resume(&team);
+            if self.instances.contains_key(&instance) {
+                self.teams.start_resume(&team, &instance, &session);
+                self.resume_team(&team);
+            } else {
+                // The instance that bound before configure is gone; stay
+                // suspended and wait for a new bind.
+                self.teams.clear_pending_resume(&team);
+            }
         }
         Ok(json!({}))
     }
@@ -260,7 +265,6 @@ impl Hub {
             crate::team::BindOutcome::Active(entry) => Ok(entry),
             crate::team::BindOutcome::Resume { team, entry } => {
                 self.resume_team(&team);
-                self.teams.finish_resume(&team);
                 Ok(entry)
             }
         }

@@ -2386,6 +2386,7 @@ impl Hub {
     }
 
     fn instance_exited(&mut self, instance_id: &str) {
+        self.teams.clear_instance_pending(instance_id);
         let delivery = self.delivery_conns(instance_id);
         self.fail_held_prompts(instance_id);
         let Some(instance) = self.instances.remove(instance_id) else {

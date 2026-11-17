@@ -1108,6 +1108,40 @@ fn configure_after_bind_starts_the_resume() {
 }
 
 #[test]
+fn configure_does_not_resume_after_the_bound_instance_exited() {
+    let fixture = Fixture::new("restart-instance-gone");
+    let mut server = fixture.start("a", &[]);
+    let mut client = fixture.connect(&server);
+    let (team, leader_session, _) = fixture.first_team(&server, &mut client, "do [report]");
+    Fixture::shutdown(&mut server);
+    drop(server);
+
+    let mut restarted = fixture.start("b", &[]);
+    let mut second = fixture.connect(&restarted);
+    wait_suspended(&mut second, &team);
+    let (instance, _session, _token, bound) = fixture.attach_leader(
+        &restarted,
+        &mut second,
+        &fixture.work,
+        Some(&leader_session),
+    );
+    assert_eq!(bound["result"]["team"]["state"], "suspended", "{bound}");
+    let stopped = second.request(
+        105,
+        "agent.stop",
+        json!({"instance": instance, "force": true}),
+    );
+    assert!(stopped["result"].is_object(), "{stopped}");
+    std::thread::sleep(Duration::from_millis(100));
+    fixture.configure(&mut second, &fixture.work, &restarted, true);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(team_entry(&mut second, &team)["state"], "suspended");
+    let closed = second.request(106, "team.close", json!({"team": team}));
+    assert!(closed["result"].is_object(), "{closed}");
+    Fixture::shutdown(&mut restarted);
+}
+
+#[test]
 fn only_suspended_teams_do_not_block_idle_exit() {
     let fixture = Fixture::new("restart-idle");
     let mut server = fixture.start("a", &[]);
