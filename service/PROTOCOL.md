@@ -1404,7 +1404,7 @@ a second front end never starts them twice.
 
 **Version check (18.14).** The front end asks `team.list` with a 5 s timeout;
 a failure or timeout counts as busy, `-32601` (a service without teams) as no
-teams.
+teams; a team whose state is `suspended` (18.15) does not count.
 
 | Code | Meaning |
 |---|---|
