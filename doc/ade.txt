@@ -1054,7 +1054,17 @@ worktree = true 的模板由服务在 stdpath("data")/ade/worktrees/ 下创建�
 都保留；面板 D 删除（可 force），未合并的分支会保留。
 
 enabled = true 时，leader 新建团队后按 default 定义调用 team.spawn，只启动 team.list
-里还没有的名字，重连或第二个前端不会重复启动。
+里还没有的名字，重连、恢复或第二个前端不会重复启动。
+
+服务重启后未关闭的团队变为挂起（suspended）：面板照常显示，标注挂起时间和“等待
+leader 会话恢复”。恢复 leader 的会话后团队自动继续，worker 按存储的 session/worktree
+恢复，恢复 notice 作为 bus 回合显示在 leader 聊天里。挂起期间 m 可发消息（排队）、
+可回答 question/message/limit、D 删除已退出 worker 的 worktree、x 关闭团队；
+w/s/p/r/c 提示团队已挂起。leader 注入不会被挂起团队阻塞；恢复出的会话不是存储的
+leader 时团队保持挂起，并提示按 x 关闭。
+
+消息正文、队列和最近 200 条消息写入服务事件日志数据库（0600）；挂起超过 7 天的团队
+在服务启动或每小时检查时删除，worktree 与分支保留。
 
 服务版本与插件不同且服务里还有团队时不自动重启（挂起的团队除外），只提示稍后重启；
 需要时用 :Ade service stop 手动重启。

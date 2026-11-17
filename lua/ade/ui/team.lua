@@ -81,6 +81,11 @@ function Panel:lines()
   end
   for _, team in ipairs(rows) do
     add(string.format(" %s  %s  [%s]", team.id, tostring(team.cwd), tostring(team.state)), "team:" .. tostring(team.id))
+    if team.state == "suspended" then
+      local at = tonumber(team.suspended_at)
+      local when = at and os.date("%Y-%m-%d %H:%M:%S", math.floor(at / 1000)) or "unknown"
+      add("   suspended since " .. when .. "; waiting for the leader session to resume", nil)
+    end
     local limits = team.limits or {}
     local cfg_teams = (self.config and self.config().teams) or {}
     local live, total = 0, 0
@@ -233,7 +238,7 @@ function Panel:open()
   end)
   self:map("R", function()
     local team = self:team_of_current()
-    if team then
+    if team and not self:refuse_suspended(team) then
       self.team:reset_limits(team, function(ok, value)
         self:report(ok, value)
         self.team:refresh()
@@ -242,7 +247,7 @@ function Panel:open()
   end)
   self:map("w", function()
     local kind, team, name = self:current()
-    if kind == "participant" and name ~= "leader" then
+    if kind == "participant" and name ~= "leader" and not self:refuse_suspended(team) then
       self.team:watch(team, name, true, function(ok, value)
         self:report(ok, value)
       end)
@@ -374,6 +379,21 @@ function Panel:close()
   self.win, self.buf = nil, nil
 end
 
+---Explain that a suspended team cannot take this operation yet.
+function Panel:suspended_notice()
+  self:notify("the team is suspended; wait for the leader session to resume or press x to close it")
+end
+
+---@param team string|nil
+---@return boolean
+function Panel:refuse_suspended(team)
+  if team and self.team:is_suspended(team) then
+    self:suspended_notice()
+    return true
+  end
+  return false
+end
+
 ---Pause/resume/cancel the participant under the cursor.
 ---@param body string
 function Panel:control_current(body)
@@ -381,7 +401,7 @@ function Panel:control_current(body)
   if kind ~= "participant" or name == nil then
     return
   end
-  if name == "human" then
+  if name == "human" or self:refuse_suspended(team) then
     return
   end
   self.team:control(team, name, body, function(ok, value)
@@ -429,6 +449,9 @@ function Panel:spawn_current()
   local team = self:team_of_current()
   if not team then
     self:notify("put the cursor on a team or participant first")
+    return
+  end
+  if self:refuse_suspended(team) then
     return
   end
   local cfg = self.config and self.config() or {}
@@ -541,6 +564,15 @@ function Panel:answer_current()
   end
   local item = self.team:item(item_id)
   if not item or item.state ~= "open" then
+    return
+  end
+  if
+    self.team:is_suspended(item.team)
+    and item.kind ~= "question"
+    and item.kind ~= "message"
+    and item.kind ~= "limit"
+  then
+    self:suspended_notice()
     return
   end
   local function answer(fields)

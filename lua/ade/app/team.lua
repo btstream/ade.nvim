@@ -66,6 +66,9 @@ function M.new(opts)
     -- cwd -> true when another session already leads that team (-32061).
     blocked = {},
     warned_blocked = {},
+    -- cwd -> team id when team.list showed a suspended team for it.
+    suspended_cwd = {},
+    warned_suspended = {},
     notified = {},
     -- team id -> {worker name: true} for the pre-built definition.
     started_workers = {},
@@ -129,35 +132,50 @@ function Team:_attach(raw)
       self:on_inbox_payload(payload)
     end)
     raw:subscribe("teams", "__disconnected", function()
-      self:reset()
+      self:forget_connection()
     end)
   end
 end
 
----Forget everything a lost connection invalidated.
-function Team:reset()
-  self.teams = {}
-  self.inbox = {}
+---Forget connection-scoped state; stored teams stay visible.
+function Team:forget_connection()
   self.leader_pending = {}
   self.leader_inflight = {}
   self.configure_inflight = {}
-  self.started_workers = {}
+  self.sent_config = {}
   self.bound = {}
   self.blocked = {}
-  -- `warned_blocked` / `notified` survive a reconnect: an item or conflict
-  -- that was already announced must not be announced again.
+  self.suspended_cwd = {}
+  -- `warned_blocked` / `warned_suspended` / `notified` survive a reconnect:
+  -- a conflict that was already announced must not be announced again.
   self:unwatch(true)
   self:changed()
 end
 
----Reset what a reconnect invalidates: teams do not survive a service restart.
+---Forget everything, including the team list (service gone/teams unavailable).
+function Team:reset()
+  self.teams = {}
+  self.inbox = {}
+  self.started_workers = {}
+  self:forget_connection()
+end
+
+---A service restart leaves teams suspended until their leader session returns.
 function Team:on_hello()
-  self:reset()
+  self:forget_connection()
   local cwd = self.resolve_cwd and self.resolve_cwd() or nil
   if cwd then
     self:configure(cwd, true)
   end
   self:refresh()
+end
+
+---Whether a known team is suspended (waiting for its leader session).
+---@param team_id string|nil
+---@return boolean
+function Team:is_suspended(team_id)
+  local team = type(team_id) == "string" and self.teams[team_id] or nil
+  return type(team) == "table" and team.state == "suspended"
 end
 
 ---The absolute directory the service creates worker worktrees under (18.12).
@@ -349,16 +367,23 @@ function Team:leader_server(instance, cwd)
   if listed_ok and type(listed) == "table" and type(listed.teams) == "table" then
     for _, entry in ipairs(listed.teams) do
       if entry.cwd == cwd and type(entry.leader) == "table" then
-        if entry.leader.instance == instance then
+        if entry.state == "suspended" then
+          -- PROTOCOL.md 18.15: a suspended team may be resumed by any instance
+          -- whose session cwd matches; leader.instance is null, never a conflict.
+          self.suspended_cwd[cwd] = entry.id
+        elseif entry.leader.instance == instance then
+          self.suspended_cwd[cwd] = nil
           self.bound[cwd] = { instance = instance, session_id = entry.leader.sessionId, team = entry.id }
           return done(nil)
+        elseif entry.leader.instance ~= nil then
+          self.suspended_cwd[cwd] = nil
+          self.blocked[cwd] = true
+          if not self.warned_blocked[cwd] then
+            self.warned_blocked[cwd] = true
+            self.notify("a team already exists for this cwd; close it before starting another", vim.log.levels.WARN)
+          end
+          return done(nil)
         end
-        self.blocked[cwd] = true
-        if not self.warned_blocked[cwd] then
-          self.warned_blocked[cwd] = true
-          self.notify("a team already exists for this cwd; close it before starting another", vim.log.levels.WARN)
-        end
-        return done(nil)
       end
     end
   end
@@ -414,10 +439,25 @@ function Team:bind_leader(instance, session_id, cwd)
       local message = type(value) == "table" and (value.message or value.code) or tostring(value)
       log.warn("team.bind_leader failed: %s", tostring(message))
       if type(value) == "table" and value.code == -32061 then
-        self.blocked[cwd] = true
-        if not self.warned_blocked[cwd] then
-          self.warned_blocked[cwd] = true
-          self.notify("another session already leads this team: " .. tostring(value.message or ""), vim.log.levels.WARN)
+        if self.suspended_cwd[cwd] then
+          -- The restored session is not the stored leader; the team stays
+          -- suspended and the person can close it from the panel.
+          if not self.warned_suspended[cwd] then
+            self.warned_suspended[cwd] = true
+            self.notify(
+              "the team for this cwd is still suspended; open :Ade team and press x to close it",
+              vim.log.levels.WARN
+            )
+          end
+        else
+          self.blocked[cwd] = true
+          if not self.warned_blocked[cwd] then
+            self.warned_blocked[cwd] = true
+            self.notify(
+              "another session already leads this team: " .. tostring(value.message or ""),
+              vim.log.levels.WARN
+            )
+          end
         end
       end
       return
@@ -546,6 +586,12 @@ function Team:on_changed_payload(payload)
       end
     end
     self.started_workers[team.id] = nil
+    for cwd, id in pairs(self.suspended_cwd) do
+      if id == team.id then
+        self.suspended_cwd[cwd] = nil
+        self.warned_suspended[cwd] = nil
+      end
+    end
     -- The team is gone: this instance may lead a new one for the same cwd.
     for cwd, entry in pairs(self.bound) do
       if entry.team == team.id or team.cwd == cwd then
@@ -564,6 +610,14 @@ function Team:on_changed_payload(payload)
     end
   else
     self.teams[team.id] = team
+    if team.state ~= "suspended" then
+      for cwd, id in pairs(self.suspended_cwd) do
+        if id == team.id then
+          self.suspended_cwd[cwd] = nil
+          self.warned_suspended[cwd] = nil
+        end
+      end
+    end
   end
   self:changed()
 end
