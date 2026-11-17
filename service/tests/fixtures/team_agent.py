@@ -34,7 +34,9 @@ PID = os.getpid()
 GATE = os.environ.get("TEAM_AGENT_GATE")
 TEMPLATE = os.environ.get("TEAM_AGENT_TEMPLATE", "dev")
 NAME = os.environ.get("TEAM_AGENT_NAME")
-CANCEL = threading.Event()
+# session id -> Event, set by `session/cancel` for that session only. A front
+# end prompt after a cancelled bus prompt starts with a fresh event.
+CANCEL = {}
 NEXT_ID = [7000]
 PENDING = {}
 LOCK = threading.Lock()
@@ -77,11 +79,12 @@ def request_client(method, params, timeout=20, ident=None):
     return slot["response"]
 
 
-def wait_gate(timeout=20):
+def wait_gate(session, timeout=20):
     if not GATE:
         return
+    event = CANCEL.get(session)
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline and not CANCEL.is_set():
+    while time.monotonic() < deadline and not (event and event.is_set()):
         if os.path.exists(GATE):
             return
         time.sleep(0.02)
@@ -206,8 +209,13 @@ def run_prompt(ident, text, session):
             log({"event": "answer-report-response", "response": response})
             result(ident, {"stopReason": "end_turn"})
             return
-        if text.startswith("spawn"):
-            response = mcp_call(session, "team_spawn", {"template": TEMPLATE, **({"name": NAME} if NAME else {}), "task": "do [report]"})
+        if text.startswith("spawn-task:"):
+            task = text[len("spawn-task:"):].strip()
+            response = mcp_call(session, "team_spawn", {"template": TEMPLATE, **({"name": NAME} if NAME else {}), "task": task})
+            log({"event": "spawn-response", "response": response})
+        elif text.startswith("spawn"):
+            task = text[len("spawn"):].strip() or "do [report]"
+            response = mcp_call(session, "team_spawn", {"template": TEMPLATE, **({"name": NAME} if NAME else {}), "task": task})
             log({"event": "spawn-response", "response": response})
         elif "[control-tool]" in text:
             response = mcp_call(session, "bus_send", {"to": "leader", "kind": "control", "body": "pause"})
@@ -250,7 +258,7 @@ def run_prompt(ident, text, session):
             log({"event": "ask-response", "response": response})
             report = mcp_call(session, "bus_send", {"to": "leader", "kind": "report", "body": "report while waiting"})
             log({"event": "report-response", "response": report})
-            wait_gate()
+            wait_gate(session)
         elif "[ask-chunk-slow]" in text:
             response = mcp_call(session, "bus_ask_human", {"question": "worker needs input", "options": ["yes", "no"]})
             log({"event": "ask-response", "response": response})
@@ -265,11 +273,11 @@ def run_prompt(ident, text, session):
                     },
                 },
             })
-            wait_gate()
+            wait_gate(session)
         elif "[ask-slow]" in text:
             response = mcp_call(session, "bus_ask_human", {"question": "worker needs input", "options": ["yes", "no"]})
             log({"event": "ask-response", "response": response})
-            wait_gate()
+            wait_gate(session)
         elif "[ask]" in text:
             response = mcp_call(session, "bus_ask_human", {"question": "worker needs input", "options": ["yes", "no"]})
             log({"event": "ask-response", "response": response})
@@ -292,18 +300,52 @@ def run_prompt(ident, text, session):
         elif "[fs]" in text:
             response = request_client("fs/read_text_file", {"sessionId": session, "path": "/etc/hostname"})
             log({"event": "fs-response", "response": response})
+        elif "[chunk-slow]" in text:
+            log({"event": "chunk", "text": "before waiting"})
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "before waiting"},
+                    },
+                },
+            })
+            wait_gate(session)
+            log({"event": "chunk", "text": "after waiting"})
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "after waiting"},
+                    },
+                },
+            })
+            response = mcp_call(session, "bus_send", {"to": "leader", "kind": "report", "body": "worker report"})
+            log({"event": "report-response", "response": response})
+        elif "[report-slow]" in text:
+            wait_gate(session)
+            response = mcp_call(session, "bus_send", {"to": "leader", "kind": "report", "body": "worker report"})
+            log({"event": "report-response", "response": response})
         elif "[slow-ignore-cancel]" in text:
             wait_gate_ignore_cancel()
         elif "[slow]" in text:
-            wait_gate()
+            wait_gate(session)
         elif "[cancel]" in text:
+            event = CANCEL.get(session)
             deadline = time.monotonic() + 20
-            while time.monotonic() < deadline and not CANCEL.is_set():
+            while time.monotonic() < deadline and not (event and event.is_set()):
                 time.sleep(0.02)
         elif "[report]" in text:
             response = mcp_call(session, "bus_send", {"to": "leader", "kind": "report", "body": "worker report"})
             log({"event": "report-response", "response": response})
-        if CANCEL.is_set():
+        event = CANCEL.get(session)
+        if event and event.is_set():
             result(ident, {"stopReason": "cancelled"})
         else:
             result(ident, {"stopReason": "end_turn"})
@@ -314,6 +356,7 @@ def run_prompt(ident, text, session):
 
 
 def main():
+    log({"event": "start", "gate": bool(GATE), "log": bool(LOG), "template": TEMPLATE})
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -370,6 +413,7 @@ def main():
             )
         elif method == "session/prompt":
             session = params.get("sessionId", "")
+            CANCEL[session] = threading.Event()
             text = "".join(
                 block.get("text", "")
                 for block in (params.get("prompt") or [])
@@ -377,8 +421,9 @@ def main():
             )
             threading.Thread(target=run_prompt, args=(ident, text, session), daemon=True).start()
         elif method == "session/cancel":
-            CANCEL.set()
-            log({"event": "cancel", "session": params.get("sessionId")})
+            session = params.get("sessionId", "")
+            CANCEL.setdefault(session, threading.Event()).set()
+            log({"event": "cancel", "session": session})
         elif method == "session/set_config_option":
             log({"event": "set_config", "params": params})
             delay = float(os.environ.get("TEAM_AGENT_SET_CONFIG_DELAY", "0") or "0")
