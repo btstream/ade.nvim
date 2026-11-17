@@ -1300,3 +1300,48 @@ A front end that finds a service of another version (its version check) must
 treat a service with any team as **busy**: it must not restart it, whatever
 the instances' states. `agent.list` result entries are unchanged; the front
 end learns about teams with `team.list` when the service offers `"teams"`.
+
+### 18.15 Recovery after a service restart (S4c)
+
+Teams are written to the event log database (section 10, mode 0600) and
+survive a restart of the service as **suspended** teams. Nothing a template's
+`env` holds is written to disk: a suspended team resumes only when a front end
+supplies its configuration again.
+
+**Recorded** (updated in the same transaction as the change): per team `id`,
+`cwd`, creation stamp, configuration **without** template `key`/`env`/`launch`
+(names, roles, models, worktree flags, limits, auto list), the leader's
+`sessionId` and agent id; per participant name, template, `sessionId`,
+worktree, state, `paused`, current task and sender, turn counters; queued
+messages; the last 200 messages of the team; open inbox items.
+
+**After a restart** every recorded team is listed by `team.list` with
+`state: "suspended"`; its participants have no instance and `bus.*`/deliveries
+do nothing. A suspended team **resumes** when both hold:
+
+1. a `team.configure` for its `cwd` has provided templates (as in 18.2);
+2. `team.bind_leader` binds a session whose `sessionId` equals the recorded
+   leader session (the front end restores the leader's conversation the usual
+   way, section 12 / the agent's `session/load`, and injects a fresh leader
+   server; a different session is `-32061` as before).
+
+Resuming: the team gets its old id if free (else a new one), state `active`;
+for each participant that was not `exited`: start its template as in 18.3
+(`cwd` = its recorded worktree when it has one, which must still exist),
+`initialize`, then `session/load {sessionId, cwd, mcpServers: [new server]}`
+when the agent advertises `loadSession` (otherwise `session/new`, and the
+leader gets a `notice` that the worker restarted without its history). New
+participant tokens are issued; old ones are gone. A participant whose
+template is no longer configured, whose worktree is gone, or whose start fails
+becomes `exited` with that reason (and the usual notices).
+
+What was in flight at the restart: a bus turn that was running counts as
+ended with an error (`"turn ended: error: the service restarted"`, 18.11), the
+person's held prompts are gone, `permission` and `request` items become
+`orphaned` (the agent request no longer exists), other open items stay open.
+Queued messages are delivered once the participants run again.
+
+`team.close` on a suspended team removes it. A suspended team that has not
+resumed after 7 days is removed. `team.list` entries of suspended teams carry
+`suspended_at`. While only suspended teams exist the service may idle-exit
+(section 8); they are kept on disk.
