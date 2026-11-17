@@ -743,6 +743,19 @@ return function(t)
       }, over or {}))
     end
 
+    local function suspended_team(dir, session_id, participants)
+      return {
+        id = "t1",
+        cwd = dir,
+        state = "suspended",
+        suspended_at = 1767225600000,
+        leader = { instance = nil, sessionId = session_id },
+        participants = participants or {},
+        inbox = {},
+        limits = { max_turns_per_task = 30, max_turns_total = 200, turns_total = 0 },
+      }
+    end
+
     t.it("starts configured workers once when the leader creates the team", function()
       local service, dir = start_service(t, "defined", { team_spawn_warning = "dirty_tree" })
       setup(t, "defined", service, dir, { teams = defined_teams() })
@@ -1679,34 +1692,289 @@ return function(t)
       end, 10000, "the person's turn to finish")
     end)
 
-    t.it("treats a reconnect as the end of every team", function()
+    t.it("keeps teams across a disconnect and shows suspended teams after hello", function()
       local service, dir = start_service(t, "reconnect", {})
       local connection = setup(t, "reconnect", service, dir)
       controller.connect()
       wait_ready()
-      -- Let the setup-time team reconcile run before injecting a team, so the
-      -- disconnect assertion is the only thing that can clear it.
-      vim.wait(100)
-      service:team_changed({
-        id = "t1",
-        cwd = dir,
-        state = "active",
-        participants = {},
-        inbox = {},
-        limits = {},
-      })
       wait(function()
-        return team():team("t1") ~= nil
-      end, 5000, "the team")
+        return team().bound[dir] ~= nil
+      end, 5000, "the first bind")
+      local entry = suspended_team(dir, "sess_mock", {
+        { name = "leader", state = "idle", task = "_", queued = 0, turns = {} },
+      })
+      service.teams.t1 = entry
+      -- A reconnect no longer forgets teams: hello re-reads team.list and
+      -- keeps a suspended team visible.
+      team():on_hello()
+      wait(function()
+        local t1 = team():team("t1")
+        return t1 ~= nil and t1.state == "suspended"
+      end, 5000, "the suspended team after hello")
       t.eq(true, controller.open_team())
       local ui = state().view.team_ui
+      local text = table.concat(vim.api.nvim_buf_get_lines(ui.buf, 0, -1, false), "\n")
+      local expected = "suspended since " .. os.date("%Y-%m-%d", math.floor(entry.suspended_at / 1000))
+      t.truthy(text:find(expected, 1, true), "the panel shows suspended_at")
+      t.match("waiting for the leader session", text)
+
       connection:on_disconnect("lost", true)
+      vim.wait(100)
+      t.truthy(team():team("t1"), "a disconnect must not forget stored teams")
+      t.eq(true, ui:is_open(), "the panel stays available")
+      ui:close()
+    end)
+
+    t.it("resumes a suspended team and does not restart its configured workers", function()
+      local service, dir = start_service(t, "suspended-resume", {})
+      service.teams.t1 = suspended_team(dir, "sess_mock", {
+        { name = "leader", state = "idle", task = "_", queued = 0, turns = {} },
+        { name = "w1", state = "idle", task = "_", queued = 0, turns = {}, template = "worker" },
+      })
+      setup(t, "suspended-resume", service, dir, {
+        teams = defined_teams({
+          definitions = { dev = { workers = { { name = "w1", template = "worker" } } } },
+        }),
+      })
+      controller.connect()
+      wait_ready()
+      wait(function()
+        local t1 = team():team("t1")
+        return t1 ~= nil and t1.state == "active"
+      end, 5000, "the resumed team")
+      wait(function()
+        local t1 = team():team("t1")
+        for _, participant in ipairs(t1.participants or {}) do
+          if participant.name == "w1" then
+            return participant.instance ~= nil
+          end
+        end
+        return false
+      end, 5000, "the resumed worker")
+      -- hello's configure must reach the service before leader_server.
+      local configure_at, leader_at
+      for index, call in ipairs(service.calls) do
+        if call.method == "team.configure" and not configure_at then
+          configure_at = index
+        end
+        if call.method == "team.leader_server" and not leader_at then
+          leader_at = index
+        end
+      end
+      t.truthy(configure_at and leader_at, "configure and leader_server")
+      t.truthy(configure_at < leader_at, "configure must precede leader injection")
+      vim.wait(100)
+      t.eq(0, #service.team_spawns, "recovered participants are not started again")
+
+      local session = state().sess.current
+      local instance = state().conn.client.proc.instance
+      service:turn_started(instance, {
+        sessionId = session.id,
+        origin = "bus",
+        prompt = { { type = "text", text = "team resumed after a service restart" } },
+      })
+      wait(function()
+        for _, block in ipairs(session.blocks) do
+          if type(block.text) == "string" and block.text:find("team resumed after a service restart", 1, true) then
+            return true
+          end
+        end
+        return false
+      end, 5000, "the recovery notice as a bus turn")
+    end)
+
+    t.it("keeps a suspended team when the restored session is not its leader", function()
+      local service, dir = start_service(t, "suspended-mismatch", {})
+      service.teams.t1 = suspended_team(dir, "stored-session", {
+        { name = "leader", state = "idle", task = "_", queued = 0, turns = {} },
+        {
+          name = "w1",
+          state = "exited",
+          task = "_",
+          queued = 0,
+          turns = {},
+          worktree = { path = "/tmp/wt/w1", branch = "ade/t1-20260101-000000/w1" },
+        },
+      })
+      setup(t, "suspended-mismatch", service, dir)
+      local notices = capture(t)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        for _, note in ipairs(notices) do
+          if note.message:find("still suspended", 1, true) then
+            return true
+          end
+        end
+        return false
+      end, 5000, "the suspended-team hint")
+      t.eq("suspended", team():team("t1").state)
+      t.eq(nil, team().blocked[dir], "a suspended team must not block leader injection")
+      t.eq(1, #calls_of(service, "team.leader_server"))
+      t.eq(true, controller.open_team())
+      local ui = state().view.team_ui
+      local text = table.concat(vim.api.nvim_buf_get_lines(ui.buf, 0, -1, false), "\n")
+      t.match("suspended since", text)
+      t.match(
+        "press x",
+        table.concat(
+          vim.tbl_map(function(note)
+            return note.message
+          end, notices),
+          "\n"
+        )
+      )
+      ui:close()
+    end)
+
+    t.it("refuses watch, spawn and control while a team is suspended", function()
+      local service, dir = start_service(t, "suspended-refuse", {})
+      service.teams.t1 = suspended_team(dir, "stored-session", {
+        { name = "leader", state = "idle", task = "_", queued = 0, turns = {} },
+        { name = "w1", state = "idle", task = "_", queued = 0, turns = {} },
+      })
+      setup(t, "suspended-refuse", service, dir)
+      local notices = capture(t)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return team():team("t1") and team():team("t1").state == "suspended"
+      end, 5000, "the suspended team")
+      t.eq(true, controller.open_team())
+      local ui = state().view.team_ui
+      local function line_of(name)
+        for index, id in pairs(ui.ids) do
+          if id == "t1|" .. name then
+            return index
+          end
+        end
+      end
+      vim.api.nvim_win_set_cursor(ui.win, { line_of("w1"), 0 })
+      local sends = #service.team_sends
+      for _, key in ipairs({ "p", "r", "c" }) do
+        vim.api.nvim_feedkeys(key, "x", false)
+        vim.wait(50)
+      end
+      t.eq(sends, #service.team_sends, "control must not reach a suspended team")
+      vim.api.nvim_feedkeys("w", "x", false)
+      vim.wait(50)
+      t.eq(nil, team().watching)
+
+      local team_line
+      for index, id in pairs(ui.ids) do
+        if id == "team:t1" then
+          team_line = index
+        end
+      end
+      vim.api.nvim_win_set_cursor(ui.win, { team_line, 0 })
+      vim.api.nvim_feedkeys("s", "x", false)
+      vim.wait(50)
+      t.eq(0, #service.team_spawns, "spawn must not reach a suspended team")
+
+      local hinted = false
+      for _, note in ipairs(notices) do
+        if note.message:find("team is suspended", 1, true) then
+          hinted = true
+        end
+      end
+      t.truthy(hinted, "the panel explains that the team is suspended")
+      ui:close()
+    end)
+
+    t.it("allows messages, answers, worktree removal and close on a suspended team", function()
+      local service, dir = start_service(t, "suspended-allow", {
+        team_remove_result = { removed = true, branch_kept = false, branch = "ade/t1-20260101-000000/w1" },
+      })
+      service.teams.t1 = suspended_team(dir, "stored-session", {
+        { name = "leader", state = "idle", task = "_", queued = 0, turns = {} },
+        {
+          name = "w1",
+          state = "exited",
+          task = "_",
+          queued = 0,
+          turns = {},
+          worktree = { path = "/tmp/wt/w1", branch = "ade/t1-20260101-000000/w1" },
+        },
+      })
+      setup(t, "suspended-allow", service, dir)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return team():team("t1") and team():team("t1").state == "suspended"
+      end, 5000, "the suspended team")
+      service:team_inbox({
+        id = "i1",
+        team = "t1",
+        kind = "question",
+        from = "w1",
+        body = "resume?",
+        state = "open",
+      })
+      wait(function()
+        return team():item("i1") ~= nil
+      end, 5000, "the inbox item")
+      t.eq(true, controller.open_team())
+      local ui = state().view.team_ui
+      local original_select, original_input = vim.ui.select, vim.ui.input
+      t.cleanup(function()
+        vim.ui.select, vim.ui.input = original_select, original_input
+      end)
+      local function line_of(id)
+        for index, value in pairs(ui.ids) do
+          if value == id then
+            return index
+          end
+        end
+      end
+
+      vim.ui.select = function(_, _, cb)
+        cb("notice")
+      end
+      vim.ui.input = function(_, cb)
+        cb("queued while suspended")
+      end
+      vim.api.nvim_win_set_cursor(ui.win, { line_of("t1|w1"), 0 })
+      vim.api.nvim_feedkeys("m", "x", false)
+      wait(function()
+        return #service.team_sends == 1
+      end, 5000, "the queued message")
+      t.eq("notice", service.team_sends[1].kind)
+      t.eq("queued while suspended", service.team_sends[1].body)
+
+      vim.ui.input = function(_, cb)
+        cb("yes please")
+      end
+      vim.api.nvim_win_set_cursor(ui.win, { line_of("item:i1"), 0 })
+      vim.api.nvim_feedkeys("a", "x", false)
+      wait(function()
+        return #service.team_answers == 1
+      end, 5000, "the answered question")
+      t.eq("yes please", service.team_answers[1].text)
+
+      vim.ui.select = function(_, _, cb)
+        cb({ label = "Remove worktree", value = false })
+      end
+      vim.api.nvim_win_set_cursor(ui.win, { line_of("t1|w1"), 0 })
+      vim.api.nvim_feedkeys("D", "x", false)
+      wait(function()
+        return #service.team_removals == 1
+      end, 5000, "the worktree removal")
+
+      vim.ui.select = function(_, _, cb)
+        cb({ label = "Close the team", value = true })
+      end
+      local team_line
+      for index, id in pairs(ui.ids) do
+        if id == "team:t1" then
+          team_line = index
+        end
+      end
+      vim.api.nvim_win_set_cursor(ui.win, { team_line, 0 })
+      vim.api.nvim_feedkeys("x", "x", false)
       wait(function()
         return team():team("t1") == nil
-      end, 5000, "the team to be forgotten")
-      wait(function()
-        return not ui:is_open()
-      end, 5000, "the panel to close")
+      end, 5000, "the suspended team to close")
+      pcall(ui.close, ui)
     end)
   end)
 end

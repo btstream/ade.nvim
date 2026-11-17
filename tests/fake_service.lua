@@ -340,6 +340,7 @@ function Server:dispatch(message, client)
       if
         team.cwd == params.cwd
         and team.state ~= "closed"
+        and team.state ~= "suspended"
         and team.leader
         and team.leader.instance ~= params.instance
       then
@@ -365,6 +366,31 @@ function Server:dispatch(message, client)
       return error_reply(ident, self.team_bind_error.code, self.team_bind_error.message)
     end
     self.team_binds[#self.team_binds + 1] = vim.deepcopy(params)
+    local existing = self.teams.t1
+    if existing and existing.state == "suspended" then
+      if existing.leader and existing.leader.sessionId ~= params.sessionId then
+        return error_reply(ident, -32061, "session does not match the suspended team")
+      end
+      -- PROTOCOL.md 18.15: resume atomically at the matching bind, then one
+      -- team.changed for the team and one per participant as instances appear.
+      existing.state = "active"
+      existing.suspended_at = nil
+      existing.leader = { instance = params.instance, sessionId = params.sessionId }
+      self:emit(client, "team.changed", { team = vim.deepcopy(existing) })
+      for _, participant in ipairs(existing.participants or {}) do
+        if participant.state ~= "exited" then
+          participant.instance = "inst-resumed"
+        end
+        self:emit(client, "team.changed", { team = vim.deepcopy(existing) })
+      end
+      vim.defer_fn(function()
+        self:send(client, { jsonrpc = "2.0", id = ident, result = { team = self.teams.t1 } })
+      end, 5)
+      return nil
+    end
+    if existing and existing.leader and existing.leader.sessionId ~= params.sessionId then
+      return error_reply(ident, -32061, "another session leads this team")
+    end
     local team = {
       id = "t1",
       cwd = params.cwd or "/",
