@@ -72,8 +72,11 @@ function M.new(opts)
     notified = {},
     -- team id -> true once this front end started the enabled workflow.
     enabled_teams = {},
-    -- team id -> {board, inflight, again} for the board cache (19.2).
+    -- team id -> {board, inflight, again, seq} for the board cache (19.2).
     boards = {},
+    -- team id -> the board_rev whose fetch was already attempted (19.2): a
+    -- failed or unavailable board must not be refetched on every team.changed.
+    board_requested = {},
     watching = nil,
     raw = nil,
   }, Team)
@@ -172,6 +175,8 @@ function Team:forget_connection()
       entry.again = false
     end
   end
+  -- A reconnect may reach a different service; let revisions be tried again.
+  self.board_requested = {}
   -- `warned_blocked` / `warned_suspended` / `notified` survive a reconnect:
   -- a conflict that was already announced must not be announced again.
   self:unwatch(true)
@@ -568,6 +573,12 @@ function Team:start_enabled_workers(team_id, entry)
   end
   local team = self.teams[team_id]
   local cwd = team and team.cwd or (type(entry) == "table" and entry.cwd or nil)
+  local bound = cwd and self.bound[cwd] or nil
+  if not bound or bound.team ~= team_id then
+    -- Another front end leads this team (or it belongs to another cwd): its
+    -- workflow is not this front end's to start.
+    return
+  end
   if cwd and require("ade.app.team_start").active(cwd) then
     -- `:Ade team start` is picking a workflow for this cwd: its own team.start
     -- must not be pre-empted by the configured default.
@@ -644,18 +655,30 @@ function Team:refresh(cb)
 end
 
 ---Fetch the board of every known team whose cached revision is stale (19.2).
+function Team:_fetch_board_if_needed(team)
+  local rev = tonumber(type(team) == "table" and team.board_rev or nil)
+  if rev == nil or self.old_service then
+    return
+  end
+  local cached = self.boards[team.id]
+  if cached and type(cached.board) == "table" and tonumber(cached.board.rev) == rev then
+    return
+  end
+  if self.board_requested[team.id] == rev then
+    -- Already tried this revision (a failure or an unavailable board waits for
+    -- the next `team.board_changed`).
+    return
+  end
+  self.board_requested[team.id] = rev
+  self:request_board(team.id)
+end
+
 function Team:_sync_boards()
   if self.old_service then
     return
   end
-  for id, team in pairs(self.teams) do
-    local rev = tonumber(team.board_rev)
-    if rev ~= nil then
-      local entry = self.boards[id]
-      if not entry or type(entry.board) ~= "table" or tonumber(entry.board.rev) ~= rev then
-        self:request_board(id)
-      end
-    end
+  for _, team in pairs(self.teams) do
+    self:_fetch_board_if_needed(team)
   end
 end
 
@@ -766,13 +789,7 @@ function Team:on_changed_payload(payload)
     end
     -- A team created after the cache was cleared (or a reconnect) gets its
     -- board when its revision differs from the cache.
-    local rev = tonumber(team.board_rev)
-    if rev ~= nil then
-      local cached = self.boards[team.id]
-      if not cached or type(cached.board) ~= "table" or tonumber(cached.board.rev) ~= rev then
-        self:request_board(team.id)
-      end
-    end
+    self:_fetch_board_if_needed(team)
     -- A suspended team may become active later; then the enabled workflow can
     -- start (still at most once per team).
     if team.state ~= "suspended" then
@@ -820,6 +837,9 @@ function Team:on_board_changed_payload(payload)
       return
     end
   end
+  -- A real notification is a fresh reason to fetch, even when an earlier
+  -- revision failed.
+  self.board_requested[team_id] = nil
   self:request_board(team_id)
 end
 
@@ -1011,6 +1031,7 @@ function Team:forget_team(team_id)
     entry.again = false
   end
   self.boards[team_id] = nil
+  self.board_requested[team_id] = nil
   self.teams[team_id] = nil
   self.enabled_teams[team_id] = nil
   for id, item in pairs(self.inbox) do

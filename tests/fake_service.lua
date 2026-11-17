@@ -46,6 +46,7 @@ Server.__index = Server
 ---  team_card_history?: table, team_card_history_error?: table,
 ---  team_workflow_delete_delay?: integer,
 ---  old_service_methods?: table<string, boolean>,
+---  team_workflows_delay?: integer,
 ---  run_error?: table, uninstall_error?: table, canned_agent?: boolean}|nil
 ---@return FakeService
 function M.new(opts)
@@ -142,6 +143,7 @@ function M.new(opts)
     team_workflow_delete_error = opts.team_workflow_delete_error,
     team_workflow_delete_delay = opts.team_workflow_delete_delay or 5,
     old_service_methods = opts.old_service_methods or {},
+    team_workflows_delay = opts.team_workflows_delay or 5,
     team_board = opts.team_board,
     team_boards = opts.team_boards,
     team_board_error = opts.team_board_error,
@@ -663,7 +665,7 @@ function Server:dispatch(message, client)
     })
     vim.defer_fn(function()
       self:send(client, { jsonrpc = "2.0", id = ident, result = { workflows = workflows } })
-    end, 5)
+    end, self.team_workflows_delay or 5)
     return nil
   end
   if method == "team.workflow_delete" then

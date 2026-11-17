@@ -242,7 +242,7 @@ return function(t)
       config = function()
         return vim.tbl_deep_extend("force", {
           cwd = cwd,
-          agent = "opencode",
+          agent = holder.agent or "opencode",
           teams = teams_config(),
         }, over and over.config or {})
       end,
@@ -700,6 +700,7 @@ return function(t)
         setup = function(d, holder)
           d.pick_agent = function(name)
             switched = name
+            holder.agent = name
             -- The real pick_agent reruns setup(): a new Team object, no
             -- binding, and a fresh session with its own controls.
             holder.view.team = fresh
@@ -747,7 +748,55 @@ return function(t)
       t.eq(0, fake_.new_session_count or 0, "no session is created before the switch")
       t.eq(1, fresh.new_session_count, "one new session for the new leader")
       t.eq("t2", fresh.starts[1].team)
+      t.eq("claude", deps.config().agent, "the flow only continues on the chosen agent")
       t.truthy(applied and applied.control == "model" and applied.value == "mock-2")
+    end)
+
+    t.it("switches the leader agent even when there is no team yet", function()
+      local cwd = "/tmp/w0e-switch-new"
+      local fake_ = fake_team(cwd, {})
+      fake_.works = {
+        {
+          name = "claude_flow",
+          summary = "wants claude",
+          text = "1. do",
+          leader = { agent = "claude" },
+          team = {},
+          scope = "project",
+        },
+      }
+      local fresh = fake_team(cwd, {})
+      fresh.works = fake_.works
+      local switched
+      local flow, deps, holder = fake_flow(cwd, fake_, {
+        setup = function(d, h)
+          d.pick_agent = function(name)
+            switched = name
+            h.agent = name
+            h.view.team = fresh
+            h.sess.current = nil
+          end
+        end,
+      })
+      local original_select, original_input = vim.ui.select, vim.ui.input
+      t.cleanup(function()
+        vim.ui.select, vim.ui.input = original_select, original_input
+      end)
+      vim.ui.select = function(items, _, cb)
+        cb(items[1]) -- open a claude leader
+      end
+      vim.ui.input = function(_, cb)
+        cb("")
+      end
+      flow:start("claude_flow")
+      wait(function()
+        return #fresh.starts == 1
+      end, 5000, "the switched workflow without a team")
+      t.eq("claude", switched)
+      t.eq("claude", deps.config().agent)
+      t.eq(1, fresh.new_session_count)
+      t.eq("t2", fresh.starts[1].team)
+      _ = holder
     end)
 
     t.it("only switches a leader model the agent offers", function()
@@ -895,6 +944,43 @@ return function(t)
       wait(function()
         return #calls_of(service, "team.close") == 1
       end, 5000, "team.close")
+    end)
+
+    t.it("cancels a running start only after the close is confirmed", function()
+      local service, dir = start_service(t, "close-cancels-start", {
+        team_workflows = {
+          { name = "dev", summary = "two workers", text = "1. do", team = {}, scope = "project" },
+        },
+        team_workflows_delay = 400,
+      })
+      setup(t, "close-cancels-start", service, dir)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the bound team")
+      local original_select = vim.ui.select
+      t.cleanup(function()
+        vim.ui.select = original_select
+      end)
+      vim.ui.select = function(items, _, cb)
+        cb(items[#items]) -- No
+      end
+      vim.cmd("Ade team start dev")
+      vim.wait(100)
+      t.eq(true, TeamStart.active(dir), "the start is waiting for the workflow list")
+      vim.cmd("Ade team close")
+      vim.wait(100)
+      t.eq(true, TeamStart.active(dir), "a refused close leaves the start alone")
+      t.eq(0, #calls_of(service, "team.close"))
+      vim.ui.select = function(items, _, cb)
+        cb(items[1]) -- Yes
+      end
+      vim.cmd("Ade team close")
+      wait(function()
+        return #calls_of(service, "team.close") == 1
+      end, 5000, "team.close")
+      t.eq(false, TeamStart.active(dir), "a confirmed close cancels the running start")
     end)
 
     t.it("lists, opens and deletes workflows from :Ade workflows", function()
@@ -1082,6 +1168,7 @@ return function(t)
         on_changed = function() end,
       })
       team.teams["t1"] = { id = "t1", cwd = cwd, state = "active", participants = {} }
+      team.bound[cwd] = { instance = "i1", session_id = "s1", team = "t1" }
       team.start = function(_, team_id, workflow)
         starts = starts + 1
         team._last = { team_id = team_id, workflow = workflow }
@@ -1105,6 +1192,133 @@ return function(t)
       t.eq("dev", team._last.workflow)
       team:start_enabled_workers("t1", team.teams["t1"])
       t.eq(1, starts, "still only once per team")
+
+      -- A team led by another front end (or another cwd) is not ours to start.
+      team.teams["t9"] = { id = "t9", cwd = "/elsewhere", state = "active", participants = {} }
+      team:start_enabled_workers("t9", team.teams["t9"])
+      t.eq(1, starts, "another front end's team is never started")
+      team.bound[cwd] = { instance = "other", session_id = "s9", team = "t9" }
+      team.teams["t1"].participants = {}
+      team:start_enabled_workers("t1", team.teams["t1"])
+      t.eq(1, starts, "a team bound to another instance is never started")
+    end)
+
+    t.it("a rebuilt controller can still cancel the flow the old one started", function()
+      local cwd = "/tmp/w0e-rebuild"
+      local old_team = fake_team(cwd, { { id = "t1", cwd = cwd, state = "active", participants = {} } })
+      old_team.workflows_delay = true
+      local first = fake_flow(cwd, old_team)
+      local original_input = vim.ui.input
+      t.cleanup(function()
+        vim.ui.input = original_input
+      end)
+      vim.ui.input = function(_, cb)
+        cb("")
+      end
+      first:start("dev")
+      t.eq(true, TeamStart.active(cwd))
+      -- `pick_agent` rebuilds the controller: a new Team/TeamCommands/Flow.
+      local new_team = fake_team(cwd, { { id = "t1", cwd = cwd, state = "active", participants = {} } })
+      new_team.workflows_delay = true
+      local second = fake_flow(cwd, new_team)
+      second:start("dev")
+      t.eq(false, first.starting, "the new start cancels the old flow")
+      t.eq(true, TeamStart.active(cwd))
+      t.eq(true, second.starting)
+      -- `:Ade team close` (or a later start) finds the new flow through the
+      -- module-level registry.
+      t.eq(true, TeamStart.cancel_for(cwd))
+      t.eq(false, TeamStart.active(cwd))
+      t.eq(false, second.starting)
+    end)
+
+    t.it("cancels a flow while it waits for its leader session", function()
+      local cwd = "/tmp/w0e-cancel-wait"
+      local fake_ = fake_team(cwd, {})
+      local flow, deps = fake_flow(cwd, fake_, {
+        setup = function(d)
+          -- A session request that never produces a team.
+          d.new_session = function() end
+        end,
+      })
+      local original_input = vim.ui.input
+      t.cleanup(function()
+        vim.ui.input = original_input
+      end)
+      vim.ui.input = function(_, cb)
+        cb("")
+      end
+      flow:start("dev")
+      t.eq(true, TeamStart.active(cwd))
+      vim.wait(200)
+      t.eq(true, TeamStart.active(cwd), "still waiting for the leader")
+      flow:cancel()
+      t.eq(false, TeamStart.active(cwd))
+      vim.wait(150)
+      t.eq(false, flow.starting)
+      -- The next start works once sessions do.
+      deps.new_session = function()
+        fake_.rows = { { id = "t2", cwd = cwd, state = "active", participants = {} } }
+        fake_.bound[cwd] = { instance = "i1", session_id = "s2", team = "t2" }
+      end
+      flow:start("dev")
+      wait(function()
+        return #fake_.starts == 1
+      end, 5000, "the start after a cancelled wait")
+    end)
+
+    t.it("does not reopen the workflows window when the first fetch is late", function()
+      local service, dir = start_service(t, "workflows-late-open", {
+        team_workflows = {
+          { name = "review", summary = "by pi", text = "x", team = {}, scope = "project" },
+        },
+        team_workflows_delay = 250,
+      })
+      setup(t, "workflows-late-open", service, dir)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the bound team")
+      vim.cmd("Ade workflows")
+      local ui = state().view.team_commands.workflows_ui
+      t.truthy(ui)
+      ui:close()
+      vim.wait(400)
+      t.eq(false, ui:is_open(), "a late first reply must not open the window")
+    end)
+
+    t.it("fetches a stale board revision only once", function()
+      local service, dir = start_service(t, "board-rev-once", {
+        team_board_error = { code = -32066, message = "board read failed" },
+      })
+      setup(t, "board-rev-once", service, dir)
+      controller.connect()
+      wait_ready()
+      local function team_changed()
+        service:team_changed({
+          id = "t1",
+          cwd = dir,
+          state = "active",
+          participants = {},
+          inbox = {},
+          limits = {},
+          board_rev = 2,
+        })
+      end
+      team_changed()
+      wait(function()
+        return team():team("t1") ~= nil and #service.team_board_requests == 1
+      end, 5000, "the first board attempt")
+      team_changed()
+      team_changed()
+      vim.wait(150)
+      t.eq(1, #service.team_board_requests, "the same revision is not retried")
+      -- A real notification is a fresh reason.
+      service:emit_team_board_changed("t1", 2)
+      wait(function()
+        return #service.team_board_requests == 2
+      end, 5000, "the retry after board_changed")
     end)
 
     t.it("ignores a board reply that arrives after the team closed", function()

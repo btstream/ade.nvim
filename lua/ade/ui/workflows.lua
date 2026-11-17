@@ -24,6 +24,10 @@ function M.new(opts)
     buf = nil,
     detail_win = nil,
     detail_buf = nil,
+    -- Whether a window should be shown, and which fetch is current: a reply
+    -- that arrives after the person closed the window must not reopen it.
+    want_open = false,
+    token = 0,
   }, Panel)
 end
 
@@ -57,7 +61,17 @@ function Panel:open(cb)
     end
     return false
   end
+  self.want_open = true
+  self.token = (self.token or 0) + 1
+  local token = self.token
   team:workflows(self:cwd(), function(ok, value)
+    if token ~= self.token or not self.want_open then
+      -- Superseded, or the person closed the window while the request ran.
+      if cb then
+        cb(false)
+      end
+      return
+    end
     if not ok then
       self:notify_message("cannot list workflows: " .. self.error_text(value), vim.log.levels.WARN)
       if cb then
@@ -293,6 +307,8 @@ function Panel:delete_current()
 end
 
 function Panel:close()
+  self.want_open = false
+  self.token = (self.token or 0) + 1
   self:close_detail()
   if self.win and vim.api.nvim_win_is_valid(self.win) then
     pcall(vim.api.nvim_win_close, self.win, true)

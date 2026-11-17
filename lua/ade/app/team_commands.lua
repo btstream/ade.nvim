@@ -74,9 +74,6 @@ end
 
 ---Close the team of this cwd after a confirmation.
 function Commands:close(cb)
-  -- A running `:Ade team start` would otherwise keep going against a team that
-  -- is being closed.
-  self.start_flow:cancel()
   local team = self:team()
   local entry = self:current_team()
   if not team or not entry then
@@ -87,6 +84,11 @@ function Commands:close(cb)
     if choice ~= "yes" then
       return
     end
+    -- A running `:Ade team start` would otherwise keep going against a team
+    -- that is being closed. Cancel it only now: a refused confirmation must
+    -- leave everything as it was, and the flow may belong to a controller
+    -- that `pick_agent` rebuilt.
+    TeamStart.cancel_for(entry.cwd)
     team:close(entry.id, function(ok, value)
       if not ok then
         self.deps.notify("cannot close the team: " .. self.deps.report_error(value), vim.log.levels.WARN)
