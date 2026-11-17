@@ -27,7 +27,7 @@
 //! The recorder is `Clone` (it is one `Arc`), so the relay and the API can hold
 //! their own handles.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -100,6 +100,7 @@ enum Job {
         state_json: String,
         max_team: u64,
         max_inbox: u64,
+        bytes: usize,
     },
     TeamDelete(String),
     /// Complete the receiver once every earlier job is written.
@@ -154,6 +155,8 @@ struct Inner {
     /// documented test hooks ([`Recorder::in_memory_paused`] /
     /// [`Recorder::resume_writer`]) ever set it.
     paused: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    /// Successful team snapshot transactions (coalescing test hook).
+    team_writes: AtomicUsize,
 }
 
 /// Handle to the asynchronous event log.
@@ -225,6 +228,7 @@ impl Recorder {
                 handles: AtomicUsize::new(0),
                 fail_batches: AtomicUsize::new(0),
                 paused: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
+                team_writes: AtomicUsize::new(0),
             }),
             enabled: false,
             max_bytes_per_instance: 0,
@@ -416,12 +420,17 @@ impl Recorder {
         if !self.enabled {
             return;
         }
-        self.send(Job::TeamSave {
+        let bytes = id.len() + state_json.len();
+        self.inner.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if !self.send(Job::TeamSave {
             id: id.to_string(),
             state_json,
             max_team,
             max_inbox,
-        });
+            bytes,
+        }) {
+            self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        }
     }
 
     pub fn delete_team(&self, id: &str) {
@@ -437,6 +446,12 @@ impl Recorder {
             return Ok(Vec::new());
         }
         self.inner.store.load_teams()
+    }
+
+    /// Number of team snapshot transactions actually written (a test sees
+    /// whether a batch coalesced several saves for one team).
+    pub fn team_write_count(&self) -> usize {
+        self.inner.team_writes.load(Ordering::Relaxed)
     }
 
     pub fn load_team_meta(&self, key: &str) -> Result<Option<String>> {
@@ -462,6 +477,7 @@ impl Recorder {
             handles: AtomicUsize::new(1),
             fail_batches: AtomicUsize::new(0),
             paused: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
+            team_writes: AtomicUsize::new(0),
         });
 
         let writer = Writer {
@@ -472,6 +488,9 @@ impl Recorder {
             last_warning: None,
             written: HashMap::new(),
             paused: Arc::clone(&inner.paused),
+            team_saves: HashMap::new(),
+            failed_teams: HashMap::new(),
+            failed_deletes: HashSet::new(),
         };
         let handle = std::thread::Builder::new()
             .name("ade-event-log".to_string())
@@ -577,6 +596,11 @@ struct Writer {
     /// a higher number for the same instance can be recognised as late.
     written: HashMap<String, u64>,
     paused: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    /// Team snapshots waiting for the end of this batch (last one wins).
+    team_saves: HashMap<String, (String, u64, u64, usize)>,
+    /// Writes that failed and are retried on the next idle tick.
+    failed_teams: HashMap<String, (String, u64, u64, usize)>,
+    failed_deletes: HashSet<String>,
 }
 
 impl Writer {
@@ -585,7 +609,12 @@ impl Writer {
             self.wait_when_paused();
             let first = match receiver.recv_timeout(self.limits.batch_interval) {
                 Ok(job) => job,
-                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Timeout) => {
+                    self.flush_team_saves();
+                    self.flush_team_deletes();
+                    self.retry_teams();
+                    continue;
+                }
                 Err(RecvTimeoutError::Disconnected) => {
                     // Every sender is gone: write what is still queued, then
                     // exit. Nothing arrives after this.
@@ -630,16 +659,24 @@ impl Writer {
                         state_json,
                         max_team,
                         max_inbox,
+                        bytes,
                     } => {
-                        self.write(&mut batch);
-                        self.save_team(&id, &state_json, max_team, max_inbox);
+                        // Coalesce per team within the batch; the last snapshot
+                        // is the state that must win.
+                        self.team_saves
+                            .insert(id, (state_json, max_team, max_inbox, bytes));
+                        if self.team_saves.len() >= 64 {
+                            self.flush_team_saves();
+                        }
                     }
                     Job::TeamDelete(id) => {
-                        self.write(&mut batch);
+                        self.flush_team_saves();
                         self.delete_team(&id);
                     }
                     Job::Barrier(sender) => {
                         self.write(&mut batch);
+                        self.flush_team_saves();
+                        self.flush_team_deletes();
                         self.prune_oversized();
                         let _ = sender.send(());
                     }
@@ -675,22 +712,28 @@ impl Writer {
                     state_json,
                     max_team,
                     max_inbox,
+                    bytes,
                 } => {
-                    self.write(&mut batch);
-                    self.save_team(&id, &state_json, max_team, max_inbox);
+                    self.team_saves
+                        .insert(id, (state_json, max_team, max_inbox, bytes));
                 }
                 Job::TeamDelete(id) => {
-                    self.write(&mut batch);
+                    self.flush_team_saves();
                     self.delete_team(&id);
                 }
                 Job::Barrier(sender) => {
                     self.write(&mut batch);
+                    self.flush_team_saves();
+                    self.flush_team_deletes();
                     self.prune_oversized();
                     let _ = sender.send(());
                 }
             }
         }
         self.write(&mut batch);
+        self.flush_team_saves();
+        self.flush_team_deletes();
+        self.retry_teams();
         self.prune_oversized();
     }
 
@@ -824,15 +867,59 @@ impl Writer {
         // after the forget.
     }
 
-    fn save_team(&mut self, id: &str, state_json: &str, max_team: u64, max_inbox: u64) {
-        if let Err(error) = self.store.save_team(id, state_json, max_team, max_inbox) {
-            self.report_team_failure(&error);
+    fn flush_team_saves(&mut self) {
+        let saves = std::mem::take(&mut self.team_saves);
+        for (id, (state_json, max_team, max_inbox, bytes)) in saves {
+            match self.store.save_team(&id, &state_json, max_team, max_inbox) {
+                Ok(()) => {
+                    self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                    self.inner.team_writes.fetch_add(1, Ordering::Relaxed);
+                    self.failed_teams.remove(&id);
+                }
+                Err(error) => {
+                    self.report_team_failure(&error);
+                    self.failed_teams
+                        .insert(id, (state_json, max_team, max_inbox, bytes));
+                }
+            }
         }
+    }
+
+    fn flush_team_deletes(&mut self) {
+        let deletes = std::mem::take(&mut self.failed_deletes);
+        for id in deletes {
+            if let Err(error) = self.store.delete_team(&id) {
+                self.report_team_failure(&error);
+                self.failed_deletes.insert(id);
+            }
+        }
+    }
+
+    fn retry_teams(&mut self) {
+        if self.failed_teams.is_empty() && self.failed_deletes.is_empty() {
+            return;
+        }
+        let retry = std::mem::take(&mut self.failed_teams);
+        for (id, value) in retry {
+            self.team_saves.insert(id, value);
+        }
+        let deletes = std::mem::take(&mut self.failed_deletes);
+        for id in deletes {
+            match self.store.delete_team(&id) {
+                Ok(()) => {}
+                Err(error) => {
+                    self.report_team_failure(&error);
+                    self.failed_deletes.insert(id);
+                }
+            }
+        }
+        self.flush_team_saves();
     }
 
     fn delete_team(&mut self, id: &str) {
         if let Err(error) = self.store.delete_team(id) {
             self.report_team_failure(&error);
+            self.failed_deletes.insert(id.to_string());
         }
     }
 

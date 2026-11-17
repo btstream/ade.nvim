@@ -383,6 +383,10 @@ def main():
                 },
             )
         elif method in ("session/new", "session/load", "session/resume"):
+            if method == "session/load" and os.environ.get("TEAM_AGENT_LOAD_FAIL") == "1":
+                log({"event": "load-failed", "session": params.get("sessionId")})
+                error(ident, "load failed")
+                continue
             if method == "session/new":
                 COUNT[0] += 1
                 session = f"team_sess_{os.getpid()}_{COUNT[0]}"

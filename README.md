@@ -771,6 +771,7 @@ worker 的权限请求、提问、spawn 请求等进入 **收件箱**，`team.in
 `nvim_ade_server` 的事件日志数据库（权限 0600）；模板的 `key`、`env`、`launch`
 不落盘，恢复时要由前端重新提供配置。重启后 suspended 团队可用 panel 关闭；
 7 天未恢复会被删除（worktree/分支保留）。suspended 团队不阻止服务空闲退出。
+`--event-log off` 时 `teams` 特性不声明、`team.*` 返回 `-32601`，团队也不会落盘或恢复。
 
 `worktree = true` 的模板由服务在
 `stdpath("data")/ade/worktrees/<repo>-<hash8>/<team>-<stamp>-<name>` 创建独立

@@ -552,8 +552,33 @@ fn a_sigkilled_team_reports_its_inflight_turn_and_delivers_nothing_twice() {
         },
         "the in-flight worker prompt",
     );
-    // Give the writer thread time to persist the delivery/bus-turn mark.
-    std::thread::sleep(Duration::from_millis(300));
+    // Wait until the store has the delivery (queue entry + bus_turn), then
+    // kill; no wall-clock sleep decides whether the state is durable.
+    let db = fixture.dir.path().join("nvim_ade_server.events.sqlite3");
+    wait_for(
+        || {
+            let conn = rusqlite::Connection::open(&db).ok()?;
+            let json: String = conn
+                .query_row(
+                    "SELECT state_json FROM teams WHERE id = ?1",
+                    rusqlite::params![team],
+                    |row| row.get(0),
+                )
+                .ok()?;
+            let value: Value = serde_json::from_str(&json).ok()?;
+            let worker = value["participants"]
+                .as_array()?
+                .iter()
+                .find(|entry| entry["name"] == "w1")?;
+            let queued = worker["mailbox"].as_array().is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|message| message["body"] == "extra work")
+            });
+            (worker["bus_turn"] == true && queued).then_some(())
+        },
+        "the delivery to be durable before SIGKILL",
+    );
     server.kill();
     drop(server);
     kill_fixture_processes(fixture.dir.path());
@@ -821,6 +846,263 @@ fn a_missing_worktree_marks_the_worker_exited_on_resume() {
         "the not-resumed notice",
     );
     let closed = second.request(93, "team.close", json!({"team": team}));
+    assert!(closed["result"].is_object(), "{closed}");
+    Fixture::shutdown(&mut restarted);
+}
+
+#[test]
+fn an_exited_worker_is_not_resurrected_by_a_restart() {
+    let fixture = Fixture::new("restart-exited");
+    let mut server = fixture.start("a", &[]);
+    let mut client = fixture.connect(&server);
+    let (team, leader_session, _) = fixture.first_team(&server, &mut client, "do [report]");
+    let worker = wait_worker_session(&mut client, &team);
+    let worker_session = worker["sessionId"].as_str().unwrap().to_string();
+    let instance = worker["instance"].as_str().unwrap().to_string();
+    let stopped = client.request(
+        10,
+        "agent.stop",
+        json!({"instance": instance, "force": true}),
+    );
+    assert!(stopped["result"].is_object(), "{stopped}");
+    let exited = wait_for(
+        || participant(&mut client, &team, "w1").filter(|entry| entry["state"] == "exited"),
+        "the exited worker",
+    );
+    let reason = exited["reason"].as_str().unwrap().to_string();
+    Fixture::shutdown(&mut server);
+    drop(server);
+    let mut restarted = fixture.start("b", &[]);
+    let mut second = fixture.connect(&restarted);
+    resume(
+        &fixture,
+        &restarted,
+        &mut second,
+        &team,
+        &leader_session,
+        true,
+    );
+    wait_active(&mut second, &team);
+    let worker = participant(&mut second, &team, "w1").expect("worker");
+    assert_eq!(worker["state"], "exited", "{worker}");
+    assert_eq!(worker["reason"], reason, "{worker}");
+    assert!(worker["instance"].is_null(), "{worker}");
+    // No session was loaded for the exited worker.
+    std::thread::sleep(Duration::from_millis(200));
+    let loads = agent_events(&fixture.log)
+        .into_iter()
+        .filter(|event| {
+            event["event"] == "session"
+                && event["session"] == worker_session
+                && event["method"] == "session/load"
+        })
+        .count();
+    assert_eq!(loads, 0, "the exited worker must not be started again");
+    let closed = second.request(97, "team.close", json!({"team": team}));
+    assert!(closed["result"].is_object(), "{closed}");
+    Fixture::shutdown(&mut restarted);
+}
+
+#[test]
+fn a_removed_worktree_keeps_the_worker_exited_on_resume() {
+    if !git_available() {
+        eprintln!("SKIP: git is not available (removed worktree)");
+        return;
+    }
+    let fixture = Fixture::new("restart-worktree-removed");
+    init_repo(&fixture.work);
+    let root = fixture.dir.path().join("worktrees");
+    let mut server = fixture.start("a", &[]);
+    let mut client = fixture.connect(&server);
+    let mut config = fixture.config(&server, true);
+    config["worktree_root"] = json!(root.to_string_lossy());
+    config["templates"]["dev"]["worktree"] = json!(true);
+    let configured = client.request(
+        2,
+        "team.configure",
+        json!({"cwd": fixture.work.to_string_lossy(), "config": config}),
+    );
+    assert!(configured["result"].is_object(), "{configured}");
+    let (_instance, leader_session, _token, bound) =
+        fixture.attach_leader(&server, &mut client, &fixture.work, None);
+    let team = bound["result"]["team"]["id"].as_str().unwrap().to_string();
+    let spawned = client.request(
+        5,
+        "team.spawn",
+        json!({"team": team, "template": "dev", "name": "w1", "task": "work"}),
+    );
+    assert_eq!(spawned["result"]["name"], "w1", "{spawned}");
+    wait_for(
+        || {
+            participant(&mut client, &team, "w1")?["worktree"]
+                .as_object()
+                .map(|_| ())
+        },
+        "the worker's worktree",
+    );
+    Fixture::shutdown(&mut server);
+    drop(server);
+
+    let mut restarted = fixture.start("b", &[]);
+    let mut second = fixture.connect(&restarted);
+    wait_suspended(&mut second, &team);
+    let removed = second.request(
+        98,
+        "team.remove_worktree",
+        json!({"team": team, "participant": "w1", "force": true}),
+    );
+    assert_eq!(removed["result"]["removed"], true, "{removed}");
+    let mut resume_config = fixture.config(&restarted, true);
+    resume_config["worktree_root"] = json!(root.to_string_lossy());
+    resume_config["templates"]["dev"]["worktree"] = json!(true);
+    let configured = second.request(
+        99,
+        "team.configure",
+        json!({"cwd": fixture.work.to_string_lossy(), "config": resume_config}),
+    );
+    assert!(configured["result"].is_object(), "{configured}");
+    let (_instance, _session, _token, bound) = fixture.attach_leader(
+        &restarted,
+        &mut second,
+        &fixture.work,
+        Some(&leader_session),
+    );
+    assert!(bound["result"]["team"].is_object(), "{bound}");
+    let worker = wait_for(
+        || participant(&mut second, &team, "w1").filter(|entry| entry["state"] == "exited"),
+        "the worker with the removed worktree",
+    );
+    assert!(
+        worker["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("worktree removed")),
+        "{worker}"
+    );
+    let closed = second.request(100, "team.close", json!({"team": team}));
+    assert!(closed["result"].is_object(), "{closed}");
+    Fixture::shutdown(&mut restarted);
+}
+
+#[test]
+fn a_failed_session_load_falls_back_and_resends_the_role_card() {
+    let fixture = Fixture::new("restart-load-fail");
+    let mut server = fixture.start("a", &[]);
+    let mut client = fixture.connect(&server);
+    let (team, leader_session, _) = fixture.first_team(&server, &mut client, "do [report]");
+    let worker_session = wait_worker_session(&mut client, &team)["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    Fixture::shutdown(&mut server);
+    drop(server);
+
+    let mut restarted = fixture.start("b", &[]);
+    let mut second = fixture.connect(&restarted);
+    wait_suspended(&mut second, &team);
+    let mut config = fixture.config(&restarted, true);
+    config["templates"]["dev"]["env"]["TEAM_AGENT_LOAD_FAIL"] = json!("1");
+    let configured = second.request(
+        101,
+        "team.configure",
+        json!({"cwd": fixture.work.to_string_lossy(), "config": config}),
+    );
+    assert!(configured["result"].is_object(), "{configured}");
+    let (_instance, _session, _token, bound) = fixture.attach_leader(
+        &restarted,
+        &mut second,
+        &fixture.work,
+        Some(&leader_session),
+    );
+    assert!(bound["result"]["team"].is_object(), "{bound}");
+    let entry = wait_for(
+        || {
+            participant(&mut second, &team, "w1").filter(|entry| {
+                entry["instance"].as_str().is_some()
+                    && entry["sessionId"].as_str() != Some(worker_session.as_str())
+            })
+        },
+        "the worker's fallback session",
+    );
+    assert_ne!(entry["sessionId"], worker_session, "{entry}");
+    wait_agent(
+        &fixture.log,
+        |event| event["event"] == "load-failed" && event["session"] == worker_session,
+        "the failed session/load",
+    );
+    wait_for(
+        || {
+            let texts = leader_texts(&mut second, &team);
+            texts
+                .iter()
+                .any(|text| text.contains("restarted without its history"))
+                .then_some(())
+        },
+        "the no-history notice",
+    );
+    // The next prompt carries the role card again.
+    let queued = second.request(
+        102,
+        "team.send",
+        json!({"team": team, "to": "w1", "kind": "task", "body": "after fallback [report]"}),
+    );
+    assert!(queued["result"].is_object(), "{queued}");
+    // The role card must be sent again, not merely be present in the log from
+    // the first run.
+    wait_for(
+        || {
+            let cards = agent_events(&fixture.log)
+                .into_iter()
+                .filter(|event| {
+                    event["event"] == "prompt"
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("You are w1"))
+                })
+                .count();
+            (cards >= 2).then_some(())
+        },
+        "the re-sent role card",
+    );
+    wait_agent(
+        &fixture.log,
+        |event| {
+            event["event"] == "prompt"
+                && event["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("after fallback"))
+        },
+        "the task after the fallback",
+    );
+    let closed = second.request(103, "team.close", json!({"team": team}));
+    assert!(closed["result"].is_object(), "{closed}");
+    Fixture::shutdown(&mut restarted);
+}
+
+#[test]
+fn configure_after_bind_starts_the_resume() {
+    let fixture = Fixture::new("restart-configure-late");
+    let mut server = fixture.start("a", &[]);
+    let mut client = fixture.connect(&server);
+    let (team, leader_session, _) = fixture.first_team(&server, &mut client, "do [report]");
+    Fixture::shutdown(&mut server);
+    drop(server);
+
+    let mut restarted = fixture.start("b", &[]);
+    let mut second = fixture.connect(&restarted);
+    wait_suspended(&mut second, &team);
+    // Bind before any configure: the team stays suspended and gets the token.
+    let (_instance, _session, _token, bound) = fixture.attach_leader(
+        &restarted,
+        &mut second,
+        &fixture.work,
+        Some(&leader_session),
+    );
+    assert_eq!(bound["result"]["team"]["state"], "suspended", "{bound}");
+    assert_eq!((&team_entry(&mut second, &team))["state"], "suspended");
+    fixture.configure(&mut second, &fixture.work, &restarted, true);
+    wait_active(&mut second, &team);
+    wait_worker_session(&mut second, &team);
+    let closed = second.request(104, "team.close", json!({"team": team}));
     assert!(closed["result"].is_object(), "{closed}");
     Fixture::shutdown(&mut restarted);
 }

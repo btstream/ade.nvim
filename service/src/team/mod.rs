@@ -433,8 +433,10 @@ pub struct Team {
     /// Loaded from disk after a service restart and not resumed yet (18.15).
     pub suspended: bool,
     pub suspended_at: Option<u64>,
-    /// The one resume triggered by `team.bind_leader` is in flight.
+    /// The one resume triggered by bind/configure is in flight.
     pub resuming: bool,
+    /// A leader bound while suspended but no configuration had arrived yet.
+    pub pending_resume: Option<(String, String)>,
     pub leader_instance: Option<String>,
     pub leader_session: Option<String>,
     pub participants: HashMap<String, Participant>,
@@ -859,6 +861,55 @@ impl Teams {
         Ok((server, token_id))
     }
 
+    /// Move a suspended team to active once; returns the entry to send. The
+    /// caller starts the participants and then calls `finish_resume`.
+    pub fn start_resume(&mut self, team_id: &str, instance: &str, session: &str) -> Value {
+        let config = self
+            .teams
+            .get(team_id)
+            .map(|team| self.config_for(&team.cwd))
+            .unwrap_or_default();
+        if let Some(team) = self.teams.get_mut(team_id) {
+            team.suspended = false;
+            team.suspended_at = None;
+            team.resuming = true;
+            team.pending_resume = None;
+            team.leader_instance = Some(instance.to_string());
+            team.leader_session = Some(session.to_string());
+            team.leaderless = false;
+            team.config = config;
+            if let Some(leader) = team.participants.get_mut("leader") {
+                leader.instance = Some(instance.to_string());
+                leader.session = Some(session.to_string());
+                leader.state = ParticipantState::Idle;
+                leader.starting = false;
+            }
+        }
+        self.events.push(TeamEvent::Changed(team_id.to_string()));
+        json!({ "team": team_entry(&self.teams[team_id]) })
+    }
+
+    pub fn finish_resume(&mut self, team_id: &str) {
+        if let Some(team) = self.teams.get_mut(team_id) {
+            team.resuming = false;
+        }
+    }
+
+    /// The token bound for a still-suspended team whose configure has just
+    /// arrived.
+    pub fn config_resume(&self, cwd: &str) -> Option<(String, String, String)> {
+        let team_id = self.by_cwd.get(cwd)?.clone();
+        let team = self.teams.get(&team_id)?;
+        if !team.suspended || !self.configs.contains_key(cwd) {
+            return None;
+        }
+        let (instance, session) = team.pending_resume.clone()?;
+        if team.leader_session.as_deref() != Some(session.as_str()) {
+            return None;
+        }
+        Some((team_id, instance, session))
+    }
+
     pub fn bind_leader(
         &mut self,
         instance: &str,
@@ -887,47 +938,35 @@ impl Teams {
                     ));
                 }
                 if !self.configs.contains_key(&cwd) {
-                    return Err(TeamError::not_allowed(
-                        "no configuration for this cwd: the team stays suspended",
-                    ));
-                }
-                let config = self.config_for(&cwd);
-                let resumed = {
-                    let team = self.teams.get_mut(&team_id).expect("cwd index");
-                    if team.resuming {
-                        false
-                    } else {
-                        // Once, atomically: state first, participants follow.
-                        team.suspended = false;
-                        team.suspended_at = None;
-                        team.resuming = true;
-                        team.leader_instance = Some(instance.to_string());
-                        team.leader_session = Some(session.to_string());
-                        team.leaderless = false;
-                        team.config = config;
-                        if let Some(leader) = team.participants.get_mut("leader") {
-                            leader.instance = Some(instance.to_string());
-                            leader.session = Some(session.to_string());
-                            leader.state = ParticipantState::Idle;
-                            leader.starting = false;
+                    // A bind before configure is accepted: the token is bound
+                    // and the team stays suspended until configure arrives.
+                    if let Some(team) = self.teams.get_mut(&team_id) {
+                        if !team.resuming {
+                            team.pending_resume = Some((instance.to_string(), session.to_string()));
                         }
-                        true
                     }
-                };
-                if resumed {
-                    self.events.push(TeamEvent::Changed(team_id.clone()));
-                    let entry = json!({ "team": team_entry(&self.teams[&team_id]) });
                     if let Some(record) = self.token_records.get_mut(token_id) {
                         record.bound = true;
                         record.team = Some(team_id.clone());
                         record.name = Some("leader".to_string());
                     }
                     self.token_entry(token_id);
-                    return Ok(BindOutcome::Resume {
-                        team: team_id,
-                        entry,
-                    });
+                    self.events.push(TeamEvent::Changed(team_id.clone()));
+                    return Ok(BindOutcome::Active(json!({
+                        "team": team_entry(&self.teams[&team_id])
+                    })));
                 }
+                let entry = self.start_resume(&team_id, instance, session);
+                if let Some(record) = self.token_records.get_mut(token_id) {
+                    record.bound = true;
+                    record.team = Some(team_id.clone());
+                    record.name = Some("leader".to_string());
+                }
+                self.token_entry(token_id);
+                return Ok(BindOutcome::Resume {
+                    team: team_id,
+                    entry,
+                });
             } else {
                 let team = self.teams.get(&team_id).expect("cwd index");
                 if team.leader_instance.as_deref() != Some(instance)
@@ -960,6 +999,7 @@ impl Teams {
             suspended: false,
             suspended_at: None,
             resuming: false,
+            pending_resume: None,
             leader_instance: Some(instance.to_string()),
             leader_session: Some(session.to_string()),
             participants: HashMap::new(),
@@ -1587,6 +1627,17 @@ impl Teams {
             stamp: worktree::stamp(team.created_at),
             worktree_root: team.config.worktree_root.clone(),
         })
+    }
+
+    /// A resumed worker starts a fresh session: its next prompt carries the
+    /// role card again (18.15).
+    pub fn worker_without_history(&mut self, team_id: &str, name: &str) {
+        if let Some(team) = self.teams.get_mut(team_id) {
+            if let Some(participant) = team.participants.get_mut(name) {
+                participant.first_prompt = true;
+            }
+            self.events.push(TeamEvent::Changed(team_id.to_string()));
+        }
     }
 
     pub fn worktree_prepared(&mut self, team_id: &str, name: &str, info: worktree::WorktreeInfo) {
@@ -2707,7 +2758,8 @@ fn team_entry(team: &Team) -> Value {
 
 // -- persistence (PROTOCOL.md 18.15) ---------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct TemplateSnapshot {
     model: Option<String>,
     role: String,
@@ -2715,6 +2767,7 @@ struct TemplateSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct ConfigSnapshot {
     max_workers: u64,
     spawn_auto: Vec<String>,
@@ -2724,7 +2777,8 @@ struct ConfigSnapshot {
     templates: BTreeMap<String, TemplateSnapshot>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct TeamSnapshot {
     id: String,
     cwd: String,
@@ -2741,6 +2795,19 @@ struct TeamSnapshot {
     total_turns: u64,
     order: Vec<String>,
     reserved_names: Vec<String>,
+}
+
+impl Default for ConfigSnapshot {
+    fn default() -> Self {
+        Self {
+            max_workers: 3,
+            spawn_auto: Vec::new(),
+            max_turns_per_task: 30,
+            max_turns_total: 200,
+            worktree_root: None,
+            templates: BTreeMap::new(),
+        }
+    }
 }
 
 impl Team {
@@ -2773,6 +2840,21 @@ impl Team {
             .iter()
             .filter(|item| item.state == ItemState::Open)
             .cloned()
+            .map(|mut item| {
+                if matches!(item.kind, ItemKind::Permission | ItemKind::Request) {
+                    // These are always orphaned after a restart; the agent
+                    // request they refer to no longer exists, so its payload
+                    // does not belong on disk.
+                    item.tool_call = None;
+                    item.tool_options = None;
+                    item.method = None;
+                    item.params = None;
+                    item.agent_id = None;
+                    item.instance = None;
+                    item.session = None;
+                }
+                item
+            })
             .collect();
         let snapshot = TeamSnapshot {
             id: self.id.clone(),
@@ -2840,13 +2922,22 @@ impl Teams {
         let mut highest_team = max_team;
         let mut highest_inbox = max_inbox;
         for (id, json) in rows {
-            let snapshot: TeamSnapshot = match serde_json::from_str(&json) {
+            let mut snapshot: TeamSnapshot = match serde_json::from_str(&json) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
-                    eprintln!("nvim_ade_server: ignoring an unreadable team {id}: {error}");
+                    eprintln!("nvim_ade_server: deleting an unreadable team {id}: {error}");
+                    expired.push(id);
                     continue;
                 }
             };
+            if snapshot.id.is_empty() {
+                snapshot.id = id.clone();
+            }
+            if snapshot.cwd.is_empty() {
+                eprintln!("nvim_ade_server: deleting team {id} without a cwd");
+                expired.push(id);
+                continue;
+            }
             if let Some(number) = id
                 .strip_prefix('t')
                 .and_then(|rest| rest.parse::<u64>().ok())
@@ -2917,8 +3008,8 @@ impl Teams {
                 participant.bus_turn = false;
                 participant.reported = false;
                 participant.state = match participant.state {
-                    ParticipantState::WaitingHuman => ParticipantState::WaitingHuman,
-                    _ => ParticipantState::Idle,
+                    ParticipantState::Working => ParticipantState::Idle,
+                    other => other,
                 };
                 participants.insert(participant.name.clone(), participant);
             }
@@ -2948,6 +3039,7 @@ impl Teams {
                 suspended: true,
                 suspended_at: Some(suspended_at),
                 resuming: false,
+                pending_resume: None,
                 leader_instance: None,
                 leader_session: snapshot.leader_session.clone(),
                 participants,
@@ -3939,6 +4031,9 @@ mod tests {
         let (_server, token) = restored.leader_server("i1", "/p", "/p").unwrap();
         let first = restored.bind_leader("i1", "s1", &token).unwrap();
         assert!(matches!(first, BindOutcome::Resume { .. }), "{first:?}");
+        assert!(restored.team(&team).unwrap().resuming);
+        restored.finish_resume(&team);
+        assert!(!restored.team(&team).unwrap().resuming);
         let second = restored.bind_leader("i1", "s1", &token).unwrap();
         assert!(
             matches!(second, BindOutcome::Active(_)),
@@ -3960,6 +4055,45 @@ mod tests {
         assert!(stored.is_empty());
         assert_eq!(expired, vec![team.clone()]);
         assert!(restored.team(&team).is_none());
+    }
+
+    #[test]
+    fn permission_payloads_are_not_written_to_the_snapshot() {
+        let (mut teams, team) = fixture(json!({}));
+        let item = InboxItem {
+            id: "i7".to_string(),
+            team: team.clone(),
+            kind: ItemKind::Permission,
+            from: "w1".to_string(),
+            body: "permission".to_string(),
+            at: 1,
+            state: ItemState::Open,
+            options: None,
+            template: None,
+            name: None,
+            task: None,
+            instance: Some("i2".to_string()),
+            session: Some("w1-s".to_string()),
+            tool_call: Some(json!({"toolCallId": "secret-tool"})),
+            tool_options: Some(json!([{"optionId": "allow"}])),
+            method: Some("session/request_permission".to_string()),
+            params: Some(json!({"secret": "payload"})),
+            message_id: None,
+            participant: None,
+            scope: None,
+            limit_task: None,
+            agent_id: Some(json!(42)),
+        };
+        teams.teams.get_mut(&team).unwrap().inbox.push(item.clone());
+        let snapshot = teams.snapshot_team(&team).unwrap();
+        assert!(!snapshot.contains("secret-tool"));
+        assert!(!snapshot.contains("payload"));
+        assert!(!snapshot.contains("allow"));
+        let value: Value = serde_json::from_str(&snapshot).unwrap();
+        let stored = &value["inbox"][0];
+        assert!(stored["tool_call"].is_null(), "{stored}");
+        assert!(stored["params"].is_null(), "{stored}");
+        assert!(stored["agent_id"].is_null(), "{stored}");
     }
 
     #[test]

@@ -322,9 +322,10 @@ other notifications).
 Rules:
 
 - The log belongs to **one instance** and lives exactly as long as it: it is
-  deleted when the instance stops or exits, and the whole log file is deleted
-  when the service starts (no instance survives a service restart, so a stale
-  log would describe nothing). It is never read after that.
+  deleted when the instance stops or exits. The database file itself is kept
+  across a service restart because teams are stored in it (18.15), but every
+  instance, event and session row is cleared when the service starts: no
+  instance survives a restart, so a stale session would describe nothing.
 - File: `<dir>/nvim_ade_server.events.sqlite3`, mode 0600, in the service
   directory (the runtime directory when there is one, so it normally never
   reaches persistent storage).
@@ -1316,10 +1317,12 @@ thread, never on the delivery path): per team `id`, `cwd`, creation stamp,
 worktree and `base`, state, `paused`, current task and sender, turn counters;
 queued messages; the last 200 messages; open inbox items. A delivery removes
 its messages from the queue and marks the participant's bus turn in the same
-transaction, so after a restart nothing is delivered twice. New tables are
-added with a schema migration (the existing event log is kept, never renamed
-away). Team ids are never reused: new teams continue after the highest id ever
-stored.
+transaction, queued before the prompt is sent. The write itself is
+asynchronous: a SIGKILL between queueing that transaction and writing it may
+deliver the prompt **once more** after the restart (at-least-once, never a
+loss). New tables are added with a schema migration (the existing event log is
+kept, never renamed away). Team ids are never reused: new teams continue after
+the highest id ever stored.
 
 **After a restart** every stored team that was not closed is `suspended`:
 `team.list` shows it with `state: "suspended"`, `suspended_at` (milliseconds

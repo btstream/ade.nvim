@@ -599,7 +599,7 @@ fn a_failed_write_does_not_kill_the_writer() {
 }
 
 #[test]
-fn a_second_open_replaces_the_file_but_a_live_one_keeps_its_handle() {
+fn a_second_open_clears_the_events_but_keeps_the_file() {
     let dir = TempDir::new("reopen");
     let path = dir.db();
     let runtime = runtime();
@@ -619,6 +619,33 @@ fn a_second_open_replaces_the_file_but_a_live_one_keeps_its_handle() {
             .expect("read")
             .events
             .is_empty());
+    });
+}
+
+#[test]
+fn team_snapshots_in_one_batch_coalesce_to_the_last_one() {
+    let runtime = runtime();
+    runtime.block_on(async {
+        let recorder = Recorder::in_memory_paused(1024 * 1024);
+        for value in 1..=10 {
+            recorder.save_team(
+                "t1",
+                format!(r#"{{"id":"t1","cwd":"/p","value":{value}}}"#),
+                value,
+                value,
+            );
+        }
+        recorder.resume_writer();
+        recorder.flush().await;
+        assert_eq!(
+            recorder.team_write_count(),
+            1,
+            "one row write for ten saves"
+        );
+        let teams = recorder.load_teams().expect("load");
+        assert_eq!(teams.len(), 1);
+        let value: serde_json::Value = serde_json::from_str(&teams[0].1).expect("json");
+        assert_eq!(value["value"], 10, "the last snapshot wins");
     });
 }
 

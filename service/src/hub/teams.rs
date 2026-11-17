@@ -230,6 +230,11 @@ impl Hub {
             .cloned()
             .ok_or_else(|| TeamError::invalid("config is required"))?;
         self.teams.configure(&cwd, config)?;
+        if let Some((team, instance, session)) = self.teams.config_resume(&cwd) {
+            self.teams.start_resume(&team, &instance, &session);
+            self.resume_team(&team);
+            self.teams.finish_resume(&team);
+        }
         Ok(json!({}))
     }
 
@@ -255,6 +260,7 @@ impl Hub {
             crate::team::BindOutcome::Active(entry) => Ok(entry),
             crate::team::BindOutcome::Resume { team, entry } => {
                 self.resume_team(&team);
+                self.teams.finish_resume(&team);
                 Ok(entry)
             }
         }
@@ -294,6 +300,17 @@ impl Hub {
             let resume_session = participant.session.clone();
             let worktree = participant.worktree.clone();
             let leader_cwd = team.cwd.clone();
+            let template_worktree = team
+                .config
+                .templates
+                .get(&template_name)
+                .is_some_and(|template| template.worktree);
+            if template_worktree && worktree.is_none() {
+                self.teams
+                    .worker_start_failed(team_id, &name, "worktree removed");
+                failures.push(name.clone());
+                continue;
+            }
             let resume_cwd = if let Some(worktree) = &worktree {
                 if !std::path::Path::new(&worktree.cwd).is_dir() {
                     self.teams.worker_start_failed(
@@ -312,13 +329,24 @@ impl Hub {
                 failures.push(name.clone());
                 continue;
             };
+            let waiting = self.teams.team(team_id).is_some_and(|team| {
+                team.inbox.iter().any(|item| {
+                    item.kind == ItemKind::Question
+                        && item.from == name
+                        && item.state == crate::team::ItemState::Open
+                })
+            });
             if let Some(participant) = self
                 .teams
                 .team_mut(team_id)
                 .and_then(|team| team.participants.get_mut(&name))
             {
                 participant.starting = true;
-                participant.state = crate::team::ParticipantState::Idle;
+                participant.state = if waiting {
+                    crate::team::ParticipantState::WaitingHuman
+                } else {
+                    crate::team::ParticipantState::Idle
+                };
                 participant.instance = None;
             }
             let spawn = SpawnRequest {
@@ -1193,7 +1221,9 @@ impl Hub {
                         self.drain_team_events();
                         return;
                     }
-                    // The agent cannot load: start a new session and say so.
+                    // The agent cannot load: start a new session, re-send the
+                    // role card, and say so.
+                    self.teams.worker_without_history(&team, &participant);
                     let _ = self.teams.send_message(
                         &team,
                         "human",
@@ -1232,6 +1262,7 @@ impl Hub {
             } => {
                 if let Some(error) = message.get("error") {
                     let reason = error_message(error);
+                    self.teams.worker_without_history(&team, &participant);
                     let _ = self.teams.send_message(
                         &team,
                         "human",
@@ -1378,9 +1409,16 @@ impl Hub {
         }
         let requests = self.teams.take_deliveries(&busy);
         if !requests.is_empty() {
-            // The dequeue and the bus-turn mark must be durable before the
-            // prompt can run, or a restart would deliver it twice (18.15).
-            self.persist_all_teams();
+            // Only the teams that lost queue entries / marked a bus turn are
+            // snapshotted; serialising every team on every delivery would be
+            // quadratic in the team count.
+            let teams: HashSet<String> = requests
+                .iter()
+                .map(|request| request.team.clone())
+                .collect();
+            for team in teams {
+                self.persist_team(&team);
+            }
         }
         for request in requests {
             let crate::team::DeliveryRequest {
