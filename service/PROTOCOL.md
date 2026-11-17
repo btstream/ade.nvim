@@ -1643,15 +1643,18 @@ the service). Items created during one prompt of the leader's session (from
 the request to its response, whether the prompt came from the bus or from a
 front end) share a group; an item created while no prompt of the leader runs
 gets a group of its own. `team.answer_group {group, allow}` `<- {answered:
-[item ids]}` answers every **open** item of the group as `team.answer` would,
-in creation order; `-32063` when none is open.
+[item ids], failed: [{id, code, message}]}` answers every **open** item of the
+group as `team.answer` would, in creation order. An item whose answer fails is
+skipped (it stays open and is listed in `failed`); the others take effect.
+`-32063` when none is open; when every item fails, the error of the first.
 
 ### 19.7 `team.start`
 
 `team.start {team, workflow, task?}` `<- {workflow, started: [name], skipped:
 [name]}` starts a team's workflow on behalf of `human`:
 
-1. The name resolves as in 19.1 (`-32060` if unknown). A `suspended` team is
+1. The name resolves as in 19.1 (`-32060` if unknown); `task` is at most
+   64 KiB (`-32060`). A `suspended` team is
    `-32061`; a `leaderless` one is allowed (the notice queues).
 2. Members whose name is already a participant (any state) are `skipped`.
    If the remaining members would exceed `max_workers` live workers, nothing
