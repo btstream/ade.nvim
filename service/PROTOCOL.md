@@ -283,6 +283,7 @@ The service exits when **all** hold for `idle_timeout` seconds (default 1800,
 - no instance has `turns_running > 0`;
 - no instance has `pending_requests > 0`.
 - no install job is running (section 16.3).
+- no team is active (section 18; suspended teams do not count).
 
 On exit it stops all agents (section 6) and removes its socket.
 An instance with a running turn or a pending request keeps the service alive
@@ -888,10 +889,9 @@ Neovim exits. Without a team nothing in this section happens: a single agent
 behaves exactly as before.
 
 `"teams"` is offered only together with `"log"` (section 10): a front end that
-was away rebuilds what the team did from the event log. While any team exists
-the service does not idle-exit (section 8). Teams live in memory: after a
-service restart there are none, and front ends treat every team they knew as
-ended. Worktrees for workers, teams started from configuration and recovery
+was away rebuilds what the team did from the event log. While any **active**
+team exists the service does not idle-exit (section 8). Teams are persisted and
+come back after a service restart as suspended teams (18.15). Worktrees for workers, teams started from configuration and recovery
 after a restart are stage S4c; everything else here is S4a (service) and S4b
 (front end).
 
@@ -1270,8 +1270,8 @@ A template may set `"worktree": true`, and `config` may carry
   where `<repo>` is the toplevel's last path component (characters outside
   `[A-Za-z0-9._-]` replaced by `_`) and `<hash8>` the first 8 hex digits of
   SHA-256 of the toplevel's absolute path, and `<stamp>` the team's creation
-  time in UTC as `YYYYMMDD-HHMMSS` (team ids restart after a service restart;
-  the stamp keeps names unique). An existing branch or directory of
+  time in UTC as `YYYYMMDD-HHMMSS` (the stamp keeps names unique even if two
+  teams share an id across separate event logs). An existing branch or directory of
   that name is an error (`-32061`), never reused;
 - the worker's `cwd` is the worktree directory, plus the same relative
   subdirectory the team's `cwd` has inside the toplevel.
@@ -1303,48 +1303,67 @@ end learns about teams with `team.list` when the service offers `"teams"`.
 
 ### 18.15 Recovery after a service restart (S4c)
 
-Teams are written to the event log database (section 10, mode 0600) and
-survive a restart of the service as **suspended** teams. Nothing a template's
-`env` holds is written to disk: a suspended team resumes only when a front end
-supplies its configuration again.
+Teams are stored in the event log database (section 10, mode 0600) and come
+back after a restart of the service as **suspended** teams. Template `key`,
+`env` and `launch` are never written: a suspended team resumes only when a
+front end supplies its configuration again. Message bodies **are** written
+(the queue and the last 200 messages of each team); README states this.
 
-**Recorded** (updated in the same transaction as the change): per team `id`,
-`cwd`, creation stamp, configuration **without** template `key`/`env`/`launch`
-(names, roles, models, worktree flags, limits, auto list), the leader's
+**Stored**, in the same transaction as each change (written by the store's own
+thread, never on the delivery path): per team `id`, `cwd`, creation stamp,
+`state`, the configuration without template `key`/`env`/`launch`, the leader's
 `sessionId` and agent id; per participant name, template, `sessionId`,
-worktree, state, `paused`, current task and sender, turn counters; queued
-messages; the last 200 messages of the team; open inbox items.
+worktree and `base`, state, `paused`, current task and sender, turn counters;
+queued messages; the last 200 messages; open inbox items. A delivery removes
+its messages from the queue and marks the participant's bus turn in the same
+transaction, so after a restart nothing is delivered twice. New tables are
+added with a schema migration (the existing event log is kept, never renamed
+away). Team ids are never reused: new teams continue after the highest id ever
+stored.
 
-**After a restart** every recorded team is listed by `team.list` with
-`state: "suspended"`; its participants have no instance and `bus.*`/deliveries
-do nothing. A suspended team **resumes** when both hold:
+**After a restart** every stored team that was not closed is `suspended`:
+`team.list` shows it with `state: "suspended"`, `suspended_at` (milliseconds
+since the epoch, like every `at`), `leader: {instance: null, sessionId}`, and
+participants with `instance: null`. While suspended: `team.send` queues,
+`team.answer` works for `question`, `message` and `limit` items,
+`team.remove_worktree` works, `team.close` removes the team and all its stored
+rows; `team.watch`, `team.spawn` and `bus.*` are `-32064` ("suspended").
 
-1. a `team.configure` for its `cwd` has provided templates (as in 18.2);
-2. `team.bind_leader` binds a session whose `sessionId` equals the recorded
-   leader session (the front end restores the leader's conversation the usual
-   way, section 12 / the agent's `session/load`, and injects a fresh leader
-   server; a different session is `-32061` as before).
+**Resuming.** Front ends send `team.configure` after every `hello`. For a
+suspended team, `team.leader_server {instance, cwd}` is allowed for any
+instance whose `key.cwd` is the team's `cwd`. The team resumes, atomically and
+once, at the first `team.bind_leader` whose `sessionId` equals the stored
+leader session while a configuration for that `cwd` is present (another
+session is `-32061`; while the resume runs, a bind of the same session only
+adds its token). The front end restores the leader's conversation as usual
+(section 12 or the agent's own `session/load`); when that produced a different
+session, the team stays suspended and the person can close it from the panel.
 
-Resuming: the team gets its old id if free (else a new one), state `active`;
-for each participant that was not `exited`: start its template as in 18.3
-(`cwd` = its recorded worktree when it has one, which must still exist),
+Resuming starts, for each participant that was not `exited`, its template as
+in 18.3 (`cwd` = its stored worktree, which must still exist), sends
 `initialize`, then `session/load {sessionId, cwd, mcpServers: [new server]}`
-when the agent advertises `loadSession` (otherwise `session/new`, and the
-leader gets a `notice` that the worker restarted without its history). New
-participant tokens are issued; old ones are gone. A participant whose
-template is no longer configured, whose worktree is gone, or whose start fails
-becomes `exited` with that reason (and the usual notices).
+when the agent advertises `loadSession`. If the agent does not advertise it,
+or the load fails, the service sends `session/new` instead and the leader gets
+a `notice` that the worker restarted without its history. New tokens are
+issued. A participant whose template is no longer configured, whose worktree
+is gone, or whose start fails becomes `exited` with that reason. Each
+participant's entry changes from `instance: null` to its new instance as it
+starts (one `team.changed` each); the team's state becomes `active` first.
+The leader receives one `notice` from the service: `"team resumed after a
+service restart"`, listing workers that could not be resumed.
 
-What was in flight at the restart: a bus turn that was running counts as
-ended with an error (`"turn ended: error: the service restarted"`, 18.11), the
-person's held prompts are gone, `permission` and `request` items become
-`orphaned` (the agent request no longer exists), other open items stay open.
-Queued messages are delivered once the participants run again.
+What was in flight at the restart: a bus turn that was running ends as an
+error (`"turn ended: error: the service restarted"`, 18.11), held prompts are
+gone, `permission` and `request` items become `orphaned`, other open items
+stay open, and queued messages are delivered once the participants run again.
 
-`team.close` on a suspended team removes it. A suspended team that has not
-resumed after 7 days is removed. `team.list` entries of suspended teams carry
-`suspended_at`. While only suspended teams exist the service may idle-exit
-(section 8); they are kept on disk.
+**Expiry.** A team suspended for more than 7 days is removed (with all its
+rows) when the service starts and on an hourly check; its worktrees and
+branches are kept, as always.
+
+Front ends no longer treat a reconnect as the end of every team: they show
+suspended teams (with `x` to close them) and do not block the leader injection
+for a suspended team's `cwd` (`leader.instance` is null).
 
 ### 18.16 S4c clarifications (normative; take precedence over 18.12–18.14)
 
