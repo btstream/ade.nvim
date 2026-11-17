@@ -188,7 +188,7 @@ unsupported shape, agent line too long).
 | -32040 to -32045 | managed installs, section 16.5 |
 | -32800 | request cancelled (section 16.3) |
 | -32050 | invalid policy rule set (section 17) |
-| -32060 to -32065 | teams, section 18.10 |
+| -32060 to -32066 | teams, sections 18.10 and 18.16 |
 | -32601, -32700, -32600, -32602 | standard JSON-RPC errors |
 
 ## 5. Relay rules (per instance)
@@ -1345,3 +1345,48 @@ Queued messages are delivered once the participants run again.
 resumed after 7 days is removed. `team.list` entries of suspended teams carry
 `suspended_at`. While only suspended teams exist the service may idle-exit
 (section 8); they are kept on disk.
+
+### 18.16 S4c clarifications (normative; take precedence over 18.12–18.14)
+
+**What a worktree starts from.** `HEAD` must resolve to a commit
+(`git rev-parse --verify HEAD^{commit}`); an unborn branch or a bare
+repository is `-32061`. A detached `HEAD` is allowed. The worktree holds the
+**committed** state only: uncommitted and untracked changes of the team's tree
+are not in it. When `git status --porcelain` of the toplevel is not empty, the
+spawn result (and the `notice` for an approved request) carries
+`warning: "dirty_tree"`, and the worker's role card says that it starts from
+the last commit. Inside a submodule the toplevel is the submodule's; the new
+worktree's own submodules are not initialised. If the team's subdirectory
+does not exist in the worktree, the worker's `cwd` is the worktree root and the
+leader gets a `notice`. The toplevel is canonicalised (symlinks resolved)
+before hashing.
+
+**Running git.** git runs with the **service's** environment minus `GIT_DIR`,
+`GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
+`GIT_COMMON_DIR`, plus `GIT_TERMINAL_PROMPT=0`; never through a shell; with a
+60 s timeout (hooks included). Commands on the same toplevel are serialised.
+A failing or timed-out git command is `-32066` with git's stderr (at most
+4 KiB) in `data.stderr`.
+
+**Removing.** Each worker records `base` (the commit its branch started
+from). `team.remove_worktree` removes the worktree first (`git worktree
+remove`, `--force` when asked); then the branch is deleted
+(`git branch -D`) only when its tip is an ancestor of the toplevel's current
+`HEAD` (`git merge-base --is-ancestor`). The result is
+`{removed: true, branch_kept: bool, branch}`; keeping the branch is not an
+error. Allowed for exited workers only (`-32061`).
+
+**`team.spawn`.** Same checks and errors as `bus.spawn`
+(`-32061` unknown template or worker limit, `-32060` invalid or used name).
+Allowed for a `leaderless` team (the leader's notice queues). Front ends start
+the workers of a configured team only for names that are **not** already in
+the team's `team.list` participants (whatever their state), so reconnecting or
+a second front end never starts them twice.
+
+**Version check (18.14).** The front end asks `team.list` with a 5 s timeout;
+a failure or timeout counts as busy, `-32601` (a service without teams) as no
+teams.
+
+| Code | Meaning |
+|---|---|
+| -32066 | a git command failed (`data.stderr`) |
