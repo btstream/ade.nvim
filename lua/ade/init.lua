@@ -31,6 +31,23 @@ function M.open_team()
   return ensure().open_team()
 end
 
+---Start a named team workflow (`:Ade team start [workflow]`).
+---@param workflow string|nil picks one when absent
+function M.start_team(workflow)
+  ensure().start_team(workflow)
+end
+
+---Close the team of this cwd, after a confirmation.
+function M.close_team()
+  ensure().close_team()
+end
+
+---Open the named workflows window (`:Ade workflows`).
+---@return boolean
+function M.workflows()
+  return ensure().workflows()
+end
+
 ---Install one managed agent. Nothing is downloaded without user confirmation.
 ---@param id string
 ---@param opts {version?: string}|nil

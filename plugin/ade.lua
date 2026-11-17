@@ -36,10 +36,44 @@ local SUBCOMMANDS = {
   "inline-reset",
   "diagnostics",
   "service",
+  "team",
+  "workflows",
 }
 
 ---Subcommands of `:Ade service`.
 local SERVICE_SUBCOMMANDS = { "install", "status", "start", "stop", "agents", "kill" }
+
+---Subcommands of `:Ade team`.
+local TEAM_SUBCOMMANDS = { "start", "close" }
+
+---Workflow names known from the configuration and the last service listing.
+---@return string[]
+local function workflow_names()
+  local names, seen = {}, {}
+  local function add(name)
+    if type(name) == "string" and name ~= "" and not seen[name] then
+      seen[name] = true
+      names[#names + 1] = name
+    end
+  end
+  local ok, controller = pcall(require, "ade.controller")
+  if ok then
+    local state_ok, state = pcall(controller.state)
+    if state_ok and type(state) == "table" and state.view and state.view.team then
+      for _, name in ipairs(state.view.team:known_workflows()) do
+        add(name)
+      end
+    end
+  end
+  local config_ok, config = pcall(require, "ade.config")
+  local current = config_ok and (config.current or config.defaults) or {}
+  for name in pairs((current.teams or {}).workflows or {}) do
+    add(name)
+  end
+  add("default")
+  table.sort(names)
+  return names
+end
 
 ---Complete subcommands, and agent ids for the commands that take one.
 local function complete(arglead, cmdline)
@@ -67,6 +101,16 @@ local function complete(arglead, cmdline)
       table.sort(candidates)
     elseif sub == "service" then
       candidates = SERVICE_SUBCOMMANDS
+    elseif sub == "team" then
+      local trailing = cmdline:match("%s$") ~= nil
+      local typing_sub = (#words == 3 and not trailing) or (#words == 2 and trailing)
+      if typing_sub then
+        candidates = TEAM_SUBCOMMANDS
+      elseif words[3] == "start" then
+        candidates = workflow_names()
+      else
+        candidates = {}
+      end
     else
       return {}
     end
@@ -124,7 +168,20 @@ local function setup()
       elseif sub == "agents" then
         ade.manage_agents()
       elseif sub == "team" then
-        ade.open_team()
+        -- `:Ade team` opens the panel; `start [workflow]` starts a workflow
+        -- and `close` ends the team for this cwd (19.7).
+        local action, argument = rest:match("^(%S+)%s*(.-)%s*$")
+        if action == nil or action == "" then
+          ade.open_team()
+        elseif action == "start" then
+          ade.start_team(argument ~= "" and argument or nil)
+        elseif action == "close" then
+          ade.close_team()
+        else
+          vim.notify("ade.nvim: unknown team command " .. action, vim.log.levels.WARN)
+        end
+      elseif sub == "workflows" then
+        ade.workflows()
       elseif sub == "install" or sub == "update" then
         -- Like :MasonInstall, the window opens so the install is visible.
         local id, version = rest:match("^(%S+)%s*(%S*)$")
@@ -196,7 +253,7 @@ local function setup()
         vim.notify("ade.nvim: unknown subcommand " .. sub, vim.log.levels.WARN)
       end
     end,
-    "open|hide|toggle|new|stop|reconnect|login|logout|agent|agents|team|install|update|uninstall|config|disconnect|permission|sessions|delete|model|mode|file|files|image|inline|inline-stop|inline-reset|diagnostics|service",
+    "open|hide|toggle|new|stop|reconnect|login|logout|agent|agents|team|workflows|install|update|uninstall|config|disconnect|permission|sessions|delete|model|mode|file|files|image|inline|inline-stop|inline-reset|diagnostics|service",
     true,
     complete
   )

@@ -581,6 +581,12 @@ impl Hub {
                 .flatten()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
+            match self.recorder.load_workflows() {
+                Ok(rows) => self.teams.restore_workflows(rows),
+                Err(error) => {
+                    eprintln!("nvim_ade_server: cannot load stored workflows: {error:#}")
+                }
+            }
             let (stored, expired) = self.teams.restore(
                 rows,
                 max_team,

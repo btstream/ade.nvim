@@ -7,7 +7,9 @@
 
 pub mod activity;
 pub mod board;
+pub mod brief;
 pub mod mcp;
+pub mod workflow;
 pub mod worktree;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -42,6 +44,8 @@ pub const MAX_ROLE_BYTES: usize = 16 * 1024;
 pub const MAX_READ_MESSAGES: usize = 100;
 /// The text of the last three bus turns, 64 KiB in total (18.11).
 pub const MAX_TURN_TEXT: usize = 64 * 1024;
+/// At most this many stored workflows per (scope, project) (19.5).
+pub const MAX_STORED_WORKFLOWS: usize = 100;
 
 #[derive(Debug, Clone)]
 pub struct TeamError {
@@ -248,6 +252,17 @@ pub struct InboxItem {
     pub template: Option<String>,
     pub name: Option<String>,
     pub task: Option<String>,
+    /// The spawn's model and role (19.6).
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+    /// The template's agent, for the inbox display (19.6).
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// The spawn group (19.6); items from one leader prompt share it.
+    #[serde(default)]
+    pub group: Option<String>,
     // permission / request
     pub instance: Option<String>,
     pub session: Option<String>,
@@ -287,6 +302,18 @@ impl InboxItem {
                 if let Some(task) = &self.task {
                     out["task"] = json!(task);
                 }
+                if let Some(model) = &self.model {
+                    out["model"] = json!(model);
+                }
+                if let Some(role) = &self.role {
+                    out["role"] = json!(role);
+                }
+                if let Some(agent) = &self.agent {
+                    out["agent"] = json!(agent);
+                }
+                if let Some(group) = &self.group {
+                    out["group"] = json!(group);
+                }
             }
             ItemKind::Permission => {
                 out["instance"] = json!(self.instance);
@@ -324,8 +351,31 @@ pub struct Template {
     pub launch: Option<crate::install::Launch>,
     pub model: Option<String>,
     pub role: String,
+    /// Models a spawn may ask for; empty = any model the agent offers (19.1).
+    pub models: Vec<String>,
+    /// How the agent reaches the team tools (19.6).
+    pub tool_style: ToolStyle,
     /// Start this worker in a git worktree (18.12).
     pub worktree: bool,
+}
+
+/// `template.tool_style` (19.1/19.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolStyle {
+    #[default]
+    Direct,
+    /// The agent calls MCP tools through its own `mcp` proxy tool.
+    McpProxy,
+}
+
+impl ToolStyle {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "direct" => Some(Self::Direct),
+            "mcp_proxy" => Some(Self::McpProxy),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -335,6 +385,10 @@ pub struct TeamConfig {
     pub max_turns_per_task: u64,
     pub max_turns_total: u64,
     pub templates: HashMap<String, Template>,
+    /// Read-only workflows from the person's setup (19.1).
+    pub workflows: HashMap<String, workflow::Workflow>,
+    /// The default workflow name (a `workflows` key or `"default"`).
+    pub default_workflow: Option<String>,
     /// Parent directory for worker worktrees; required when a template asks
     /// for one (18.12).
     pub worktree_root: Option<String>,
@@ -348,6 +402,8 @@ impl Default for TeamConfig {
             max_turns_per_task: 30,
             max_turns_total: 200,
             templates: HashMap::new(),
+            workflows: HashMap::new(),
+            default_workflow: None,
             worktree_root: None,
         }
     }
@@ -402,6 +458,12 @@ pub struct Participant {
     /// When `state` last changed, in ms since the epoch (19.9).
     #[serde(skip)]
     pub state_since: u64,
+    /// The model a spawn asked for (19.6); re-applied when the worker resumes.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The role a spawn appended to the template's role card (19.6).
+    #[serde(default)]
+    pub spawn_role: Option<String>,
 }
 
 impl Participant {
@@ -434,6 +496,8 @@ impl Participant {
             activity_throttle: activity::ActivityThrottle::default(),
             turn_activity: false,
             state_since: now_ms(),
+            model: None,
+            spawn_role: None,
         }
     }
 
@@ -476,6 +540,8 @@ pub struct Team {
     pub board: board::Board,
     /// When the pending worker board write is persisted and announced (19.2).
     pub board_flush_at: Option<u64>,
+    /// The spawn group of a prompt the leader is running (19.6).
+    pub current_group: Option<String>,
 }
 
 impl Team {
@@ -610,6 +676,10 @@ pub struct SpawnRequest {
     pub team: String,
     pub name: String,
     pub template: String,
+    /// The spawn's model (19.6); falls back to the template's `model`.
+    pub model: Option<String>,
+    /// The spawn's role, appended to the template's role card (19.6).
+    pub role: Option<String>,
     pub task: Option<String>,
 }
 
@@ -658,6 +728,12 @@ pub struct Teams {
     next_inbox: u64,
     closed_teams: HashSet<String>,
     events: Vec<TeamEvent>,
+    /// The next spawn group number (19.6).
+    next_group: u64,
+    /// Stored (project and user) workflows (19.5).
+    workflows: workflow::StoredWorkflows,
+    /// cwd -> project key, so git runs at most once per cwd.
+    project_keys: HashMap<String, String>,
 }
 
 impl Teams {
@@ -674,6 +750,9 @@ impl Teams {
             next_inbox: 0,
             closed_teams: HashSet::new(),
             events: Vec::new(),
+            next_group: 0,
+            workflows: workflow::StoredWorkflows::new(),
+            project_keys: HashMap::new(),
         }
     }
 
@@ -752,6 +831,193 @@ impl Teams {
 
     pub fn config_for(&self, cwd: &str) -> TeamConfig {
         self.configs.get(cwd).cloned().unwrap_or_default()
+    }
+
+    // -- workflows (PROTOCOL.md 19.5) --------------------------------------
+
+    /// The configuration in force for a cwd: the running team's, else the last
+    /// stored one (19.5).
+    fn config_for_cwd(&self, cwd: &str) -> TeamConfig {
+        match self.team_for_cwd(cwd) {
+            Some(team) => team.config.clone(),
+            None => self.config_for(cwd),
+        }
+    }
+
+    /// The cached project key of a cwd (19.1).
+    pub fn project_key(&self, cwd: &str) -> Option<&str> {
+        self.project_keys.get(cwd).map(String::as_str)
+    }
+
+    pub fn set_project_key(&mut self, cwd: &str, project: &str) {
+        self.project_keys
+            .insert(cwd.to_string(), project.to_string());
+    }
+
+    /// Replace the stored workflows, as loaded at startup.
+    pub fn restore_workflows(&mut self, rows: Vec<(String, String, String, String)>) {
+        self.workflows = workflow::StoredWorkflows::new();
+        self.workflows.load(rows);
+    }
+
+    /// `team.workflows {cwd}` (19.5): every visible name once, resolved.
+    pub fn workflows_for_cwd(&self, cwd: &str, project: &str) -> Value {
+        let config = self.config_for_cwd(cwd);
+        let workflows: Vec<Value> = workflow::list(&config, &self.workflows, project)
+            .iter()
+            .map(workflow::Workflow::to_json)
+            .collect();
+        json!({ "workflows": workflows })
+    }
+
+    /// `bus.status`'s short workflow list for a leader (19.3).
+    pub fn workflow_short_list(&self, team_id: &str, project: &str) -> Vec<Value> {
+        match self.teams.get(team_id) {
+            Some(team) => workflow::short_list(&team.config, &self.workflows, project),
+            None => Vec::new(),
+        }
+    }
+
+    /// Resolve a workflow for a team (19.1).
+    pub fn resolve_workflow(
+        &self,
+        team_id: &str,
+        project: &str,
+        name: &str,
+    ) -> Result<workflow::Workflow, TeamError> {
+        let team = self
+            .teams
+            .get(team_id)
+            .ok_or_else(|| TeamError::unknown("unknown team"))?;
+        workflow::resolve(&team.config, &self.workflows, project, name)
+            .ok_or_else(|| TeamError::invalid(format!("unknown workflow {name}")))
+    }
+
+    /// `bus.workflow_save` (19.5). Returns the stored workflow.
+    pub fn workflow_save(
+        &mut self,
+        team_id: &str,
+        project: &str,
+        value: &Value,
+        scope: workflow::Scope,
+        replace: bool,
+    ) -> Result<workflow::Workflow, TeamError> {
+        let team = self
+            .teams
+            .get(team_id)
+            .ok_or_else(|| TeamError::unknown("unknown team"))?;
+        if team.closed {
+            return Err(TeamError::unknown("team closed"));
+        }
+        let stored = workflow::parse_workflow(value, scope, Some(&team.config))?;
+        if team.config.workflows.contains_key(&stored.name) {
+            return Err(TeamError::not_allowed("workflow exists"));
+        }
+        if self.workflows.get(scope, project, &stored.name).is_some() && !replace {
+            return Err(TeamError::not_allowed("workflow exists"));
+        }
+        if self.workflows.count(scope, project) >= MAX_STORED_WORKFLOWS
+            && self.workflows.get(scope, project, &stored.name).is_none()
+        {
+            return Err(TeamError::not_allowed("too many workflows"));
+        }
+        self.workflows.insert(project, stored.clone());
+        Ok(stored)
+    }
+
+    /// `bus.workflow_get` (19.5).
+    pub fn workflow_get(
+        &self,
+        team_id: &str,
+        project: &str,
+        name: &str,
+    ) -> Result<Value, TeamError> {
+        let resolved = self.resolve_workflow(team_id, project, name)?;
+        Ok(json!({ "workflow": resolved.to_json() }))
+    }
+
+    /// `bus.workflow_delete` (19.5): without a scope the stored workflow the
+    /// name resolves to; a config or builtin one, or no stored one, is
+    /// `-32061`. Returns the removed record for the database.
+    pub fn workflow_delete(
+        &mut self,
+        team_id: &str,
+        project: &str,
+        name: &str,
+        scope: Option<workflow::Scope>,
+    ) -> Result<workflow::Workflow, TeamError> {
+        let team = self
+            .teams
+            .get(team_id)
+            .ok_or_else(|| TeamError::unknown("unknown team"))?;
+        match scope {
+            Some(scope) => self
+                .workflows
+                .remove(scope, project, name)
+                .ok_or_else(|| TeamError::not_allowed("no such workflow")),
+            None => {
+                if team.config.workflows.contains_key(name) {
+                    return Err(TeamError::not_allowed("workflow is configured"));
+                }
+                for scope in [workflow::Scope::Project, workflow::Scope::User] {
+                    if let Some(removed) = self.workflows.remove(scope, project, name) {
+                        return Ok(removed);
+                    }
+                }
+                Err(TeamError::not_allowed("no such workflow"))
+            }
+        }
+    }
+
+    /// `team.workflow_delete {cwd, name, scope}` (19.5).
+    pub fn workflow_delete_for_cwd(
+        &mut self,
+        project: &str,
+        name: &str,
+        scope: workflow::Scope,
+    ) -> Result<workflow::Workflow, TeamError> {
+        self.workflows
+            .remove(scope, project, name)
+            .ok_or_else(|| TeamError::not_allowed("no such workflow"))
+    }
+
+    // -- spawn groups (PROTOCOL.md 19.6) -----------------------------------
+
+    fn new_group(&mut self) -> String {
+        self.next_group += 1;
+        format!("g{}", self.next_group)
+    }
+
+    /// Start a group for a leader prompt that has no group yet.
+    pub fn begin_leader_group(&mut self, team_id: &str) {
+        let needs_group = self
+            .teams
+            .get(team_id)
+            .is_some_and(|team| team.current_group.is_none());
+        if !needs_group {
+            return;
+        }
+        let group = self.new_group();
+        if let Some(team) = self.teams.get_mut(team_id) {
+            team.current_group = Some(group);
+        }
+    }
+
+    /// Close the leader's current prompt group; later items get their own.
+    pub fn finish_leader_group(&mut self, team_id: &str) {
+        if let Some(team) = self.teams.get_mut(team_id) {
+            team.current_group = None;
+        }
+    }
+
+    /// The group a new spawn item belongs to (19.6): the leader's running
+    /// prompt's group, or a fresh one for an item created outside a prompt.
+    fn next_spawn_group(&mut self, team_id: &str) -> Option<String> {
+        let current = self.teams.get(team_id)?.current_group.clone();
+        match current {
+            Some(group) => Some(group),
+            None => Some(self.new_group()),
+        }
     }
 
     // -- tokens ------------------------------------------------------------
@@ -1046,6 +1312,7 @@ impl Teams {
             created_at: now_ms(),
             board: board::Board::default(),
             board_flush_at: None,
+            current_group: None,
         };
         let mut leader = Participant::new("leader", Role::Leader);
         leader.instance = Some(instance.to_string());
@@ -1086,6 +1353,7 @@ impl Teams {
             return Err(TeamError::unknown("team closed"));
         }
         team.closed = true;
+        team.current_group = None;
         let mut orphaned = Vec::new();
         for item in &mut team.inbox {
             if item.kind == ItemKind::Spawn && item.state == ItemState::Open {
@@ -1241,6 +1509,10 @@ impl Teams {
                 template: None,
                 name: None,
                 task: None,
+                model: None,
+                role: None,
+                agent: None,
+                group: None,
                 instance: None,
                 session: None,
                 tool_call: None,
@@ -1347,6 +1619,10 @@ impl Teams {
             template: None,
             name: None,
             task: None,
+            model: None,
+            role: None,
+            agent: None,
+            group: None,
             instance: Some(instance.to_string()),
             session: session.map(str::to_string),
             tool_call: if permission { Some(tool_call) } else { None },
@@ -1414,6 +1690,10 @@ impl Teams {
             template: None,
             name: None,
             task: None,
+            model: None,
+            role: None,
+            agent: None,
+            group: None,
             instance: None,
             session: None,
             tool_call: None,
@@ -1434,7 +1714,7 @@ impl Teams {
         Ok(id)
     }
 
-    pub fn status(&self, team_id: &str, name: &str) -> Result<Value, TeamError> {
+    pub fn status(&self, team_id: &str, name: &str, project: &str) -> Result<Value, TeamError> {
         let team = self
             .teams
             .get(team_id)
@@ -1470,9 +1750,21 @@ impl Teams {
             "members": members,
         });
         if self_participant.role == Role::Leader {
-            let mut templates: Vec<&String> = team.config.templates.keys().collect();
-            templates.sort();
+            let mut templates: Vec<Value> = team
+                .config
+                .templates
+                .iter()
+                .map(|(name, template)| {
+                    json!({
+                        "name": name,
+                        "agent": template.key.agent,
+                        "models": template.models,
+                    })
+                })
+                .collect();
+            templates.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
             out["templates"] = json!(templates);
+            out["workflows"] = json!(self.workflow_short_list(team_id, project));
             out["workers_left"] = json!(team
                 .config
                 .max_workers
@@ -1538,13 +1830,17 @@ impl Teams {
 
     // -- spawning ----------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     pub fn request_spawn(
         &mut self,
         team_id: &str,
         template: &str,
         name: Option<&str>,
+        model: Option<&str>,
+        role: Option<&str>,
         task: Option<&str>,
     ) -> Result<SpawnOutcome, TeamError> {
+        let group = self.next_spawn_group(team_id);
         let spawn_item_id = self.next_inbox_id();
         let team = self
             .teams
@@ -1556,10 +1852,11 @@ impl Teams {
         if team.suspended {
             return Err(TeamError::unknown("suspended"));
         }
+        validate_spawn_choice(team, template, model, role)?;
         let name = spawn_name(team, template, name, task)?;
         let auto = team.config.spawn_auto.contains(template);
         if auto {
-            spawn_participant(team, &name, template, task)?;
+            spawn_participant(team, &name, template, model, role, task)?;
             team.order.push(name.clone());
             let team_id = team.id.clone();
             self.events.push(TeamEvent::Changed(team_id.clone()));
@@ -1567,9 +1864,16 @@ impl Teams {
                 team: team_id,
                 name,
                 template: template.to_string(),
+                model: model.map(str::to_string),
+                role: role.map(str::to_string),
                 task: task.map(str::to_string),
             }));
         }
+        let agent = team
+            .config
+            .templates
+            .get(template)
+            .map(|template| template.key.agent.clone());
         team.reserved_names.insert(name.clone());
         let item = InboxItem {
             id: spawn_item_id.clone(),
@@ -1583,6 +1887,10 @@ impl Teams {
             template: Some(template.to_string()),
             name: Some(name.clone()),
             task: task.map(str::to_string),
+            model: model.map(str::to_string),
+            role: role.map(str::to_string),
+            agent,
+            group,
             instance: None,
             session: None,
             tool_call: None,
@@ -1606,11 +1914,14 @@ impl Teams {
     }
 
     /// `team.spawn` (18.13): the person starts a worker without the inbox.
+    #[allow(clippy::too_many_arguments)]
     pub fn request_spawn_human(
         &mut self,
         team_id: &str,
         template: &str,
         name: Option<&str>,
+        model: Option<&str>,
+        role: Option<&str>,
         task: Option<&str>,
     ) -> Result<SpawnRequest, TeamError> {
         let team = self
@@ -1623,8 +1934,9 @@ impl Teams {
         if team.suspended {
             return Err(TeamError::unknown("suspended"));
         }
+        validate_spawn_choice(team, template, model, role)?;
         let name = spawn_name(team, template, name, task)?;
-        spawn_participant(team, &name, template, task)?;
+        spawn_participant(team, &name, template, model, role, task)?;
         team.order.push(name.clone());
         let team_id = team.id.clone();
         self.events.push(TeamEvent::Changed(team_id.clone()));
@@ -1632,6 +1944,8 @@ impl Teams {
             team: team_id,
             name,
             template: template.to_string(),
+            model: model.map(str::to_string),
+            role: role.map(str::to_string),
             task: task.map(str::to_string),
         })
     }
@@ -1745,13 +2059,19 @@ impl Teams {
         let Some((team_id, name)) = self.by_instance.get(instance).cloned() else {
             return;
         };
+        let mut leader = false;
         if let Some(team) = self.teams.get_mut(&team_id) {
             if let Some(participant) = team.participants.get_mut(&name) {
                 if participant.state != ParticipantState::Exited {
                     participant.set_state(ParticipantState::Working);
                 }
+                leader = participant.role == Role::Leader;
             }
-            self.events.push(TeamEvent::Changed(team_id));
+            self.events.push(TeamEvent::Changed(team_id.clone()));
+        }
+        if leader || name == "leader" {
+            // A prompt from the front end opens a spawn group too (19.6).
+            self.begin_leader_group(&team_id);
         }
     }
 
@@ -1774,7 +2094,14 @@ impl Teams {
                 });
             }
         }
-        self.events.push(TeamEvent::Changed(team_id));
+        let leader = team
+            .participants
+            .get(&name)
+            .is_some_and(|participant| participant.role == Role::Leader);
+        self.events.push(TeamEvent::Changed(team_id.clone()));
+        if leader || name == "leader" {
+            self.finish_leader_group(&team_id);
+        }
     }
 
     /// The worker's session and optional model configuration are ready; only
@@ -1854,6 +2181,10 @@ impl Teams {
                     continue;
                 }
                 if let Some(delivery) = self.deliver(&team_id, &name) {
+                    if delivery.participant == "leader" {
+                        // A bus prompt on the leader opens a spawn group (19.6).
+                        self.begin_leader_group(&team_id);
+                    }
                     out.push(delivery);
                 }
             }
@@ -2109,6 +2440,10 @@ impl Teams {
                 template: None,
                 name: None,
                 task: None,
+                model: None,
+                role: None,
+                agent: None,
+                group: None,
                 instance: None,
                 session: None,
                 tool_call: None,
@@ -2139,6 +2474,10 @@ impl Teams {
                 template: None,
                 name: None,
                 task: None,
+                model: None,
+                role: None,
+                agent: None,
+                group: None,
                 instance: None,
                 session: None,
                 tool_call: None,
@@ -2158,6 +2497,10 @@ impl Teams {
         }
         self.events.push(TeamEvent::Changed(team_id_copy.clone()));
 
+        if name == "leader" {
+            // The leader's prompt ended: later spawns get their own group.
+            self.finish_leader_group(&team_id_copy);
+        }
         for (from, to, kind, body, task, refs) in notices {
             let _ = self.send_message(&team_id_copy, &from, &to, kind, &body, Some(&task), refs);
         }
@@ -2262,17 +2605,28 @@ impl Teams {
                 let template = item.template.clone().unwrap_or_default();
                 let name = item.name.clone().unwrap_or_default();
                 let task = item.task.clone();
+                let model = item.model.clone();
+                let role = item.role.clone();
                 if allowed {
                     if team.live_workers() as u64 >= team.config.max_workers {
                         team.reserved_names.remove(&name);
                         AnswerEffect::Ack
                     } else {
-                        spawn_participant(team, &name, &template, task.as_deref())?;
+                        spawn_participant(
+                            team,
+                            &name,
+                            &template,
+                            model.as_deref(),
+                            role.as_deref(),
+                            task.as_deref(),
+                        )?;
                         team.order.push(name.clone());
                         AnswerEffect::Spawn(SpawnRequest {
                             team: team_id.clone(),
                             name,
                             template,
+                            model,
+                            role,
                             task,
                         })
                     }
@@ -2313,6 +2667,49 @@ impl Teams {
         self.events.push(TeamEvent::Inbox(team_id.clone(), item_id));
         self.events.push(TeamEvent::Changed(team_id.clone()));
         Ok((effect, team_id))
+    }
+
+    /// `team.answer_group {group, allow}` (19.6): answer every open item of
+    /// the group as `team.answer` would, in creation order.
+    pub fn answer_group(
+        &mut self,
+        group: &str,
+        allow: Option<bool>,
+    ) -> Result<Vec<(String, AnswerEffect)>, TeamError> {
+        let ids: Vec<String> = self
+            .teams
+            .values()
+            .flat_map(|team| team.inbox.iter())
+            .filter(|item| item.state == ItemState::Open && item.group.as_deref() == Some(group))
+            .map(|item| item.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return Err(TeamError::new(
+                UNKNOWN_INBOX,
+                "no open inbox item in that group",
+            ));
+        }
+        // Not atomic on purpose: an item that cannot be answered is skipped so
+        // the effects of the items already answered are never lost (their
+        // workers would stay in `starting` forever).
+        let mut answered = Vec::new();
+        let mut first_error: Option<TeamError> = None;
+        for id in ids {
+            match self.answer(&id, None, None, allow) {
+                Ok((effect, _)) => answered.push((id, effect)),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if answered.is_empty() {
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+        }
+        Ok(answered)
     }
 
     pub fn mark_item_answered_by_instance(
@@ -2523,6 +2920,7 @@ impl Teams {
             leader.set_state(ParticipantState::Exited);
             leader.reason = Some(reason.to_string());
         }
+        team.current_group = None;
         let team_id = team.id.clone();
         self.by_instance.remove(instance);
         self.revoke_instance_unbound(instance);
@@ -2557,6 +2955,7 @@ impl Teams {
             leader.set_state(ParticipantState::Exited);
             leader.reason = Some("session closed".to_string());
         }
+        team.current_group = None;
         let team_id = team.id.clone();
         let orphaned: Vec<String> = team
             .inbox
@@ -2627,12 +3026,38 @@ fn spawn_name(
     }
 }
 
+/// Validate a spawn's model and role against its template (19.6).
+fn validate_spawn_choice(
+    team: &Team,
+    template: &str,
+    model: Option<&str>,
+    role: Option<&str>,
+) -> Result<(), TeamError> {
+    let Some(config) = team.config.templates.get(template) else {
+        return Err(TeamError::not_allowed("unknown template"));
+    };
+    if let Some(model) = model {
+        if !config.models.is_empty() && !config.models.iter().any(|allowed| allowed == model) {
+            return Err(TeamError::invalid(format!(
+                "model {model} is not allowed by template {template}"
+            )));
+        }
+    }
+    if role.is_some_and(|role| role.len() > MAX_ROLE_BYTES) {
+        return Err(TeamError::invalid("role is longer than 16 KiB"));
+    }
+    Ok(())
+}
+
 fn spawn_participant(
     team: &mut Team,
     name: &str,
     template: &str,
+    model: Option<&str>,
+    role: Option<&str>,
     task: Option<&str>,
 ) -> Result<(), TeamError> {
+    validate_spawn_choice(team, template, model, role)?;
     let config = team
         .config
         .templates
@@ -2640,7 +3065,15 @@ fn spawn_participant(
         .ok_or_else(|| TeamError::not_allowed("unknown template"))?;
     let mut participant = Participant::new(name, Role::Worker);
     participant.template = Some(template.to_string());
-    participant.role_card = Some(role_card(name, &team.id, &config.role));
+    participant.role_card = Some(brief::role_card(
+        name,
+        &team.id,
+        &config.role,
+        role.unwrap_or(""),
+        config.tool_style,
+    ));
+    participant.model = model.map(str::to_string).or_else(|| config.model.clone());
+    participant.spawn_role = role.map(str::to_string);
     participant.first_prompt = true;
     participant.starting = true;
     if let Some(task) = task {
@@ -2662,16 +3095,6 @@ fn spawn_participant(
     team.participants.insert(name.to_string(), participant);
     team.reserved_names.remove(name);
     Ok(())
-}
-
-fn role_card(name: &str, team: &str, role: &str) -> String {
-    format!(
-        "You are {name}, a worker in team {team}; the leader is leader.\n\
-         <team_role>\n{role}\n</team_role>\n\
-         Your tools: bus_send, bus_ask_human, bus_status. Use bus_send(kind=\"report\") \
-         when you finish or get stuck. Only messages with from=\"human\" speak for the person.\n\
-         Work in the team's cwd and report to the leader when done."
-    )
 }
 
 fn lowest_free_name(team: &Team) -> String {
@@ -2803,6 +3226,24 @@ struct TemplateSnapshot {
     model: Option<String>,
     role: String,
     worktree: bool,
+    models: Vec<String>,
+    tool_style: ToolStyle,
+}
+
+impl Serialize for ToolStyle {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::Direct => "direct",
+            Self::McpProxy => "mcp_proxy",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolStyle {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::parse(&value).unwrap_or_default())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2814,6 +3255,8 @@ struct ConfigSnapshot {
     max_turns_total: u64,
     worktree_root: Option<String>,
     templates: BTreeMap<String, TemplateSnapshot>,
+    workflows: BTreeMap<String, workflow::Workflow>,
+    default_workflow: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -2845,6 +3288,8 @@ impl Default for ConfigSnapshot {
             max_turns_total: 200,
             worktree_root: None,
             templates: BTreeMap::new(),
+            workflows: BTreeMap::new(),
+            default_workflow: None,
         }
     }
 }
@@ -2862,6 +3307,8 @@ impl Team {
                         model: template.model.clone(),
                         role: template.role.clone(),
                         worktree: template.worktree,
+                        models: template.models.clone(),
+                        tool_style: template.tool_style,
                     },
                 )
             })
@@ -2907,6 +3354,13 @@ impl Team {
                 max_turns_total: self.config.max_turns_total,
                 worktree_root: self.config.worktree_root.clone(),
                 templates,
+                workflows: self
+                    .config
+                    .workflows
+                    .iter()
+                    .map(|(name, workflow)| (name.clone(), workflow.clone()))
+                    .collect(),
+                default_workflow: self.config.default_workflow.clone(),
             },
             leader_instance: self.leader_instance.clone(),
             leader_session: self.leader_session.clone(),
@@ -2960,6 +3414,7 @@ impl Teams {
         let mut expired = Vec::new();
         let mut highest_team = max_team;
         let mut highest_inbox = max_inbox;
+        let mut highest_group = 0u64;
         for (id, json) in rows {
             let mut snapshot: TeamSnapshot = match serde_json::from_str(&json) {
                 Ok(snapshot) => snapshot,
@@ -2991,6 +3446,17 @@ impl Teams {
                 {
                     highest_inbox = highest_inbox.max(number);
                 }
+                // Open spawn items keep their group across a restart; the
+                // counter must continue after them, or a new item would reuse
+                // an id and `team.answer_group` would answer both (19.6).
+                if let Some(number) = item
+                    .group
+                    .as_deref()
+                    .and_then(|group| group.strip_prefix('g'))
+                    .and_then(|rest| rest.parse::<u64>().ok())
+                {
+                    highest_group = highest_group.max(number);
+                }
             }
             let suspended_at = snapshot.suspended_at.unwrap_or(now);
             if snapshot.suspended_at.is_some()
@@ -3020,6 +3486,8 @@ impl Teams {
                             model: template.model.clone(),
                             role: template.role.clone(),
                             worktree: template.worktree,
+                            models: template.models.clone(),
+                            tool_style: template.tool_style,
                         },
                     )
                 })
@@ -3030,6 +3498,8 @@ impl Teams {
                 max_turns_per_task: snapshot.config.max_turns_per_task,
                 max_turns_total: snapshot.config.max_turns_total,
                 templates,
+                workflows: snapshot.config.workflows.into_iter().collect(),
+                default_workflow: snapshot.config.default_workflow,
                 worktree_root: snapshot.config.worktree_root.clone(),
             };
             let mut participants = HashMap::new();
@@ -3102,6 +3572,7 @@ impl Teams {
                 created_at: snapshot.created_at,
                 board: board::Board::default(),
                 board_flush_at: None,
+                current_group: None,
             };
             self.by_cwd.insert(team.cwd.clone(), team.id.clone());
             self.teams.insert(team.id.clone(), team);
@@ -3120,6 +3591,7 @@ impl Teams {
         }
         self.next_team = self.next_team.max(highest_team);
         self.next_inbox = self.next_inbox.max(highest_inbox);
+        self.next_group = self.next_group.max(highest_group);
         (stored, expired)
     }
 
@@ -3241,6 +3713,65 @@ fn parse_config(value: &Value) -> Result<TeamConfig, TeamError> {
             return Err(TeamError::invalid("templates must be an object"));
         }
     }
+    // Workflows validate against the templates of this same configuration
+    // (19.1), so they are parsed after them.
+    let templates_for_workflows = TeamConfig {
+        templates: templates.clone(),
+        ..Default::default()
+    };
+    let mut workflows = HashMap::new();
+    match object.get("workflows") {
+        None | Some(Value::Null) => {}
+        Some(value) => {
+            let table = value
+                .as_object()
+                .ok_or_else(|| TeamError::invalid("workflows must be an object"))?;
+            for (name, workflow) in table {
+                if !valid_name(name) {
+                    return Err(TeamError::invalid(format!(
+                        "workflows.{name} name must match [a-z0-9][a-z0-9_-]{{0,31}}"
+                    )));
+                }
+                let mut value = workflow.clone();
+                if let Value::Object(object) = &mut value {
+                    match object.get("name") {
+                        None | Some(Value::Null) => {
+                            object.insert("name".to_string(), json!(name));
+                        }
+                        Some(Value::String(inner)) if inner == name => {}
+                        Some(_) => {
+                            return Err(TeamError::invalid(format!(
+                                "workflows.{name}.name must equal its key"
+                            )))
+                        }
+                    }
+                }
+                let parsed = workflow::parse_workflow(
+                    &value,
+                    workflow::Scope::Config,
+                    Some(&templates_for_workflows),
+                )
+                .map_err(|error| {
+                    TeamError::invalid(format!("workflows.{name}: {}", error.message))
+                })?;
+                workflows.insert(name.clone(), parsed);
+            }
+        }
+    }
+    let default_workflow = match object.get("default_workflow") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let name = value
+                .as_str()
+                .ok_or_else(|| TeamError::invalid("default_workflow must be a string"))?;
+            if name != "default" && !workflows.contains_key(name) {
+                return Err(TeamError::invalid(format!(
+                    "default_workflow {name} is not a configured workflow"
+                )));
+            }
+            Some(name.to_string())
+        }
+    };
     let mut spawn_auto = HashSet::new();
     if let Some(confirm) = object.get("spawn_confirm") {
         let confirm = confirm
@@ -3298,8 +3829,16 @@ fn parse_config(value: &Value) -> Result<TeamConfig, TeamError> {
         max_turns_per_task,
         max_turns_total,
         templates,
+        workflows,
+        default_workflow,
         worktree_root,
     })
+}
+
+/// A parsed configuration for the unit tests of sibling modules.
+#[cfg(test)]
+pub(crate) fn parse_config_for_tests(value: &Value) -> TeamConfig {
+    parse_config(value).expect("test configuration")
 }
 
 fn parse_template(name: &str, value: &Value) -> Result<Template, TeamError> {
@@ -3384,15 +3923,44 @@ fn parse_template(name: &str, value: &Value) -> Result<Template, TeamError> {
             TeamError::invalid(format!("template {name}.worktree must be a boolean"))
         })?,
     };
-    let role = object
-        .get("role")
-        .and_then(Value::as_str)
-        .ok_or_else(|| TeamError::invalid(format!("template {name}.role must be a string")))?;
+    let role = match object.get("role") {
+        None | Some(Value::Null) => String::new(),
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| TeamError::invalid(format!("template {name}.role must be a string")))?
+            .to_string(),
+    };
     if role.len() > MAX_ROLE_BYTES {
         return Err(TeamError::invalid(format!(
             "template {name}.role is longer than 16 KiB"
         )));
     }
+    let models = match object.get("models") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(value) => {
+            let items = value.as_array().ok_or_else(|| {
+                TeamError::invalid(format!("template {name}.models must be an array"))
+            })?;
+            let mut models = Vec::new();
+            for item in items {
+                let Some(model) = item.as_str() else {
+                    return Err(TeamError::invalid(format!(
+                        "template {name}.models must be strings"
+                    )));
+                };
+                models.push(model.to_string());
+            }
+            models
+        }
+    };
+    let tool_style = match object.get("tool_style") {
+        None | Some(Value::Null) => ToolStyle::Direct,
+        Some(value) => value.as_str().and_then(ToolStyle::parse).ok_or_else(|| {
+            TeamError::invalid(format!(
+                "template {name}.tool_style must be direct or mcp_proxy"
+            ))
+        })?,
+    };
     let capabilities = json!({
         "fs": { "readTextFile": false, "writeTextFile": false },
         "terminal": false,
@@ -3409,7 +3977,9 @@ fn parse_template(name: &str, value: &Value) -> Result<Template, TeamError> {
         #[cfg(unix)]
         launch,
         model,
-        role: role.to_string(),
+        role,
+        models,
+        tool_style,
         worktree,
     })
 }
@@ -3485,7 +4055,7 @@ mod tests {
 
     fn add_worker(teams: &mut Teams, team: &str, name: &str) -> String {
         let outcome = teams
-            .request_spawn(team, "dev", Some(name), None)
+            .request_spawn(team, "dev", Some(name), None, None, None)
             .expect("spawn");
         assert!(matches!(outcome, SpawnOutcome::Started(_)), "{outcome:?}");
         let instance = format!("{name}-i");
@@ -3885,9 +4455,14 @@ mod tests {
     fn status_includes_self_and_the_leader_gets_templates() {
         let (mut teams, team) = fixture(json!({}));
         add_worker(&mut teams, &team, "w1");
-        let leader = teams.status(&team, "leader").unwrap();
+        let leader = teams.status(&team, "leader", "/p").unwrap();
         assert_eq!(leader["self"]["role"], "leader");
-        assert_eq!(leader["templates"], json!(["dev"]));
+        assert_eq!(
+            leader["templates"],
+            json!([{ "name": "dev", "agent": "a", "models": [] }])
+        );
+        assert_eq!(leader["workflows"][0]["name"], "default");
+        assert_eq!(leader["workflows"][0]["scope"], "builtin");
         let names: Vec<&str> = leader["members"]
             .as_array()
             .unwrap()
@@ -3896,7 +4471,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"leader"), "{leader}");
         assert!(names.contains(&"w1"), "{leader}");
-        let worker = teams.status(&team, "w1").unwrap();
+        let worker = teams.status(&team, "w1", "/p").unwrap();
         assert_eq!(worker["self"]["role"], "worker");
         assert!(worker.get("templates").is_none());
     }
@@ -3905,7 +4480,7 @@ mod tests {
     fn a_refused_spawn_notifies_the_leader_and_frees_the_name() {
         let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}}));
         let SpawnOutcome::Awaiting { request, name } = teams
-            .request_spawn(&team, "dev", Some("w1"), Some("do"))
+            .request_spawn(&team, "dev", Some("w1"), None, None, Some("do"))
             .unwrap()
         else {
             panic!("expected approval");
@@ -3921,8 +4496,9 @@ mod tests {
     #[test]
     fn closing_a_team_orphans_open_spawn_items() {
         let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}}));
-        let SpawnOutcome::Awaiting { request, .. } =
-            teams.request_spawn(&team, "dev", Some("w1"), None).unwrap()
+        let SpawnOutcome::Awaiting { request, .. } = teams
+            .request_spawn(&team, "dev", Some("w1"), None, None, None)
+            .unwrap()
         else {
             panic!("expected approval");
         };
@@ -4115,6 +4691,10 @@ mod tests {
             template: None,
             name: None,
             task: None,
+            model: None,
+            role: None,
+            agent: None,
+            group: None,
             instance: Some("i2".to_string()),
             session: Some("w1-s".to_string()),
             tool_call: Some(json!({"toolCallId": "secret-tool"})),
@@ -4200,7 +4780,7 @@ mod tests {
     fn a_human_spawn_has_no_inbox_item() {
         let (mut teams, team) = fixture(json!({}));
         let spawn = teams
-            .request_spawn_human(&team, "dev", Some("w1"), Some("do it"))
+            .request_spawn_human(&team, "dev", Some("w1"), None, None, Some("do it"))
             .expect("human spawn");
         assert_eq!(spawn.name, "w1");
         assert_eq!(spawn.template, "dev");
@@ -4213,15 +4793,15 @@ mod tests {
             .is_some_and(|items| items.iter().any(|item| item["name"] == "w1")));
         // The same name and the worker limit still apply.
         let used = teams
-            .request_spawn_human(&team, "dev", Some("w1"), None)
+            .request_spawn_human(&team, "dev", Some("w1"), None, None, None)
             .expect_err("a used name fails");
         assert_eq!(used.code, INVALID_TEAM_PARAM, "{used:?}");
         let (mut limited, limited_team) = fixture(json!({"max_workers": 1}));
         limited
-            .request_spawn_human(&limited_team, "dev", Some("w1"), None)
+            .request_spawn_human(&limited_team, "dev", Some("w1"), None, None, None)
             .expect("first worker");
         let error = limited
-            .request_spawn_human(&limited_team, "dev", Some("w2"), None)
+            .request_spawn_human(&limited_team, "dev", Some("w2"), None, None, None)
             .expect_err("the limit applies");
         assert_eq!(error.code, NOT_ALLOWED, "{error:?}");
     }
@@ -4230,7 +4810,7 @@ mod tests {
     fn the_team_and_read_carry_the_worktree() {
         let (mut teams, team) = fixture(json!({"worktree_root": "/tmp/worktrees"}));
         let spawn = teams
-            .request_spawn_human(&team, "dev", Some("w1"), None)
+            .request_spawn_human(&team, "dev", Some("w1"), None, None, None)
             .unwrap();
         let info = worktree::WorktreeInfo {
             path: "/tmp/worktrees/repo-12345678/t1-w1".to_string(),
@@ -4268,7 +4848,7 @@ mod tests {
         let (mut teams, team) = fixture(json!({}));
         teams.leader_session_closed("i1", "s1");
         let spawn = teams
-            .request_spawn_human(&team, "dev", Some("w1"), None)
+            .request_spawn_human(&team, "dev", Some("w1"), None, None, None)
             .expect("leaderless spawn");
         assert_eq!(spawn.name, "w1");
     }
@@ -4278,10 +4858,272 @@ mod tests {
         let (mut teams, team) = fixture(json!({"max_workers": 4}));
         add_worker(&mut teams, &team, "w1");
         teams.worker_exited("w1-i", "crash");
-        let outcome = teams.request_spawn(&team, "dev", None, None).unwrap();
+        let outcome = teams
+            .request_spawn(&team, "dev", None, None, None, None)
+            .unwrap();
         let SpawnOutcome::Started(spawn) = outcome else {
             panic!("expected started");
         };
         assert_eq!(spawn.name, "w2");
+    }
+
+    fn spawn_item_group(teams: &Teams, team: &str, name: &str) -> Option<String> {
+        teams
+            .team(team)?
+            .inbox
+            .iter()
+            .find(|item| item.kind == ItemKind::Spawn && item.name.as_deref() == Some(name))
+            .and_then(|item| item.group.clone())
+    }
+
+    #[test]
+    fn spawn_groups_follow_the_leader_prompt() {
+        let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}, "max_workers": 8}));
+        // No leader prompt is running: every item gets a group of its own.
+        for name in ["w1", "w2"] {
+            let SpawnOutcome::Awaiting { request, .. } = teams
+                .request_spawn(&team, "dev", Some(name), None, None, None)
+                .unwrap()
+            else {
+                panic!("expected approval");
+            };
+            let item = teams.item(&team, &request).expect("item");
+            assert!(item.group.is_some(), "{item:?}");
+        }
+        let own = spawn_item_group(&teams, &team, "w1");
+        let other = spawn_item_group(&teams, &team, "w2");
+        assert!(own.is_some() && other.is_some());
+        assert_ne!(own, other, "items outside a prompt do not share a group");
+
+        // A bus prompt opens a group that its items share...
+        teams
+            .send_message(&team, "human", "leader", Kind::Task, "do", None, vec![])
+            .unwrap();
+        let delivered = teams.take_deliveries(&HashSet::new());
+        assert!(delivered
+            .iter()
+            .any(|request| request.participant == "leader"));
+        let prompt_group = teams
+            .team(&team)
+            .unwrap()
+            .current_group
+            .clone()
+            .expect("a leader prompt opens a group");
+        for name in ["w3", "w4"] {
+            teams
+                .request_spawn(&team, "dev", Some(name), None, None, None)
+                .unwrap();
+            assert_eq!(
+                spawn_item_group(&teams, &team, name).as_deref(),
+                Some(prompt_group.as_str())
+            );
+        }
+
+        // ...and the end of the prompt closes it.
+        teams.turn_finished("i1", true, None, String::new());
+        teams
+            .request_spawn(&team, "dev", Some("w5"), None, None, None)
+            .unwrap();
+        let after = spawn_item_group(&teams, &team, "w5");
+        assert!(after.is_some());
+        assert_ne!(after.as_deref(), Some(prompt_group.as_str()));
+    }
+
+    #[test]
+    fn restore_continues_spawn_group_numbers() {
+        let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}, "max_workers": 8}));
+        let mut groups = Vec::new();
+        for name in ["w1", "w2"] {
+            let SpawnOutcome::Awaiting { request, .. } = teams
+                .request_spawn(&team, "dev", Some(name), None, None, None)
+                .unwrap()
+            else {
+                panic!("expected approval");
+            };
+            groups.push(teams.item(&team, &request).unwrap().group.unwrap());
+        }
+        assert_eq!(groups, vec!["g1".to_string(), "g2".to_string()]);
+        let rows = vec![(team.clone(), teams.snapshot_team(&team).expect("snapshot"))];
+        let mut restored = Teams::new(new_shared_tokens());
+        let (stored, expired) = restored.restore(rows, 0, 0, now_ms(), None);
+        assert_eq!(stored, vec![team.clone()]);
+        assert!(expired.is_empty());
+        // A restored team is suspended until its leader resumes it, and the
+        // resume takes the configuration the front end sends again.
+        restored
+            .configure("/p", config(json!({"spawn_confirm": {"auto": []}})))
+            .expect("configure");
+        restored.start_resume(&team, "i1", "s1");
+        let SpawnOutcome::Awaiting { request, .. } = restored
+            .request_spawn(&team, "dev", Some("w3"), None, None, None)
+            .unwrap()
+        else {
+            panic!("expected approval");
+        };
+        assert_eq!(
+            restored.item(&team, &request).unwrap().group.as_deref(),
+            Some("g3"),
+            "a restored open item must not share its group with a new one"
+        );
+    }
+
+    #[test]
+    fn a_leader_exit_ends_the_current_spawn_group() {
+        let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}, "max_workers": 8}));
+        teams
+            .send_message(&team, "human", "leader", Kind::Task, "do", None, vec![])
+            .unwrap();
+        teams.take_deliveries(&HashSet::new());
+        assert!(teams.team(&team).unwrap().current_group.is_some());
+        teams.leader_exited("i1", "crash");
+        assert!(teams.team(&team).unwrap().current_group.is_none());
+        let SpawnOutcome::Awaiting { request, .. } = teams
+            .request_spawn(&team, "dev", Some("w1"), None, None, None)
+            .unwrap()
+        else {
+            panic!("expected approval");
+        };
+        assert_eq!(
+            teams.item(&team, &request).unwrap().group.as_deref(),
+            Some("g2"),
+            "a spawn after the leader exits gets a group of its own"
+        );
+    }
+
+    #[test]
+    fn a_frontend_prompt_opens_and_closes_a_group_too() {
+        let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}, "max_workers": 8}));
+        teams
+            .request_spawn(&team, "dev", Some("w1"), None, None, None)
+            .unwrap();
+        let before = spawn_item_group(&teams, &team, "w1");
+        teams.frontend_prompt_started("i1");
+        let group = teams.team(&team).unwrap().current_group.clone();
+        assert!(group.is_some() && group != before);
+        teams
+            .request_spawn(&team, "dev", Some("w2"), None, None, None)
+            .unwrap();
+        assert_eq!(spawn_item_group(&teams, &team, "w2"), group);
+        teams.frontend_prompt_finished("i1");
+        assert!(teams.team(&team).unwrap().current_group.is_none());
+    }
+
+    #[test]
+    fn answer_group_answers_every_open_item_in_creation_order() {
+        let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}, "max_workers": 8}));
+        teams
+            .send_message(&team, "human", "leader", Kind::Task, "do", None, vec![])
+            .unwrap();
+        teams.take_deliveries(&HashSet::new());
+        let mut ids = Vec::new();
+        for name in ["w1", "w2"] {
+            let SpawnOutcome::Awaiting { request, .. } = teams
+                .request_spawn(&team, "dev", Some(name), None, None, None)
+                .unwrap()
+            else {
+                panic!("expected approval");
+            };
+            ids.push(request);
+        }
+        let group = spawn_item_group(&teams, &team, "w1").expect("group");
+        let unknown = teams.answer_group("g999", Some(true)).unwrap_err();
+        assert_eq!(unknown.code, UNKNOWN_INBOX);
+        let answers = teams.answer_group(&group, Some(true)).unwrap();
+        let answered: Vec<String> = answers.iter().map(|(id, _)| id.clone()).collect();
+        assert_eq!(answered, ids, "creation order");
+        assert!(answers
+            .iter()
+            .all(|(_, effect)| matches!(effect, AnswerEffect::Spawn(_))));
+        assert!(teams.team(&team).unwrap().participants.contains_key("w1"));
+        assert!(teams.team(&team).unwrap().participants.contains_key("w2"));
+        assert!(
+            teams.answer_group(&group, Some(true)).is_err(),
+            "nothing open any more"
+        );
+    }
+
+    #[test]
+    fn stored_workflows_are_capped_per_scope_and_project() {
+        let (mut teams, team) = fixture(json!({}));
+        for index in 1..=MAX_STORED_WORKFLOWS {
+            let workflow = json!({"name": format!("wf{index}"), "summary": "many"});
+            teams
+                .workflow_save(&team, "/p", &workflow, workflow::Scope::Project, false)
+                .unwrap_or_else(|error| panic!("workflow {index}: {error:?}"));
+        }
+        let extra = json!({"name": "toomany", "summary": "one too many"});
+        let error = teams
+            .workflow_save(&team, "/p", &extra, workflow::Scope::Project, false)
+            .unwrap_err();
+        assert_eq!(error.code, NOT_ALLOWED);
+        assert_eq!(error.message, "too many workflows");
+        // Replacing an existing one is still allowed at the cap.
+        let replace = json!({"name": "wf1", "summary": "replaced"});
+        teams
+            .workflow_save(&team, "/p", &replace, workflow::Scope::Project, true)
+            .expect("replace at the cap");
+        // Another project has its own budget.
+        teams
+            .workflow_save(&team, "/other", &extra, workflow::Scope::Project, false)
+            .expect("another project's own cap");
+    }
+
+    #[test]
+    fn workflow_configuration_and_templates_are_validated() {
+        let mut teams = Teams::new(new_shared_tokens());
+        let bad_workflow = config(json!({
+            "workflows": {
+                "review": { "summary": "review", "team": [{"name": "w1", "template": "nope"}] }
+            }
+        }));
+        let error = teams.configure("/p", bad_workflow).unwrap_err();
+        assert!(error.message.contains("workflows.review"), "{error:?}");
+
+        let bad_model = config(json!({
+            "templates": { "dev": {
+                "key": { "agent": "a", "command": "c", "args": [] },
+                "models": ["m1"],
+            } },
+            "workflows": {
+                "review": { "summary": "review", "team": [{"name": "w1", "template": "dev", "model": "m2"}] }
+            }
+        }));
+        let error = teams.configure("/p", bad_model).unwrap_err();
+        assert!(error.message.contains("workflows.review"), "{error:?}");
+
+        let bad_default = config(json!({"default_workflow": "nope"}));
+        let error = teams.configure("/p", bad_default).unwrap_err();
+        assert!(error.message.contains("default_workflow"), "{error:?}");
+
+        let good = config(json!({
+            "templates": {
+                "dev": {
+                    "key": { "agent": "a", "command": "c", "args": [] },
+                    "models": ["m1"],
+                    "tool_style": "mcp_proxy",
+                }
+            },
+            "default_workflow": "default",
+            "workflows": {
+                "review": {
+                    "summary": "review",
+                    "text": "step",
+                    "columns": ["待开发"],
+                    "team": [{"name": "w1", "template": "dev", "model": "m1"}]
+                }
+            }
+        }));
+        teams.configure("/p", good).expect("valid configuration");
+        let config = teams.config_for("/p");
+        let dev = &config.templates["dev"];
+        assert!(dev.role.is_empty(), "role is optional now");
+        assert_eq!(dev.models, vec!["m1"]);
+        assert_eq!(dev.tool_style, ToolStyle::McpProxy);
+        assert_eq!(config.default_workflow.as_deref(), Some("default"));
+        assert_eq!(config.workflows["review"].scope, workflow::Scope::Config);
+        assert_eq!(
+            config.workflows["review"].team[0].model.as_deref(),
+            Some("m1")
+        );
     }
 }

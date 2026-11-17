@@ -147,6 +147,7 @@ require("tests.spec_s1b_wiring")(t)
 require("tests.spec_s2_install")(t)
 require("tests.spec_s3_policy")(t)
 require("tests.spec_s4_team")(t)
+require("tests.spec_w0e_team")(t)
 require("tests.spec_s1b_tunnel")(t)
 
 t.run()

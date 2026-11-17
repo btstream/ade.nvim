@@ -112,6 +112,20 @@ enum Job {
         cleared: Vec<String>,
         bytes: usize,
     },
+    /// Persist one named workflow (19.11).
+    WorkflowSave {
+        scope: String,
+        project: String,
+        name: String,
+        json: String,
+        updated_ms: u64,
+        bytes: usize,
+    },
+    WorkflowDelete {
+        scope: String,
+        project: String,
+        name: String,
+    },
     /// Complete the receiver once every earlier job is written.
     Barrier(oneshot::Sender<()>),
 }
@@ -530,6 +544,53 @@ impl Recorder {
         self.inner.store.load_team_meta(key)
     }
 
+    // -- workflows (PROTOCOL.md 19.11) -------------------------------------
+
+    /// Queue a named workflow write. Never blocks; the writer owns the store.
+    pub fn save_workflow(
+        &self,
+        scope: &str,
+        project: &str,
+        name: &str,
+        json: String,
+        updated_ms: u64,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let bytes = scope.len() + project.len() + name.len() + json.len();
+        self.inner.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if !self.send(Job::WorkflowSave {
+            scope: scope.to_string(),
+            project: project.to_string(),
+            name: name.to_string(),
+            json,
+            updated_ms,
+            bytes,
+        }) {
+            self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub fn delete_workflow(&self, scope: &str, project: &str, name: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.send(Job::WorkflowDelete {
+            scope: scope.to_string(),
+            project: project.to_string(),
+            name: name.to_string(),
+        });
+    }
+
+    /// Read the stored workflows. Startup only: blocks on the database.
+    pub fn load_workflows(&self) -> Result<Vec<(String, String, String, String)>> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        self.inner.store.load_workflows()
+    }
+
     // -- internals ----------------------------------------------------------
 
     fn start(store: Store, max_bytes_per_instance: u64, limits: Limits) -> Recorder {
@@ -757,6 +818,24 @@ impl Writer {
                     } => {
                         self.save_board(&team_id, rev, &json, &history, &cleared, bytes);
                     }
+                    Job::WorkflowSave {
+                        scope,
+                        project,
+                        name,
+                        json,
+                        updated_ms,
+                        bytes,
+                    } => {
+                        self.write(&mut batch);
+                        self.save_workflow(&scope, &project, &name, &json, updated_ms, bytes);
+                    }
+                    Job::WorkflowDelete {
+                        scope,
+                        project,
+                        name,
+                    } => {
+                        self.delete_workflow(&scope, &project, &name);
+                    }
                     Job::Barrier(sender) => {
                         self.write(&mut batch);
                         self.flush_team_saves();
@@ -816,6 +895,24 @@ impl Writer {
                     bytes,
                 } => {
                     self.save_board(&team_id, rev, &json, &history, &cleared, bytes);
+                }
+                Job::WorkflowSave {
+                    scope,
+                    project,
+                    name,
+                    json,
+                    updated_ms,
+                    bytes,
+                } => {
+                    self.write(&mut batch);
+                    self.save_workflow(&scope, &project, &name, &json, updated_ms, bytes);
+                }
+                Job::WorkflowDelete {
+                    scope,
+                    project,
+                    name,
+                } => {
+                    self.delete_workflow(&scope, &project, &name);
                 }
                 Job::Barrier(sender) => {
                     self.write(&mut batch);
@@ -1131,6 +1228,30 @@ impl Writer {
         if let Err(error) = self.store.delete_team(id) {
             self.report_team_failure(&error);
             self.failed_deletes.insert(id.to_string());
+        }
+    }
+
+    fn save_workflow(
+        &mut self,
+        scope: &str,
+        project: &str,
+        name: &str,
+        json: &str,
+        updated_ms: u64,
+        bytes: usize,
+    ) {
+        self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        if let Err(error) = self
+            .store
+            .save_workflow(scope, project, name, json, updated_ms)
+        {
+            self.report_team_failure(&error);
+        }
+    }
+
+    fn delete_workflow(&mut self, scope: &str, project: &str, name: &str) {
+        if let Err(error) = self.store.delete_workflow(scope, project, name) {
+            self.report_team_failure(&error);
         }
     }
 

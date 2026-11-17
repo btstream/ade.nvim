@@ -67,6 +67,10 @@ use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBeha
 ///
 /// A file with any other non-zero value is treated as incompatible and moved
 /// aside; a zero-length file (version 0) is initialised in place.
+///
+/// - 1: the S4a event log.
+/// - 2: the team tables (18.15).
+/// - 3: boards, card history and named workflows (19.11).
 pub const SCHEMA_VERSION: i64 = 3;
 
 /// How long a writer waits for another process holding the database lock.
@@ -828,6 +832,59 @@ impl Store {
         .context("reading team meta")
     }
 
+    // -- workflows (PROTOCOL.md 19.11) -------------------------------------
+
+    /// Store one named workflow; `project` is `""` for the user scope.
+    pub fn save_workflow(
+        &self,
+        scope: &str,
+        project: &str,
+        name: &str,
+        json: &str,
+        updated_ms: u64,
+    ) -> Result<()> {
+        let updated_ms = to_i64(updated_ms, "updated_ms")?;
+        let conn = self.lock()?;
+        conn.prepare_cached(
+            "INSERT INTO workflows (scope, project, name, json, updated_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (scope, project, name) DO UPDATE SET \
+             json = excluded.json, updated_ms = excluded.updated_ms",
+        )
+        .context("preparing the workflow upsert")?
+        .execute(params![scope, project, name, json, updated_ms])
+        .context("writing a workflow")?;
+        Ok(())
+    }
+
+    pub fn delete_workflow(&self, scope: &str, project: &str, name: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.prepare_cached(
+            "DELETE FROM workflows WHERE scope = ?1 AND project = ?2 AND name = ?3",
+        )
+        .context("preparing the workflow delete")?
+        .execute(params![scope, project, name])
+        .context("deleting a workflow")?;
+        Ok(())
+    }
+
+    /// Every stored workflow as `(scope, project, name, json)`.
+    pub fn load_workflows(&self) -> Result<Vec<(String, String, String, String)>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT scope, project, name, json FROM workflows ORDER BY scope, project, name",
+            )
+            .context("preparing the workflow load")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .context("reading workflows")?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .context("collecting workflows")
+    }
+
     /// Forget every instance and event from the previous service run while
     /// keeping the team rows (section 10/18.15): a new service has no agents,
     /// so old sessions can never be replayed, but teams must survive.
@@ -1126,6 +1183,14 @@ fn create_schema(conn: &Connection) -> Result<()> {
              json    TEXT NOT NULL,
              ts_ms   INTEGER NOT NULL,
              PRIMARY KEY (team_id, card_id, rev)
+         );
+         CREATE TABLE IF NOT EXISTS workflows (
+             scope      TEXT    NOT NULL,
+             project    TEXT    NOT NULL,
+             name       TEXT    NOT NULL,
+             json       TEXT    NOT NULL,
+             updated_ms INTEGER NOT NULL,
+             PRIMARY KEY (scope, project, name)
          );",
     )
     .context("creating tables")

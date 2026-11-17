@@ -178,11 +178,19 @@ def mcp_list(session):
             process.stdin.write(json.dumps(frame) + "\n")
         process.stdin.flush()
         process.stdin.close()
+        init_result = None
         for line in process.stdout:
             value = json.loads(line)
+            if value.get("id") == 1:
+                init_result = value.get("result")
             if value.get("id") == 2:
                 names = [tool.get("name") for tool in (value.get("result") or {}).get("tools") or []]
-                log({"event": "tools", "session": session, "names": names})
+                log({
+                    "event": "tools",
+                    "session": session,
+                    "names": names,
+                    "instructions": (init_result or {}).get("instructions"),
+                })
                 return names
         process.wait(timeout=10)
     except Exception as problem:  # noqa: BLE001
@@ -213,6 +221,11 @@ def run_prompt(ident, text, session):
             task = text[len("spawn-task:"):].strip()
             response = mcp_call(session, "team_spawn", {"template": TEMPLATE, **({"name": NAME} if NAME else {}), "task": task})
             log({"event": "spawn-response", "response": response})
+        elif "spawn-pair" in text:
+            # Two spawn requests in one prompt: they must share a group (19.6).
+            for name in ("w1", "w2"):
+                response = mcp_call(session, "team_spawn", {"template": TEMPLATE, "name": name})
+                log({"event": "spawn-response", "name": name, "response": response})
         elif text.startswith("spawn"):
             task = text[len("spawn"):].strip() or "do [report]"
             response = mcp_call(session, "team_spawn", {"template": TEMPLATE, **({"name": NAME} if NAME else {}), "task": task})
