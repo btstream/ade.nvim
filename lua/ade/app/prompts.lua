@@ -127,7 +127,12 @@ function Prompts:send(session, text, attachments, hooks, retrying)
     end
   end
 
-  if session.status == "running" or session.status == "cancelling" then
+  local active = session.status == "running" or session.status == "cancelling"
+  -- PROTOCOL.md 18.4/18.11: the person's prompt on the leader takes priority.
+  -- The service cancels the bus turn when this prompt arrives; queueing it
+  -- locally would mean it is never sent and the bus turn keeps the floor.
+  local supersedes_bus = active and session.bus_turn ~= nil and not hooks
+  if active and not supersedes_bus then
     if hooks then
       self.notify("Wait for the current turn to finish before submitting inline", vim.log.levels.WARN)
       return false
@@ -140,6 +145,12 @@ function Prompts:send(session, text, attachments, hooks, retrying)
     end
     self.on_changed()
     return true
+  end
+  if supersedes_bus then
+    -- Close the bus turn's streaming blocks locally; the service's cancelled
+    -- `_ade/turn_finished` may arrive later and must not end the user's turn.
+    runtime:finish_turn(session, session.bus_turn, "cancelled")
+    session.bus_turn = nil
   end
 
   -- An agent without `promptCapabilities.image` cannot take an `image` block.

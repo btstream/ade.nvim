@@ -1121,7 +1121,7 @@ function M.validate(cfg)
     if template.model ~= nil and type(template.model) ~= "string" then
       fail("%s.model must be a string or nil", where)
     end
-    if type(template.role) ~= "string" or template.role == "" then
+    if type(template.role) ~= "string" or template.role:match("^%s*$") then
       fail("%s.role must be a non-empty string", where)
     end
     if #template.role > 16 * 1024 then

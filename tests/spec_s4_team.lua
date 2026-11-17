@@ -7,6 +7,7 @@ return function(t)
   local controller = require("ade.controller")
   local ade = require("ade")
   local Framing = require("ade.transport.framing")
+  local async = require("ade.async")
 
   local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
   local counter = 0
@@ -184,6 +185,7 @@ return function(t)
         { teams = { templates = { Bad = { agent = "opencode", role = "" } } } },
         { teams = { templates = { worker = { agent = "missing", role = "" } } } },
         { teams = { templates = { worker = { agent = "opencode" } } } },
+        { teams = { templates = { worker = { agent = "opencode", role = "   " } } } },
         { teams = teams_config({ spawn_confirm = { auto = { "nope" } } }) },
         { teams = teams_config({ limits = { max_turns_per_task = 0, max_turns_total = 10 } }) },
         { teams = teams_config({ limits = { max_turns_per_task = 50, max_turns_total = 10 } }) },
@@ -633,6 +635,44 @@ return function(t)
       t.eq(0, #sent_frames(service, "session/new")[1].params.mcpServers)
     end)
 
+    t.it("treats an all-unresolvable template set as unavailable", function()
+      local service, dir = start_service(t, "all-skipped")
+      setup(t, "all-skipped", service, dir, {
+        agents = { broken = { command = "broken", source = "managed" } },
+      })
+      -- Deep-merging overrides keeps the default worker template; use only
+      -- the template whose managed agent cannot resolve.
+      state().config.teams.templates = {
+        broken = { agent = "broken", role = "You are broken." },
+      }
+      local notices = capture(t)
+      controller.connect()
+      wait_ready()
+      local n = 0
+      for _, call in ipairs(service.calls) do
+        if
+          call.method == "team.configure"
+          or call.method == "team.leader_server"
+          or call.method == "team.bind_leader"
+        then
+          n = n + 1
+        end
+      end
+      t.eq(0, n, "no configure/leader request when every template is skipped")
+      t.eq(0, #sent_frames(service, "session/new")[1].params.mcpServers)
+      -- Re-running configure with the same broken template must not repeat the
+      -- warning.
+      team():configure(dir, true)
+      vim.wait(100)
+      local skipped = 0
+      for _, note in ipairs(notices) do
+        if note.message:find("team template skipped", 1, true) then
+          skipped = skipped + 1
+        end
+      end
+      t.eq(1, skipped)
+    end)
+
     t.it("does not inject a leader when another instance already leads the cwd", function()
       local service, dir = start_service(t, "other-leader")
       service.teams.t1 = {
@@ -696,6 +736,40 @@ return function(t)
       t.eq(1, #calls_of(service, "team.leader_server"))
       t.eq(1, #calls_of(service, "team.bind_leader"))
       t.eq(0, #sent_frames(service, "session/new")[2].params.mcpServers)
+    end)
+
+    t.it("does not inject twice for concurrent session requests", function()
+      local service, dir = start_service(t, "leader-race")
+      setup(t, "leader-race", service, dir)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return team().bound[dir] ~= nil
+      end, 5000, "the first bind")
+      -- Start from scratch and race two leader_server calls for this cwd.
+      team().bound[dir] = nil
+      service.teams = {}
+      local instance = state().conn.client.proc.instance
+      local results = {}
+      local function start()
+        return async.run(function()
+          local server = team():leader_server(instance, dir)
+          results[#results + 1] = server
+        end)
+      end
+      local first = start()
+      local second = start()
+      wait(function()
+        return coroutine.status(first) == "dead" and coroutine.status(second) == "dead"
+      end, 10000, "both leader_server calls")
+      local servers = 0
+      for _, result in ipairs(results) do
+        if type(result) == "table" and result.name == "ade-team" then
+          servers = servers + 1
+        end
+      end
+      t.eq(1, servers, "only one of the concurrent sessions may become leader")
+      t.eq(2, #calls_of(service, "team.leader_server"), "the initial session plus one racer")
     end)
 
     t.it("can lead again after the team is closed", function()
@@ -775,6 +849,20 @@ return function(t)
       end, 5000, "the panel message")
       t.eq("task", service.team_sends[1].kind)
       t.eq("do the thing", service.team_sends[1].body)
+
+      -- Cancelling the kind picker must abort, not fall back to `notice`.
+      vim.ui.select = function(_, _, cb)
+        cb(nil)
+      end
+      for index, id in pairs(ui.ids) do
+        if id == "t1|w1" then
+          lnum = index
+        end
+      end
+      vim.api.nvim_win_set_cursor(ui.win, { lnum, 0 })
+      vim.api.nvim_feedkeys("m", "x", false)
+      vim.wait(150)
+      t.eq(1, #service.team_sends, "a cancelled kind picker must not send")
       ui:close()
     end)
 
@@ -926,6 +1014,47 @@ return function(t)
       m:unwatch()
     end)
 
+    t.it("releases a superseded watch response without disturbing the newer watch", function()
+      local service, dir = start_service(t, "watch-superseded")
+      setup(t, "watch-superseded", service, dir)
+      controller.connect()
+      wait_ready()
+      local m = team()
+      local seen = {}
+      local original = m.on_watch
+      m.on_watch = function(session, title)
+        if title then
+          seen[#seen + 1] = title
+        end
+        return original and original(session, title)
+      end
+      t.cleanup(function()
+        m.on_watch = original
+      end)
+      -- The abandoned first response arrives after the new watch is live.
+      service.team_watch = { instance = "inst-w", sessionId = "sess-w", delays = { 200, 5 } }
+      local first_ok, second_ok
+      m:watch("t1", "w1", false, function(result)
+        first_ok = result
+      end)
+      m:watch("t1", "w2", false, function(result)
+        second_ok = result
+      end)
+      wait(function()
+        return second_ok ~= nil
+      end, 5000, "the new watch")
+      wait(function()
+        return first_ok ~= nil
+      end, 5000, "the abandoned watch response")
+      vim.wait(100)
+      t.eq("w2", m.watching.participant)
+      t.eq("t1/w2", seen[#seen], "the late response must not reopen the old worker")
+      for _, call in ipairs(service.team_unwatch or {}) do
+        t.truthy(call.participant ~= "w2", "the abandoned response must not unwatch the newer watch")
+      end
+      m:unwatch()
+    end)
+
     t.it("the panel's w opens the watch view, keeps the panel, and can reopen it", function()
       local service, dir = start_service(t, "panel-watch")
       setup(t, "panel-watch", service, dir)
@@ -938,6 +1067,7 @@ return function(t)
         participants = {
           { name = "leader", state = "idle", task = "_", queued = 0, turns = {} },
           { name = "w1", state = "idle", task = "_", queued = 0, turns = {} },
+          { name = "w2", state = "idle", task = "_", queued = 0, turns = {} },
         },
         inbox = {},
         limits = {},
@@ -975,6 +1105,31 @@ return function(t)
       wait(function()
         return ui.watch_buf ~= nil and ui.watch_buf ~= first and vim.api.nvim_buf_is_valid(ui.watch_buf)
       end, 5000, "the reopened watch view")
+      local reopened = ui.watch_buf
+
+      -- Switching workers must not let the old window's wipe callback kill
+      -- the new watch.
+      local other
+      for index, id in pairs(ui.ids) do
+        if id == "t1|w2" then
+          other = index
+        end
+      end
+      t.truthy(other, "the second worker line")
+      vim.api.nvim_win_set_cursor(ui.win, { other, 0 })
+      vim.api.nvim_feedkeys("w", "x", false)
+      wait(function()
+        return team().watching
+          and team().watching.participant == "w2"
+          and ui.watch_buf ~= nil
+          and ui.watch_buf ~= reopened
+      end, 5000, "the switched watch")
+      vim.wait(150)
+      t.eq("w2", team().watching.participant, "the switch must survive the old window cleanup")
+      t.truthy(ui.watch_buf and vim.api.nvim_buf_is_valid(ui.watch_buf))
+      for _, call in ipairs(service.team_unwatch or {}) do
+        t.truthy(call.participant ~= "w2", "the old view must not unwatch the new worker")
+      end
       ui:close()
     end)
 
@@ -1069,6 +1224,45 @@ return function(t)
       wait(function()
         return session.status == "idle"
       end, 5000, "the cancelled bus turn to settle")
+    end)
+
+    t.it("sends the person's prompt straight through while a bus turn runs", function()
+      local service, dir = start_service(t, "bus-priority")
+      setup(t, "bus-priority", service, dir)
+      controller.connect()
+      wait_ready()
+      local session = state().sess.current
+      local instance = state().conn.client.proc.instance
+      service:turn_started(instance, {
+        sessionId = session.id,
+        origin = "bus",
+        prompt = { { type = "text", text = "bus work" } },
+      })
+      wait(function()
+        return session.bus_turn ~= nil and session.status == "running"
+      end, 5000, "the bus turn")
+      local before = session.turn
+      t.eq(true, controller.send_now("person first", nil))
+      -- The person's prompt supersedes the bus turn instead of being queued.
+      t.eq(nil, session.bus_turn)
+      t.eq(0, #session.queue)
+      t.truthy(session.turn > before)
+      -- A late cancelled bus finish must not end the person's turn.
+      team():turn_finished({ sessionId = session.id, stopReason = "cancelled" })
+      t.eq("running", session.status)
+      wait(function()
+        return #sent_frames(service, "session/prompt") == 1
+      end, 10000, "the person's session/prompt")
+      local found = false
+      for _, block in ipairs(session.blocks) do
+        if block.kind == "user" and type(block.text) == "string" and block.text:find("person first", 1, true) then
+          found = true
+        end
+      end
+      t.truthy(found, "the person's message is shown")
+      wait(function()
+        return session.status == "idle"
+      end, 10000, "the person's turn to finish")
     end)
 
     t.it("treats a reconnect as the end of every team", function()
