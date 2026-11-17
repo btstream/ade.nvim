@@ -638,6 +638,83 @@ fn board_restart_scenario(label: &str, sigkill: bool) {
 }
 
 #[test]
+fn an_unreadable_board_row_stays_untouched_and_refuses_writes() {
+    let fixture = Fixture::new("restart-board-corrupt");
+    let mut server = fixture.start("a", &[]);
+    let mut client = fixture.connect(&server);
+    fixture.configure(&mut client, &fixture.work, &server, true);
+    let (_instance, leader_session, token, bound) =
+        fixture.attach_leader(&server, &mut client, &fixture.work, None);
+    let team = bound["result"]["team"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("bind: {bound}"))
+        .to_string();
+    board_update(&server, &token, "default");
+    Fixture::shutdown(&mut server);
+    drop(server);
+
+    // Corrupt only the board row; the team must still load.
+    {
+        let conn = rusqlite::Connection::open(database_path(&fixture)).expect("database");
+        conn.execute(
+            "UPDATE boards SET json = '{broken' WHERE team_id = ?1",
+            rusqlite::params![team],
+        )
+        .expect("corrupt the board");
+    }
+
+    let mut restarted = fixture.start("b", &[]);
+    let mut second = fixture.connect(&restarted);
+    wait_suspended(&mut second, &team);
+    let board = second.request(60, "team.board", json!({"team": team}));
+    assert_eq!(board["result"]["board"]["unavailable"], true, "{board}");
+    assert_eq!(
+        board["result"]["board"]["cards"].as_array().map(Vec::len),
+        Some(0),
+        "{board}"
+    );
+
+    fixture.configure(&mut second, &fixture.work, &restarted, true);
+    let (_instance, session, token, bound) = fixture.attach_leader(
+        &restarted,
+        &mut second,
+        &fixture.work,
+        Some(&leader_session),
+    );
+    assert_eq!(session, leader_session);
+    assert_eq!(bound["result"]["team"]["id"], team, "{bound}");
+    wait_active(&mut second, &team);
+
+    let status = mcp_call(&restarted, &token, "bus_status", json!({}));
+    let status: Value = serde_json::from_str(&mcp_text(&status)).expect("bus.status JSON");
+    assert_eq!(status["board"]["unavailable"], true, "{status}");
+
+    let refused = mcp_call(
+        &restarted,
+        &token,
+        "board_update",
+        json!({"workflow_name": "new"}),
+    );
+    assert_eq!(refused["isError"], true, "{refused}");
+    let message = mcp_text(&refused);
+    assert!(message.contains("-32061"), "{message}");
+    assert!(message.contains("board unavailable"), "{message}");
+
+    Fixture::shutdown(&mut restarted);
+    drop(second);
+    drop(restarted);
+    let conn = rusqlite::Connection::open(database_path(&fixture)).expect("database");
+    let json: String = conn
+        .query_row(
+            "SELECT json FROM boards WHERE team_id = ?1",
+            rusqlite::params![team],
+            |row| row.get(0),
+        )
+        .expect("board row");
+    assert_eq!(json, "{broken", "the unreadable row is never overwritten");
+}
+
+#[test]
 fn a_gracefully_stopped_team_keeps_its_board() {
     board_restart_scenario("restart-board-graceful", false);
 }

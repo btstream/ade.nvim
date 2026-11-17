@@ -79,6 +79,9 @@ impl Participant {
         if self.state != state {
             self.state = state;
             self.state_since = now_ms();
+            // The state-change `team.changed` already carries the current
+            // activity, so a throttled activity notice would be redundant.
+            self.activity_throttle.flushed(self.state_since);
         }
     }
 
@@ -86,6 +89,16 @@ impl Participant {
     pub fn observe_activity(&mut self, text: String, now: u64, interval: u64) -> bool {
         let text = clip(&text);
         if text.is_empty() {
+            return false;
+        }
+        if self
+            .activity
+            .as_ref()
+            .is_some_and(|activity| activity.text == text)
+        {
+            // The source was seen (so the end-of-turn fallback does not apply),
+            // but unchanged text neither moves `at` nor reopens the throttle.
+            self.turn_activity = true;
             return false;
         }
         self.activity = Some(Activity { text, at: now });
@@ -176,10 +189,12 @@ pub fn from_bus(method: &str, params: &Value, result: &Value) -> Option<String> 
             format!("asks: {}", first_line(question))
         }
         "bus.spawn" => {
-            let name = params
+            // The service-assigned name wins: a worktree spawn with no explicit
+            // name gets one after the request was created.
+            let name = result
                 .get("name")
                 .and_then(Value::as_str)
-                .or_else(|| result.get("name").and_then(Value::as_str))
+                .or_else(|| params.get("name").and_then(Value::as_str))
                 .or_else(|| params.get("template").and_then(Value::as_str))
                 .unwrap_or("?");
             format!("spawn {name}")
@@ -443,6 +458,15 @@ mod tests {
             Some("spawn w2")
         );
         assert_eq!(
+            from_bus(
+                "bus.spawn",
+                &json!({"template": "dev"}),
+                &json!({"name": "w7"})
+            )
+            .as_deref(),
+            Some("spawn w7")
+        );
+        assert_eq!(
             from_bus("bus.card_update", &json!({"card": "T4"}), &json!({})).as_deref(),
             Some("card T4 updated")
         );
@@ -480,6 +504,23 @@ mod tests {
             "a flush starts a fresh window"
         );
         assert!(throttle.record(4_100, 2_000), "a later window opens again");
+    }
+
+    #[test]
+    fn unchanged_text_does_not_reopen_the_window_but_still_counts_as_a_source() {
+        let mut participant = Participant::new("w1", Role::Worker);
+        assert!(participant.observe_activity("same".to_string(), 100, 2_000));
+        assert!(!participant.observe_activity("same".to_string(), 200, 2_000));
+        assert_eq!(
+            participant.activity.as_ref().map(|activity| activity.at),
+            Some(100)
+        );
+        assert_eq!(participant.activity_throttle.pending(), None);
+        assert!(participant.turn_activity);
+        assert!(!participant.observe_activity("next".to_string(), 300, 2_000));
+        assert_eq!(participant.activity_throttle.pending(), Some(2_100));
+        participant.set_state(super::super::ParticipantState::Working);
+        assert_eq!(participant.activity_throttle.pending(), None);
     }
 
     #[test]

@@ -786,6 +786,7 @@ impl Hub {
     /// `bus.spawn`: a worktree spawn answers after git finished, so the reply
     /// is sent here instead of returning a value.
     fn bus_spawn(&mut self, conn: u64, id: &Value, team: &str, params: &Value) {
+        let mut assigned_name: Option<String> = None;
         let result = (|| -> Result<Option<(Value, bool)>, TeamError> {
             let template = required_team_string(params, "template")?;
             let name = optional_string(params, "name")?;
@@ -795,6 +796,7 @@ impl Hub {
                 .request_spawn(team, &template, name.as_deref(), task.as_deref())?
             {
                 SpawnOutcome::Started(spawn) => {
+                    assigned_name = Some(spawn.name.clone());
                     let opts = StartOptions {
                         reply: Some((conn, id.clone(), SpawnReplyKind::Bus)),
                         ..StartOptions::default()
@@ -807,13 +809,16 @@ impl Hub {
                         StartResult::Deferred | StartResult::Replied => Ok(None),
                     }
                 }
-                SpawnOutcome::Awaiting { request, name: _ } => Ok(Some((
-                    json!({
-                        "status": "awaiting_approval",
-                        "request": request,
-                    }),
-                    false,
-                ))),
+                SpawnOutcome::Awaiting { request, name } => {
+                    assigned_name = Some(name);
+                    Ok(Some((
+                        json!({
+                            "status": "awaiting_approval",
+                            "request": request,
+                        }),
+                        false,
+                    )))
+                }
             }
         })();
         match result {
@@ -834,13 +839,18 @@ impl Hub {
             }
             Ok(None) => {
                 // The worktree spawn answers later; the call itself is still
-                // the leader's latest activity.
+                // the leader's latest activity, named after the worker the
+                // service actually assigned.
+                let named = assigned_name
+                    .as_ref()
+                    .map(|name| json!({ "name": name }))
+                    .unwrap_or(Value::Null);
                 self.teams.note_bus_call(
                     team,
                     "leader",
                     "bus.spawn",
                     params,
-                    &Value::Null,
+                    &named,
                     crate::team::now_ms(),
                 );
                 self.drain_team_events();

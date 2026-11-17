@@ -608,7 +608,11 @@ impl Hub {
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        eprintln!("nvim_ade_server: cannot load the board of {id}: {error:#}");
+                        eprintln!(
+                            "nvim_ade_server: cannot load the board of {id}: {error:#}; \
+                             keeping its database row and refusing board writes"
+                        );
+                        self.teams.mark_board_unavailable(id);
                     }
                 }
             }

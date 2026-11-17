@@ -139,7 +139,11 @@ impl Board {
     }
 
     pub fn to_json(&self) -> Value {
-        serde_json::to_value(self).unwrap_or_else(|_| json!({}))
+        let mut value = serde_json::to_value(self).unwrap_or_else(|_| json!({}));
+        if self.unavailable {
+            value["unavailable"] = json!(true);
+        }
+        value
     }
 
     /// The leader's view in `bus.status` (19.3).
@@ -156,13 +160,17 @@ impl Board {
                 .entry(card.stage.clone().unwrap_or_default())
                 .or_insert(0) += 1;
         }
-        json!({
+        let mut out = json!({
             "rev": self.rev,
             "workflow_name": self.workflow_name,
             "columns": self.columns,
             "cards": cards,
             "archived": archived,
-        })
+        });
+        if self.unavailable {
+            out["unavailable"] = json!(true);
+        }
+        out
     }
 
     /// `team.list`'s `stages`: counts per stage, in first-card order.
@@ -949,6 +957,15 @@ impl Teams {
             .collect()
     }
 
+    /// Mark a team's board unreadable after a database error. The row is left
+    /// untouched and writes are refused from now on.
+    pub fn mark_board_unavailable(&mut self, team_id: &str) {
+        if let Some(team) = self.teams.get_mut(team_id) {
+            team.board = Board::unavailable();
+            team.board_flush_at = None;
+        }
+    }
+
     pub fn restore_board(
         &mut self,
         team_id: &str,
@@ -1437,6 +1454,8 @@ mod tests {
         assert_eq!(error.code, super::super::NOT_ALLOWED);
         assert!(board.take_persist(0).is_none());
         assert!(!board.is_dirty());
+        assert_eq!(board.to_json()["unavailable"], true);
+        assert_eq!(board.status()["unavailable"], true);
     }
 
     #[test]

@@ -1903,7 +1903,7 @@ impl Teams {
         }
         let first_prompt = participant.first_prompt;
         participant.first_prompt = false;
-        participant.state = ParticipantState::Working;
+        participant.set_state(ParticipantState::Working);
         participant.bus_turn = true;
         participant.turn_text.clear();
         participant.turn_task = participant.task.clone();
@@ -1943,7 +1943,7 @@ impl Teams {
             participant.mailbox.push_front(message);
         }
         participant.first_prompt |= first_prompt;
-        participant.state = ParticipantState::Idle;
+        participant.set_state(ParticipantState::Idle);
         participant.bus_turn = false;
         participant.reported = false;
         self.events.push(TeamEvent::Changed(team_id.to_string()));

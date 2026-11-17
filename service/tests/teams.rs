@@ -1008,25 +1008,33 @@ fn activity_notifications_are_throttled_and_state_since_moves() {
         "team-activity-throttle",
         json!({"spawn_confirm": {"auto": ["dev"]}}),
         None,
-        &[("NVIM_ADE_SERVER_ACTIVITY_NOTIFY_MS", "1000")],
+        &[("NVIM_ADE_SERVER_ACTIVITY_NOTIFY_MS", "800")],
     );
-    let spawn = mcp_call(
-        &harness.server,
-        &harness.token,
-        "team_spawn",
-        json!({"template": "dev", "name": "w1", "task": "do [activity-gated]"}),
-    );
-    assert_eq!(spawn["isError"], false, "{spawn}");
+    harness.spawn_worker("w1", "idle");
+    // Wait for the spawn turn to finish: an idle participant right after spawn
+    // still has its creation time as `state_since`.
+    let idle = harness.wait_participant("w1", |entry| {
+        entry["state"] == "idle" && entry["turns"]["total"].as_u64().unwrap_or(0) >= 1
+    });
+    let idle_before = idle["state_since"].as_u64().expect("idle since");
+    std::thread::sleep(Duration::from_millis(50));
+
+    harness.send("w1", "task", "do [activity-gated]");
     let working = harness.wait_participant("w1", |entry| entry["state"] == "working");
     let working_since = working["state_since"].as_u64().expect("working since");
+    assert!(
+        working_since > idle_before,
+        "state_since advances at the delivery: {working_since} <= {idle_before}"
+    );
 
     let mut watcher = harness.connect_watcher();
     std::fs::write(harness.server.dir().join("team-agent.gate"), b"go").expect("gate");
 
-    // Two activity changes inside the 1 s window produce exactly one
-    // activity-triggered `team.changed`; nothing else changes meanwhile.
+    // The state change to Working already carried the current activity, so the
+    // two rapid updates stay inside the 800 ms window; the tick announces the
+    // last value once.
     let mut changes = 0;
-    let deadline = Instant::now() + Duration::from_millis(600);
+    let deadline = Instant::now() + Duration::from_millis(1400);
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let Some(frame) = watcher.try_next_notification(remaining) else {
@@ -1036,7 +1044,7 @@ fn activity_notifications_are_throttled_and_state_since_moves() {
             changes += 1;
         }
     }
-    assert_eq!(changes, 1, "the second rapid update is coalesced");
+    assert_eq!(changes, 1, "the tick announces the coalesced last value");
     harness.wait_activity("w1", "gated step 2");
 
     let idle = harness.wait_participant("w1", |entry| entry["state"] == "idle");
