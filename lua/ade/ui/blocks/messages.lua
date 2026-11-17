@@ -74,6 +74,40 @@ function M.render_user(block, ctx)
   return out
 end
 
+---A notice/message with a caller-supplied header. Used by the watch view for
+---bus messages and the collapsed role card; the reducer never produces it.
+---@param block AdeBlock
+---@param ctx table
+---@return AdeRenderedLine[]
+function M.render_message(block, ctx)
+  local ic = ctx.icons
+  local expanded = block.expanded ~= false
+  local caret = block.collapsible and (expanded and ic.chevron_down or ic.chevron_right) or ""
+  local header = one_line(block.title or "message")
+  if caret ~= "" then
+    header = caret .. " " .. header
+  end
+  local out = {
+    { text = header, segments = { { s = 0, e = -1, group = "AdeNotice" } } },
+  }
+  if block.collapsible and not expanded then
+    out[#out + 1] = { text = "", segments = nil }
+    return out
+  end
+  local text = block.text or ""
+  if block.display_text ~= nil and not expanded then
+    text = block.display_text
+  end
+  block._md_agent = block._md_agent or {}
+  local body_width = math.max(20, ctx.width - BODY_INDENT - 1)
+  local body = render_text(text, "AdeAssistant", body_width, block._md_agent)
+  for _, line in ipairs(indent_lines(body, string.rep(" ", BODY_INDENT))) do
+    out[#out + 1] = line
+  end
+  out[#out + 1] = { text = "", segments = nil }
+  return out
+end
+
 function M.render_assistant(block, ctx)
   local ic = ctx.icons
   local prefix = block.child and (ic.child .. " ") or ""

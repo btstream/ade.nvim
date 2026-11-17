@@ -358,7 +358,7 @@ function M.build(ctx, opts, action)
     notify = notify,
     on_changed = function()
       if S.view.team_ui then
-        S.view.team_ui:refresh()
+        S.view.team_ui:schedule_refresh()
       end
       ctx.refresh_chrome()
     end,
@@ -859,9 +859,29 @@ function M.build(ctx, opts, action)
     end,
   })
 
+  if S.view.team_ui then
+    pcall(S.view.team_ui.close, S.view.team_ui)
+  end
   S.view.team_ui = TeamUI.new({
     team = S.view.team,
     config = cfg,
+    notify = notify,
+    panel = function()
+      return S.view.panel
+    end,
+    -- The watch view reuses the leader's existing chat; it never creates a
+    -- second Chat or a second input area.
+    leader_chat = function()
+      return S.view.chat
+    end,
+    leader_input = function()
+      return S.view.input
+    end,
+    start_team = function(workflow)
+      if S.view.team_commands then
+        S.view.team_commands:start(workflow)
+      end
+    end,
   })
 
   S.view.team_commands = TeamCommands.new({

@@ -35,7 +35,7 @@ Server.__index = Server
 ---  install_fail?: boolean, install_log?: string, install_delay_ms?: integer,
 ---  install_busy?: boolean, uninstall_busy?: boolean, resolve_delay_ms?: integer,
 ---  policy_delay_ms?: integer, policy_error?: table,
----  teams?: table, team_watch?: table, team_leader_error?: table,
+---  teams?: table, team_watch?: table, team_read?: table, team_leader_error?: table,
 ---  team_bind_error?: table, team_participants?: table, team_spawn_warning?: string,
 ---  team_spawn_error?: table, team_remove_result?: table, team_remove_error?: table,
 ---  team_start_error?: table, team_start_result?: table,
@@ -116,6 +116,8 @@ function M.new(opts)
     team_sends = {},
     team_answers = {},
     team_watch = opts.team_watch,
+    team_read = opts.team_read,
+    replay_inflight = false,
     team_leader_error = opts.team_leader_error,
     team_bind_error = opts.team_bind_error,
     team_participants = opts.team_participants,
@@ -583,8 +585,9 @@ function Server:dispatch(message, client)
     return nil
   end
   if method == "team.read" then
+    local result = self.team_read or { messages = {}, turns = {} }
     vim.defer_fn(function()
-      self:send(client, { jsonrpc = "2.0", id = ident, result = { messages = {}, turns = {} } })
+      self:send(client, { jsonrpc = "2.0", id = ident, result = vim.deepcopy(result) })
     end, 5)
     return nil
   end
@@ -705,6 +708,22 @@ function Server:dispatch(message, client)
       return error_reply(ident, -32064, "suspended")
     end
     local watch = self.team_watch or {}
+    if params.replay and self.replay_inflight then
+      return error_reply(ident, -32061, "a replay is already in progress")
+    end
+    local delay = 5
+    if type(watch.delays) == "table" then
+      delay = table.remove(watch.delays, 1) or delay
+    end
+    if type(watch.errors) == "table" then
+      local message = table.remove(watch.errors, 1)
+      if message and message ~= "" then
+        vim.defer_fn(function()
+          self:send(client, { jsonrpc = "2.0", id = ident, error = { code = -32060, message = message } })
+        end, delay)
+        return nil
+      end
+    end
     local instance = watch.instance or "inst-1"
     local session_id = watch.sessionId or "watch-session"
     for _, foreign in ipairs(watch.foreign or {}) do
@@ -733,11 +752,11 @@ function Server:dispatch(message, client)
         },
       })
     end
-    local delay = 5
-    if type(watch.delays) == "table" then
-      delay = table.remove(watch.delays, 1) or delay
+    if params.replay then
+      self.replay_inflight = true
     end
     vim.defer_fn(function()
+      self.replay_inflight = false
       self:send(client, {
         jsonrpc = "2.0",
         id = ident,
@@ -1369,6 +1388,17 @@ function Server:turn_started(instance, params)
     instance = instance,
     seq = 1,
     message = { jsonrpc = "2.0", method = "_ade/turn_started", params = params },
+  })
+end
+
+---Send one `_ade/turn_finished` to the attached connection of an instance.
+---@param instance string
+---@param params table
+function Server:turn_finished(instance, params)
+  self:broadcast("tunnel.recv", {
+    instance = instance,
+    seq = 1,
+    message = { jsonrpc = "2.0", method = "_ade/turn_finished", params = params },
   })
 end
 

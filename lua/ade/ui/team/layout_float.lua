@@ -3,6 +3,11 @@
 -- Deliberately small and reusable: the panel is one scratch buffer with a
 -- cursor-mapped list; the watch window renders a session from the ordinary
 -- reducer, so a watched worker looks like a chat without owning one.
+local Watch = require("ade.ui.team.watch")
+local Board = require("ade.ui.team.board")
+local Detail = require("ade.ui.team.detail")
+local Inbox = require("ade.ui.team.inbox")
+
 local M = {}
 
 local Panel = {}
@@ -11,15 +16,29 @@ Panel.__index = Panel
 ---@param opts {team: table, config: fun(): table}
 ---@return table
 function M.new(opts)
-  return setmetatable({
+  local panel = setmetatable({
     team = opts.team,
     config = opts.config,
+    start_team = opts.start_team,
+    leader_chat = opts.leader_chat,
     win = nil,
     buf = nil,
     watch_win = nil,
     watch_buf = nil,
     help = false,
   }, Panel)
+  panel.watcher = Watch.new({
+    team = opts.team,
+    config = opts.config,
+    leader_chat = opts.leader_chat,
+    notify = function(message)
+      panel:notify(message)
+    end,
+    on_change = function(watch)
+      panel.watch_win, panel.watch_buf = watch.win, watch.buf
+    end,
+  })
+  return panel
 end
 
 function Panel:is_open()
@@ -42,6 +61,17 @@ function Panel:current()
   if id:sub(1, 5) == "item:" then
     return "item", id:sub(6)
   end
+  if id:sub(1, 6) == "card:" then
+    local team, card = id:sub(7):match("^([^|]+)|(.+)$")
+    return "card", team, card
+  end
+  if id:sub(1, 6) == "stage:" then
+    local team, stage = id:sub(7):match("^([^|]*)|(.*)$")
+    return "stage", team, stage
+  end
+  if id:sub(1, 9) == "workflow:" then
+    return "workflow", id:sub(10)
+  end
   if id:sub(1, 5) == "team:" then
     return "team", id:sub(6)
   end
@@ -53,9 +83,6 @@ end
 function Panel:lines()
   local lines, ids = {}, {}
   local rows = self.team:list_rows()
-  if #rows == 0 then
-    return {}, {}
-  end
   local function add(text, id)
     lines[#lines + 1] = text
     ids[#lines] = id
@@ -66,7 +93,7 @@ function Panel:lines()
     for _, entry in ipairs({
       { "m", "send a message to a participant" },
       { "p / r / c", "pause / resume / cancel the participant" },
-      { "w", "watch the participant's transcript" },
+      { "<CR> / w", "watch the participant's transcript" },
       { "s", "start a worker from a template" },
       { "D", "remove an exited worker's worktree" },
       { "a", "answer the inbox item under the cursor" },
@@ -78,6 +105,29 @@ function Panel:lines()
       add(string.format("    %-10s %s", entry[1], entry[2]), nil)
     end
     add("", nil)
+  end
+  if #rows == 0 then
+    add(" ade.nvim · team", nil)
+    add("", nil)
+    add(" 还没有团队", nil)
+    local workflows = self.team.workflows_list
+    if workflows == nil then
+      add(" 正在读取可用流程…", nil)
+      self:load_workflows()
+      workflows = {}
+    end
+    if #workflows == 0 then
+      add(" 没有可用流程", nil)
+    else
+      add(" 可用流程（S 启动，<CR> 看全文）", nil)
+      for _, workflow in ipairs(workflows) do
+        add(
+          string.format("   %-20s %s", tostring(workflow.name), tostring(workflow.summary or "")),
+          "workflow:" .. tostring(workflow.name)
+        )
+      end
+    end
+    return lines, ids
   end
   for _, team in ipairs(rows) do
     add(string.format(" %s  %s  [%s]", team.id, tostring(team.cwd), tostring(team.state)), "team:" .. tostring(team.id))
@@ -132,6 +182,9 @@ function Panel:lines()
         ),
         team.id .. "|" .. tostring(entry.name)
       )
+      if entry.activity and type(entry.activity.text) == "string" and entry.activity.text ~= "" then
+        add("      ↳ " .. (entry.activity.text:gsub("[\r\n]+", " ")):sub(1, 100), nil)
+      end
     end
     -- Follow `team.inbox` (the notification stream), not the inbox snapshot
     -- that happened to be inside the last `team.changed`.
@@ -141,21 +194,41 @@ function Panel:lines()
         items[#items + 1] = item
       end
     end
-    table.sort(items, function(a, b)
-      return tostring(a.id) < tostring(b.id)
-    end)
-    for _, item in ipairs(items) do
-      if item.state == "open" then
-        add(
-          string.format(
-            "   inbox %-10s %-10s from %-10s %s",
-            tostring(item.id),
-            tostring(item.kind),
-            tostring(item.from),
-            (tostring(item.body or ""):gsub("%s+", " ")):sub(1, 60)
-          ),
-          "item:" .. tostring(item.id)
-        )
+    local inbox_lines, inbox_ids = Inbox.lines(team, items, math.max(50, vim.o.columns - 8))
+    for index, text in ipairs(inbox_lines) do
+      add("   inbox " .. text, inbox_ids[index])
+    end
+    local board = self.team:board(team.id)
+    if board then
+      add("", nil)
+      add(string.format("   看板 · rev %s", tostring(board.rev or "?")), nil)
+      local states = {}
+      for _, participant in ipairs(team.participants or {}) do
+        states[participant.name] =
+          { icon = require("ade.ui.team.members").state_icon(participant), state = participant.state }
+      end
+      self.scrolls = self.scrolls or {}
+      self.expanded_stages = self.expanded_stages or {}
+      local board_lines, board_meta, board_ids = Board.lines(board, states, {
+        scroll = self.scrolls[team.id] or 0,
+        expanded = self.expanded_stages[team.id] or {},
+        width = math.max(50, vim.o.columns - 8),
+        team = team,
+      })
+      for index, text in ipairs(board_lines) do
+        local id = board_ids[index]
+        if not id and board_meta[index] then
+          local info = board_meta[index]
+          if info.kind == "archived_stage" then
+            id = "stage:" .. team.id .. "|" .. tostring(info.stage or "")
+          elseif info.kind == "board_row" and info.cells and #info.cells == 1 and info.cells[1].card then
+            id = "card:" .. team.id .. "|" .. tostring(info.cells[1].card.id)
+          end
+        end
+        if id and id:sub(1, 5) == "card:" then
+          id = "card:" .. team.id .. "|" .. id:sub(6)
+        end
+        add("   " .. text, id)
       end
     end
     add("", nil)
@@ -167,10 +240,16 @@ function Panel:refresh()
   if not self:is_open() then
     return
   end
+  if self.watcher then
+    self.watcher:update_header()
+  end
   local rows = self.team:list_rows()
-  if #rows == 0 then
+  if #rows == 0 and self.had_teams then
     self:close()
     return
+  end
+  if #rows > 0 then
+    self.had_teams = true
   end
   local lines, ids = self:lines()
   self.ids = ids
@@ -199,11 +278,6 @@ function Panel:open()
     self:refresh()
     return true
   end
-  local rows = self.team:list_rows()
-  if #rows == 0 then
-    self.team:refresh()
-    return false
-  end
   self.buf = vim.api.nvim_create_buf(false, true)
   vim.bo[self.buf].bufhidden = "wipe"
   vim.bo[self.buf].filetype = "ade_team"
@@ -230,6 +304,20 @@ function Panel:open()
   self:map("a", function()
     self:answer_current()
   end)
+  self:map("A", function()
+    self:answer_group_current()
+  end)
+  self:map("H", function()
+    self:history_current()
+  end)
+  self:map("L", function()
+    local chat = self.leader_chat and self.leader_chat() or nil
+    if chat and chat.win and vim.api.nvim_win_is_valid(chat.win) then
+      pcall(vim.api.nvim_set_current_win, chat.win)
+    else
+      self:notify("the leader chat window is not open")
+    end
+  end)
   self:map("p", function()
     self:control_current("pause")
   end)
@@ -248,18 +336,33 @@ function Panel:open()
       end)
     end
   end)
-  self:map("w", function()
-    local kind, team, name = self:current()
-    if
-      kind == "participant"
-      and name ~= "leader"
-      and not self:refuse_stale(team)
-      and not self:refuse_suspended(team)
-    then
-      self.team:watch(team, name, true, function(ok, value)
-        self:report(ok, value)
-      end)
+  self:map("<CR>", function()
+    self:detail_current()
+  end)
+  self:map("zh", function()
+    local team = self:team_of_current()
+    if team then
+      self.scrolls = self.scrolls or {}
+      self.scrolls[team] = math.max(0, (self.scrolls[team] or 0) - 1)
+      self:refresh()
     end
+  end)
+  self:map("zl", function()
+    local team = self:team_of_current()
+    if team then
+      self.scrolls = self.scrolls or {}
+      self.scrolls[team] = (self.scrolls[team] or 0) + 1
+      self:refresh()
+    end
+  end)
+  self:map("w", function()
+    self:open_watch_current()
+  end)
+  self:map("<CR>", function()
+    self:open_watch_current()
+  end)
+  self:map("S", function()
+    self:start_workflow_current()
   end)
   self:map("s", function()
     self:spawn_current()
@@ -295,9 +398,6 @@ function Panel:open()
     self:send_current()
   end)
   self:map("q", function()
-    self:close()
-  end)
-  self:map("<Esc>", function()
     self:close()
   end)
   self.augroup = vim.api.nvim_create_augroup("AdeTeam", { clear = true })
@@ -379,8 +479,12 @@ end
 function Panel:close()
   self.interacting = false
   self.watch_pending = false
-  self.team:unwatch()
-  self:watch(nil)
+  if self.watcher then
+    self.watcher:close()
+  else
+    self.team:unwatch()
+  end
+  self.watch_win, self.watch_buf = nil, nil
   if self.win and vim.api.nvim_win_is_valid(self.win) then
     pcall(vim.api.nvim_win_close, self.win, true)
   end
@@ -703,88 +807,150 @@ function Panel:answer_current()
   answer({})
 end
 
----Render a watched session into a read-only split.
+---Render a watched session in the read-only watch view.
+---
+---Kept as the app's `on_watch` callback; the view itself owns the window,
+---turn grouping and the read-only Chat instance.
 ---@param session table|nil
 ---@param title string|nil
 function Panel:watch(session, title)
-  if not session then
-    if self.watch_win and vim.api.nvim_win_is_valid(self.watch_win) then
-      pcall(vim.api.nvim_win_close, self.watch_win, true)
-    end
-    self.watch_win, self.watch_buf = nil, nil
+  self.watcher:on_watch(session, title)
+  self.watch_win, self.watch_buf = self.watcher.win, self.watcher.buf
+end
+
+---Open (or close) the cursor participant's watch view. `<CR>` and `w` both
+---use this.
+---@return boolean
+function Panel:open_watch_current()
+  local kind, team, name = self:current()
+  if kind ~= "participant" then
+    return false
+  end
+  if self:refuse_stale(team) or self:refuse_suspended(team) then
+    return false
+  end
+  self.watcher:open(team, name)
+  self.watch_win, self.watch_buf = self.watcher.win, self.watcher.buf
+  return true
+end
+
+function Panel:load_workflows()
+  if self.loading_workflows then
     return
   end
-  if self.watch_win and not vim.api.nvim_win_is_valid(self.watch_win) then
-    self.watch_win = nil
+  self.loading_workflows = true
+  local cwd = self.team.resolve_cwd and self.team.resolve_cwd() or nil
+  if not cwd then
+    self.loading_workflows = false
+    return
   end
-  if self.watch_buf and not vim.api.nvim_buf_is_valid(self.watch_buf) then
-    self.watch_buf = nil
+  self.team:workflows(cwd, function(ok, value)
+    self.loading_workflows = false
+    self.team.workflows_list = ok and type(value) == "table" and value.workflows or {}
+    self:refresh()
+  end)
+end
+
+function Panel:start_workflow_current()
+  local kind, id = self:current()
+  if kind ~= "workflow" or not id then
+    return
   end
-  if not self.watch_win then
-    self.watch_buf = nil
+  if self.start_team then
+    self.start_team(id)
   end
-  if not self.watch_buf or not vim.api.nvim_buf_is_valid(self.watch_buf) then
-    local previous = vim.api.nvim_get_current_win()
-    vim.cmd("botright vsplit")
-    self.watch_win = vim.api.nvim_get_current_win()
-    self.watch_buf = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_win_set_buf(self.watch_win, self.watch_buf)
-    vim.bo[self.watch_buf].filetype = "ade_team_watch"
-    vim.bo[self.watch_buf].bufhidden = "wipe"
-    vim.bo[self.watch_buf].modifiable = false
-    local group = vim.api.nvim_create_augroup("AdeTeamWatch", { clear = true })
-    -- `bufhidden=wipe` wipes this buffer when the user closes the window, so
-    -- BufWipeout is the reliable "watch window is gone" event (WinClosed has
-    -- no buffer-local meaning). Capture this view's session/buffer: switching
-    -- workers wipes the old buffer while a newer watch is already current.
-    local watched, wiped = session, self.watch_buf
-    vim.api.nvim_create_autocmd("BufWipeout", {
-      group = group,
-      buffer = wiped,
-      callback = function()
-        vim.schedule(function()
-          if self.watch_buf ~= wiped then
-            return
-          end
-          if not self.team.watching or self.team.watching.session ~= watched then
-            return
-          end
-          self.watch_win, self.watch_buf = nil, nil
-          self.team:unwatch()
-        end)
-      end,
-    })
-    vim.wo[self.watch_win].number = false
-    vim.wo[self.watch_win].wrap = true
-    vim.api.nvim_set_current_win(previous)
-  end
-  local lines = { " watching " .. tostring(title or session.id) .. " (read-only)" }
-  for _, block in ipairs(session.blocks or {}) do
-    local text = block.text
-    if block.kind == "tool" then
-      text = (block.status or "") .. " " .. tostring(block.title or block.name or "tool")
+end
+
+function Panel:detail_current()
+  local kind, team_id, obj = self:current()
+  if kind == "card" and obj then
+    local team = self.team:team(team_id)
+    self:popup("卡片 " .. tostring(obj), Detail.card(team, self:find_card(team_id, obj)))
+  elseif kind == "item" and obj then
+    local item = self.team:item(obj)
+    if item then
+      self:popup("收件箱 " .. tostring(item.id), Detail.inbox(item))
     end
-    if type(text) == "string" and text ~= "" then
-      for _, line in ipairs(vim.split(text, "\n", { plain = true })) do
-        lines[#lines + 1] = (block.kind == "user" and "> " or "  ") .. line
-      end
-    end
-  end
-  if not self.watch_pending then
-    self.watch_pending = true
-    vim.schedule(function()
-      self.watch_pending = false
-      if not self.watch_buf or not vim.api.nvim_buf_is_valid(self.watch_buf) then
+  elseif kind == "stage" and obj ~= nil then
+    self.expanded_stages = self.expanded_stages or {}
+    local expanded = self.expanded_stages[team_id] or {}
+    expanded[obj] = not expanded[obj]
+    self.expanded_stages[team_id] = expanded
+    self:refresh()
+  elseif kind == "workflow" and obj then
+    for _, workflow in ipairs(self.team.workflows_list or {}) do
+      if workflow.name == obj then
+        self:popup("流程 " .. obj, Detail.workflow(workflow))
         return
       end
-      if self.watch_lines then
-        vim.bo[self.watch_buf].modifiable = true
-        vim.api.nvim_buf_set_lines(self.watch_buf, 0, -1, false, self.watch_lines)
-        vim.bo[self.watch_buf].modifiable = false
-      end
-    end)
+    end
   end
-  self.watch_lines = lines
+end
+
+function Panel:find_card(team_id, card_id)
+  local board = self.team:board(team_id)
+  for _, card in ipairs(board and board.cards or {}) do
+    if card.id == card_id then
+      return card
+    end
+  end
+end
+
+function Panel:popup(title, lines)
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = "wipe"
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  local width = math.min(100, math.max(50, math.floor(vim.o.columns * 0.8)))
+  local height = math.max(8, math.min(#lines, math.floor((vim.o.lines - vim.o.cmdheight) * 0.6)))
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    width = width,
+    height = height,
+    row = math.max(0, math.floor((vim.o.lines - height) / 2) - 1),
+    col = math.max(0, math.floor((vim.o.columns - width) / 2)),
+    style = "minimal",
+    border = "rounded",
+    title = " " .. tostring(title) .. " ",
+    title_pos = "center",
+  })
+  vim.keymap.set("n", "q", function()
+    pcall(vim.api.nvim_win_close, win, true)
+  end, { buffer = buf, nowait = true, silent = true })
+  vim.keymap.set("n", "<Esc>", function()
+    pcall(vim.api.nvim_win_close, win, true)
+  end, { buffer = buf, nowait = true, silent = true })
+end
+
+function Panel:answer_group_current()
+  local kind, item_id = self:current()
+  if kind ~= "item" or not item_id then
+    return
+  end
+  local item = self.team:item(item_id)
+  if not item then
+    return
+  end
+  if not item.group then
+    self:answer_current()
+    return
+  end
+  self.team:answer_group(item.group, true, function(ok, value)
+    self:report(ok, value)
+    self.team:refresh()
+  end)
+end
+
+function Panel:history_current()
+  local kind, team_id, card_id = self:current()
+  if kind ~= "card" or not card_id then
+    return
+  end
+  self.team:card_history(team_id, card_id, function(ok, value)
+    if self:report(ok, value) and type(value) == "table" then
+      require("ade.ui.team.history").open(team_id, card_id, value.versions or {})
+    end
+  end)
 end
 
 M.Panel = Panel

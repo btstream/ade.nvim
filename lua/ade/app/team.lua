@@ -630,6 +630,14 @@ function Team:refresh(cb)
       for _, team in ipairs(value.teams) do
         teams[team.id] = team
       end
+      -- Keep open items announced by `team.inbox` when an older snapshot does
+      -- not list them yet: the list and the notification stream race.
+      local announced = {}
+      for id, item in pairs(self.inbox) do
+        if item.state == "open" then
+          announced[id] = item
+        end
+      end
       self.teams = teams
       self.inbox = {}
       for id, team in pairs(teams) do
@@ -641,6 +649,11 @@ function Team:refresh(cb)
             -- service; do not notify them again after a reconnect.
             self.notified[item.id] = item.team
           end
+        end
+      end
+      for id, item in pairs(announced) do
+        if self.inbox[id] == nil and teams[item.team] ~= nil then
+          self.inbox[id] = item
         end
       end
       self:changed()
@@ -1182,6 +1195,14 @@ end
 
 ---@param payload table
 ---@return string
+local function epoch_ms()
+  if vim.uv and vim.uv.gettimeofday then
+    local seconds, micros = vim.uv.gettimeofday()
+    return seconds * 1000 + math.floor(micros / 1000)
+  end
+  return os.time() * 1000
+end
+
 local function prompt_text(payload)
   local parts = {}
   for _, block in ipairs(type(payload) == "table" and payload.prompt or {}) do
@@ -1195,39 +1216,45 @@ end
 ---Mark a bus turn on a session and render it as user-side content.
 ---@param session table|nil
 ---@param payload table
----@return boolean changed
+---@return table|nil block the bus prompt block
 function M.apply_turn_started(session, payload)
   if not session then
-    return false
+    return nil
   end
   local text = prompt_text(payload)
   local origin = type(payload) == "table" and payload.origin or "bus"
   session.status = "running"
   session.turn = (session.turn or 0) + 1
   session.bus_turn = session.turn
-  session:append({
+  return session:append({
     id = require("ade.session.state").next_id("bus"),
     kind = "user",
     text = "[" .. tostring(origin) .. "] " .. text,
     bus = { origin = origin },
   })
-  return true
 end
 
 ---@param session table|nil
----@return boolean changed
+---@return table|nil block the bus prompt block the turn ended on
 function M.apply_turn_finished(session, payload)
   if not session or not session.bus_turn then
-    return false
+    return nil
   end
   local bus_turn = session.bus_turn
   session.bus_turn = nil
+  local block
+  for i = #session.blocks, 1, -1 do
+    if session.blocks[i].bus then
+      block = session.blocks[i]
+      break
+    end
+  end
   -- A person's prompt may have replaced the bus turn while it was cancelling;
   -- its late finish must not end the user's (newer) turn.
   if session.turn == bus_turn then
     session:finish_turn(type(payload) == "table" and payload.stopReason or "end_turn")
   end
-  return true
+  return block
 end
 
 ---The main (attached) session a notification is about.
@@ -1268,7 +1295,9 @@ end
 function Team:turn_finished(payload)
   payload = type(payload) == "table" and payload or {}
   local session = self:session_of(payload.sessionId or payload.session_id)
-  if session and session.bus_turn and M.apply_turn_finished(session, payload) then
+  if session and session.bus_turn then
+    -- Even without a bus block to attach the finish to, the turn still ended.
+    M.apply_turn_finished(session, payload)
     self:changed()
     self:_watch_rendered()
     if self.on_turn then
@@ -1308,6 +1337,8 @@ function Team:watch(team, participant, replay, cb)
     participant = participant,
     buffer = {},
     ready = false,
+    -- Display-only turn timings, keyed by the bus prompt block id.
+    turn_times = {},
   }
   self.watching = entry
   local function apply(payload)
@@ -1322,12 +1353,20 @@ function Team:watch(team, participant, replay, cb)
       return
     end
     if message.method == "_ade/turn_started" then
-      M.apply_turn_started(session, message.params or {})
+      local block = M.apply_turn_started(session, message.params or {})
+      if block then
+        entry.turn_times[block.id] = { started_at = epoch_ms() }
+      end
       self:_watch_rendered()
       return
     end
     if message.method == "_ade/turn_finished" then
-      M.apply_turn_finished(session, message.params or {})
+      local block = M.apply_turn_finished(session, message.params or {})
+      if block then
+        local timing = entry.turn_times[block.id] or {}
+        timing.ended_at = epoch_ms()
+        entry.turn_times[block.id] = timing
+      end
       self:_watch_rendered()
       return
     end
@@ -1358,10 +1397,9 @@ function Team:watch(team, participant, replay, cb)
     function(ok, value)
       if self.watching ~= entry then
         -- This watch was superseded/abandoned while its request was in flight.
-        -- Do not touch the newer watch, but release the service-side watch.
-        if ok then
-          raw:request_tracked("team.unwatch", { team = team, participant = participant }, function() end)
-        end
+        -- The switch/close that superseded it already released that watch; a
+        -- late success must not send another unwatch that could cancel a newer
+        -- watch of the same participant.
         cb(ok, value)
         return
       end
@@ -1372,6 +1410,7 @@ function Team:watch(team, participant, replay, cb)
       end
       if type(value) == "table" then
         entry.instance = value.instance
+        entry.replayed = value.replayed ~= false
         if type(value.sessionId) == "string" then
           session.id = value.sessionId
         end
