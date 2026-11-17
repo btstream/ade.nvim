@@ -712,11 +712,18 @@ impl Hub {
             let cwd = plan.cwd.clone();
             let stamp = plan.stamp.clone();
             let sender = self.command_sender.clone();
+            let closing = self.closing_flag.clone();
             let team_for_git = team.clone();
             let name_for_git = participant.clone();
             tokio::spawn(async move {
                 let result =
                     worktree::create(&cwd, &root, &team_for_git, &stamp, &name_for_git).await;
+                if closing.load(std::sync::atomic::Ordering::SeqCst) {
+                    if let Ok(info) = &result {
+                        worktree::discard(&info.toplevel, &info.path, &info.branch).await;
+                    }
+                    return;
+                }
                 let _ = sender
                     .send(Command::TeamWorktree {
                         team,
@@ -895,6 +902,21 @@ impl Hub {
                         self.teams
                             .worktree_prepared(team, participant, info.clone());
                         if self.teams.team(team).is_none() {
+                            // The team closed while git ran: the new worktree
+                            // belongs to nobody.
+                            eprintln!(
+                                "nvim_ade_server: discarding worktree {} of closed team {team}",
+                                info.path
+                            );
+                            let discarded = info.clone();
+                            tokio::spawn(async move {
+                                worktree::discard(
+                                    &discarded.toplevel,
+                                    &discarded.path,
+                                    &discarded.branch,
+                                )
+                                .await;
+                            });
                             if let Some((conn, id, _)) = &pending.opts.reply {
                                 self.send_error(*conn, id, &TeamError::unknown("team closed"));
                             }
@@ -939,20 +961,27 @@ impl Hub {
                     return;
                 };
                 match result {
-                    Ok(removed) => {
-                        self.teams.worktree_removed(team, participant);
-                        self.drain_team_events();
-                        self.send_to(
-                            conn,
-                            &success(
-                                &id,
-                                json!({
-                                    "removed": true,
-                                    "branch_kept": removed.branch_kept,
-                                    "branch": removed.branch,
-                                }),
+                    Ok(report) => {
+                        if report.removed {
+                            // The directory is gone; do not leave a record that
+                            // makes every retry fail (18.16).
+                            self.teams.worktree_removed(team, participant);
+                            self.drain_team_events();
+                        }
+                        match report.error {
+                            Some(error) => self.send_error(conn, &id, &error),
+                            None => self.send_to(
+                                conn,
+                                &success(
+                                    &id,
+                                    json!({
+                                        "removed": report.removed,
+                                        "branch_kept": report.branch_kept,
+                                        "branch": report.branch,
+                                    }),
+                                ),
                             ),
-                        );
+                        }
                     }
                     Err(error) => self.send_error(conn, &id, &error),
                 }

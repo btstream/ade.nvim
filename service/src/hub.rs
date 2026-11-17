@@ -139,7 +139,7 @@ impl OutboxReceiver {
 #[derive(Debug)]
 pub enum WorktreeOutcome {
     Spawn(Result<crate::team::worktree::WorktreeInfo, crate::team::TeamError>),
-    Remove(Result<crate::team::worktree::Removed, crate::team::TeamError>),
+    Remove(Result<crate::team::worktree::RemoveReport, crate::team::TeamError>),
 }
 
 /// Instructions from connection tasks to the hub.
@@ -421,6 +421,9 @@ pub struct Hub {
     pending_stop_replies: HashMap<String, Vec<(u64, Value)>>,
     /// The hub's own command sender, so spawned tasks can report back.
     command_sender: mpsc::Sender<Command>,
+    /// Shared with background worktree tasks: they discard what they created
+    /// once shutdown starts.
+    closing_flag: Arc<std::sync::atomic::AtomicBool>,
     /// Set when the shutdown sequence completed; the run loop then ends.
     finished: bool,
     load_results: mpsc::UnboundedReceiver<LoadResult>,
@@ -493,6 +496,7 @@ impl Hub {
             load_results,
             pending_stop_replies: HashMap::new(),
             command_sender,
+            closing_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             finished: false,
             #[cfg(unix)]
             install_jobs: HashMap::new(),
@@ -679,6 +683,8 @@ impl Hub {
                     return;
                 }
                 self.closing = true;
+                self.closing_flag
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 let instances: Vec<(String, ProcControl, Arc<Exited>)> = self
                     .instances
                     .iter()

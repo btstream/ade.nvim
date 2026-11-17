@@ -14,6 +14,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use common::{Client, TestServer};
 
@@ -101,6 +102,16 @@ fn child_env(server: &TestServer, log: &Path, gate: &Path) -> Value {
     })
 }
 
+#[derive(Clone)]
+enum Root {
+    /// `<server dir>/worktrees` (the normal case).
+    Default,
+    /// `<repo>/wt-root`, i.e. inside the toplevel.
+    InsideRepo,
+    /// A worktree template without `worktree_root`.
+    Missing,
+}
+
 struct Harness {
     server: TestServer,
     client: Client,
@@ -131,6 +142,24 @@ impl Harness {
         wait_for(
             || self.participant(name).filter(|entry| predicate(entry)),
             &format!("participant {name}"),
+        )
+    }
+
+    fn client_instance(&mut self) -> String {
+        // The harness leader instance is the only attached agent; team.list
+        // names it.
+        self.team()["leader"]["instance"]
+            .as_str()
+            .unwrap_or("i1")
+            .to_string()
+    }
+
+    fn spawn_human(&mut self, name: &str, task: &str) -> Value {
+        let team = self.team.clone();
+        self.client.request(
+            33,
+            "team.spawn",
+            json!({"team": team, "template": "dev", "name": name, "task": task}),
         )
     }
 
@@ -294,6 +323,18 @@ fn mcp_call(server: &TestServer, token: &str, tool: &str, arguments: Value) -> V
         ],
         2,
     )
+}
+
+fn alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn worktree_root(harness: &Harness) -> PathBuf {
+    harness.server.dir().join("worktrees")
+}
+
+fn branch_list(cwd: &Path) -> String {
+    git_ok(cwd, &["branch", "--list", "ade/*"])
 }
 
 fn mcp_text(result: &Value) -> String {
@@ -771,7 +812,7 @@ fn git_does_not_block_the_hub_and_a_timeout_is_reported() {
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\ncase \"$*\" in\n  *\"worktree add\"*) sleep 1 ;;\nesac\nexec {real} \"$@\"\n"
+            "#!/bin/sh\ncase \"$*\" in\n  *\"worktree add\"*) sleep 3 ;;\nesac\nexec {real} \"$@\"\n"
         ),
     )
     .expect("fake git");
@@ -820,7 +861,7 @@ fn git_does_not_block_the_hub_and_a_timeout_is_reported() {
     let elapsed = started.elapsed();
     assert!(listed["result"].is_object(), "{listed}");
     assert!(
-        elapsed < Duration::from_millis(700),
+        elapsed < Duration::from_millis(2000),
         "team.list took {elapsed:?} while git slept; the hub must not block"
     );
     spawn.join().expect("spawn thread");
@@ -828,14 +869,16 @@ fn git_does_not_block_the_hub_and_a_timeout_is_reported() {
 
     // A timeout is -32066 with the git output.
     let slow = wrapper.join("git");
+    let timeout_pid = std::env::temp_dir().join(format!("ade-timeout-pid-{}", std::process::id()));
     std::fs::write(
         &slow,
         format!(
-            "#!/bin/sh\ncase \"$*\" in\n  *\"worktree add\"*) sleep 5 ;;\nesac\nexec {real} \"$@\"\n"
+            "#!/bin/sh\ncase \"$*\" in\n  *\"worktree add\"*) echo $$ > \"{}\" ; sleep 5 ;;\nesac\nexec {real} \"$@\"\n",
+            timeout_pid.display()
         ),
     )
     .expect("fake git");
-    let timed = Harness::with_worktree_env(
+    let mut timed = Harness::with_worktree_env(
         "wt-timeout",
         &[("PATH", &path), ("NVIM_ADE_SERVER_GIT_TIMEOUT_MS", "200")],
         |work| {
@@ -843,13 +886,27 @@ fn git_does_not_block_the_hub_and_a_timeout_is_reported() {
             work.to_path_buf()
         },
     );
-    let spawned = timed.spawn("w1", "work");
-    assert_eq!(spawned["isError"], true, "{spawned}");
+    let spawned = timed.spawn_human("w1", "work");
+    assert_eq!(spawned["error"]["code"], -32066, "{spawned}");
     assert!(
-        mcp_text(&spawned).contains("git worktree add failed"),
-        "{}",
-        mcp_text(&spawned)
+        spawned["error"]["data"]["stderr"]
+            .as_str()
+            .is_some_and(|stderr| stderr.contains("timed out")),
+        "{spawned}"
     );
+    let pid = wait_for(
+        || {
+            std::fs::read_to_string(&timeout_pid)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+        },
+        "the slow wrapper pid",
+    );
+    wait_for(
+        || (!alive(pid)).then_some(()),
+        "the slow wrapper to be gone",
+    );
+    std::fs::remove_file(timeout_pid).ok();
 }
 
 #[test]
@@ -927,6 +984,400 @@ fn an_approved_dirty_worktree_notice_has_the_warning() {
         .is_some_and(|body| body.contains("(warning: dirty_tree)"))));
 }
 
+#[test]
+fn a_hung_hook_is_killed_with_its_group_and_the_half_worktree_is_removed() {
+    if skip("a_hung_hook_is_killed_with_its_group_and_the_half_worktree_is_removed") {
+        return;
+    }
+    let pid_file = std::env::temp_dir().join(format!("ade-hook-pids-{}", std::process::id()));
+    let hook_pid_file = pid_file.clone();
+    let hook = hook_pid_file.to_string_lossy().to_string();
+    let env = [
+        ("NVIM_ADE_SERVER_GIT_TIMEOUT_MS", "500"),
+        ("ADE_TEST_HOOK_PID", hook.as_str()),
+    ];
+    let mut harness = Harness::with_worktree_env("wt-hook", &env, |work| {
+        init_repo(work);
+        // A post-checkout hook that starts a grandchild and hangs.
+        let path = work.join(".git/hooks/post-checkout");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\necho $$ > \"$ADE_TEST_HOOK_PID\"\nsleep 300 &\necho $! >> \"$ADE_TEST_HOOK_PID\"\nsleep 300\n",
+        )
+        .expect("hook");
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        work.to_path_buf()
+    });
+    let spawned = harness.spawn_human("w1", "work");
+    assert_eq!(spawned["error"]["code"], -32066, "{spawned}");
+    assert!(
+        spawned["error"]["data"]["stderr"]
+            .as_str()
+            .is_some_and(|stderr| stderr.contains("timed out")),
+        "{spawned}"
+    );
+    let pids = wait_for(
+        || {
+            let text = std::fs::read_to_string(&pid_file).ok()?;
+            let pids: Vec<u32> = text
+                .lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect();
+            (!pids.is_empty()).then_some(pids)
+        },
+        "the hook's pids",
+    );
+    for pid in &pids {
+        wait_for(
+            || (!alive(*pid)).then_some(()),
+            &format!("hook pid {pid} to be gone"),
+        );
+    }
+    let root = worktree_root(&harness);
+    assert_eq!(
+        std::fs::read_dir(&root).map(|dir| dir.count()).unwrap_or(0),
+        0,
+        "the half-created worktree directory is removed"
+    );
+    assert!(
+        branch_list(&harness.cwd).is_empty(),
+        "the branch is removed"
+    );
+
+    // With the hook gone the same team can create a worker again.
+    std::fs::remove_file(harness.cwd.join(".git/hooks/post-checkout")).ok();
+    let again = harness.spawn_human("w2", "work");
+    assert_eq!(again["result"]["name"], "w2", "{again}");
+    std::fs::remove_file(pid_file).ok();
+}
+
+#[test]
+fn closing_the_team_discards_a_worktree_created_meanwhile() {
+    if skip("closing_the_team_discards_a_worktree_created_meanwhile") {
+        return;
+    }
+    let real = Command::new("sh")
+        .arg("-c")
+        .arg("command -v git")
+        .output()
+        .expect("find git");
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    let wrapper = std::env::temp_dir().join(format!("ade-slow-close-git-{}", std::process::id()));
+    std::fs::create_dir_all(&wrapper).expect("wrapper dir");
+    let marker = std::env::temp_dir().join(format!("ade-slow-close-{}", std::process::id()));
+    let script = wrapper.join("git");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *\"worktree add\"*) touch \"{}\" ; sleep 1 ;;\nesac\nexec {real} \"$@\"\n",
+            marker.display()
+        ),
+    )
+    .expect("fake git");
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("chmod");
+    let path = format!(
+        "{}:{}",
+        wrapper.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut harness = Harness::with_worktree_env("wt-close-mid", &[("PATH", &path)], |work| {
+        init_repo(work);
+        work.to_path_buf()
+    });
+    let mut probe = harness.server.connect();
+    let hello = probe.hello(&harness.server.token(), nvim_ade_server::API_VERSION);
+    assert!(hello["result"].is_object(), "{hello}");
+    probe.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 30,
+        "method": "team.spawn",
+        "params": {"team": harness.team, "template": "dev", "name": "w1", "task": "work"},
+    }));
+    wait_for(
+        || marker.exists().then_some(()),
+        "git worktree add to start",
+    );
+    let closed = harness
+        .client
+        .request(31, "team.close", json!({"team": harness.team}));
+    assert!(closed["result"].is_object(), "{closed}");
+    let reply = wait_for(
+        || loop {
+            let value = probe.recv()?;
+            if value["id"] == 30 {
+                return Some(value);
+            }
+        },
+        "the spawn reply after close",
+    );
+    assert_eq!(reply["error"]["code"], -32064, "{reply}");
+    let root = worktree_root(&harness);
+    wait_for(
+        || {
+            let empty = std::fs::read_dir(&root).map(|dir| dir.count()).unwrap_or(0) == 0;
+            empty.then_some(())
+        },
+        "the abandoned worktree to be removed",
+    );
+    assert!(
+        branch_list(&harness.cwd).is_empty(),
+        "the abandoned branch is removed: {}",
+        branch_list(&harness.cwd)
+    );
+    std::fs::remove_file(marker).ok();
+}
+
+#[test]
+fn removal_clears_the_record_when_the_directory_was_deleted_by_hand() {
+    if skip("removal_clears_the_record_when_the_directory_was_deleted_by_hand") {
+        return;
+    }
+    let mut harness = Harness::with_worktree("wt-manual-delete", |work| {
+        init_repo(work);
+        work.to_path_buf()
+    });
+    let spawned = harness.spawn("w1", "work");
+    assert_eq!(spawned["isError"], false, "{spawned}");
+    let worktree = harness.worktree("w1");
+    let path = PathBuf::from(worktree["path"].as_str().unwrap());
+    harness.wait_participant("w1", |entry| entry["state"] == "idle");
+    std::fs::write(path.join("root.txt"), "unmerged work\n").expect("worker file");
+    git_ok(&path, &["add", "-A"]);
+    git_ok(&path, &["commit", "-q", "-m", "worker work"]);
+    harness.stop_worker("w1");
+    std::fs::remove_dir_all(&path).expect("delete the worktree by hand");
+    let removed = harness.client.request(
+        34,
+        "team.remove_worktree",
+        json!({"team": harness.team, "participant": "w1"}),
+    );
+    assert_eq!(removed["result"]["removed"], true, "{removed}");
+    assert_eq!(removed["result"]["branch_kept"], true, "{removed}");
+    let entry = harness.participant("w1").expect("worker");
+    assert!(entry.get("worktree").is_none(), "{entry}");
+    let again = harness.client.request(
+        35,
+        "team.remove_worktree",
+        json!({"team": harness.team, "participant": "w1"}),
+    );
+    assert_eq!(again["error"]["code"], -32060, "{again}");
+
+    // A branch that is already gone counts as not kept.
+    let spawned = harness.spawn("w2", "work");
+    assert_eq!(spawned["isError"], false, "{spawned}");
+    let worktree = harness.worktree("w2");
+    let path = PathBuf::from(worktree["path"].as_str().unwrap());
+    let branch = worktree["branch"].as_str().unwrap().to_string();
+    harness.wait_participant("w2", |entry| entry["state"] == "idle");
+    harness.stop_worker("w2");
+    std::fs::remove_dir_all(&path).expect("delete w2's worktree");
+    git_ok(&harness.cwd, &["worktree", "prune"]);
+    git_ok(&harness.cwd, &["branch", "-D", &branch]);
+    let removed = harness.client.request(
+        36,
+        "team.remove_worktree",
+        json!({"team": harness.team, "participant": "w2"}),
+    );
+    assert_eq!(removed["result"]["removed"], true, "{removed}");
+    assert_eq!(removed["result"]["branch_kept"], false, "{removed}");
+    assert!(!path.exists());
+}
+
+#[test]
+fn a_git_timeout_during_rev_parse_is_not_a_parameter_error() {
+    if skip("a_git_timeout_during_rev_parse_is_not_a_parameter_error") {
+        return;
+    }
+    let real = Command::new("sh")
+        .arg("-c")
+        .arg("command -v git")
+        .output()
+        .expect("find git");
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    let wrapper = std::env::temp_dir().join(format!("ade-slow-rev-git-{}", std::process::id()));
+    std::fs::create_dir_all(&wrapper).expect("wrapper dir");
+    let pid_file = std::env::temp_dir().join(format!("ade-slow-rev-pid-{}", std::process::id()));
+    let script = wrapper.join("git");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *\"rev-parse --show-toplevel\"*) echo $$ > \"{}\" ; sleep 30 ;;\nesac\nexec {real} \"$@\"\n",
+            pid_file.display()
+        ),
+    )
+    .expect("fake git");
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("chmod");
+    let path = format!(
+        "{}:{}",
+        wrapper.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut harness = Harness::with_worktree_env(
+        "wt-rev-timeout",
+        &[("PATH", &path), ("NVIM_ADE_SERVER_GIT_TIMEOUT_MS", "200")],
+        |work| {
+            init_repo(work);
+            work.to_path_buf()
+        },
+    );
+    let spawned = harness.spawn_human("w1", "work");
+    assert_eq!(spawned["error"]["code"], -32066, "{spawned}");
+    assert!(
+        spawned["error"]["data"]["stderr"]
+            .as_str()
+            .is_some_and(|stderr| stderr.contains("timed out")),
+        "{spawned}"
+    );
+    let pid = wait_for(
+        || {
+            std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+        },
+        "the wrapper pid",
+    );
+    wait_for(|| (!alive(pid)).then_some(()), "the wrapper to be gone");
+    std::fs::remove_file(pid_file).ok();
+}
+
+#[test]
+fn a_symlinked_toplevel_is_hashed_canonically() {
+    if skip("a_symlinked_toplevel_is_hashed_canonically") {
+        return;
+    }
+    let mut harness = Harness::with_worktree("wt-symlink", |work| {
+        init_repo(work);
+        let link = work.with_file_name("repo-link");
+        std::os::unix::fs::symlink(work, &link).expect("symlink");
+        link.join("sub")
+    });
+    let spawned = harness.spawn("w1", "work");
+    assert_eq!(spawned["isError"], false, "{spawned}");
+    let worktree = harness.worktree("w1");
+    let path = PathBuf::from(worktree["path"].as_str().unwrap());
+    let canonical = std::fs::canonicalize(harness.server.dir().join("work")).expect("canonical");
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    let hash: String = digest
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let directory = path.parent().and_then(|parent| parent.file_name());
+    assert!(
+        directory
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(&hash)),
+        "the worktree directory uses the canonical toplevel hash: {} ({hash})",
+        path.display()
+    );
+    let cwds = wait_for(
+        || {
+            let values = harness.worker_cwds();
+            (!values.is_empty()).then_some(values)
+        },
+        "the worker session",
+    );
+    assert_eq!(cwds[0], path.join("sub").to_string_lossy(), "{cwds:?}");
+}
+
+#[test]
+fn a_worktree_root_inside_the_repository_is_refused() {
+    if skip("a_worktree_root_inside_the_repository_is_refused") {
+        return;
+    }
+    let mut harness =
+        Harness::with_worktree_root("wt-root-inside", Root::InsideRepo, true, |work| {
+            init_repo(work);
+            work.to_path_buf()
+        });
+    let spawned = harness.spawn_human("w1", "work");
+    assert_eq!(spawned["error"]["code"], -32060, "{spawned}");
+    assert!(
+        spawned["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("outside")),
+        "{spawned}"
+    );
+}
+
+#[test]
+fn a_relative_worktree_root_is_refused() {
+    if skip("a_relative_worktree_root_is_refused") {
+        return;
+    }
+    let mut harness = Harness::with_worktree("wt-root-relative", |work| {
+        init_repo(work);
+        work.to_path_buf()
+    });
+    let configured = harness.client.request(
+        38,
+        "team.configure",
+        json!({
+            "cwd": harness.cwd.to_string_lossy(),
+            "config": {
+                "worktree_root": "relative/worktrees",
+                "templates": {"dev": {"worktree": true}}
+            }
+        }),
+    );
+    assert_eq!(configured["error"]["code"], -32060, "{configured}");
+}
+
+#[test]
+fn a_worktree_template_without_a_root_is_not_allowed() {
+    if skip("a_worktree_template_without_a_root_is_not_allowed") {
+        return;
+    }
+    let mut harness = Harness::with_worktree_root("wt-root-missing", Root::Missing, true, |work| {
+        init_repo(work);
+        work.to_path_buf()
+    });
+    let spawned = harness.spawn_human("w1", "work");
+    assert_eq!(spawned["error"]["code"], -32061, "{spawned}");
+    assert!(
+        spawned["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("worktree_root")),
+        "{spawned}"
+    );
+}
+
+#[test]
+fn a_leaderless_team_can_start_a_worker_from_the_front_end() {
+    if skip("a_leaderless_team_can_start_a_worker_from_the_front_end") {
+        return;
+    }
+    let mut harness = Harness::with_worktree("wt-leaderless", |work| {
+        init_repo(work);
+        work.to_path_buf()
+    });
+    let leader = harness.client_instance();
+    let stopped =
+        harness
+            .client
+            .request(37, "agent.stop", json!({"instance": leader, "force": true}));
+    assert!(stopped["result"].is_object(), "{stopped}");
+    wait_for(
+        || {
+            let team = harness.team();
+            (team["state"] == "leaderless").then_some(team)
+        },
+        "the leaderless team",
+    );
+    let spawned = harness.spawn_human("w1", "work");
+    assert_eq!(spawned["result"]["name"], "w1", "{spawned}");
+    harness.wait_participant("w1", |entry| entry["worktree"].is_object());
+    let messages = harness.read_leader();
+    assert!(messages.iter().any(|message| message["body"]
+        .as_str()
+        .is_some_and(|body| body == "worker w1 started from template dev")));
+}
+
 // ---------------------------------------------------------------------------
 // harness with a worktree template configured from the start
 // ---------------------------------------------------------------------------
@@ -944,11 +1395,20 @@ impl Harness {
         // The worktree root lives under the server's temporary directory, and
         // the config is sent before the leader binds, so the team starts with
         // the worktree template.
-        Self::new_with_setup(label, env, setup, true, true)
+        Self::new_with_setup(label, env, setup, true, true, Root::Default)
     }
 
     fn with_worktree_manual(label: &str, setup: impl FnOnce(&Path) -> PathBuf) -> Self {
-        Self::new_with_setup(label, &[], setup, true, false)
+        Self::new_with_setup(label, &[], setup, true, false, Root::Default)
+    }
+
+    fn with_worktree_root(
+        label: &str,
+        root: Root,
+        auto_spawn: bool,
+        setup: impl FnOnce(&Path) -> PathBuf,
+    ) -> Self {
+        Self::new_with_setup(label, &[], setup, true, auto_spawn, root)
     }
 
     fn new_with_setup(
@@ -957,6 +1417,7 @@ impl Harness {
         setup: impl FnOnce(&Path) -> PathBuf,
         worktree: bool,
         auto_spawn: bool,
+        root: Root,
     ) -> Self {
         let server = TestServer::start_with(label, &["--idle-timeout", "600"], env);
         let work = server.dir().join("work");
@@ -1008,7 +1469,14 @@ impl Harness {
             "templates": { "dev": template }
         });
         if worktree {
-            config["worktree_root"] = json!(server.dir().join("worktrees").to_string_lossy());
+            let root = match &root {
+                Root::Default => Some(server.dir().join("worktrees")),
+                Root::InsideRepo => Some(work.join("wt-root")),
+                Root::Missing => None,
+            };
+            if let Some(root) = root {
+                config["worktree_root"] = json!(root.to_string_lossy());
+            }
         }
         let configured = client.request(
             2,
@@ -1041,6 +1509,9 @@ impl Harness {
             .as_str()
             .expect("session id")
             .to_string();
+        // `tunnel_call` polls with a short timeout; later requests may wait for
+        // git, so restore the default.
+        client.reset_read_timeout();
         let bound = client.request(
             4,
             "team.bind_leader",
@@ -1050,6 +1521,7 @@ impl Harness {
             .as_str()
             .unwrap_or_else(|| panic!("bind: {bound}"))
             .to_string();
+        client.reset_read_timeout();
         Self {
             server,
             client,
