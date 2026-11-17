@@ -313,7 +313,9 @@ impl Board {
         columns: Option<&[String]>,
     ) -> Result<Option<u64>, TeamError> {
         if self.unavailable {
-            return Err(TeamError::not_allowed("board unavailable"));
+            // 19.7 step 4: an unavailable board is left alone and the start
+            // goes on (the leader still needs the notice).
+            return Ok(None);
         }
         if self.workflow_name.is_some() {
             return Ok(None);
@@ -1507,6 +1509,12 @@ mod tests {
         assert!(!board.is_dirty());
         assert_eq!(board.to_json()["unavailable"], true);
         assert_eq!(board.status()["unavailable"], true);
+        // 19.7 step 4: an unavailable board is skipped, not an error.
+        assert_eq!(
+            board.apply_workflow("flow", "text", None).expect("skip"),
+            None
+        );
+        assert_eq!(board.rev, 0);
     }
 
     #[test]

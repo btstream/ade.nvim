@@ -1270,6 +1270,72 @@ return function(t)
     end)
   end)
 
+  t.describe("W0e old service", function()
+    t.it("explains an api-5 service instead of showing raw -32601", function()
+      local service, dir = start_service(t, "old-service", {
+        old_service_methods = {
+          ["team.board"] = true,
+          ["team.card_history"] = true,
+          ["team.start"] = true,
+          ["team.workflows"] = true,
+          ["team.workflow_delete"] = true,
+          ["team.answer_group"] = true,
+        },
+      })
+      setup(t, "old-service", service, dir)
+      local notices = capture(t)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the bound team")
+      -- hello's workflow cache warm-up already noticed the old service.
+      wait(function()
+        return team().old_service == true
+      end, 5000, "the old-service flag")
+      local function warnings()
+        local n = 0
+        for _, note in ipairs(notices) do
+          if note.message:find("too old", 1, true) then
+            n = n + 1
+          end
+        end
+        return n
+      end
+      t.eq(1, warnings(), "the version hint is shown once")
+
+      local function call(fn)
+        local done, ok, value = false, nil, nil
+        fn(function(result, result_value)
+          done, ok, value = true, result, result_value
+        end)
+        wait(function()
+          return done
+        end, 5000, "the old-service call")
+        return ok, value
+      end
+      local ok, value = call(function(cb)
+        team():workflows(dir, cb)
+      end)
+      t.eq(false, ok)
+      t.match("too old", value.message)
+      t.match(":Ade service stop", value.message)
+      t.eq(1, warnings(), "still one hint")
+      ok, value = call(function(cb)
+        team():start("t1", "dev", nil, cb)
+      end)
+      t.eq(false, ok)
+      t.match("too old", value.message)
+
+      -- The board cache does not retry a method the service does not have.
+      team():request_board("t1")
+      vim.wait(150)
+      service:emit_team_board_changed("t1", 2)
+      vim.wait(200)
+      t.eq(0, #service.team_board_requests, "no board request against an api-5 service")
+    end)
+  end)
+
   t.describe("W0e completion", function()
     t.it("completes the team subcommands and workflow names", function()
       local complete = vim.fn.getcompletion("Ade team ", "cmdline")

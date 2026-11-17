@@ -605,26 +605,6 @@ impl Mcp {
             // role's tool.
             "board_update" => ("bus.board_update", arguments),
             "card_update" => ("bus.card_update", arguments),
-            "workflow_save" if leader => {
-                let mut call = json!({
-                    "workflow": arguments.get("workflow"),
-                    "replace": arguments.get("replace"),
-                });
-                if let Some(scope) = arguments.get("scope") {
-                    call["scope"] = scope.clone();
-                }
-                ("bus.workflow_save", call)
-            }
-            "workflow_get" if leader => {
-                ("bus.workflow_get", json!({ "name": arguments.get("name") }))
-            }
-            "workflow_delete" if leader => {
-                let mut call = json!({ "name": arguments.get("name") });
-                if let Some(scope) = arguments.get("scope") {
-                    call["scope"] = scope.clone();
-                }
-                ("bus.workflow_delete", call)
-            }
             "team_spawn" | "bus_read" | "workflow_save" | "workflow_get" | "workflow_delete" => {
                 return Ok(error_result("this tool is only available to the leader"))
             }

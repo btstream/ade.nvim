@@ -1734,8 +1734,8 @@ fn a_database_error_loading_the_board_marks_it_unavailable() {
 }
 
 #[test]
-fn team_start_reports_a_board_that_cannot_be_written() {
-    let fixture = Fixture::new("restart-start-board-error");
+fn team_start_skips_an_unavailable_board_and_still_notifies() {
+    let fixture = Fixture::new("restart-start-board-unavailable");
     let mut server = fixture.start("a", &[]);
     let mut client = fixture.connect(&server);
     fixture.configure(&mut client, &fixture.work, &server, true);
@@ -1749,6 +1749,7 @@ fn team_start_reports_a_board_that_cannot_be_written() {
     Fixture::shutdown(&mut server);
     drop(server);
 
+    // A board that cannot be read is shown as unavailable and refuses writes.
     {
         let conn = rusqlite::Connection::open(database_path(&fixture)).expect("database");
         conn.execute(
@@ -1784,29 +1785,35 @@ fn team_start_reports_a_board_that_cannot_be_written() {
     assert_eq!(bound["result"]["team"]["id"], team, "{bound}");
     wait_active(&mut second, &team);
 
-    // Step 4 cannot write the board: the call fails instead of pretending the
-    // workflow was recorded, and the error is the board's.
+    // 19.7 step 4: skipping the board write must not fail the start or drop the
+    // leader notice.
     let started = second.request(3, "team.start", json!({"team": team, "workflow": "flow"}));
-    assert_eq!(started["error"]["code"], -32061, "{started}");
-    assert!(
-        started["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("board unavailable")),
-        "{started}"
+    assert!(started["result"].is_object(), "{started}");
+    assert_eq!(started["result"]["started"], json!(["w1"]), "{started}");
+    assert_eq!(started["result"]["workflow"], "flow", "{started}");
+    wait_for(
+        || {
+            let read = second.request(
+                4,
+                "team.read",
+                json!({"team": team, "participant": "leader"}),
+            );
+            read["result"]["messages"]
+                .as_array()
+                .is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message["kind"] == "notice"
+                            && message["body"]
+                                .as_str()
+                                .is_some_and(|body| body.contains("流程：flow"))
+                    })
+                })
+                .then_some(())
+        },
+        "the team.start notice",
     );
-    // The member was started before step 4; it must still be visible.
-    wait_active(&mut second, &team);
-    let listed = second.request(4, "team.list", json!({}));
-    let participants = listed["result"]["teams"]
-        .as_array()
-        .and_then(|teams| teams.iter().find(|entry| entry["id"] == team.as_str()))
-        .and_then(|entry| entry["participants"].as_array())
-        .cloned()
-        .expect("participants");
-    assert!(
-        participants.iter().any(|entry| entry["name"] == "w1"),
-        "{participants:?}"
-    );
+    let board = second.request(5, "team.board", json!({"team": team}));
+    assert_eq!(board["result"]["board"]["unavailable"], true, "{board}");
 
     Fixture::shutdown(&mut restarted);
 }

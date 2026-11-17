@@ -189,6 +189,9 @@ end
 
 ---A service restart leaves teams suspended until their leader session returns.
 function Team:on_hello()
+  -- A new handshake may be a newer service.
+  self.old_service = false
+  self.warned_old_service = false
   self:forget_connection()
   local cwd = self.resolve_cwd and self.resolve_cwd() or nil
   if cwd then
@@ -642,6 +645,9 @@ end
 
 ---Fetch the board of every known team whose cached revision is stale (19.2).
 function Team:_sync_boards()
+  if self.old_service then
+    return
+  end
   for id, team in pairs(self.teams) do
     local rev = tonumber(team.board_rev)
     if rev ~= nil then
@@ -671,6 +677,11 @@ end
 function Team:request_board(team_id, cb)
   cb = cb or function() end
   if type(team_id) ~= "string" then
+    cb(false, nil)
+    return
+  end
+  if self.old_service then
+    -- An api-5 service has no team.board; never retry it in a loop.
     cb(false, nil)
     return
   end
@@ -796,9 +807,9 @@ function Team:on_board_changed_payload(payload)
   if type(team_id) ~= "string" then
     return
   end
-  if not self.teams[team_id] then
-    -- A late notification for a closed (or not yet listed) team: do not
-    -- recreate its cache entry or fetch a board that no longer exists.
+  if self.old_service or not self.teams[team_id] then
+    -- An api-5 service has no board, and a late notification for a closed (or
+    -- not yet listed) team must not recreate its cache entry.
     return
   end
   local entry = self.boards[team_id]
@@ -848,6 +859,30 @@ function Team:participant(team_id, name)
   end
 end
 
+---Methods that only exist at api_version 6 (19.5/19.7). An older service
+---answers -32601 for them; that is a version problem, not a bug in the call.
+local NEW_METHODS = {
+  ["team.start"] = true,
+  ["team.answer_group"] = true,
+  ["team.board"] = true,
+  ["team.card_history"] = true,
+  ["team.workflows"] = true,
+  ["team.workflow_delete"] = true,
+}
+
+---Explain that the running service predates boards/workflows, once.
+function Team:_warn_old_service()
+  if self.warned_old_service then
+    return
+  end
+  self.warned_old_service = true
+  self.notify(
+    "the running service is too old for team boards and workflows; "
+      .. "it restarts automatically when idle, or run :Ade service stop",
+    vim.log.levels.WARN
+  )
+end
+
 ---@param method string
 ---@param params table
 ---@param cb fun(ok: boolean, value: any)|nil
@@ -858,7 +893,20 @@ function Team:_call(method, params, cb)
     return
   end
   local raw = self:_raw()
-  raw:request_tracked(method, params, cb)
+  raw:request_tracked(method, params, function(ok, value)
+    if not ok and type(value) == "table" and value.code == -32601 and NEW_METHODS[method] then
+      self.old_service = true
+      self:_warn_old_service()
+      value = {
+        code = -32601,
+        message = "the running service is too old for "
+          .. method
+          .. "; it restarts automatically when idle, or run :Ade service stop",
+        data = { old_service = true, method = method },
+      }
+    end
+    cb(ok, value)
+  end)
 end
 
 ---@param team string

@@ -45,6 +45,7 @@ Server.__index = Server
 ---  team_answer_group_failed?: table,
 ---  team_card_history?: table, team_card_history_error?: table,
 ---  team_workflow_delete_delay?: integer,
+---  old_service_methods?: table<string, boolean>,
 ---  run_error?: table, uninstall_error?: table, canned_agent?: boolean}|nil
 ---@return FakeService
 function M.new(opts)
@@ -140,6 +141,7 @@ function M.new(opts)
     team_workflows_error = opts.team_workflows_error,
     team_workflow_delete_error = opts.team_workflow_delete_error,
     team_workflow_delete_delay = opts.team_workflow_delete_delay or 5,
+    old_service_methods = opts.old_service_methods or {},
     team_board = opts.team_board,
     team_boards = opts.team_boards,
     team_board_error = opts.team_board_error,
@@ -298,6 +300,10 @@ function Server:dispatch(message, client)
   local params = type(message.params) == "table" and message.params or {}
   if method then
     self.calls[#self.calls + 1] = { method = method, params = params, id = ident }
+    if self.old_service_methods[method] then
+      -- An api-5 service: the method does not exist.
+      return error_reply(ident, -32601, "method not found")
+    end
   end
   if method == "hello" then
     if self.wrong_token or params.token ~= self.token then

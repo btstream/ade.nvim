@@ -39,7 +39,7 @@ they do not change what is written here.
 `-> {token, client, client_version, api_version}`
 `<- {server_version, api_version, features}`
 
-`api_version` is `5`. `features` contains `"tunnel"`, `"policy"` (section 17),
+`api_version` is `6`. `features` contains `"tunnel"`, `"policy"` (section 17),
 `"teams"` (section 18),
 `"install"` on unix (section 16), and `"log"` when the event log is enabled (section 10). Errors are unchanged:
 `-32001` bad token (connection closed), `-32002` incompatible api_version with
