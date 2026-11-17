@@ -48,7 +48,7 @@ function M.card_text(card, states)
   if #fields > 0 then
     suffix = "  " .. table.concat(fields, " ", 1, math.min(2, #fields))
   end
-  return string.format("%s %s · %s%s%s", tostring(card.id), one_line(card.title), owner, state, suffix)
+  return string.format("%s %s · %s%s%s", one_line(card.id), one_line(card.title), owner, state, suffix)
 end
 
 ---@param board table

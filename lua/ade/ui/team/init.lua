@@ -265,7 +265,8 @@ function Dashboard:render_tab(tab)
         .. " · 看板 rev "
         .. tostring((self:board(team) or {}).rev or "?")
       vim.wo[tab.panels.inbox].winbar = string.format(" 收件箱 %d", #rendered.inbox)
-      vim.wo[tab.panels.detail].winbar = self:title(team) .. " · " .. self:workflow_line(team)
+      local title = self:title(team) .. " · " .. self:workflow_line(team)
+      vim.wo[tab.panels.detail].winbar = title:gsub("%%", "%%%%")
     end)
   end
   return rendered
@@ -325,7 +326,11 @@ function Dashboard:update_detail()
     if self.tab.active == "detail" then
       return
     end
-    local lines = self:detail_lines()
+    local ok, lines = pcall(self.detail_lines, self)
+    if not ok then
+      vim.notify("team dashboard detail: " .. tostring(lines), vim.log.levels.ERROR)
+      lines = { "dashboard error: " .. tostring(lines) }
+    end
     self.tab:set_lines("detail", lines)
     if self.tab.panels.detail and vim.api.nvim_win_is_valid(self.tab.panels.detail) then
       local info = self:layout_current()
@@ -335,8 +340,10 @@ function Dashboard:update_detail()
         vim.api.nvim_win_set_cursor(win, { math.min(1, count), 0 })
       end)
       if info then
+        local team = self:current_team()
         pcall(function()
-          vim.wo[win].winbar = " 详情"
+          local title = self:title(team) .. " · " .. self:workflow_line(team)
+          vim.wo[win].winbar = title:gsub("%%", "%%%%")
         end)
       end
     end
@@ -941,16 +948,16 @@ function Dashboard:mount_leader()
     return
   end
   local panel = self.panel and self.panel() or nil
-  local original_tab = vim.api.nvim_get_current_tabpage()
-  if chat.win and vim.api.nvim_win_is_valid(chat.win) then
+  local was_visible = chat.win ~= nil and vim.api.nvim_win_is_valid(chat.win)
+  local original_tab = nil
+  if was_visible then
     original_tab = vim.api.nvim_win_get_tabpage(chat.win)
   end
   if panel then
     -- Closes the original chat/input windows without losing drafts.
     panel:hide()
-    -- While mounted these buffers are on screen, so `:Ade hide` is the only
-    -- thing that may clear this flag and keep them hidden on unmount.
-    panel.requested = true
+    -- A previously hidden panel stays hidden after unmount.
+    panel.requested = was_visible
   end
   -- `panel:hide()` may focus the tab that held the old windows.
   if self.tab and self.tab:is_open() then
@@ -992,9 +999,6 @@ function Dashboard:mount_leader()
       end
     end,
   })
-  pcall(function()
-    vim.wo[chat_win].winbar = " leader · 对话"
-  end)
   vim.api.nvim_set_current_win(input_win)
 end
 

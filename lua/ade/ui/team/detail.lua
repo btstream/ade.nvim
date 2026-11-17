@@ -94,7 +94,7 @@ function M.participant(team, name, board)
   for _, card in ipairs(board and board.cards or {}) do
     if card.owner == name and not card.archived then
       found = found + 1
-      lines[#lines + 1] = "  " .. tostring(card.id) .. " " .. tostring(card.title)
+      lines[#lines + 1] = "  " .. one_line(card.id) .. " " .. one_line(card.title)
     end
   end
   if found == 0 then
@@ -109,10 +109,10 @@ function M.inbox(item)
   local lines = {
     string.format(
       "%s %s · %s · from %s",
-      tostring(item.kind),
-      tostring(item.id),
-      tostring(item.state),
-      tostring(item.from)
+      one_line(item.kind),
+      one_line(item.id),
+      one_line(item.state),
+      one_line(item.from)
     ),
     "",
   }

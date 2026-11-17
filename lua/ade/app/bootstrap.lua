@@ -859,6 +859,9 @@ function M.build(ctx, opts, action)
     end,
   })
 
+  if S.view.team_ui then
+    pcall(S.view.team_ui.close, S.view.team_ui)
+  end
   S.view.team_ui = TeamUI.new({
     team = S.view.team,
     config = cfg,

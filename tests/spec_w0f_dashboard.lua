@@ -410,6 +410,29 @@ return function(t)
         updated_at = 1,
       })
       t.falsy(detail[1]:find("\n", 1, true), detail[1])
+      local inbox_detail =
+        Detail.inbox({ kind = "question", id = "i1", state = "open", from = "w1\nsecond", body = "a\nb" })
+      t.falsy(inbox_detail[1]:find("\n", 1, true), inbox_detail[1])
+      local member_detail = Detail.participant(
+        {
+          participants = {
+            {
+              name = "w1",
+              state = "idle",
+              task = "T\n1",
+              activity = { text = "a\nb" },
+              turns = { task = 0, total = 0 },
+            },
+          },
+        },
+        "w1",
+        {
+          cards = { { id = "T1", title = "title\nsecond", owner = "w1" } },
+        }
+      )
+      for _, line in ipairs(member_detail) do
+        t.falsy(line:find("\n", 1, true), line)
+      end
     end)
 
     t.it("board lines align mixed widths and support scroll, unavailable and empty", function()
@@ -577,6 +600,89 @@ return function(t)
           and vim.api.nvim_win_get_buf(input.win) == input.buf
           and not UI._impl.leader_mounted
       end, 5000, "the chat restored to the panel")
+    end)
+
+    t.it("closing the dashboard as the last tab keeps a normal window", function()
+      wide(t)
+      local service, dir = start_service(t, "last-tab")
+      setup(t, "last-tab", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      vim.cmd("tabonly")
+      vim.api.nvim_set_current_win(UI.tab.panels.members)
+      vim.api.nvim_feedkeys("q", "x", false)
+      wait(function()
+        return UI.tab == nil
+      end, 5000, "the closed dashboard")
+      t.truthy(#vim.api.nvim_list_wins() >= 1, "a normal window remains")
+      t.truthy(vim.api.nvim_win_is_valid(vim.api.nvim_get_current_win()))
+    end)
+
+    t.it("closing one dashboard pane closes the whole dashboard", function()
+      wide(t)
+      local service, dir = start_service(t, "zombie")
+      setup(t, "zombie", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      vim.api.nvim_win_close(UI.tab.panels.inbox, true)
+      wait(function()
+        return UI.tab == nil
+      end, 5000, "the whole dashboard closing")
+      t.truthy(#vim.api.nvim_list_wins() >= 1)
+    end)
+
+    t.it("a hidden panel stays hidden after a leader mount", function()
+      wide(t)
+      local service, dir = start_service(t, "hidden-leader")
+      setup(t, "hidden-leader", service, dir)
+      controller.connect()
+      wait_ready()
+      controller.open()
+      local chat = controller.state().view.chat
+      wait(function()
+        return chat.win ~= nil
+      end, 5000, "the main panel")
+      controller.hide()
+      wait(function()
+        return chat.win == nil
+      end, 5000, "the hidden panel")
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      local leader_line
+      for index, id in pairs(UI.tab.ids.members or {}) do
+        if id == "t1|leader" then
+          leader_line = index
+        end
+      end
+      t.truthy(leader_line)
+      vim.api.nvim_set_current_win(UI.tab.panels.members)
+      vim.api.nvim_win_set_cursor(UI.tab.panels.members, { leader_line, 0 })
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+      wait(function()
+        return UI._impl.leader_mounted ~= nil
+      end, 5000, "the leader mount")
+      vim.api.nvim_set_current_win(UI.tab.panels.members)
+      vim.api.nvim_feedkeys("q", "x", false)
+      wait(function()
+        return UI._impl.leader_mounted == nil
+      end, 5000, "the unmounted leader")
+      t.eq(nil, chat.win, "a hidden panel is not reopened")
     end)
 
     t.it("the narrow float keeps the group A key", function()

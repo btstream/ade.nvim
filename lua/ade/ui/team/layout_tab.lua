@@ -21,6 +21,7 @@ function M.new(dashboard)
     active = "members",
     watch_win = nil,
     group = nil,
+    closing = false,
   }, Tab)
 end
 
@@ -130,6 +131,25 @@ function Tab:open()
       end)
     end,
   })
+  vim.api.nvim_create_autocmd("WinClosed", {
+    group = self.group,
+    callback = function(args)
+      local closed = tonumber(args.match)
+      if self.closing then
+        return
+      end
+      for _, name in ipairs(PANELS) do
+        if self.panels[name] == closed then
+          vim.schedule(function()
+            if not self.closing then
+              self.dashboard:close(true)
+            end
+          end)
+          return
+        end
+      end
+    end,
+  })
   vim.api.nvim_create_autocmd("TabClosed", {
     group = self.group,
     callback = function()
@@ -152,16 +172,16 @@ function Tab:resize()
     return
   end
   local width = vim.o.columns
-  if self.watch_win and vim.api.nvim_win_is_valid(self.watch_win) then
-    pcall(vim.api.nvim_win_set_width, self.watch_win, math.floor(width * 0.42))
+  local watch = self.watch_win and vim.api.nvim_win_is_valid(self.watch_win)
+  local left = watch and math.floor(width * 0.30) or math.floor(width * 0.40)
+  if self.panels.members and vim.api.nvim_win_is_valid(self.panels.members) then
+    pcall(vim.api.nvim_win_set_width, self.panels.members, left)
   end
-  if not (self.watch_win and vim.api.nvim_win_is_valid(self.watch_win)) then
-    if self.panels.members and vim.api.nvim_win_is_valid(self.panels.members) then
-      pcall(vim.api.nvim_win_set_width, self.panels.members, math.floor(width * 0.4))
-    end
-    if self.panels.inbox and vim.api.nvim_win_is_valid(self.panels.inbox) then
-      pcall(vim.api.nvim_win_set_width, self.panels.inbox, math.floor(width * 0.4))
-    end
+  if self.panels.inbox and vim.api.nvim_win_is_valid(self.panels.inbox) then
+    pcall(vim.api.nvim_win_set_width, self.panels.inbox, left)
+  end
+  if watch then
+    pcall(vim.api.nvim_win_set_width, self.watch_win, math.floor(width * 0.34))
   end
   if self.panels.detail and vim.api.nvim_win_is_valid(self.panels.detail) then
     pcall(
@@ -186,7 +206,13 @@ function Tab:refresh()
   if not self:is_open() then
     return
   end
-  local rendered = self.dashboard:render_tab(self)
+  local ok, rendered = pcall(self.dashboard.render_tab, self.dashboard, self)
+  if not ok then
+    local message = "dashboard error: " .. tostring(rendered)
+    vim.notify(message, vim.log.levels.ERROR)
+    rendered =
+      { members = { message }, inbox = { message }, board = { message }, detail = { message }, meta = {}, ids = {} }
+  end
   self.meta = rendered.meta
   self.ids = rendered.ids
   self.last_lines = self.last_lines or {}
@@ -297,6 +323,8 @@ end
 function Tab:close()
   local original = self.original_tab
   local tab = self.tab
+  local panels = self.panels
+  self.closing = true
   self.tab, self.original_tab = nil, nil
   self.panels, self.buffers, self.meta, self.ids = {}, {}, {}, {}
   self.last_lines = {}
@@ -305,12 +333,31 @@ function Tab:close()
     pcall(vim.api.nvim_del_augroup_by_id, self.group)
     self.group = nil
   end
+  local tabs = vim.api.nvim_list_tabpages()
   if tab and vim.api.nvim_tabpage_is_valid(tab) then
-    pcall(vim.cmd, "tabclose " .. vim.api.nvim_tabpage_get_number(tab))
+    if #tabs > 1 then
+      pcall(vim.cmd, "tabclose " .. vim.api.nvim_tabpage_get_number(tab))
+    else
+      -- Closing the last tab is E784. Close only the dashboard windows and
+      -- keep one normal window alive.
+      local current = vim.api.nvim_get_current_win()
+      for _, win in ipairs(panels) do
+        if win and vim.api.nvim_win_is_valid(win) and #vim.api.nvim_list_wins() > 1 then
+          pcall(vim.api.nvim_win_close, win, true)
+        end
+      end
+      if current and vim.api.nvim_win_is_valid(current) then
+        pcall(vim.api.nvim_set_current_win, current)
+      end
+    end
   end
   if original and vim.api.nvim_tabpage_is_valid(original) then
     pcall(vim.api.nvim_set_current_tabpage, original)
   end
+  if #vim.api.nvim_list_wins() == 0 then
+    vim.cmd("enew")
+  end
+  self.closing = false
 end
 
 M.Tab = Tab

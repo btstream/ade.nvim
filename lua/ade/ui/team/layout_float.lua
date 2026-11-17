@@ -6,6 +6,7 @@
 local Watch = require("ade.ui.team.watch")
 local Board = require("ade.ui.team.board")
 local Detail = require("ade.ui.team.detail")
+local Inbox = require("ade.ui.team.inbox")
 
 local M = {}
 
@@ -190,22 +191,9 @@ function Panel:lines()
         items[#items + 1] = item
       end
     end
-    table.sort(items, function(a, b)
-      return tostring(a.id) < tostring(b.id)
-    end)
-    for _, item in ipairs(items) do
-      if item.state == "open" then
-        add(
-          string.format(
-            "   inbox %-10s %-10s from %-10s %s",
-            tostring(item.id),
-            tostring(item.kind),
-            tostring(item.from),
-            (tostring(item.body or ""):gsub("%s+", " ")):sub(1, 60)
-          ),
-          "item:" .. tostring(item.id)
-        )
-      end
+    local inbox_lines, inbox_ids = Inbox.lines(team, items, math.max(50, vim.o.columns - 8))
+    for index, text in ipairs(inbox_lines) do
+      add("   inbox " .. text, inbox_ids[index])
     end
     local board = self.team:board(team.id)
     if board then
@@ -326,12 +314,6 @@ function Panel:open()
     else
       self:notify("the leader chat window is not open")
     end
-  end)
-  self:map("]t", function()
-    self.team:refresh()
-  end)
-  self:map("[t", function()
-    self.team:refresh()
   end)
   self:map("p", function()
     self:control_current("pause")
