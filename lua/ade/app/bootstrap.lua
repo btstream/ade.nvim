@@ -24,6 +24,8 @@ local AgentManagerUI = require("ade.ui.agent_manager")
 local Sessions = require("ade.app.sessions")
 local Prompts = require("ade.app.prompts")
 local PermissionPolicy = require("ade.service.policy")
+local Team = require("ade.app.team")
+local TeamUI = require("ade.ui.team")
 local Auth = require("ade.app.auth")
 local Connection = require("ade.app.connection")
 local Panel = require("ade.ui.panel")
@@ -339,6 +341,45 @@ function M.build(ctx, opts, action)
       return S.view.input
     end,
   })
+  -- Teams (PROTOCOL.md 18). Created before sessions because session/new,
+  -- session/load and session/resume ask it for the leader's MCP server.
+  S.view.team = Team.new({
+    config = function()
+      return S.config or merged
+    end,
+    connection = function()
+      return S.conn.service
+    end,
+    resolve_cwd = ctx.resolve_cwd,
+    store = function()
+      return S.conn.store
+    end,
+    notify = notify,
+    on_changed = function()
+      if S.view.team_ui then
+        S.view.team_ui:refresh()
+      end
+      ctx.refresh_chrome()
+    end,
+    on_watch = function(session, title)
+      if S.view.team_ui then
+        S.view.team_ui:watch(session, title)
+      end
+    end,
+    runtime = function()
+      return S.sess.runtime
+    end,
+    on_turn = function(session)
+      if session == S.sess.current and S.view.chat then
+        S.view.chat:schedule_render()
+      end
+    end,
+  })
+  if merged.teams and merged.teams.enabled then
+    vim.schedule(function()
+      notify("teams.enabled (pre-built teams) is not supported yet; start a team from chat", vim.log.levels.WARN)
+    end)
+  end
   S.sess.service = Sessions.new({
     config = cfg,
     runtime = function()
@@ -384,6 +425,15 @@ function M.build(ctx, opts, action)
       S.conn.creating_session = value
     end,
     prune = ctx.prune_sessions,
+    -- Teams (PROTOCOL.md 18.2): the leader's MCP server goes in before
+    -- session/new|load|resume, and the leader is bound after the response.
+    before_session = function(cwd, client)
+      local instance = client and client.proc and client.proc.instance or nil
+      return S.view.team:leader_server(instance, cwd)
+    end,
+    after_session = function(cwd, session_id, instance)
+      return S.view.team:bind_leader(instance, session_id, cwd)
+    end,
     -- PROTOCOL.md 13: the adoption notification precedes the committed replay,
     -- so it is deferred until the session exists, then applied from here.
     session_ready = function(session)
@@ -638,6 +688,9 @@ function M.build(ctx, opts, action)
     if S.conn.policy then
       pcall(S.conn.policy.reconcile, S.conn.policy, true)
     end
+    if S.view.team then
+      pcall(S.view.team.on_hello, S.view.team)
+    end
   end)
   S.view.agent_manager = AgentManagerUI.new({
     manager = S.view.agent_manager_service,
@@ -681,6 +734,7 @@ function M.build(ctx, opts, action)
     add_block = ctx.add_system_block,
     prune = ctx.prune_sessions,
     adoption = S.conn.adoption,
+    team = S.view.team,
     on_exit = function(payload)
       return S.conn.service:lost(payload)
     end,
@@ -798,6 +852,11 @@ function M.build(ctx, opts, action)
       ctx.update_chat_title()
       ctx.refresh_chrome()
     end,
+  })
+
+  S.view.team_ui = TeamUI.new({
+    team = S.view.team,
+    config = cfg,
   })
 
   S.view.chat = Chat.new({ config = merged })

@@ -46,6 +46,11 @@ function Sessions.new(opts)
     on_changed = opts.on_changed,
     on_replaying = opts.on_replaying,
     on_creating = opts.on_creating,
+    -- Teams (PROTOCOL.md 18.2): inject the leader MCP server before the
+    -- session request and bind afterwards. Returning nil keeps single-agent
+    -- behaviour byte-for-byte.
+    before_session = opts.before_session,
+    after_session = opts.after_session,
     prune = opts.prune,
     notify = opts.notify,
     creating = false,
@@ -55,6 +60,33 @@ end
 
 function Sessions:ready()
   return self.connection() == "ready" and self.get_client() ~= nil
+end
+
+---Extra MCP servers for the leader's session request, if teams are active.
+---@param client table
+---@param cwd string
+---@return table|nil
+function Sessions:team_mcp(client, cwd)
+  if not self.before_session then
+    return nil
+  end
+  local server = self.before_session(cwd, client)
+  if type(server) ~= "table" then
+    return nil
+  end
+  return { server }
+end
+
+---Bind the leader once the session call succeeded.
+---@param client table
+---@param cwd string
+---@param session_id string
+function Sessions:bind_team(client, cwd, session_id)
+  if not self.after_session then
+    return
+  end
+  local instance = client and client.proc and client.proc.instance or nil
+  self.after_session(cwd, session_id, instance)
 end
 
 ---Request a new session from the agent.
@@ -80,7 +112,8 @@ function Sessions:create(on_missing)
   local intent = runtime:intend()
   local token = runtime:expect_create()
   self.run("create", client, nil, function(task)
-    local ok, result = task:call("new_session", cwd)
+    local extra = self:team_mcp(client, cwd)
+    local ok, result = task:call("new_session", cwd, extra)
     if not ok then
       task.status = "failed"
       runtime:drop_create(token)
@@ -100,6 +133,7 @@ function Sessions:create(on_missing)
       runtime:drop_create(token)
       error("invalid session/new response")
     end
+    self:bind_team(client, cwd, result.sessionId)
     local session, replayed = runtime:commit_create(token, result.sessionId, cwd, result)
     if not session then
       runtime:drop_create(token)
@@ -156,7 +190,8 @@ function Sessions:resume(session_id, opts)
   self.replaying = true
   self.on_replaying(true)
   self.run("resume", client, entry, function(task)
-    local ok, result = task:call("resume_session", session_id, cwd)
+    local extra = self:team_mcp(client, cwd)
+    local ok, result = task:call("resume_session", session_id, cwd, extra)
     if not ok then
       task.status = "failed"
       runtime:rollback(entry)
@@ -193,6 +228,7 @@ function Sessions:resume(session_id, opts)
     if type(result) ~= "table" then
       error("invalid session/resume response")
     end
+    self:bind_team(client, cwd, session_id)
     entry:configure(result)
     entry.needs_load = false
     if not runtime:commit(entry) then
@@ -250,7 +286,8 @@ function Sessions:replay(session_id, opts)
   self.replaying = true
   self.on_replaying(true)
   self.run("replay", client, entry, function(task)
-    local ok, result = task:call("load_session", session_id, cwd)
+    local extra = self:team_mcp(client, cwd)
+    local ok, result = task:call("load_session", session_id, cwd, extra)
     if not ok then
       task.status = "failed"
       -- No rollback here: `on_finally` always runs and is the single cleanup
@@ -288,6 +325,7 @@ function Sessions:replay(session_id, opts)
     if type(result) ~= "table" then
       error("invalid session/load response")
     end
+    self:bind_team(client, cwd, session_id)
     entry:configure(result)
     entry:finish_turn("end_turn")
     if not runtime:commit(entry) then

@@ -1011,6 +1011,36 @@ follow_cursor = false 让输入框停在打开时的位置。审查内容随窗�
 审查按结果到达时的 filetype 解析，<C-d> 切换本次模式；同一时间只运行一个请求。
 
 ==============================================================================
+23b. 团队（teams，实验性）                                *ade-teams*
+
+服务声明 teams 能力（0.6.0+）时，主 agent 可以在聊天里用 team_spawn 组建小团队：
+worker 通过服务总线传消息，人在收件箱里审批/回答。团队运行在服务里，Neovim 退出后继续；
+服务重启后所有团队结束（本阶段不做恢复）。
+
+    teams = {
+      spawn_from_chat = true,        -- 允许主 agent 从聊天里组建团队
+      max_workers = 3,               -- 每个 leader 最多 3 个 worker（1..8）
+      spawn_confirm = { auto = {} }, -- 列出的模板无需人工确认
+      limits = { max_turns_per_task = 30, max_turns_total = 200 },
+      templates = {
+        reviewer = {
+          agent = "claude",          -- 必须是已配置的 agent
+          role = "Review the diff and report with bus_send(kind=\"report\").",
+          model = nil,
+        },
+      },
+    }
+
+每次 team_spawn 默认需要确认；加入 spawn_confirm.auto 才自动放行。worker 的问题、
+spawn、权限请求、一般 request、消息和回合上限都会进入收件箱（team.inbox 通知一次）。
+
+    :Ade team      团队面板；没有团队时不显示
+
+面板按键：m 发消息、p/r/c 暂停/恢复/取消、w 只读查看 worker 转录（重放+实时）、
+a 回答收件箱项、R 重置回合上限、x 结束团队、g? 帮助、q 关闭。
+直连/旧服务/spawn_from_chat=false 时不注入 team MCP server，单 agent 行为不变。
+
+==============================================================================
 24. 服务后端（nvim_ade_server）                          *ade-service*
 
 Agent 可以交给 Rust 后台服务 nvim_ade_server 持有，这样 Neovim 退出后 agent 继续运行，

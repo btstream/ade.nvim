@@ -35,6 +35,7 @@ Server.__index = Server
 ---  install_fail?: boolean, install_log?: string, install_delay_ms?: integer,
 ---  install_busy?: boolean, uninstall_busy?: boolean, resolve_delay_ms?: integer,
 ---  policy_delay_ms?: integer, policy_error?: table,
+---  teams?: table, team_watch?: table,
 ---  run_error?: table, uninstall_error?: table, canned_agent?: boolean}|nil
 ---@return FakeService
 function M.new(opts)
@@ -96,6 +97,14 @@ function M.new(opts)
     pending_installs = {},
     -- PROTOCOL.md 17: recorded rule sets, keyed by name.
     policy_sets = {},
+    -- PROTOCOL.md 18: canned team state and the last configure/bind payloads.
+    teams = opts.teams or {},
+    team_configures = {},
+    team_binds = {},
+    team_sends = {},
+    team_answers = {},
+    team_watch = opts.team_watch,
+    team_counter = 0,
     policy_responses = 0,
     policy_before_prompt = nil,
     -- Answer ACP requests with canned replies instead of spawning a child. Used
@@ -305,6 +314,122 @@ function Server:dispatch(message, client)
     return reply
   end
 
+  if method == "team.configure" then
+    self.team_configures[#self.team_configures + 1] = vim.deepcopy(params)
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
+    end, 5)
+    return nil
+  end
+  if method == "team.leader_server" then
+    local result = {
+      server = {
+        name = "ade-team",
+        command = "/fake/nvim_ade_server",
+        args = { "mcp" },
+        env = { { name = "ADE_TEAM_TOKEN", value = "k-test-token" } },
+      },
+      token_id = "k1",
+    }
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = result })
+    end, 5)
+    return nil
+  end
+  if method == "team.bind_leader" then
+    self.team_binds[#self.team_binds + 1] = vim.deepcopy(params)
+    local team = {
+      id = "t1",
+      cwd = params.cwd or "/",
+      state = "active",
+      leader = { instance = params.instance, sessionId = params.sessionId },
+      participants = {},
+      inbox = {},
+      limits = { max_workers = 3, max_turns_per_task = 30, max_turns_total = 200, turns_total = 0 },
+    }
+    if not self.teams.t1 then
+      self.teams.t1 = team
+    end
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = { team = self.teams.t1 } })
+    end, 5)
+    return nil
+  end
+  if method == "team.list" then
+    local teams = {}
+    for _, team in pairs(self.teams) do
+      teams[#teams + 1] = vim.deepcopy(team)
+    end
+    table.sort(teams, function(a, b)
+      return a.id < b.id
+    end)
+    return { jsonrpc = "2.0", id = ident, result = { teams = teams } }
+  end
+  if method == "team.send" then
+    self.team_sends[#self.team_sends + 1] = vim.deepcopy(params)
+    self.team_counter = self.team_counter + 1
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = { id = self.team_counter } })
+    end, 5)
+    return nil
+  end
+  if method == "team.read" then
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = { messages = {}, turns = {} } })
+    end, 5)
+    return nil
+  end
+  if method == "team.answer" then
+    self.team_answers[#self.team_answers + 1] = vim.deepcopy(params)
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
+    end, 5)
+    return nil
+  end
+  if method == "team.watch" then
+    local watch = self.team_watch or {}
+    local instance = watch.instance or "inst-1"
+    local session_id = watch.sessionId or "watch-session"
+    for _, update in ipairs(watch.replay or {}) do
+      self:send(client, {
+        jsonrpc = "2.0",
+        method = "tunnel.recv",
+        params = {
+          instance = instance,
+          seq = 1,
+          message = { jsonrpc = "2.0", method = "session/update", params = { sessionId = session_id, update = update } },
+        },
+      })
+    end
+    vim.defer_fn(function()
+      self:send(client, {
+        jsonrpc = "2.0",
+        id = ident,
+        result = {
+          instance = instance,
+          sessionId = session_id,
+          replayed = watch.replayed ~= false and #(watch.replay or {}) > 0,
+        },
+      })
+    end, 5)
+    return nil
+  end
+  if method == "team.unwatch" or method == "team.reset_limits" then
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
+    end, 5)
+    return nil
+  end
+  if method == "team.close" then
+    local team = self.teams[params.team]
+    if team then
+      team.state = "closed"
+    end
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
+    end, 5)
+    return nil
+  end
   if method == "policy.set" then
     if self.policy_error then
       return error_reply(ident, self.policy_error.code or -32050, self.policy_error.message or "invalid rule set")
@@ -874,6 +999,42 @@ function Server:drop(client)
       client.peer:close()
     end)
   end
+end
+
+---Send a team.changed notification to every live connection (18.9).
+---@param team table
+function Server:team_changed(team)
+  self.teams[team.id] = team
+  self:broadcast("team.changed", { team = team })
+end
+
+---Send a team.inbox notification to every live connection (18.9).
+---@param item table
+function Server:team_inbox(item)
+  self:broadcast("team.inbox", { item = item })
+end
+
+---Send one `_ade/turn_started` to the attached connection of an instance.
+---@param instance string
+---@param params table
+function Server:turn_started(instance, params)
+  self:broadcast("tunnel.recv", {
+    instance = instance,
+    seq = 1,
+    message = { jsonrpc = "2.0", method = "_ade/turn_started", params = params },
+  })
+end
+
+---Send one live `session/update` for a watched/attached instance.
+---@param instance string
+---@param sessionId string
+---@param update table
+function Server:watch_update(instance, sessionId, update)
+  self:broadcast("tunnel.recv", {
+    instance = instance,
+    seq = 1,
+    message = { jsonrpc = "2.0", method = "session/update", params = { sessionId = sessionId, update = update } },
+  })
 end
 
 ---Announce a policy decision the way the service does (PROTOCOL.md 17.4).

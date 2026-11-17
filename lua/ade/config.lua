@@ -118,6 +118,17 @@ M.defaults = {
   -- advertise support for are dropped rather than sent and rejected.
   mcp_servers = {},
 
+  -- Teams (PROTOCOL.md section 18). S4b supports teams started from chat;
+  -- `enabled` (pre-built teams) is S4c and is rejected with a notice.
+  teams = {
+    enabled = false,
+    spawn_from_chat = true,
+    max_workers = 3,
+    spawn_confirm = { auto = {} },
+    limits = { max_turns_per_task = 30, max_turns_total = 200 },
+    templates = {},
+  },
+
   completion = {
     native = true, -- keep <C-x><C-u>; external sources are explicitly configured
     max_items = 200, -- native menu only; frameworks/pickers receive the full index
@@ -1069,6 +1080,74 @@ function M.validate(cfg)
       end
     else
       fail('%s.type must be "stdio", "http" or "sse"', where)
+    end
+  end
+
+  local teams = cfg.teams
+  if type(teams) ~= "table" then
+    fail("teams must be a table")
+  end
+  if type(teams.enabled) ~= "boolean" then
+    fail("teams.enabled must be a boolean")
+  end
+  if type(teams.spawn_from_chat) ~= "boolean" then
+    fail("teams.spawn_from_chat must be a boolean")
+  end
+  if
+    type(teams.max_workers) ~= "number"
+    or teams.max_workers % 1 ~= 0
+    or teams.max_workers < 1
+    or teams.max_workers > 8
+  then
+    fail("teams.max_workers must be an integer between 1 and 8")
+  end
+  if type(teams.templates) ~= "table" then
+    fail("teams.templates must be a table")
+  end
+  for name, template in pairs(teams.templates) do
+    if type(name) ~= "string" or not name:match("^[a-z0-9][a-z0-9_%-]*$") or #name > 32 then
+      fail("teams.templates keys must match [a-z0-9][a-z0-9_-]{0,31}, got %s", vim.inspect(name))
+    end
+    local where = "teams.templates." .. name
+    if type(template) ~= "table" then
+      fail("%s must be a table", where)
+    end
+    if type(template.agent) ~= "string" or template.agent == "" then
+      fail("%s.agent must be a non-empty string", where)
+    end
+    if type(cfg.agents[template.agent]) ~= "table" then
+      fail("%s.agent %q is not a configured agent", where, template.agent)
+    end
+    if template.model ~= nil and type(template.model) ~= "string" then
+      fail("%s.model must be a string or nil", where)
+    end
+    if type(template.role) ~= "string" then
+      fail("%s.role must be a string", where)
+    end
+    if #template.role > 16 * 1024 then
+      fail("%s.role is longer than 16 KiB", where)
+    end
+  end
+  local confirm = teams.spawn_confirm
+  if type(confirm) ~= "table" then
+    fail("teams.spawn_confirm must be a table")
+  end
+  if type(confirm.auto) ~= "table" or not vim.islist(confirm.auto) then
+    fail("teams.spawn_confirm.auto must be a list")
+  end
+  for _, name in ipairs(confirm.auto) do
+    if type(name) ~= "string" or teams.templates[name] == nil then
+      fail("teams.spawn_confirm.auto includes unknown template %s", vim.inspect(name))
+    end
+  end
+  local limits = teams.limits
+  if type(limits) ~= "table" then
+    fail("teams.limits must be a table")
+  end
+  for _, key in ipairs({ "max_turns_per_task", "max_turns_total" }) do
+    local value = limits[key]
+    if type(value) ~= "number" or value % 1 ~= 0 or value < 1 then
+      fail("teams.limits.%s must be a positive integer", key)
     end
   end
 

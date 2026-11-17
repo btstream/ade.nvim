@@ -726,6 +726,48 @@ require("ade").setup({
 托管安装损坏时 `auto` 会报错而不是换一个版本运行；想严格禁止 npx 回退时用
 `source = "managed"`。
 
+## 团队（teams，实验性）
+
+服务声明 `teams` 能力（0.6.0+）时，可以在聊天里让主 agent 组建一个小团队：主 agent 用
+`team_spawn` 拉 worker，worker 之间通过服务总线（bus）传消息，人来审批/回答。团队运行在
+服务里，Neovim 退出后继续；服务重启后所有团队结束（本阶段不做恢复）。
+
+```lua
+teams = {
+  spawn_from_chat = true,      -- 允许主 agent 从聊天里组建团队
+  max_workers = 3,             -- 每个 leader 最多 3 个 worker（1..8）
+  spawn_confirm = { auto = {} }, -- 模板名；列在这里的模板无需人工确认
+  limits = { max_turns_per_task = 30, max_turns_total = 200 },
+  templates = {
+    reviewer = {
+      agent = "claude",        -- 必须是已配置的 agent
+      role = "Review the diff and report with bus_send(kind=\"report\").",
+      model = nil,
+    },
+  },
+}
+```
+
+每次 `team_spawn` 默认都要人确认；把模板加进 `spawn_confirm.auto` 才会自动放行。
+worker 的权限请求、提问、spawn 请求等进入 **收件箱**，`team.inbox` 到来时通知一次。
+
+    :Ade team     团队面板（没有团队时不显示）
+
+面板按键（光标所在参与者/收件箱项）：
+
+| 按键 | 动作 |
+|---|---|
+| `m` | 给参与者发消息（`team.send`） |
+| `p` / `r` / `c` | 暂停 / 恢复 / 取消该参与者 |
+| `w` | 只读查看 worker 的转录（`team.watch`，含重放和实时更新） |
+| `a` | 回答光标所在收件箱项（question/spawn/permission/request/message/limit） |
+| `R` | 重置回合数限制（`team.reset_limits`） |
+| `x` | 结束整个团队（`team.close`） |
+| `g?` / `q` | 帮助 / 关闭面板 |
+
+直连模式、旧服务或 `spawn_from_chat = false` 时完全不注入 team MCP server，单 agent 体验
+不变。`teams.enabled`（预建团队）属于后续阶段，配置为 true 会给出“尚未支持”提示。
+
 ## 服务后端（nvim_ade_server）
 
 Agent 可以交给 Rust 后台服务 `nvim_ade_server` 持有，这样 Neovim 退出后 agent 继续工作，

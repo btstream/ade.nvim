@@ -45,6 +45,9 @@ local NAMES = {
   "install.progress",
   -- PROTOCOL.md 17.4: a policy the service applied instead of relaying.
   "policy.applied",
+  -- PROTOCOL.md 18.9: teams state pushed to every connection.
+  "team.changed",
+  "team.inbox",
 }
 
 ---@param opts {paths?: table, timeout?: integer, resolve_binary?: fun(): table|nil,string|nil,
