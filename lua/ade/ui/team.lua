@@ -178,6 +178,7 @@ function Panel:team_of_current()
 end
 
 function Panel:open()
+  self.interacting = false
   if self:is_open() then
     self:refresh()
     return true
@@ -257,7 +258,7 @@ function Panel:open()
         return entry.label
       end,
     }, function(choice)
-      self.interacting = false
+      self:interaction_done()
       if choice and choice.value then
         close_it()
       end
@@ -327,7 +328,24 @@ function Panel:report(ok, value)
   return false
 end
 
+---A UI prompt ended: re-check whether the user left the panel meanwhile.
+function Panel:interaction_done()
+  self.interacting = false
+  vim.schedule(function()
+    if self.interacting or not self:is_open() then
+      return
+    end
+    local current = vim.api.nvim_get_current_win()
+    if current == self.win or (self.watch_win and current == self.watch_win) then
+      return
+    end
+    self:close()
+  end)
+end
+
 function Panel:close()
+  self.interacting = false
+  self.watch_pending = false
   self.team:unwatch()
   self:watch(nil)
   if self.win and vim.api.nvim_win_is_valid(self.win) then
@@ -368,11 +386,13 @@ function Panel:send_current()
       return entry
     end,
   }, function(choice)
-    self.interacting = false
-    choice = choice or "notice"
+    if choice == nil then
+      self:interaction_done()
+      return
+    end
     self.interacting = true
     vim.ui.input({ prompt = choice .. " to " .. name .. ": " }, function(body)
-      self.interacting = false
+      self:interaction_done()
       if not body or body == "" then
         return
       end
@@ -403,14 +423,14 @@ function Panel:answer_current()
   local function select(opts, cb)
     self.interacting = true
     vim.ui.select(opts.items, opts, function(choice)
-      self.interacting = false
+      self:interaction_done()
       cb(choice)
     end)
   end
   local function input(prompt, cb)
     self.interacting = true
     vim.ui.input({ prompt = prompt }, function(text)
-      self.interacting = false
+      self:interaction_done()
       cb(text)
     end)
   end
@@ -529,16 +549,22 @@ function Panel:watch(session, title)
     local group = vim.api.nvim_create_augroup("AdeTeamWatch", { clear = true })
     -- `bufhidden=wipe` wipes this buffer when the user closes the window, so
     -- BufWipeout is the reliable "watch window is gone" event (WinClosed has
-    -- no buffer-local meaning).
+    -- no buffer-local meaning). Capture this view's session/buffer: switching
+    -- workers wipes the old buffer while a newer watch is already current.
+    local watched, wiped = session, self.watch_buf
     vim.api.nvim_create_autocmd("BufWipeout", {
       group = group,
-      buffer = self.watch_buf,
+      buffer = wiped,
       callback = function()
         vim.schedule(function()
-          if not self.watch_buf or not vim.api.nvim_buf_is_valid(self.watch_buf) then
-            self.watch_win, self.watch_buf = nil, nil
-            self.team:unwatch()
+          if self.watch_buf ~= wiped then
+            return
           end
+          if not self.team.watching or self.team.watching.session ~= watched then
+            return
+          end
+          self.watch_win, self.watch_buf = nil, nil
+          self.team:unwatch()
         end)
       end,
     })

@@ -452,6 +452,10 @@ function Server:dispatch(message, client)
         },
       })
     end
+    local delay = 5
+    if type(watch.delays) == "table" then
+      delay = table.remove(watch.delays, 1) or delay
+    end
     vim.defer_fn(function()
       self:send(client, {
         jsonrpc = "2.0",
@@ -462,7 +466,7 @@ function Server:dispatch(message, client)
           replayed = watch.replayed ~= false and #(watch.replay or {}) > 0,
         },
       })
-    end, 5)
+    end, delay)
     return nil
   end
   if method == "team.unwatch" then

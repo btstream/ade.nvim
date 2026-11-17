@@ -39,8 +39,15 @@ function M.new(opts)
     inbox = {},
     -- cwd -> the exact config sent (so a rebuild/hello can re-send it).
     sent_config = {},
+    resolved_config = {},
+    configure_inflight = {},
+    warned_skipped = {},
     pending_bind = {},
-    -- cwd -> {instance, session_id} once this front end's leader is bound.
+    -- instance+cwd -> {instance, cwd, token_id} while a leader token is unused.
+    leader_pending = {},
+    -- cwd -> true while a leader_server request is in flight for this cwd.
+    leader_inflight = {},
+    -- cwd -> {instance, session_id, team} once this front end's leader binds.
     bound = {},
     -- cwd -> true when another session already leads that team (-32061).
     blocked = {},
@@ -115,7 +122,9 @@ end
 function Team:reset()
   self.teams = {}
   self.inbox = {}
-  self.leader_pending = nil
+  self.leader_pending = {}
+  self.leader_inflight = {}
+  self.configure_inflight = {}
   self.bound = {}
   self.blocked = {}
   -- `warned_blocked` / `notified` survive a reconnect: an item or conflict
@@ -179,6 +188,18 @@ function Team:service_config(cwd)
     skipped
 end
 
+---Whether at least one template resolves to a launchable agent.
+---@param cwd string
+---@return boolean
+function Team:has_usable_templates(cwd)
+  local config = self:service_config(cwd)
+  return config ~= nil and next(config.templates or {}) ~= nil
+end
+
+local function pending_key(instance, cwd)
+  return tostring(instance) .. "\0" .. tostring(cwd)
+end
+
 ---Send `team.configure` for a cwd when the resolved config changed.
 ---@param cwd string
 ---@param force boolean|nil
@@ -190,15 +211,41 @@ function Team:configure(cwd, force, cb)
     return
   end
   local config, skipped = self:service_config(cwd)
+  local changed = not vim.deep_equal(config, self.resolved_config[cwd])
+  if changed then
+    -- A new configuration is a fresh reason to explain its broken templates.
+    self.warned_skipped[cwd] = {}
+    self.resolved_config[cwd] = config
+  end
+  local warned = self.warned_skipped[cwd] or {}
   for _, problem in ipairs(skipped or {}) do
-    self.notify("team template skipped: " .. problem, vim.log.levels.WARN)
+    -- The same name+error is announced once per configuration, not on every
+    -- hello/reconcile pass.
+    if not warned[problem] then
+      warned[problem] = true
+      self.notify("team template skipped: " .. problem, vim.log.levels.WARN)
+    end
+  end
+  self.warned_skipped[cwd] = warned
+  if next(config.templates or {}) == nil then
+    -- Every template failed to resolve: behave as if teams were unavailable.
+    self.sent_config[cwd] = nil
+    cb(false, "no usable team templates")
+    return
   end
   if not force and vim.deep_equal(config, self.sent_config[cwd]) then
     cb(true, nil)
     return
   end
+  if self.configure_inflight[cwd] then
+    -- Two hello listeners can race; one request is enough.
+    cb(true, nil)
+    return
+  end
+  self.configure_inflight[cwd] = true
   local raw = self:_raw()
   raw:request_tracked("team.configure", { cwd = cwd, config = config }, function(ok, value)
+    self.configure_inflight[cwd] = nil
     if ok then
       self.sent_config[cwd] = config
     else
@@ -214,8 +261,6 @@ end
 ---@param cwd string
 ---@return table|nil server
 function Team:leader_server(instance, cwd)
-  -- Never bind with a token from an earlier session request.
-  self.leader_pending = nil
   if not self:available() or not instance then
     return nil
   end
@@ -228,38 +273,69 @@ function Team:leader_server(instance, cwd)
   if self.blocked[cwd] then
     return nil
   end
+  -- Concurrent session/new|load|resume for the same cwd must not each ask
+  -- for (and inject) a leader server.
+  if self.leader_inflight[cwd] then
+    return nil
+  end
+  -- Every template failed to resolve: nothing to configure or inject.
+  if not self:has_usable_templates(cwd) then
+    return nil
+  end
+  local key = pending_key(instance, cwd)
+  -- No stale token may bind a session whose request never completed.
+  self.leader_pending[key] = nil
+  local inflight = {}
+  self.leader_inflight[cwd] = inflight
+  local finished = false
+  local function done(server)
+    if not finished then
+      finished = true
+      if self.leader_inflight[cwd] == inflight then
+        self.leader_inflight[cwd] = nil
+      end
+    end
+    return server
+  end
+  -- Backstop if an unexpected error unwinds before `done` runs; the identity
+  -- check keeps a stale finalizer from clearing a newer request.
+  async.finally(function()
+    if self.leader_inflight[cwd] == inflight then
+      self.leader_inflight[cwd] = nil
+    end
+  end)
   -- A reconnect empties `bound`; ask the service who leads this cwd before
   -- injecting a second leader server for the same instance.
-  local listed_ok, listed = async.await(function(done)
+  local listed_ok, listed = async.await(function(settled)
     local raw = self:_raw()
     if not raw then
-      done(false, nil)
+      settled(false, nil)
       return
     end
     raw:request_tracked("team.list", {}, function(ok, value)
-      done(ok, value)
+      settled(ok, value)
     end)
   end)
   if listed_ok and type(listed) == "table" and type(listed.teams) == "table" then
     for _, entry in ipairs(listed.teams) do
       if entry.cwd == cwd and type(entry.leader) == "table" then
         if entry.leader.instance == instance then
-          self.bound[cwd] = { instance = instance, session_id = entry.leader.sessionId }
-          return nil
+          self.bound[cwd] = { instance = instance, session_id = entry.leader.sessionId, team = entry.id }
+          return done(nil)
         end
         self.blocked[cwd] = true
         if not self.warned_blocked[cwd] then
           self.warned_blocked[cwd] = true
           self.notify("a team already exists for this cwd; close it before starting another", vim.log.levels.WARN)
         end
-        return nil
+        return done(nil)
       end
     end
   end
-  local ok, result = async.await(function(done)
+  local ok, result = async.await(function(settled)
     self:configure(cwd, false, function(ok)
       if not ok then
-        done(false, nil)
+        settled(false, nil)
         return
       end
       local raw = self:_raw()
@@ -269,19 +345,19 @@ function Team:leader_server(instance, cwd)
           -- session must not be injected with a leader server.
           self.blocked[cwd] = true
         end
-        done(ok2, value)
+        settled(ok2, value)
       end)
     end)
   end)
   if not ok or type(result) ~= "table" or type(result.server) ~= "table" then
-    return nil
+    return done(nil)
   end
-  self.leader_pending = {
+  self.leader_pending[key] = {
     instance = instance,
     cwd = cwd,
     token_id = result.token_id,
   }
-  return result.server
+  return done(result.server)
 end
 
 ---Bind the leader after session/new|load|resume succeeded.
@@ -289,11 +365,12 @@ end
 ---@param session_id string
 ---@param cwd string
 function Team:bind_leader(instance, session_id, cwd)
-  local pending = self.leader_pending
+  local key = pending_key(instance, cwd)
+  local pending = self.leader_pending[key]
   if not pending or pending.instance ~= instance or pending.cwd ~= cwd then
     return
   end
-  self.leader_pending = nil
+  self.leader_pending[key] = nil
   local raw = self:_raw()
   if not raw then
     return
@@ -346,6 +423,11 @@ function Team:refresh(cb)
         for _, item in ipairs(team.inbox or {}) do
           item.team = item.team or id
           self.inbox[item.id] = item
+          if item.state == "open" then
+            -- Items first seen through refresh were already announced by the
+            -- service; do not notify them again after a reconnect.
+            self.notified[item.id] = item.team
+          end
         end
       end
       self:changed()
@@ -371,6 +453,12 @@ function Team:on_changed_payload(payload)
     for id, item in pairs(self.inbox) do
       if item.team == team.id then
         self.inbox[id] = nil
+        self.notified[id] = nil
+      end
+    end
+    for id, team_id in pairs(self.notified) do
+      if team_id == team.id then
+        self.notified[id] = nil
       end
     end
     -- The team is gone: this instance may lead a new one for the same cwd.
@@ -403,8 +491,8 @@ function Team:on_inbox_payload(payload)
   end
   local fresh = self.inbox[item.id] == nil and item.state == "open"
   self.inbox[item.id] = item
-  if fresh and not self.notified[item.id] then
-    self.notified[item.id] = true
+  if fresh and self.notified[item.id] ~= item.team then
+    self.notified[item.id] = item.team
     local message = string.format("team inbox: %s from %s", tostring(item.kind), tostring(item.from))
     self.notify(message, vim.log.levels.INFO)
   end
@@ -539,9 +627,9 @@ function M.apply_turn_started(session, payload)
   end
   local text = prompt_text(payload)
   local origin = type(payload) == "table" and payload.origin or "bus"
-  session.bus_turn = true
   session.status = "running"
   session.turn = (session.turn or 0) + 1
+  session.bus_turn = session.turn
   session:append({
     id = require("ade.session.state").next_id("bus"),
     kind = "user",
@@ -557,8 +645,13 @@ function M.apply_turn_finished(session, payload)
   if not session or not session.bus_turn then
     return false
   end
+  local bus_turn = session.bus_turn
   session.bus_turn = nil
-  session:finish_turn(type(payload) == "table" and payload.stopReason or "end_turn")
+  -- A person's prompt may have replaced the bus turn while it was cancelling;
+  -- its late finish must not end the user's (newer) turn.
+  if session.turn == bus_turn then
+    session:finish_turn(type(payload) == "table" and payload.stopReason or "end_turn")
+  end
   return true
 end
 
@@ -688,6 +781,15 @@ function Team:watch(team, participant, replay, cb)
     "team.watch",
     { team = team, participant = participant, replay = replay == true },
     function(ok, value)
+      if self.watching ~= entry then
+        -- This watch was superseded/abandoned while its request was in flight.
+        -- Do not touch the newer watch, but release the service-side watch.
+        if ok then
+          raw:request_tracked("team.unwatch", { team = team, participant = participant }, function() end)
+        end
+        cb(ok, value)
+        return
+      end
       if not ok then
         self:unwatch(true)
         cb(false, value)
