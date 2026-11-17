@@ -734,15 +734,30 @@ require("ade").setup({
 
 ```lua
 teams = {
+  enabled = false,             -- true: 新建团队时按 default 定义启动 worker
+  default = "dev",
+  definitions = {
+    dev = {
+      workers = {
+        { name = "w1", template = "coder", task = "T1" },
+        { name = "w2", template = "reviewer" },
+      },
+    },
+  },
   spawn_from_chat = true,      -- 允许主 agent 从聊天里组建团队
   max_workers = 3,             -- 每个 leader 最多 3 个 worker（1..8）
   spawn_confirm = { auto = {} }, -- 模板名；列在这里的模板无需人工确认
   limits = { max_turns_per_task = 30, max_turns_total = 200 },
   templates = {
-    reviewer = {
+    coder = {
       agent = "claude",        -- 必须是已配置的 agent
-      role = "Review the diff and report with bus_send(kind=\"report\").",
+      role = "Implement the task and report with bus_send(kind=\"report\").",
       model = nil,
+      worktree = true,         -- 在独立 git worktree 中运行（默认 false）
+    },
+    reviewer = {
+      agent = "claude",
+      role = "Review the diff and report with bus_send(kind=\"report\").",
     },
   },
 }
@@ -750,6 +765,19 @@ teams = {
 
 每次 `team_spawn` 默认都要人确认；把模板加进 `spawn_confirm.auto` 才会自动放行。
 worker 的权限请求、提问、spawn 请求等进入 **收件箱**，`team.inbox` 到来时通知一次。
+
+`worktree = true` 的模板由服务在
+`stdpath("data")/ade/worktrees/<repo>-<hash8>/<team>-<stamp>-<name>` 创建独立
+worktree（分支 `ade/<team>-<stamp>/<name>`），worker 在其中工作。worktree 只包含
+**已提交**的内容：团队目录有未提交/未跟踪改动时会提示 `dirty_tree`，worker 从最后
+一次提交开始。worker 退出或团队关闭后 worktree 和分支都会保留；用面板 `D` 删除，
+未合并的分支会被保留（可用 force 选项强制删除 worktree）。
+
+`enabled = true` 时，leader 新建团队后前端会按 `default` 定义调用 `team.spawn`；
+只启动 `team.list` 里还没有的名字，因此重连或第二个前端不会重复启动。
+
+服务版本与插件不同且服务里还有团队时，**不会自动重启服务**（挂起的团队除外）：
+先提示“有更新、稍后重启”，需要时用 `:Ade service stop` 手动重启。
 
     :Ade team     团队面板（没有团队时不显示）
 
@@ -760,13 +788,15 @@ worker 的权限请求、提问、spawn 请求等进入 **收件箱**，`team.in
 | `m` | 给参与者发消息（`team.send`） |
 | `p` / `r` / `c` | 暂停 / 恢复 / 取消该参与者 |
 | `w` | 只读查看 worker 的转录（`team.watch`，含重放和实时更新） |
+| `s` | 按模板启动一个 worker（`team.spawn`） |
+| `D` | 删除已退出 worker 的 worktree（确认；可选 force；未合并分支保留） |
 | `a` | 回答光标所在收件箱项（question/spawn/permission/request/message/limit） |
 | `R` | 重置回合数限制（`team.reset_limits`） |
 | `x` | 结束整个团队（`team.close`） |
 | `g?` / `q` | 帮助 / 关闭面板 |
 
 直连模式、旧服务或 `spawn_from_chat = false` 时完全不注入 team MCP server，单 agent 体验
-不变。`teams.enabled`（预建团队）属于后续阶段，配置为 true 会给出“尚未支持”提示。
+不变。worker 行会显示 worktree 分支（`wt ade/...`）。
 
 ## 服务后端（nvim_ade_server）
 

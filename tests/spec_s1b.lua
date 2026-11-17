@@ -726,7 +726,17 @@ return function(t)
         config = function()
           return opts.config or config_with({})
         end,
-        request_sync = function()
+        request_sync = function(method, _, timeout)
+          if method == "team.list" then
+            record.team_list_timeout = timeout
+            if opts.team_list == "timeout" then
+              return false, { code = -32000, message = "timed out" }
+            end
+            if opts.team_list == "unsupported" then
+              return false, { code = -32601, message = "Method not found" }
+            end
+            return true, { teams = opts.teams or {} }
+          end
           if opts.list == "timeout" then
             return false, { code = -32000, message = "timed out" }
           end
@@ -811,6 +821,54 @@ return function(t)
       local instance, record = harness({ instances = instances })
       instance:check({ server_version = Version.VERSION .. "-old", api_version = Version.API_VERSION })
       t.eq(0, record.restarts)
+    end)
+
+    t.it("does not restart a service with a live team", function()
+      local instance, record = harness({ teams = { { id = "t1", state = "active" } } })
+      local info = {
+        server_version = Version.VERSION .. "-old",
+        api_version = Version.API_VERSION,
+        features = { "tunnel", "teams" },
+      }
+      t.truthy(instance:check(info))
+      t.eq(0, record.restarts, "a team must keep its service alive")
+      t.eq(1, #record.notes)
+      t.match("restarts automatically", record.notes[1].message)
+      t.eq(5000, record.team_list_timeout, "the team probe has its own 5 s timeout")
+      instance:check(info)
+      t.eq(1, #record.notes, "the warning is once per Neovim")
+    end)
+
+    t.it("ignores suspended teams when deciding idleness", function()
+      local instance, record = harness({ teams = { { id = "t1", state = "suspended" } }, instances = {} })
+      t.truthy(instance:check({
+        server_version = Version.VERSION .. "-old",
+        api_version = Version.API_VERSION,
+        features = { "teams" },
+      }))
+      t.eq(1, record.restarts)
+    end)
+
+    t.it("treats a failed team probe as busy", function()
+      local instance, record = harness({ team_list = "timeout" })
+      t.truthy(instance:check({
+        server_version = Version.VERSION .. "-old",
+        api_version = Version.API_VERSION,
+        features = { "teams" },
+      }))
+      t.eq(0, record.restarts)
+      t.eq(1, #record.notes)
+      t.match("restarts automatically", record.notes[1].message)
+    end)
+
+    t.it("treats -32601 from team.list as no teams", function()
+      local instance, record = harness({ team_list = "unsupported", instances = {} })
+      t.truthy(instance:check({
+        server_version = Version.VERSION .. "-old",
+        api_version = Version.API_VERSION,
+        features = { "teams" },
+      }))
+      t.eq(1, record.restarts)
     end)
 
     t.it("treats a service without agent.list as idle", function()

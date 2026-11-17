@@ -13,6 +13,20 @@ local transport = require("ade.service.transport")
 
 local M = {}
 
+---Message for a failed team request, including git's stderr when present.
+---@param value any
+---@return string
+function M.error_text(value)
+  local message = type(value) == "table" and (value.message or value.code) or tostring(value)
+  if type(value) == "table" and type(value.data) == "table" then
+    local stderr = value.data.stderr
+    if type(stderr) == "string" and stderr ~= "" then
+      return tostring(message) .. ": " .. stderr
+    end
+  end
+  return tostring(message)
+end
+
 local Team = {}
 Team.__index = Team
 
@@ -53,6 +67,8 @@ function M.new(opts)
     blocked = {},
     warned_blocked = {},
     notified = {},
+    -- team id -> {worker name: true} for the pre-built definition.
+    started_workers = {},
     watching = nil,
     raw = nil,
   }, Team)
@@ -125,6 +141,7 @@ function Team:reset()
   self.leader_pending = {}
   self.leader_inflight = {}
   self.configure_inflight = {}
+  self.started_workers = {}
   self.bound = {}
   self.blocked = {}
   -- `warned_blocked` / `notified` survive a reconnect: an item or conflict
@@ -141,6 +158,17 @@ function Team:on_hello()
     self:configure(cwd, true)
   end
   self:refresh()
+end
+
+---The absolute directory the service creates worker worktrees under (18.12).
+---@return string
+function M.worktree_root()
+  local path = vim.fn.stdpath("data") .. "/ade/worktrees"
+  path = vim.fn.fnamemodify(path, ":p")
+  if #path > 1 then
+    path = path:gsub("/+$", "")
+  end
+  return path
 end
 
 ---Resolve the configuration the service expects (18.2).
@@ -163,6 +191,7 @@ function Team:service_config(cwd)
         env = transport.child_env(launch.env or (cfg.agents[template.agent] or {}).env),
         model = template.model,
         role = template.role,
+        worktree = template.worktree == true,
       }
       if launch.source == "managed" and launch.install_id then
         entry.launch = {
@@ -178,6 +207,7 @@ function Team:service_config(cwd)
   local limits = type(teams.limits) == "table" and teams.limits or {}
   return {
     max_workers = teams.max_workers or 3,
+    worktree_root = M.worktree_root(),
     spawn_confirm = { auto = vim.deepcopy(confirm.auto or {}) },
     limits = {
       max_turns_per_task = limits.max_turns_per_task or 30,
@@ -395,7 +425,55 @@ function Team:bind_leader(instance, session_id, cwd)
     local team_id = type(value) == "table" and type(value.team) == "table" and value.team.id or nil
     self.bound[cwd] = { instance = instance, session_id = session_id, team = team_id }
     self:refresh()
+    self:start_defined_workers(team_id, type(value) == "table" and value.team or nil)
   end)
+end
+
+---Start the workers of the configured default definition (18.13/18.16).
+---
+---Only names that are absent from the returned team's participants are started,
+---so a re-bind/reconnect or a second front end never starts them twice.
+---@param team_id string|nil
+---@param entry table|nil team.list entry returned by bind_leader
+function Team:start_defined_workers(team_id, entry)
+  if type(team_id) ~= "string" then
+    return
+  end
+  local cfg = self.config() or {}
+  local teams = type(cfg.teams) == "table" and cfg.teams or {}
+  if teams.enabled ~= true then
+    return
+  end
+  local definition = type(teams.definitions) == "table" and teams.default and teams.definitions[teams.default] or nil
+  if type(definition) ~= "table" then
+    return
+  end
+  local started = self.started_workers[team_id]
+  if started then
+    -- This team's definition was already reconciled by this front end.
+    return
+  end
+  started = {}
+  self.started_workers[team_id] = started
+  local present = {}
+  for _, participant in ipairs(type(entry) == "table" and entry.participants or {}) do
+    present[participant.name] = true
+  end
+  for _, worker in ipairs(definition.workers or {}) do
+    if not present[worker.name] and not started[worker.name] then
+      started[worker.name] = true
+      self:spawn(team_id, worker.template, worker.name, worker.task, function(ok, value)
+        if not ok then
+          local message = type(value) == "table" and (value.message or value.code) or tostring(value)
+          self.notify(
+            "could not start worker " .. tostring(worker.name) .. ": " .. tostring(message),
+            vim.log.levels.WARN
+          )
+        end
+        self:refresh()
+      end)
+    end
+  end
 end
 
 ---Refresh the whole team list.
@@ -461,6 +539,7 @@ function Team:on_changed_payload(payload)
         self.notified[id] = nil
       end
     end
+    self.started_workers[team.id] = nil
     -- The team is gone: this instance may lead a new one for the same cwd.
     for cwd, entry in pairs(self.bound) do
       if entry.team == team.id or team.cwd == cwd then
@@ -583,6 +662,49 @@ end
 function Team:answer(item_id, fields, cb)
   local params = vim.tbl_extend("force", { request = item_id }, fields or {})
   self:_call("team.answer", params, cb)
+end
+
+---Start a worker on behalf of the person (18.13).
+---@param team string
+---@param template string
+---@param name string|nil
+---@param task string|nil
+---@param cb fun(ok: boolean, value: any)|nil
+function Team:spawn(team, template, name, task, cb)
+  cb = cb or function() end
+  self:_call("team.spawn", { team = team, template = template, name = name, task = task }, function(ok, value)
+    if ok and type(value) == "table" and value.warning == "dirty_tree" then
+      self.notify(
+        "worker "
+          .. tostring(value.name or name or template)
+          .. " starts from the last commit; uncommitted changes are not in its worktree",
+        vim.log.levels.WARN
+      )
+    end
+    cb(ok, value)
+  end)
+end
+
+---Remove an exited worker's worktree (18.12).
+---@param team string
+---@param participant string
+---@param force boolean|nil
+---@param cb fun(ok: boolean, value: any)|nil
+function Team:remove_worktree(team, participant, force, cb)
+  cb = cb or function() end
+  local params = { team = team, participant = participant }
+  if force then
+    params.force = true
+  end
+  self:_call("team.remove_worktree", params, function(ok, value)
+    if ok and type(value) == "table" and value.branch_kept then
+      self.notify(
+        "branch " .. tostring(value.branch or "?") .. " was kept (it is not merged into HEAD)",
+        vim.log.levels.INFO
+      )
+    end
+    cb(ok, value)
+  end)
 end
 
 ---@param team string

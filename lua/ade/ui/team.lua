@@ -42,6 +42,9 @@ function Panel:current()
   if id:sub(1, 5) == "item:" then
     return "item", id:sub(6)
   end
+  if id:sub(1, 5) == "team:" then
+    return "team", id:sub(6)
+  end
   local team, name = id:match("^([^|]+)|(.+)$")
   return "participant", team, name
 end
@@ -64,6 +67,8 @@ function Panel:lines()
       { "m", "send a message to a participant" },
       { "p / r / c", "pause / resume / cancel the participant" },
       { "w", "watch the participant's transcript" },
+      { "s", "start a worker from a template" },
+      { "D", "remove an exited worker's worktree" },
       { "a", "answer the inbox item under the cursor" },
       { "R", "reset limits" },
       { "x", "close the team" },
@@ -75,7 +80,7 @@ function Panel:lines()
     add("", nil)
   end
   for _, team in ipairs(rows) do
-    add(string.format(" %s  %s  [%s]", team.id, tostring(team.cwd), tostring(team.state)), nil)
+    add(string.format(" %s  %s  [%s]", team.id, tostring(team.cwd), tostring(team.state)), "team:" .. tostring(team.id))
     local limits = team.limits or {}
     local cfg_teams = (self.config and self.config().teams) or {}
     local live, total = 0, 0
@@ -103,16 +108,19 @@ function Panel:lines()
       if entry.paused then
         marks[#marks + 1] = "paused"
       end
+      local worktree = entry.worktree
+      local branch = type(worktree) == "table" and worktree.branch or nil
       add(
         string.format(
-          "   %-10s %-13s task %-8s queued %d turns %s/%s%s",
+          "   %-10s %-13s task %-8s queued %d turns %s/%s%s%s",
           tostring(entry.name),
           tostring(entry.state),
           tostring(entry.task or "-"),
           tonumber(entry.queued) or 0,
           tostring(turns.task or 0),
           tostring(turns.total or 0),
-          #marks > 0 and (" (" .. table.concat(marks, ",") .. ")") or ""
+          #marks > 0 and (" (" .. table.concat(marks, ",") .. ")") or "",
+          branch and ("  wt " .. tostring(branch)) or ""
         ),
         team.id .. "|" .. tostring(entry.name)
       )
@@ -163,11 +171,11 @@ function Panel:refresh()
   vim.bo[self.buf].modifiable = false
 end
 
----The team id for the cursor line, whether it is a participant or an item.
+---The team id for the cursor line, whether it is a team, participant or item.
 ---@return string|nil
 function Panel:team_of_current()
   local kind, a, b = self:current()
-  if kind == "participant" then
+  if kind == "participant" or kind == "team" then
     return a
   end
   if kind == "item" then
@@ -239,6 +247,12 @@ function Panel:open()
         self:report(ok, value)
       end)
     end
+  end)
+  self:map("s", function()
+    self:spawn_current()
+  end)
+  self:map("D", function()
+    self:remove_worktree_current()
   end)
   self:map("x", function()
     local team = self:team_of_current()
@@ -324,6 +338,12 @@ function Panel:report(ok, value)
     return true
   end
   local message = type(value) == "table" and (value.message or value.code) or tostring(value)
+  if type(value) == "table" and type(value.data) == "table" then
+    local stderr = value.data.stderr
+    if type(stderr) == "string" and stderr ~= "" then
+      message = tostring(message) .. ": " .. stderr
+    end
+  end
   self:notify(message)
   return false
 end
@@ -400,6 +420,102 @@ function Panel:send_current()
         self:report(ok, value)
         self.team:refresh()
       end)
+    end)
+  end)
+end
+
+---Start a worker from a configured template (18.13).
+function Panel:spawn_current()
+  local team = self:team_of_current()
+  if not team then
+    self:notify("put the cursor on a team or participant first")
+    return
+  end
+  local cfg = self.config and self.config() or {}
+  local teams_cfg = type(cfg.teams) == "table" and cfg.teams or {}
+  local names = {}
+  for name in pairs(teams_cfg.templates or {}) do
+    names[#names + 1] = name
+  end
+  table.sort(names)
+  if #names == 0 then
+    self:notify("no team templates are configured")
+    return
+  end
+  self.interacting = true
+  vim.ui.select(names, {
+    prompt = "template for the new worker",
+    format_item = function(entry)
+      return entry
+    end,
+  }, function(template)
+    if template == nil then
+      self:interaction_done()
+      return
+    end
+    self.interacting = true
+    vim.ui.input({ prompt = "worker name (blank: next free wN): " }, function(name)
+      if name == nil then
+        self:interaction_done()
+        return
+      end
+      if name == "" then
+        name = nil
+      end
+      self.interacting = true
+      vim.ui.input({ prompt = "task label (optional): " }, function(task)
+        self:interaction_done()
+        if task == nil then
+          return
+        end
+        if task == "" then
+          task = nil
+        end
+        self.team:spawn(team, template, name, task, function(ok, value)
+          self:report(ok, value)
+          self.team:refresh()
+        end)
+      end)
+    end)
+  end)
+end
+
+---Remove an exited worker's worktree (18.12).
+function Panel:remove_worktree_current()
+  local kind, team, name = self:current()
+  if kind ~= "participant" or name == nil or name == "leader" or name == "human" then
+    return
+  end
+  local entry = self.team:participant(team, name)
+  if not entry then
+    return
+  end
+  if entry.state ~= "exited" then
+    self:notify("the worker must have exited before its worktree can be removed")
+    return
+  end
+  local worktree = entry.worktree
+  if type(worktree) ~= "table" or type(worktree.path) ~= "string" or worktree.path == "" then
+    self:notify("this worker has no worktree")
+    return
+  end
+  self.interacting = true
+  vim.ui.select({
+    { label = "Remove worktree (an unmerged branch is kept)", value = false },
+    { label = "Force remove worktree", value = true },
+  }, {
+    prompt = "remove " .. tostring(worktree.branch or worktree.path) .. "?",
+    format_item = function(choice)
+      return choice.label
+    end,
+  }, function(choice)
+    self:interaction_done()
+    if not choice then
+      return
+    end
+    self.team:remove_worktree(team, name, choice.value, function(ok, value)
+      self:report(ok, value)
+      self.team:refresh()
     end)
   end)
 end

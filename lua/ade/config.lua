@@ -118,10 +118,12 @@ M.defaults = {
   -- advertise support for are dropped rather than sent and rejected.
   mcp_servers = {},
 
-  -- Teams (PROTOCOL.md section 18). S4b supports teams started from chat;
-  -- `enabled` (pre-built teams) is S4c and is rejected with a notice.
+  -- Teams (PROTOCOL.md section 18). `enabled` starts a configured set of
+  -- workers when a leader creates its team; templates may run in a worktree.
   teams = {
     enabled = false,
+    default = nil,
+    definitions = {},
     spawn_from_chat = true,
     max_workers = 3,
     spawn_confirm = { auto = {} },
@@ -1124,6 +1126,9 @@ function M.validate(cfg)
     if type(template.role) ~= "string" or template.role:match("^%s*$") then
       fail("%s.role must be a non-empty string", where)
     end
+    if template.worktree ~= nil and type(template.worktree) ~= "boolean" then
+      fail("%s.worktree must be a boolean or nil", where)
+    end
     if #template.role > 16 * 1024 then
       fail("%s.role is longer than 16 KiB", where)
     end
@@ -1146,6 +1151,58 @@ function M.validate(cfg)
     end
   end
   teams.spawn_confirm.auto = auto
+
+  local definitions = teams.definitions
+  if type(definitions) ~= "table" then
+    fail("teams.definitions must be a table")
+  end
+  local worker_pattern = "^[a-z0-9][a-z0-9_%-]*$"
+  for name, definition in pairs(definitions) do
+    if type(name) ~= "string" or not name:match(worker_pattern) or #name > 32 then
+      fail("teams.definitions keys must match [a-z0-9][a-z0-9_-]{0,31}, got %s", vim.inspect(name))
+    end
+    if type(definition) ~= "table" then
+      fail("teams.definitions.%s must be a table", name)
+    end
+    local workers = definition.workers
+    if workers ~= nil then
+      if type(workers) ~= "table" or not vim.islist(workers) then
+        fail("teams.definitions.%s.workers must be a list", name)
+      end
+      if #workers > teams.max_workers then
+        fail("teams.definitions.%s has %d workers but teams.max_workers is %d", name, #workers, teams.max_workers)
+      end
+      local seen = {}
+      for index, worker in ipairs(workers) do
+        local where = string.format("teams.definitions.%s.workers[%d]", name, index)
+        if type(worker) ~= "table" then
+          fail("%s must be a table", where)
+        end
+        if type(worker.name) ~= "string" or not worker.name:match(worker_pattern) or #worker.name > 32 then
+          fail("%s.name must match [a-z0-9][a-z0-9_-]{0,31}", where)
+        end
+        if seen[worker.name] then
+          fail("%s.name %q is duplicated in this definition", where, worker.name)
+        end
+        seen[worker.name] = true
+        if type(worker.template) ~= "string" or teams.templates[worker.template] == nil then
+          fail("%s.template must name a configured template", where)
+        end
+        if worker.task ~= nil and type(worker.task) ~= "string" then
+          fail("%s.task must be a string or nil", where)
+        end
+      end
+    end
+  end
+  if teams.default ~= nil then
+    if type(teams.default) ~= "string" or definitions[teams.default] == nil then
+      fail("teams.default must name a configured definition")
+    end
+  end
+  if teams.enabled and teams.default == nil then
+    fail("teams.enabled requires teams.default")
+  end
+
   local limits = teams.limits
   if type(limits) ~= "table" then
     fail("teams.limits must be a table")
