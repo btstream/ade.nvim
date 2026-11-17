@@ -1074,12 +1074,13 @@ return function(t)
   end)
 
   t.describe("W0e review regressions", function()
-    t.it("never switches the agent after the person chose to ignore it", function()
+    t.it("refuses a team this front end does not lead instead of offering a switch", function()
       local cwd = "/tmp/w0e-ignore"
-      -- The team exists but this front end is not its leader (a suspended or
-      -- foreign team): no binding here.
+      -- The team exists but this front end is not its leader: the service
+      -- refused its bind, so the team is blocked.
       local fake_ = fake_team(cwd, { { id = "t1", cwd = cwd, state = "active", participants = {} } })
       fake_.bound = {}
+      fake_.blocked = { [cwd] = true }
       fake_.works = {
         {
           name = "claude_flow",
@@ -1106,8 +1107,10 @@ return function(t)
       t.cleanup(function()
         vim.ui.select, vim.ui.input = original_select, original_input
       end)
+      local prompts = 0
       vim.ui.select = function(items, _, cb)
-        cb(items[2]) -- ignore and use the current leader
+        prompts = prompts + 1
+        cb(items[2])
       end
       vim.ui.input = function(_, cb)
         cb("")
@@ -1115,12 +1118,13 @@ return function(t)
       flow:start("claude_flow")
       wait(function()
         return #notices > 0
-      end, 5000, "the unbound-team notice")
-      t.eq(nil, switched, "ignoring the mismatch must not switch the agent")
+      end, 5000, "the blocked-team notice")
+      t.eq(nil, switched, "a blocked team must not switch the agent")
+      t.eq(0, prompts, "no switch/ignore prompt is offered for a blocked team")
       t.eq(0, #fake_.starts)
       t.eq(0, #fake_.closes)
       t.eq(0, fake_.new_session_count)
-      t.match("not the leader", table.concat(notices, "\n"))
+      t.match("another session leads", table.concat(notices, "\n"))
       _ = deps
     end)
 
@@ -1188,18 +1192,23 @@ return function(t)
       t.eq(0, starts, "the flow owns this cwd")
       flow:cancel()
       team:start_enabled_workers("t1", team.teams["t1"])
-      t.eq(1, starts, "the enabled workflow starts once the flow is done")
+      t.eq(0, starts, "the cancelled manual start must not hand over to the default")
+      -- A different team that never saw a manual flow still starts once.
+      team.teams["t2"] = { id = "t2", cwd = cwd, state = "active", participants = {} }
+      team.bound[cwd] = { instance = "i1", session_id = "s1", team = "t2" }
+      team:start_enabled_workers("t2", team.teams["t2"])
+      t.eq(1, starts, "the enabled workflow starts once for a fresh team")
       t.eq("dev", team._last.workflow)
-      team:start_enabled_workers("t1", team.teams["t1"])
+      team:start_enabled_workers("t2", team.teams["t2"])
       t.eq(1, starts, "still only once per team")
 
       -- A team led by another front end (or another cwd) is not ours to start.
       team.teams["t9"] = { id = "t9", cwd = "/elsewhere", state = "active", participants = {} }
       team:start_enabled_workers("t9", team.teams["t9"])
       t.eq(1, starts, "another front end's team is never started")
-      team.bound[cwd] = { instance = "other", session_id = "s9", team = "t9" }
-      team.teams["t1"].participants = {}
-      team:start_enabled_workers("t1", team.teams["t1"])
+      team.teams["t3"] = { id = "t3", cwd = cwd, state = "active", participants = {} }
+      team.bound[cwd] = { instance = "other", session_id = "s9", team = "t2" }
+      team:start_enabled_workers("t3", team.teams["t3"])
       t.eq(1, starts, "a team bound to another instance is never started")
     end)
 
@@ -1265,6 +1274,133 @@ return function(t)
       wait(function()
         return #fake_.starts == 1
       end, 5000, "the start after a cancelled wait")
+    end)
+
+    t.it("times out waiting for the leader session and releases the flow", function()
+      local cwd = "/tmp/w0e-wait-timeout"
+      local fake_ = fake_team(cwd, {})
+      local notices = {}
+      local flow = fake_flow(cwd, fake_, {
+        setup = function(d)
+          d.new_session = function() end
+          d.timeout = function()
+            return 80
+          end
+          d.notify = function(message)
+            notices[#notices + 1] = tostring(message)
+          end
+        end,
+      })
+      local original_input = vim.ui.input
+      t.cleanup(function()
+        vim.ui.input = original_input
+      end)
+      vim.ui.input = function(_, cb)
+        cb("")
+      end
+      flow:start("dev")
+      wait(function()
+        return #notices > 0
+      end, 5000, "the timeout notice")
+      t.match("timed out waiting for the leader session", table.concat(notices, "\n"))
+      t.eq(false, TeamStart.active(cwd), "a timed out flow must not stay registered")
+      t.eq(false, flow.starting)
+    end)
+
+    t.it("waits for a bind reply that arrives just after the team", function()
+      local cwd = "/tmp/w0e-bind-race"
+      local fake_ = fake_team(cwd, { { id = "t1", cwd = cwd, state = "active", participants = {} } })
+      -- `team.changed` first, bind reply a few milliseconds later.
+      fake_.bound = {}
+      local notices = {}
+      local flow = fake_flow(cwd, fake_, {
+        setup = function(d)
+          d.notify = function(message)
+            notices[#notices + 1] = tostring(message)
+          end
+        end,
+      })
+      local original_input = vim.ui.input
+      t.cleanup(function()
+        vim.ui.input = original_input
+      end)
+      vim.ui.input = function(_, cb)
+        cb("")
+      end
+      vim.defer_fn(function()
+        fake_.bound[cwd] = { instance = "i1", session_id = "s1", team = "t1" }
+      end, 60)
+      flow:start("dev")
+      wait(function()
+        return #fake_.starts == 1
+      end, 5000, "the start after the late bind")
+      t.eq("", table.concat(notices, "\n"), "the bind race must not warn")
+    end)
+
+    t.it("switches through the real pick_agent rebuild and :Ade team close can still cancel it", function()
+      local service, dir = start_service(t, "real-switch", {
+        team_workflows = {
+          {
+            name = "claude_flow",
+            summary = "wants claude",
+            text = "1. do",
+            leader = { agent = "claude" },
+            team = {},
+            scope = "project",
+          },
+        },
+        team_start_delay = 500,
+      })
+      setup(t, "real-switch", service, dir, {
+        agents = {
+          opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } },
+          claude = {
+            command = "python3",
+            args = { root .. "tests/mock_agent.py" },
+            env = { ACP_MOCK_PROFILE = "claude" },
+            profile = "claude",
+          },
+        },
+      })
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the bound team")
+      local original_select, original_input = vim.ui.select, vim.ui.input
+      t.cleanup(function()
+        vim.ui.select, vim.ui.input = original_select, original_input
+      end)
+      local selects = 0
+      vim.ui.select = function(items, _, cb)
+        selects = selects + 1
+        if selects == 1 then
+          cb(items[1]) -- open a claude session as the leader
+        else
+          cb(items[1]) -- Yes: close the team
+        end
+      end
+      vim.ui.input = function(_, cb)
+        cb("")
+      end
+      vim.cmd("Ade team start claude_flow")
+      wait(function()
+        return state().config.agent == "claude"
+      end, 15000, "the real agent switch")
+      wait(function()
+        return #service.team_starts == 1 and TeamStart.active(dir)
+      end, 5000, "team.start from the rebuilt controller")
+      -- One flow only: the new controller's own Flow is idle; the registry
+      -- still points at the Flow that survived the rebuild.
+      t.eq(false, state().view.team_commands.start_flow.starting)
+      vim.cmd("Ade team close")
+      wait(function()
+        return #calls_of(service, "team.close") == 1
+      end, 5000, "the close after the rebuild")
+      wait(function()
+        return TeamStart.active(dir) == false
+      end, 5000, "the close to cancel the rebuilt flow")
+      vim.wait(100) -- let the close reply land before teardown
     end)
 
     t.it("does not reopen the workflows window when the first fetch is late", function()
@@ -1475,7 +1611,9 @@ return function(t)
       end
       vim.api.nvim_win_set_cursor(ui.win, { 3, 0 })
       ui:delete_current()
-      ui:close()
+      -- Close it the way the person would (`:q`/`:close`): the WinClosed hook
+      -- must clear want_open too, like the q keymap does.
+      vim.api.nvim_win_close(ui.win, true)
       wait(function()
         return #service.team_workflow_deletes == 1
       end, 5000, "the late delete")

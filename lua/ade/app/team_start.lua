@@ -17,6 +17,10 @@ local M = {}
 local Flow = {}
 Flow.__index = Flow
 
+---How long a continuation waits for the leader session or a team to close.
+---Tests shorten it through `deps.timeout` or this field.
+M.wait_timeout_ms = 20000
+
 ---cwd -> true while a start flow runs for it. Module level on purpose: the
 ---controller (and its Team/flow objects) is rebuilt when the leader agent is
 ---switched, but the start keeps running across that rebuild.
@@ -169,7 +173,14 @@ end
 ---@param done fun(ok: boolean)
 function Flow:wait_for(predicate, label, done)
   local generation = self.generation
-  local deadline = vim.uv.now() + 20000
+  local timeout = M.wait_timeout_ms
+  if type(self.deps.timeout) == "function" then
+    local ok, value = pcall(self.deps.timeout)
+    if ok and type(value) == "number" and value >= 0 then
+      timeout = value
+    end
+  end
+  local deadline = vim.uv.now() + timeout
   local function check()
     if not self:alive(generation) then
       return
@@ -193,15 +204,17 @@ end
 ---@param name string|nil
 function Flow:start(name)
   local cwd = self:cwd()
+  -- Check first: a switch flow waits for the rebuilt Team to reconnect, and an
+  -- extra start while that Team is not available yet must not kill it.
+  if not self:available() then
+    self:notify("teams are not available: connect to the service and configure a template", vim.log.levels.WARN)
+    return
+  end
   local previous = running[cwd]
   if previous then
     -- Starting again replaces the old flow instead of leaving it wedged; the
     -- old flow may belong to a controller that `pick_agent` rebuilt.
     previous.flow:cancel()
-  end
-  if not self:available() then
-    self:notify("teams are not available: connect to the service and configure a template", vim.log.levels.WARN)
-    return
   end
   self.generation = (self.generation or 0) + 1
   local generation = self.generation
@@ -306,6 +319,25 @@ function Flow:with_workflow(workflow, cwd, generation)
   local entry = self:team_for_cwd(cwd)
   local current_agent = self:config().agent
   if wanted and wanted ~= current_agent then
+    local team = self:team()
+    local blocked = team and team.blocked or {}
+    local why
+    if entry then
+      if blocked[cwd] then
+        why = "another session leads this team; close it there first"
+      elseif entry.state == "suspended" then
+        why = "the team is suspended; resume it with its leader session first"
+      elseif entry.stale then
+        why = "the connection to the service is lost; wait for it to reconnect"
+      end
+    end
+    if why then
+      -- Switching would close a team this front end does not lead; refuse
+      -- before promising an option that cannot be carried out.
+      self:finish()
+      self:notify(why, vim.log.levels.WARN)
+      return
+    end
     local switch = "open a " .. wanted .. " session as the leader"
     if entry then
       switch = switch .. " (ends the current team)"
@@ -377,6 +409,50 @@ function Flow:proceed(workflow, cwd, generation)
   end)
 end
 
+---Close `team_id` and continue, treating a team that disappeared while the
+---task prompt was open as already closed.
+---@param team_id string
+---@param cwd string
+---@param generation integer
+---@param on_closed fun()
+function Flow:close_team(team_id, cwd, generation, on_closed)
+  local entry = self:team_for_cwd(cwd)
+  if not entry or entry.id ~= team_id then
+    on_closed()
+    return
+  end
+  self:team():close(team_id, function(ok, value)
+    vim.schedule(function()
+      if not self:alive(generation) then
+        return
+      end
+      -- -32064: the team was closed from somewhere else in the meantime.
+      local gone = type(value) == "table" and value.code == -32064
+      if not ok and not gone then
+        self:finish()
+        self:notify("cannot end the current team: " .. self.deps.report_error(value), vim.log.levels.WARN)
+        return
+      end
+      local team = self:team()
+      if type(team.forget_team) == "function" and (ok or gone) then
+        team:forget_team(team_id)
+      end
+      self:wait_for(
+        function()
+          local now = self:team_for_cwd(cwd)
+          return now == nil or now.id ~= team_id
+        end,
+        "the old team to close",
+        function(closed)
+          if closed and self:alive(generation) then
+            on_closed()
+          end
+        end
+      )
+    end)
+  end)
+end
+
 ---Close the current team (if any), switch the leader agent, open a new
 ---session and start the workflow there.
 ---@param workflow table
@@ -415,36 +491,7 @@ function Flow:switch_and_launch(workflow, cwd, generation, agent, team_id, task)
     switch()
     return
   end
-  self:team():close(team_id, function(ok, value)
-    vim.schedule(function()
-      if not self:alive(generation) then
-        return
-      end
-      if not ok then
-        self:finish()
-        self:notify("cannot end the current team: " .. self.deps.report_error(value), vim.log.levels.WARN)
-        return
-      end
-      -- The close reply may arrive before `team.changed(closed)`.
-      local team = self:team()
-      if type(team.forget_team) == "function" then
-        team:forget_team(team_id)
-      end
-      self:wait_for(
-        function()
-          local entry = self:team_for_cwd(cwd)
-          return entry == nil or entry.id ~= team_id
-        end,
-        "the old team to close",
-        function()
-          if not self:alive(generation) then
-            return
-          end
-          switch()
-        end
-      )
-    end)
-  end)
+  self:close_team(team_id, cwd, generation, switch)
 end
 
 ---Make sure the session that is about to lead exists and has bound its team.
@@ -476,6 +523,17 @@ function Flow:ensure_session(cwd, team_id, generation, done)
     local bound = team and team.bound and team.bound[cwd] or nil
     if bound and bound.team == entry.id then
       done()
+      return
+    end
+    if not bound then
+      -- `team.changed` can arrive a few milliseconds before the bind reply;
+      -- wait for the binding instead of claiming this session is not the
+      -- leader.
+      self:wait_for_leader(cwd, nil, generation, function(ok)
+        if ok then
+          done()
+        end
+      end)
       return
     end
     self:finish()
@@ -563,39 +621,13 @@ end
 ---@param team_id string
 ---@param task string|nil
 function Flow:close_and_relaunch(workflow, cwd, generation, team_id, task)
-  self:team():close(team_id, function(ok, value)
-    vim.schedule(function()
-      if not self:alive(generation) then
-        return
+  -- The close reply may arrive before `team.changed(closed)`, so close_team
+  -- waits until the old team is really gone instead of trusting list order.
+  self:close_team(team_id, cwd, generation, function()
+    self:ensure_session(cwd, team_id, generation, function()
+      if self:alive(generation) then
+        self:launch(workflow, cwd, task, generation)
       end
-      if not ok then
-        self:finish()
-        self:notify("cannot end the current team: " .. self.deps.report_error(value), vim.log.levels.WARN)
-        return
-      end
-      -- The close reply may arrive before `team.changed(closed)`, so wait
-      -- until the old team is really gone instead of trusting list order.
-      local team = self:team()
-      if type(team.forget_team) == "function" then
-        team:forget_team(team_id)
-      end
-      self:wait_for(
-        function()
-          local entry = self:team_for_cwd(cwd)
-          return entry == nil or entry.id ~= team_id
-        end,
-        "the old team to close",
-        function()
-          if not self:alive(generation) then
-            return
-          end
-          self:ensure_session(cwd, team_id, generation, function()
-            if self:alive(generation) then
-              self:launch(workflow, cwd, task, generation)
-            end
-          end)
-        end
-      )
     end)
   end)
 end

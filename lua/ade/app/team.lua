@@ -581,7 +581,10 @@ function Team:start_enabled_workers(team_id, entry)
   end
   if cwd and require("ade.app.team_start").active(cwd) then
     -- `:Ade team start` is picking a workflow for this cwd: its own team.start
-    -- must not be pre-empted by the configured default.
+    -- must not be pre-empted by the configured default. Remember the decision
+    -- even if that flow is cancelled: the person already chose a workflow, so
+    -- the default must not start behind their back later.
+    self.enabled_teams[team_id] = true
     return
   end
   if type(entry) == "table" and entry.state == "suspended" then
@@ -654,7 +657,7 @@ function Team:refresh(cb)
   end)
 end
 
----Fetch the board of every known team whose cached revision is stale (19.2).
+---Fetch the board of `team` when its cached revision is stale (19.2).
 function Team:_fetch_board_if_needed(team)
   local rev = tonumber(type(team) == "table" and team.board_rev or nil)
   if rev == nil or self.old_service then
@@ -673,6 +676,7 @@ function Team:_fetch_board_if_needed(team)
   self:request_board(team.id)
 end
 
+---Ask for the board of every known team whose cached revision is stale (19.2).
 function Team:_sync_boards()
   if self.old_service then
     return

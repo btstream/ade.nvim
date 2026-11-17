@@ -44,6 +44,7 @@ Server.__index = Server
 ---  team_board_error?: table, team_board_delay?: integer,
 ---  team_answer_group_failed?: table,
 ---  team_card_history?: table, team_card_history_error?: table,
+---  team_start_delay?: integer,
 ---  team_workflow_delete_delay?: integer,
 ---  old_service_methods?: table<string, boolean>,
 ---  team_workflows_delay?: integer,
@@ -135,6 +136,7 @@ function M.new(opts)
     team_workflow_deletes = {},
     team_board_requests = {},
     team_start_error = opts.team_start_error,
+    team_start_delay = opts.team_start_delay or 5,
     team_start_result = opts.team_start_result,
     team_answer_group_error = opts.team_answer_group_error,
     team_answer_group_failed = opts.team_answer_group_failed,
@@ -467,20 +469,25 @@ function Server:dispatch(message, client)
     if existing and existing.leader and existing.leader.sessionId ~= params.sessionId then
       return error_reply(ident, -32061, "another session leads this team")
     end
-    local team = {
-      id = "t1",
-      cwd = self.team_cwd or "/",
-      state = "active",
-      leader = { instance = params.instance, sessionId = params.sessionId },
-      participants = vim.deepcopy(self.team_participants or {}),
-      inbox = {},
-      limits = { max_turns_per_task = 30, max_turns_total = 200, turns_total = 0 },
-    }
-    if not self.teams.t1 then
-      self.teams.t1 = team
+    local team = existing
+    if not team then
+      -- The service gives every new team a fresh id; reusing `t1` after a
+      -- close would let a start flow mistake the replacement for the team it
+      -- just closed.
+      self.team_seq = (self.team_seq or 0) + 1
+      team = {
+        id = "t" .. self.team_seq,
+        cwd = self.team_cwd or "/",
+        state = "active",
+        leader = { instance = params.instance, sessionId = params.sessionId },
+        participants = vim.deepcopy(self.team_participants or {}),
+        inbox = {},
+        limits = { max_turns_per_task = 30, max_turns_total = 200, turns_total = 0 },
+      }
+      self.teams[team.id] = team
     end
     vim.defer_fn(function()
-      self:send(client, { jsonrpc = "2.0", id = ident, result = { team = self.teams.t1 } })
+      self:send(client, { jsonrpc = "2.0", id = ident, result = { team = team } })
     end, 5)
     return nil
   end
@@ -597,7 +604,7 @@ function Server:dispatch(message, client)
       or { workflow = params.workflow, started = {}, skipped = {} }
     vim.defer_fn(function()
       self:send(client, { jsonrpc = "2.0", id = ident, result = result })
-    end, 5)
+    end, self.team_start_delay)
     return nil
   end
   if method == "team.answer_group" then

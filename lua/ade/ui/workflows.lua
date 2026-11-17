@@ -180,6 +180,21 @@ function Panel:show()
     vim.keymap.set("n", "d", function()
       self:delete_current()
     end, { buffer = self.buf, nowait = true, silent = true })
+    -- `:q`, `:close` and every other way of closing the float must count as
+    -- the person closing it: a fetch or delete reply still in flight must not
+    -- reopen the window.
+    local win = self.win
+    vim.api.nvim_create_autocmd("WinClosed", {
+      pattern = tostring(win),
+      once = true,
+      callback = function()
+        if self.win == win then
+          self.win = nil
+        end
+        self.want_open = false
+        self.token = (self.token or 0) + 1
+      end,
+    })
   else
     vim.api.nvim_win_set_cursor(self.win, { 1, 0 })
   end

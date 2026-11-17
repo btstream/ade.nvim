@@ -3776,6 +3776,118 @@ fn team_start_refuses_a_task_longer_than_64_kib() {
 }
 
 #[test]
+fn team_start_error_path_still_pushes_the_started_member_events() {
+    // Fill the board until one more byte would be refused, then start a
+    // workflow whose text no longer fits. The member starts before the board
+    // write fails, so its team.changed must reach the front end before the
+    // error reply (19.7); reading team.list afterwards would hide a missing
+    // drain.
+    let mut harness = Harness::new(
+        "team-start-error-events",
+        json!({
+            "spawn_confirm": {"auto": []},
+            "workflows": {
+                "one": {
+                    "summary": "one worker",
+                    "text": "y".repeat(4 * 1024),
+                    "team": [{"name": "w1", "template": "dev"}]
+                }
+            }
+        }),
+        None,
+    );
+    let body = "x".repeat(8 * 1024);
+    let title = "t".repeat(200);
+    let mut next = 0;
+    let mut added = 0;
+    loop {
+        let written = mcp_call(
+            &harness.server,
+            &harness.token,
+            "board_update",
+            json!({
+                "columns": ["todo"],
+                "upsert": [{
+                    "id": format!("C{next}"),
+                    "title": title,
+                    "column": "todo",
+                    "body": body
+                }]
+            }),
+        );
+        if written["isError"] == true {
+            break;
+        }
+        next += 1;
+        added += 1;
+        assert!(added < 100, "the board never filled up");
+    }
+    // The largest body that still fits brings the board within a few bytes of
+    // the limit; the workflow text then cannot fit.
+    let mut lo = 0usize;
+    let mut hi = 8 * 1024;
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let written = mcp_call(
+            &harness.server,
+            &harness.token,
+            "board_update",
+            json!({
+                "upsert": [{
+                    "id": "fill",
+                    "title": "f",
+                    "column": "todo",
+                    "body": "z".repeat(mid)
+                }]
+            }),
+        );
+        if written["isError"] == true {
+            hi = mid - 1;
+        } else {
+            lo = mid;
+        }
+    }
+    assert!(lo > 0, "the filler card never fit");
+
+    let started = harness.start("one", None);
+    assert_eq!(started["error"]["code"], -32060, "{started}");
+    assert!(
+        started["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("256 KiB")),
+        "{started}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_w1 = false;
+    while Instant::now() < deadline {
+        let Some(frame) = harness
+            .client
+            .try_next_notification(Duration::from_millis(200))
+        else {
+            continue;
+        };
+        if frame["method"] != "team.changed" {
+            continue;
+        }
+        let participants = frame["params"]["team"]["participants"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if participants
+            .iter()
+            .any(|participant| participant["name"] == "w1")
+        {
+            saw_w1 = true;
+            break;
+        }
+    }
+    assert!(
+        saw_w1,
+        "the team.changed for the member that started before the error was not pushed"
+    );
+}
+
+#[test]
 fn team_start_boundary_and_a_leaderless_team() {
     // One existing worker plus one missing member is exactly max_workers: the
     // workflow starts.
