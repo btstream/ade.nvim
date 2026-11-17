@@ -2190,12 +2190,12 @@ def scenario_version_restart(case):
     third.capture_notifications()
     third.connect()
     warnings = third.wait_notifications(
-        lambda seen: any("restarts automatically" in line for line in seen),
+        lambda seen: any("has an update" in line for line in seen),
         "the busy-service warning",
         timeout=WAIT,
     )
     assert_true(
-        any("restarts automatically" in line for line in warnings),
+        any("has an update" in line for line in warnings),
         f"a busy stale service must be explained once: {warnings!r}",
     )
     assert_true(
