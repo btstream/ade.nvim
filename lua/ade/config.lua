@@ -1248,8 +1248,14 @@ function M.validate(cfg)
           fail("%s.leader.%s must be a string", where, key)
         end
       end
+      if leader.agent ~= nil then
+        if type(leader.agent) ~= "string" or cfg.agents[leader.agent] == nil then
+          fail("%s.leader.agent must be a configured agent", where)
+        end
+      end
       if leader.role ~= nil then
-        check_text(leader.role, 16 * 1024, where .. ".leader.role", "16 KiB")
+        -- 19.1: the leader's role is up to 4 KiB (a member's is 16 KiB).
+        check_text(leader.role, 4 * 1024, where .. ".leader.role", "4 KiB")
       end
     end
     if workflow.team ~= nil then

@@ -55,7 +55,8 @@ function Commands:start(workflow)
   self.start_flow:start(workflow)
 end
 
----The team of this cwd, or the only team when there is exactly one.
+---The team of this cwd. Never another cwd's team: `:Ade team close` must not
+---close something the person cannot see.
 ---@return table|nil
 function Commands:current_team()
   local team = self:team()
@@ -63,27 +64,26 @@ function Commands:current_team()
     return nil
   end
   local cwd = self:cwd()
-  local rows = team:list_rows()
-  for _, entry in ipairs(rows) do
+  for _, entry in ipairs(team:list_rows()) do
     if entry.cwd == cwd and entry.state ~= "closed" then
       return entry
     end
-  end
-  if #rows == 1 and rows[1].state ~= "closed" then
-    return rows[1]
   end
   return nil
 end
 
 ---Close the team of this cwd after a confirmation.
 function Commands:close(cb)
+  -- A running `:Ade team start` would otherwise keep going against a team that
+  -- is being closed.
+  self.start_flow:cancel()
   local team = self:team()
   local entry = self:current_team()
   if not team or not entry then
     self.deps.notify("no team to close for this cwd", vim.log.levels.WARN)
     return
   end
-  presenter.confirm("Close team " .. tostring(entry.id) .. "?", function(choice)
+  presenter.confirm(string.format("Close team %s (%s)?", tostring(entry.id), tostring(entry.cwd)), function(choice)
     if choice ~= "yes" then
       return
     end

@@ -184,7 +184,9 @@ function Panel:detail()
     " summary:  " .. tostring(workflow.summary or ""),
     "",
   }
-  for line in tostring(workflow.text or ""):gmatch("[^\r\n]*") do
+  -- `gmatch("[^\r\n]*")` yields an extra empty string after every line on
+  -- LuaJIT (and one for the empty text), which showed the flow double spaced.
+  for _, line in ipairs(vim.split(tostring(workflow.text or ""), "\r?\n")) do
     lines[#lines + 1] = line
   end
   if type(workflow.leader) == "table" then
@@ -262,24 +264,32 @@ function Panel:delete_current()
     self:notify_message("this workflow cannot be deleted", vim.log.levels.WARN)
     return
   end
-  local team = self.team()
-  team:workflow_delete(self:cwd(), workflow.name, scope, function(ok, value)
-    if not ok then
-      self:notify_message(
-        "cannot delete " .. tostring(workflow.name) .. ": " .. self.error_text(value),
-        vim.log.levels.WARN
-      )
-      return
-    end
-    local left = {}
-    for _, entry in ipairs(self.entries) do
-      if entry.name ~= workflow.name or entry.scope ~= scope then
-        left[#left + 1] = entry
+  local presenter = require("ade.app.presenter")
+  presenter.confirm(
+    string.format("Delete workflow %s (%s)?", tostring(workflow.name), tostring(scope)),
+    function(choice)
+      if choice ~= "yes" then
+        return
       end
+      local team = self.team()
+      team:workflow_delete(self:cwd(), workflow.name, scope, function(ok, value)
+        if not ok then
+          self:notify_message(
+            "cannot delete " .. tostring(workflow.name) .. ": " .. self.error_text(value),
+            vim.log.levels.WARN
+          )
+          return
+        end
+        if not self:is_open() then
+          -- The person closed the window while the request was in flight; a
+          -- late reply must not reopen it.
+          return
+        end
+        -- Refetch: deleting a project workflow can reveal a user one.
+        self:open()
+      end)
     end
-    self:set_entries(left)
-    self:show()
-  end)
+  )
 end
 
 function Panel:close()

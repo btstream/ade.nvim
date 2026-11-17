@@ -8,10 +8,26 @@
 --
 -- Everything that touches the editor is injected by the controller, so the
 -- flow can be driven by tests with fake pickers and a fake team module.
+--
+-- A flow is identified by a generation: starting again, cancelling, timing out
+-- or a team closing invalidates every pending continuation of the old flow, so
+-- a stale `team.changed`/`team.board` callback can never drive a new start.
 local M = {}
 
 local Flow = {}
 Flow.__index = Flow
+
+---cwd -> true while a start flow runs for it. Module level on purpose: the
+---controller (and its Team/flow objects) is rebuilt when the leader agent is
+---switched, but the start keeps running across that rebuild.
+local active = {}
+
+---Whether a start flow is running for `cwd`.
+---@param cwd string
+---@return boolean
+function M.active(cwd)
+  return active[cwd] == true
+end
 
 ---@param deps {state: fun(): table, config: fun(): table, notify: fun(message: string, level: integer|nil),
 ---  resolve_cwd: fun(): string, open: fun(), new_session: fun(), connect: fun(),
@@ -20,7 +36,7 @@ Flow.__index = Flow
 ---  report_error: fun(value: any)}
 ---@return table
 function M.new(deps)
-  return setmetatable({ deps = deps, starting = false }, Flow)
+  return setmetatable({ deps = deps, starting = false, generation = 0, cwd = nil }, Flow)
 end
 
 function Flow:notify(message, level)
@@ -87,22 +103,53 @@ function Flow:workers_of(team)
   return names
 end
 
----Poll until `predicate` holds, without blocking the editor.
----
----A callback rather than `vim.wait`: the flow runs from command callbacks and
----socket notifications, and `vim.wait` cannot be nested inside another one.
+---End the flow: clear `starting`, release the cwd and invalidate every
+---continuation. Safe to call more than once.
+function Flow:finish()
+  self.starting = false
+  local cwd = self.cwd
+  self.cwd = nil
+  if cwd then
+    active[cwd] = nil
+  end
+end
+
+---Cancel a running flow (a second `:Ade team start`, `:Ade team close`, ...).
+function Flow:cancel()
+  if not self.starting then
+    return
+  end
+  self.generation = self.generation + 1
+  self:finish()
+end
+
+---Whether a continuation from `generation` may still run.
+---@param generation integer
+---@return boolean
+function Flow:alive(generation)
+  return self.starting and generation == self.generation
+end
+
+---Poll until `predicate` holds, without blocking the editor and while staying
+---cancellable. A callback rather than `vim.wait`: the flow runs from command
+---callbacks and socket notifications, and `vim.wait` cannot be nested.
 ---@param predicate fun(): boolean
 ---@param label string
 ---@param done fun(ok: boolean)
 function Flow:wait_for(predicate, label, done)
+  local generation = self.generation
   local deadline = vim.uv.now() + 20000
   local function check()
+    if not self:alive(generation) then
+      return
+    end
     if predicate() then
       done(true)
       return
     end
     if vim.uv.now() >= deadline then
       self:notify("timed out waiting for " .. tostring(label), vim.log.levels.WARN)
+      self:finish()
       done(false)
       return
     end
@@ -115,24 +162,28 @@ end
 ---@param name string|nil
 function Flow:start(name)
   if self.starting then
-    self:notify("a team start is already in progress", vim.log.levels.WARN)
-    return
+    -- Starting again replaces the old flow instead of leaving it wedged.
+    self:cancel()
   end
   if not self:available() then
     self:notify("teams are not available: connect to the service and configure a template", vim.log.levels.WARN)
     return
   end
-  self.starting = true
+  self.generation = self.generation + 1
+  local generation = self.generation
   local cwd = self:cwd()
+  self.starting = true
+  self.cwd = cwd
+  active[cwd] = true
   local team = self:team()
   team:workflows(cwd, function(ok, value)
     -- The callback runs in the socket's fast event context; the steps below
-    -- prompt and wait, which is only legal on the main loop.
+    -- prompt and poll, which is only legal on the main loop.
     vim.schedule(function()
-      if self.starting == false then
+      if not self:alive(generation) then
         return
       end
-      self:on_workflows(ok, value, name, cwd)
+      self:on_workflows(ok, value, name, cwd, generation)
     end)
   end)
 end
@@ -142,46 +193,51 @@ end
 ---@param value any
 ---@param name string|nil
 ---@param cwd string
-function Flow:on_workflows(ok, value, name, cwd)
+---@param generation integer
+function Flow:on_workflows(ok, value, name, cwd, generation)
   if not ok then
-    self.starting = false
+    self:finish()
     self:notify("cannot list workflows: " .. self.deps.report_error(value), vim.log.levels.WARN)
     return
   end
   local workflows = type(value) == "table" and type(value.workflows) == "table" and value.workflows or {}
   if #workflows == 0 then
-    self.starting = false
+    self:finish()
     self:notify("no workflows are configured", vim.log.levels.WARN)
     return
   end
   if name == nil or name == "" then
-    self:pick(workflows, function(workflow)
+    self:pick(workflows, generation, function(workflow)
+      if not self:alive(generation) then
+        return
+      end
       if workflow then
-        self:with_workflow(workflow, cwd)
+        self:with_workflow(workflow, cwd, generation)
       else
-        self.starting = false
+        self:finish()
       end
     end)
-  else
-    local workflow
-    for _, entry in ipairs(workflows) do
-      if entry.name == name then
-        workflow = entry
-        break
-      end
-    end
-    if not workflow then
-      self.starting = false
-      self:notify("unknown workflow " .. tostring(name), vim.log.levels.WARN)
-      return
-    end
-    self:with_workflow(workflow, cwd)
+    return
   end
+  local workflow
+  for _, entry in ipairs(workflows) do
+    if entry.name == name then
+      workflow = entry
+      break
+    end
+  end
+  if not workflow then
+    self:finish()
+    self:notify("unknown workflow " .. tostring(name), vim.log.levels.WARN)
+    return
+  end
+  self:with_workflow(workflow, cwd, generation)
 end
 
 ---@param workflows table[]
+---@param generation integer
 ---@param on_choice fun(workflow: table|nil)
-function Flow:pick(workflows, on_choice)
+function Flow:pick(workflows, generation, on_choice)
   local items = {}
   local by_name = {}
   for _, workflow in ipairs(workflows) do
@@ -198,6 +254,9 @@ function Flow:pick(workflows, on_choice)
       return item
     end,
   }, function(choice)
+    if not self:alive(generation) then
+      return
+    end
     on_choice(choice and by_name[choice] or nil)
   end)
 end
@@ -205,53 +264,13 @@ end
 ---Continue once a workflow is known: leader agent, existing team, task.
 ---@param workflow table
 ---@param cwd string
-function Flow:with_workflow(workflow, cwd)
+---@param generation integer
+function Flow:with_workflow(workflow, cwd, generation)
   local leader = type(workflow.leader) == "table" and workflow.leader or {}
   local wanted = type(leader.agent) == "string" and leader.agent ~= "" and leader.agent or nil
-  local cfg = self:config()
-  local current_agent = cfg.agent
-  local team = self:team_for_cwd(cwd)
-  local workers = self:workers_of(team)
-  local function proceed()
-    if #workers > 0 then
-      -- 2.7: an existing team with workers asks before it is touched.
-      local restart = "close the team and start over"
-      local append = "start only the missing members"
-      local cancel = "cancel"
-      vim.ui.select({ restart, append, cancel }, {
-        prompt = "team already runs " .. table.concat(workers, ", "),
-        format_item = function(item)
-          return item
-        end,
-      }, function(choice)
-        if choice == nil or choice == cancel then
-          self.starting = false
-          return
-        end
-        if choice == restart then
-          self:team():close(team.id, function(ok, value)
-            vim.schedule(function()
-              if not ok then
-                self.starting = false
-                self:notify("cannot close the team: " .. self.deps.report_error(value), vim.log.levels.WARN)
-                return
-              end
-              self:ensure_session(wanted, current_agent, function()
-                self:ask_task(workflow, cwd, wanted)
-              end)
-            end)
-          end)
-          return
-        end
-        self:ask_task(workflow, cwd, wanted)
-      end)
-      return
-    end
-    self:ensure_session(wanted, current_agent, function()
-      self:ask_task(workflow, cwd, wanted)
-    end)
-  end
-  if wanted and team and wanted ~= current_agent then
+  local entry = self:team_for_cwd(cwd)
+  local current_agent = self:config().agent
+  if wanted and entry and wanted ~= current_agent then
     local switch = "open a " .. wanted .. " session as the leader (ends the current team)"
     local ignore = "ignore it and use the current leader"
     vim.ui.select({ switch, ignore }, {
@@ -260,41 +279,98 @@ function Flow:with_workflow(workflow, cwd)
         return item
       end,
     }, function(choice)
+      if not self:alive(generation) then
+        return
+      end
       if choice == nil then
-        self.starting = false
+        self:finish()
         return
       end
       if choice == ignore then
-        proceed()
+        self:proceed(workflow, cwd, generation)
         return
       end
-      self:switch_agent(wanted, team, function()
-        proceed()
+      self:switch_leader(wanted, entry, cwd, generation, function()
+        -- The controller was rebuilt: ask the task and start on the new team.
+        -- The "team already runs ..." question does not apply here.
+        self:wait_for_leader(cwd, nil, generation, function(ok)
+          if ok then
+            self:ask_task(workflow, cwd, generation, nil)
+          end
+        end)
       end)
     end)
     return
   end
-  proceed()
+  self:proceed(workflow, cwd, generation)
 end
 
----Close the team (if needed), switch the leader agent and open a new session.
+---Ask about an existing team with workers, then continue.
+---@param workflow table
+---@param cwd string
+---@param generation integer
+function Flow:proceed(workflow, cwd, generation)
+  local entry = self:team_for_cwd(cwd)
+  local workers = self:workers_of(entry)
+  if #workers == 0 then
+    self:ask_task(workflow, cwd, generation, nil)
+    return
+  end
+  local restart = "close the team and start over"
+  local append = "start only the missing members"
+  local cancel = "cancel"
+  vim.ui.select({ restart, append, cancel }, {
+    prompt = "team already runs " .. table.concat(workers, ", "),
+    format_item = function(item)
+      return item
+    end,
+  }, function(choice)
+    if not self:alive(generation) then
+      return
+    end
+    if choice == nil or choice == cancel then
+      self:finish()
+      return
+    end
+    if choice == restart then
+      -- Ask for the task first: cancelling the input must leave the running
+      -- team untouched.
+      self:ask_task(workflow, cwd, generation, { restart = true, team = entry.id })
+      return
+    end
+    self:ask_task(workflow, cwd, generation, nil)
+  end)
+end
+
+---Close the current team, switch the leader agent and open a new session.
 ---@param agent string
----@param team table|nil
+---@param entry table|nil
+---@param cwd string
+---@param generation integer
 ---@param done fun()
-function Flow:switch_agent(agent, team, done)
+function Flow:switch_leader(agent, entry, cwd, generation, done)
   local function switch()
+    if not self:alive(generation) then
+      return
+    end
     if self.deps.pick_agent then
       pcall(self.deps.pick_agent, agent)
+    end
+    if not self:alive(generation) then
+      return
     end
     pcall(self.deps.open)
     pcall(self.deps.new_session)
     done()
   end
-  if team then
-    self:team():close(team.id, function(ok, value)
+  if entry then
+    self:team():close(entry.id, function(ok, value)
       vim.schedule(function()
+        if not self:alive(generation) then
+          return
+        end
         if not ok then
-          self.starting = false
+          self:finish()
           self:notify("cannot end the current team: " .. self.deps.report_error(value), vim.log.levels.WARN)
           return
         end
@@ -307,91 +383,179 @@ function Flow:switch_agent(agent, team, done)
 end
 
 ---Make sure the session that is about to lead exists and has bound its team.
----@param wanted_agent string|nil
----@param current_agent string|nil
+---Never switches the agent: that decision was made (or declined) already.
+---@param cwd string
+---@param team_id string|nil the team being replaced, must not be accepted
+---@param generation integer
 ---@param done fun()
-function Flow:ensure_session(wanted_agent, current_agent, done)
-  local cwd = self:cwd()
-  if self:team_for_cwd(cwd) and self:team().bound[cwd] then
-    done()
-    return
-  end
-  if wanted_agent and current_agent and wanted_agent ~= current_agent then
-    self:switch_agent(wanted_agent, nil, function()
-      self:wait_for_leader(cwd, done)
-    end)
+function Flow:ensure_session(cwd, team_id, generation, done)
+  local team = self:team()
+  local entry = self:team_for_cwd(cwd)
+  if entry then
+    local blocked = (team and team.blocked) or {}
+    if blocked[cwd] then
+      self:finish()
+      self:notify("another session leads this team; close it there first", vim.log.levels.WARN)
+      return
+    end
+    if entry.state == "suspended" then
+      self:finish()
+      self:notify("the team is suspended; resume it with its leader session first", vim.log.levels.WARN)
+      return
+    end
+    if entry.stale then
+      self:finish()
+      self:notify("the connection to the service is lost; wait for it to reconnect", vim.log.levels.WARN)
+      return
+    end
+    local bound = team and team.bound and team.bound[cwd] or nil
+    if bound and bound.team == entry.id then
+      done()
+      return
+    end
+    self:finish()
+    self:notify("this session is not the leader of the team for this cwd", vim.log.levels.WARN)
     return
   end
   pcall(self.deps.open)
   local S = self.deps.state()
   if not (S and S.sess and S.sess.current) then
     pcall(self.deps.connect)
-    pcall(self.deps.new_session)
-  else
-    -- A session without a team cannot become a leader: the MCP server is only
-    -- injected while a session is created (18.2/19.8), so start a new one.
-    pcall(self.deps.new_session)
   end
-  self:wait_for_leader(cwd, done)
+  -- A session without a team cannot become a leader: the MCP server is only
+  -- injected while a session is created (18.2/19.8), so start a new one.
+  pcall(self.deps.new_session)
+  self:wait_for_leader(cwd, team_id, generation, function(ok)
+    if ok then
+      done()
+    end
+  end)
 end
 
----Wait until the service reports a team for this cwd.
+---Wait until the service reports a team for this cwd, not `except_id`.
 ---@param cwd string
----@param done fun()
-function Flow:wait_for_leader(cwd, done)
+---@param except_id string|nil
+---@param generation integer
+---@param done fun(ok: boolean)
+function Flow:wait_for_leader(cwd, except_id, generation, done)
   self:wait_for(
     function()
-      return self:team_for_cwd(cwd) ~= nil
+      local entry = self:team_for_cwd(cwd)
+      if not entry or (except_id and entry.id == except_id) then
+        return false
+      end
+      local team = self:team()
+      local bound = team and team.bound[cwd] or nil
+      return bound ~= nil and bound.team == entry.id
     end,
     "the leader session",
     function(ok)
-      if not ok then
-        self.starting = false
+      if not self:alive(generation) then
         return
       end
-      done()
+      done(ok)
     end
   )
 end
 
----Ask for the task and start the workflow.
+---Ask for the task, then start (or restart) the workflow.
 ---@param workflow table
 ---@param cwd string
----@param wanted_agent string|nil
-function Flow:ask_task(workflow, cwd, wanted_agent)
+---@param generation integer
+---@param restart {restart: boolean, team: string}|nil
+function Flow:ask_task(workflow, cwd, generation, restart)
   vim.ui.input({ prompt = "task for " .. tostring(workflow.name) .. " (optional): " }, function(task)
+    if not self:alive(generation) then
+      return
+    end
     if task == nil then
-      self.starting = false
+      self:finish()
       return
     end
     if task == "" then
       task = nil
     end
-    self:launch(workflow, cwd, task, wanted_agent)
+    if restart then
+      self:close_and_relaunch(workflow, cwd, generation, restart.team, task)
+      return
+    end
+    self:ensure_session(cwd, nil, generation, function()
+      if self:alive(generation) then
+        self:launch(workflow, cwd, task, generation)
+      end
+    end)
+  end)
+end
+
+---Close `team_id` and continue on the team the new session creates.
+---@param workflow table
+---@param cwd string
+---@param generation integer
+---@param team_id string
+---@param task string|nil
+function Flow:close_and_relaunch(workflow, cwd, generation, team_id, task)
+  self:team():close(team_id, function(ok, value)
+    vim.schedule(function()
+      if not self:alive(generation) then
+        return
+      end
+      if not ok then
+        self:finish()
+        self:notify("cannot end the current team: " .. self.deps.report_error(value), vim.log.levels.WARN)
+        return
+      end
+      -- The close reply may arrive before `team.changed(closed)`, so wait
+      -- until the old team is really gone instead of trusting list order.
+      local team = self:team()
+      if type(team.forget_team) == "function" then
+        team:forget_team(team_id)
+      end
+      self:wait_for(
+        function()
+          local entry = self:team_for_cwd(cwd)
+          return entry == nil or entry.id ~= team_id
+        end,
+        "the old team to close",
+        function()
+          if not self:alive(generation) then
+            return
+          end
+          self:ensure_session(cwd, team_id, generation, function()
+            if self:alive(generation) then
+              self:launch(workflow, cwd, task, generation)
+            end
+          end)
+        end
+      )
+    end)
   end)
 end
 
 ---@param workflow table
 ---@param cwd string
 ---@param task string|nil
----@param wanted_agent string|nil
-function Flow:launch(workflow, cwd, task, wanted_agent)
+---@param generation integer
+function Flow:launch(workflow, cwd, task, generation)
   local entry = self:team_for_cwd(cwd)
   if not entry then
-    self.starting = false
+    self:finish()
     self:notify("no team took the workflow: is the leader session connected?", vim.log.levels.WARN)
     return
   end
   self:team():start(entry.id, workflow.name, task, function(ok, value)
-    self.starting = false
+    if not self:alive(generation) then
+      return
+    end
     if not ok then
+      self:finish()
       self:notify(
         "cannot start " .. tostring(workflow.name) .. ": " .. self.deps.report_error(value),
         vim.log.levels.WARN
       )
       return
     end
-    self:apply_leader_model(workflow, wanted_agent)
+    self:apply_leader_model(workflow)
+    self:finish()
     if self.deps.open_team then
       pcall(self.deps.open_team)
     else
@@ -402,8 +566,7 @@ end
 
 ---Switch the leader's model when the workflow asks for one (2.6).
 ---@param workflow table
----@param _wanted_agent string|nil
-function Flow:apply_leader_model(workflow, _wanted_agent)
+function Flow:apply_leader_model(workflow)
   local leader = type(workflow.leader) == "table" and workflow.leader or {}
   local model = type(leader.model) == "string" and leader.model ~= "" and leader.model or nil
   if not model then
