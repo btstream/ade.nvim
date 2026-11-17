@@ -12,6 +12,8 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt;
+
 use serde_json::json;
 
 use super::{now_ms, TeamError};
@@ -47,10 +49,14 @@ pub struct WorktreeInfo {
     pub missing_subdir: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Removed {
+#[derive(Debug, Clone)]
+pub struct RemoveReport {
+    pub removed: bool,
     pub branch: String,
     pub branch_kept: bool,
+    /// The branch step failed after the worktree was already removed; the
+    /// participant record is still cleared so a retry is not wedged.
+    pub error: Option<TeamError>,
 }
 
 /// `YYYYMMDD-HHMMSS` in UTC (18.12).
@@ -181,6 +187,34 @@ fn timeout_ms() -> u64 {
         .unwrap_or(60_000)
 }
 
+/// Kill the whole process group of a timed-out git (its hooks and their
+/// children included) and wait until it is gone.
+#[cfg(unix)]
+fn kill_group_now(pid: u32) {
+    // A negative pid addresses the group created by `setpgid(0, 0)`.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+/// Wait until no member of the group is left. The direct child is reaped by
+/// the caller first; this covers hooks and their children.
+#[cfg(unix)]
+async fn wait_group_gone(pid: u32) {
+    let pgid = pid as i32;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let alive = unsafe { libc::kill(-pgid, 0) } == 0;
+        if !alive || tokio::time::Instant::now() >= deadline {
+            if alive {
+                kill_group_now(pid);
+            }
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn git(toplevel: &Path, args: &[&str]) -> Result<GitOutput, TeamError> {
     let mut command = tokio::process::Command::new("git");
     command.arg("-C").arg(toplevel).args(args);
@@ -192,40 +226,157 @@ async fn git(toplevel: &Path, args: &[&str]) -> Result<GitOutput, TeamError> {
         }
     }
     command.env("GIT_TERMINAL_PROMPT", "0");
+    // Stable diagnostics for the "not a repository"/"unborn HEAD" checks; git
+    // otherwise localises stderr.
+    command.env("LC_ALL", "C");
+    command.env("LANG", "C");
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.kill_on_drop(true);
+    #[cfg(unix)]
+    unsafe {
+        // Its own group, so a timed-out hook's children die with it.
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| git_failed(&format!("cannot run git: {error}"), &error.to_string()))?;
+    let pid = child.id();
+    let mut stdout_pipe = child.stdout.take().expect("stdout pipe");
+    let mut stderr_pipe = child.stderr.take().expect("stderr pipe");
+    let stdout_task = tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buffer).await;
+        buffer
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buffer).await;
+        buffer
+    });
     let timeout = Duration::from_millis(timeout_ms());
-    match tokio::time::timeout(timeout, command.output()).await {
-        Err(_) => Ok(GitOutput {
-            ok: false,
-            stdout: String::new(),
-            stderr: format!("git {} timed out after {:?}", args.join(" "), timeout),
-            timed_out: true,
-        }),
-        Ok(Err(error)) => Err(git_failed(
-            &format!("cannot run git: {error}"),
-            &error.to_string(),
-        )),
-        Ok(Ok(output)) => Ok(GitOutput {
-            ok: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-            stderr: truncated(&output.stderr),
-            timed_out: false,
-        }),
+    let waited = tokio::time::timeout(timeout, child.wait()).await;
+    match waited {
+        Ok(Ok(status)) => {
+            let stdout = tokio::time::timeout(Duration::from_secs(2), stdout_task)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            let stderr = tokio::time::timeout(Duration::from_secs(2), stderr_task)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            Ok(GitOutput {
+                ok: status.success(),
+                stdout: truncated(&stdout),
+                stderr: truncated(&stderr),
+                timed_out: false,
+            })
+        }
+        Ok(Err(error)) => {
+            // The child produced no status; its group may still be alive.
+            if let Some(pid) = pid {
+                #[cfg(unix)]
+                {
+                    kill_group_now(pid);
+                    wait_group_gone(pid).await;
+                }
+            }
+            Err(git_failed(
+                &format!("git {} could not be waited for: {error}", args.join(" ")),
+                &error.to_string(),
+            ))
+        }
+        Err(_) => {
+            if let Some(pid) = pid {
+                #[cfg(unix)]
+                kill_group_now(pid);
+                // Reap git itself, then wait for the hook's children: a zombie
+                // would otherwise count as a live group member forever.
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                #[cfg(unix)]
+                wait_group_gone(pid).await;
+            }
+            let stdout = tokio::time::timeout(Duration::from_secs(2), stdout_task)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            let stderr = tokio::time::timeout(Duration::from_secs(2), stderr_task)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default();
+            Ok(GitOutput {
+                ok: false,
+                stdout: truncated(&stdout),
+                stderr: format!(
+                    "git {} timed out after {:?}{}{}",
+                    args.join(" "),
+                    timeout,
+                    if stderr.is_empty() { "" } else { ": " },
+                    truncated(&stderr)
+                ),
+                timed_out: true,
+            })
+        }
     }
 }
 
-fn git_output(output: &GitOutput, args: &[&str]) -> Result<String, TeamError> {
-    if output.ok {
-        Ok(output.stdout.clone())
-    } else {
-        Err(git_failed(
-            &format!("git {} failed", args.join(" ")),
+fn failed(output: &GitOutput, args: &[&str]) -> TeamError {
+    git_failed(&format!("git {} failed", args.join(" ")), &output.stderr)
+}
+
+/// A command whose failure means "this is not a usable repository", with
+/// timeouts and all other failures still reported as git errors (18.16).
+fn repository_error(
+    output: &GitOutput,
+    args: &[&str],
+    missing_markers: &[&str],
+    message: &str,
+) -> Result<String, TeamError> {
+    if output.timed_out {
+        return Err(git_failed(
+            &format!("git {} timed out", args.join(" ")),
             &output.stderr,
-        ))
+        ));
     }
+    if output.ok {
+        return Ok(output.stdout.clone());
+    }
+    if missing_markers
+        .iter()
+        .any(|marker| output.stderr.contains(marker))
+    {
+        return Err(TeamError::not_allowed(message));
+    }
+    Err(failed(output, args))
+}
+
+/// Remove a worktree and its branch, ignoring errors; used when a spawn was
+/// abandoned (team closed, service shutting down) or when `worktree add`
+/// failed halfway.
+pub async fn discard(toplevel: &str, worktree: &str, branch: &str) {
+    let toplevel = Path::new(toplevel);
+    let _ = git(toplevel, &["worktree", "remove", "--force", worktree]).await;
+    let _ = git(toplevel, &["worktree", "prune"]).await;
+    if Path::new(worktree).exists() {
+        let _ = std::fs::remove_dir_all(worktree);
+    }
+    // The per-repository parent (`<repo>-<hash8>`) is ours too; remove it when
+    // this was the only worktree.
+    if let Some(parent) = Path::new(worktree).parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+    let _ = git(toplevel, &["branch", "-D", branch]).await;
 }
 
 /// Create the worktree and return everything the hub needs to start the
@@ -238,44 +389,70 @@ pub async fn create(
     name: &str,
 ) -> Result<WorktreeInfo, TeamError> {
     let cwd = Path::new(team_cwd);
-    let toplevel_raw = git(cwd, &["rev-parse", "--show-toplevel"]).await?;
-    if !toplevel_raw.ok {
-        return Err(TeamError::not_allowed(
-            "the team's cwd is not inside a git work tree",
-        ));
-    }
-    let toplevel = std::fs::canonicalize(toplevel_raw.stdout.trim()).map_err(|error| {
+    let args = ["rev-parse", "--show-toplevel"];
+    let toplevel_raw = git(cwd, &args).await?;
+    let toplevel_raw = repository_error(
+        &toplevel_raw,
+        &args,
+        &["not a git repository", "must be run in a work tree"],
+        "the team's cwd is not inside a git work tree",
+    )?;
+    let toplevel = std::fs::canonicalize(toplevel_raw.trim()).map_err(|error| {
         TeamError::not_allowed(format!("cannot resolve the git work tree: {error}"))
     })?;
     let lock = lock_for(&toplevel);
     let _guard = lock.lock().await;
 
-    let bare = git(&toplevel, &["rev-parse", "--is-bare-repository"]).await?;
-    if bare.ok && bare.stdout.trim() == "true" {
+    let bare_args = ["rev-parse", "--is-bare-repository"];
+    let bare = git(&toplevel, &bare_args).await?;
+    if bare.timed_out {
+        return Err(git_failed("git rev-parse timed out", &bare.stderr));
+    }
+    if !bare.ok {
+        return Err(failed(&bare, &bare_args));
+    }
+    if bare.stdout.trim() == "true" {
         return Err(TeamError::not_allowed("the git repository is bare"));
     }
-    let head = git(&toplevel, &["rev-parse", "--verify", "HEAD^{commit}"]).await?;
-    if !head.ok {
-        return Err(TeamError::not_allowed(
-            "the git repository has no commit at HEAD",
-        ));
+    let head_args = ["rev-parse", "--verify", "HEAD^{commit}"];
+    let head = git(&toplevel, &head_args).await?;
+    let base = repository_error(
+        &head,
+        &head_args,
+        &[
+            "Needed a single revision",
+            "unknown revision",
+            "bad revision",
+            "ambiguous argument 'HEAD'",
+        ],
+        "the git repository has no commit at HEAD",
+    )?;
+    let dirty_args = ["status", "--porcelain"];
+    let dirty = git(&toplevel, &dirty_args).await?;
+    if !dirty.ok {
+        return Err(failed(&dirty, &dirty_args));
     }
-    let base = git_output(&head, &["rev-parse", "--verify", "HEAD^{commit}"])?;
-    let dirty = git(&toplevel, &["status", "--porcelain"]).await?;
-    let warning = if !dirty.ok {
-        return Err(git_output(&dirty, &["status", "--porcelain"]).unwrap_err());
-    } else if !dirty.stdout.is_empty() {
-        Some("dirty_tree".to_string())
-    } else {
+    let warning = if dirty.stdout.is_empty() {
         None
+    } else {
+        Some("dirty_tree".to_string())
     };
 
     let root = Path::new(worktree_root);
+    if let Some(canonical_root) = canonical_with_missing(root) {
+        if canonical_root.starts_with(&toplevel) {
+            return Err(TeamError::invalid(
+                "worktree_root must be outside the git work tree",
+            ));
+        }
+    }
     std::fs::create_dir_all(root).map_err(|error| {
         TeamError::not_allowed(format!("cannot create the worktree root: {error}"))
     })?;
     let (branch, directory) = names(root, &toplevel, team, stamp, name);
-    if directory.exists() {
+    // `symlink_metadata` also notices a dangling symlink, which `exists()`
+    // would not.
+    if std::fs::symlink_metadata(&directory).is_ok() {
         return Err(TeamError::not_allowed(format!(
             "the worktree directory {} already exists",
             directory.display()
@@ -283,19 +460,17 @@ pub async fn create(
     }
     let branch_ref = format!("refs/heads/{branch}");
     let existing = git(&toplevel, &["show-ref", "--verify", "--quiet", &branch_ref]).await?;
+    if existing.timed_out {
+        return Err(git_failed("git show-ref timed out", &existing.stderr));
+    }
     if existing.ok {
         return Err(TeamError::not_allowed(format!(
             "the worktree branch {branch} already exists"
         )));
     }
-    if existing.timed_out {
-        return Err(git_failed("git show-ref timed out", &existing.stderr));
-    }
     // `show-ref --quiet` exits 1 for "no such ref"; anything else is a real
     // failure.
-    if !existing.ok && existing.stderr.is_empty() && existing.stdout.is_empty() {
-        // Expected absence.
-    } else if !existing.ok {
+    if !existing.stderr.is_empty() || !existing.stdout.is_empty() {
         return Err(git_failed("git show-ref failed", &existing.stderr));
     }
 
@@ -305,13 +480,19 @@ pub async fn create(
         })?;
     }
     let directory_text = directory.to_string_lossy().to_string();
-    let added = git(
+    // `base` is the commit the branch records; the worktree must start from
+    // exactly that commit, not from a HEAD that may have moved.
+    let add = git(
         &toplevel,
-        &["worktree", "add", "-b", &branch, &directory_text, "HEAD"],
+        &["worktree", "add", "-b", &branch, &directory_text, &base],
     )
     .await?;
-    if !added.ok {
-        return Err(git_failed("git worktree add failed", &added.stderr));
+    if !add.ok {
+        // A hook may have failed or the command may have timed out after the
+        // directory/branch were created: remove only what this call made. The
+        // branch was checked absent above under the toplevel lock.
+        discard(&toplevel.to_string_lossy(), &directory_text, &branch).await;
+        return Err(git_failed("git worktree add failed", &add.stderr));
     }
 
     let relative = subdir(cwd, &toplevel).unwrap_or_default();
@@ -337,52 +518,138 @@ pub async fn create(
     })
 }
 
+/// Resolve a path that may not exist yet, by canonicalising the nearest
+/// existing ancestor and appending the missing components.
+fn canonical_with_missing(path: &Path) -> Option<PathBuf> {
+    let mut missing = Vec::new();
+    let mut current = path;
+    loop {
+        if std::fs::symlink_metadata(current).is_ok() {
+            break;
+        }
+        missing.push(current.file_name()?.to_os_string());
+        current = current.parent()?;
+    }
+    let mut canonical = std::fs::canonicalize(current).ok()?;
+    for component in missing.into_iter().rev() {
+        canonical.push(component);
+    }
+    Some(canonical)
+}
+
 /// Remove an exited worker's worktree, then delete the branch when its tip is
-/// an ancestor of the toplevel's current HEAD (18.16).
+/// an ancestor of the toplevel's current HEAD (18.16). A missing worktree or
+/// branch is treated as already/otherwise removed; the participant record is
+/// cleared by the caller even when only the branch step fails.
 pub async fn remove(
     toplevel: &str,
     worktree: &str,
     branch: &str,
     force: bool,
-) -> Result<Removed, TeamError> {
-    let toplevel = std::fs::canonicalize(toplevel).map_err(|error| {
-        TeamError::not_allowed(format!("cannot resolve the git work tree: {error}"))
-    })?;
+) -> Result<RemoveReport, TeamError> {
+    let report = |removed: bool, branch_kept: bool, error: Option<TeamError>| RemoveReport {
+        removed,
+        branch: branch.to_string(),
+        branch_kept,
+        error,
+    };
+    let toplevel = match std::fs::canonicalize(toplevel) {
+        Ok(path) => path,
+        Err(error) => {
+            return Err(TeamError::not_allowed(format!(
+                "cannot resolve the git work tree: {error}"
+            )))
+        }
+    };
     let lock = lock_for(&toplevel);
     let _guard = lock.lock().await;
 
-    let mut args = vec!["worktree", "remove"];
-    if force {
-        args.push("--force");
-    }
-    args.push(worktree);
-    let removed = git(&toplevel, &args).await?;
-    if !removed.ok {
-        return Err(git_failed("git worktree remove failed", &removed.stderr));
+    let existed = std::fs::symlink_metadata(worktree).is_ok();
+    if existed {
+        let mut args = vec!["worktree", "remove"];
+        if force {
+            args.push("--force");
+        }
+        args.push(worktree);
+        let removed = git(&toplevel, &args).await?;
+        if !removed.ok {
+            return Ok(report(
+                false,
+                true,
+                Some(git_failed("git worktree remove failed", &removed.stderr)),
+            ));
+        }
+    } else {
+        // Someone deleted the directory by hand: prune the administrative
+        // entry and continue with the branch.
+        let pruned = git(&toplevel, &["worktree", "prune"]).await?;
+        if !pruned.ok {
+            return Ok(report(
+                false,
+                true,
+                Some(git_failed("git worktree prune failed", &pruned.stderr)),
+            ));
+        }
     }
 
-    let head_output = git(&toplevel, &["rev-parse", "--verify", "HEAD^{commit}"]).await?;
-    let head = git_output(&head_output, &["rev-parse", "--verify", "HEAD^{commit}"])?;
-    let ancestor = git(&toplevel, &["merge-base", "--is-ancestor", branch, &head]).await?;
+    let branch_ref = format!("refs/heads/{branch}");
+    let branch_ref_arg = branch_ref.as_str();
+    let branch_args = ["rev-parse", "--verify", branch_ref_arg];
+    let exists = git(&toplevel, &branch_args).await?;
+    if exists.timed_out {
+        return Ok(report(
+            true,
+            true,
+            Some(git_failed("git rev-parse timed out", &exists.stderr)),
+        ));
+    }
+    if !exists.ok {
+        let missing = exists.stderr.contains("Needed a single revision")
+            || exists.stderr.contains("unknown revision")
+            || exists.stderr.contains("bad revision");
+        if missing {
+            return Ok(report(true, false, None));
+        }
+        return Ok(report(true, true, Some(failed(&exists, &branch_args))));
+    }
+
+    let head_args = ["rev-parse", "--verify", "HEAD^{commit}"];
+    let head_output = git(&toplevel, &head_args).await?;
+    let head = match repository_error(
+        &head_output,
+        &head_args,
+        &["Needed a single revision", "unknown revision"],
+        "the git repository has no commit at HEAD",
+    ) {
+        Ok(head) => head,
+        Err(error) => return Ok(report(true, true, Some(error))),
+    };
+    let ancestor_args = ["merge-base", "--is-ancestor", branch_ref_arg, head.as_str()];
+    let ancestor = git(&toplevel, &ancestor_args).await?;
     if ancestor.timed_out {
-        return Err(git_failed("git merge-base timed out", &ancestor.stderr));
+        return Ok(report(
+            true,
+            true,
+            Some(git_failed("git merge-base timed out", &ancestor.stderr)),
+        ));
     }
     // Exit 1 means "not an ancestor" (keep the branch); other failures are
     // real git errors.
     if !ancestor.ok && !ancestor.stderr.is_empty() {
-        return Err(git_failed("git merge-base failed", &ancestor.stderr));
+        return Ok(report(true, true, Some(failed(&ancestor, &ancestor_args))));
     }
-    let branch_kept = !ancestor.ok;
-    if !branch_kept {
-        let deleted = git(&toplevel, &["branch", "-D", branch]).await?;
-        if !deleted.ok {
-            return Err(git_failed("git branch -D failed", &deleted.stderr));
-        }
+    if !ancestor.ok {
+        return Ok(report(true, true, None));
     }
-    Ok(Removed {
-        branch: branch.to_string(),
-        branch_kept,
-    })
+    let deleted = git(&toplevel, &["branch", "-D", branch]).await?;
+    if !deleted.ok {
+        return Ok(report(
+            true,
+            true,
+            Some(git_failed("git branch -D failed", &deleted.stderr)),
+        ));
+    }
+    Ok(report(true, false, None))
 }
 
 /// The role-card line a dirty-tree worker gets (18.16).

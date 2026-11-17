@@ -485,6 +485,11 @@ impl Client {
         }
     }
 
+    /// Restore the blocking read timeout after polling helpers narrowed it.
+    pub fn reset_read_timeout(&mut self) {
+        self.set_read_timeout(Duration::from_secs(10));
+    }
+
     fn recv_with_timeout(&mut self, timeout: Duration) -> ReadOutcome {
         self.set_read_timeout(timeout);
         let mut line = String::new();
