@@ -153,6 +153,20 @@ impl Hub {
             "bus.send" => self.bus_send(conn, &team, &name, params),
             "bus.ask_human" => self.bus_ask_human(&team, &name, params),
             "bus.status" => self.teams.status(&team, &name).map(|value| (value, false)),
+            "bus.board_update" => {
+                if role != Role::Leader {
+                    Err(TeamError::not_allowed("board_update is leader only"))
+                } else {
+                    self.bus_board_update(&team, params)
+                }
+            }
+            "bus.card_update" => {
+                if role != Role::Worker {
+                    Err(TeamError::not_allowed("card_update is worker only"))
+                } else {
+                    self.bus_card_update(&team, &name, params)
+                }
+            }
             "bus.read" => {
                 if role != Role::Leader {
                     Err(TeamError::not_allowed("bus_read is leader only"))
@@ -164,6 +178,14 @@ impl Hub {
         };
         match result {
             Ok((value, delivery)) => {
+                self.teams.note_bus_call(
+                    &team,
+                    &name,
+                    method,
+                    params,
+                    &value,
+                    crate::team::now_ms(),
+                );
                 self.drain_team_events();
                 if delivery {
                     self.team_deliveries();
@@ -196,6 +218,8 @@ impl Hub {
             "team.list" => Ok((self.teams.list(), false)),
             "team.send" => self.team_send(params),
             "team.read" => self.team_read(params).map(|value| (value, false)),
+            "team.board" => self.team_board(params).map(|value| (value, false)),
+            "team.card_history" => self.team_card_history(params).map(|value| (value, false)),
             "team.answer" => self.team_answer(params),
             "team.watch" => {
                 self.team_watch(conn, id, params);
@@ -346,11 +370,11 @@ impl Hub {
                 .and_then(|team| team.participants.get_mut(&name))
             {
                 participant.starting = true;
-                participant.state = if waiting {
+                participant.set_state(if waiting {
                     crate::team::ParticipantState::WaitingHuman
                 } else {
                     crate::team::ParticipantState::Idle
-                };
+                });
                 participant.instance = None;
             }
             let spawn = SpawnRequest {
@@ -393,8 +417,15 @@ impl Hub {
                 .get("kind")
                 .ok_or_else(|| TeamError::invalid("kind is required"))?,
         )?;
-        let body = required_team_string(params, "body")?;
-        let task = optional_string(params, "task")?;
+        let mut body = required_team_string(params, "body")?;
+        let mut task = optional_string(params, "task")?;
+        if let Some(card) = optional_string(params, "card")? {
+            let (prefixed, default_task) =
+                self.teams
+                    .card_message(&team, &card, &body, task.as_deref())?;
+            body = prefixed;
+            task = task.or(default_task);
+        }
         let refs = team_refs(params)?;
         let id =
             self.teams
@@ -410,6 +441,17 @@ impl Hub {
         let participant = required_team_string(params, "participant")?;
         let since = optional_u64(params, "since")?;
         self.teams.read(&team, &participant, since)
+    }
+
+    fn team_board(&mut self, params: &Value) -> Result<Value, TeamError> {
+        let team = required_team_string(params, "team")?;
+        self.teams.board(&team)
+    }
+
+    fn team_card_history(&mut self, params: &Value) -> Result<Value, TeamError> {
+        let team = required_team_string(params, "team")?;
+        let card = required_team_string(params, "card")?;
+        self.teams.card_history(&team, &card)
     }
 
     fn team_answer(&mut self, params: &Value) -> Result<(Value, bool), TeamError> {
@@ -477,6 +519,9 @@ impl Hub {
 
     fn team_close(&mut self, params: &Value) -> Result<Value, TeamError> {
         let team = required_team_string(params, "team")?;
+        // Pending worker writes are flushed before the team (and its board)
+        // goes away (19.2).
+        self.flush_pending_board(&team, false);
         let (_entry, workers) = self.teams.close(&team)?;
         for instance in workers {
             let Some(handle) = self.instances.get(&instance) else {
@@ -663,9 +708,85 @@ impl Hub {
         Ok((self.teams.read(team, &participant, since)?, false))
     }
 
+    /// `bus.board_update` (leader, 19.2): one atomic write, persisted and
+    /// announced at once. A worker write still waiting for its timer is
+    /// flushed first.
+    fn bus_board_update(&mut self, team: &str, params: &Value) -> Result<(Value, bool), TeamError> {
+        self.flush_pending_board(team, true);
+        let rev = self
+            .teams
+            .board_update(team, params, crate::team::now_ms())?;
+        self.persist_board(team);
+        self.announce_board(team, rev);
+        Ok((json!({ "rev": rev }), false))
+    }
+
+    /// `bus.card_update` (owner worker, 19.2): applied at once, persisted and
+    /// announced by the coalescing timer.
+    fn bus_card_update(
+        &mut self,
+        team: &str,
+        name: &str,
+        params: &Value,
+    ) -> Result<(Value, bool), TeamError> {
+        let now = crate::team::now_ms();
+        let rev = self.teams.card_update(team, name, params, now)?;
+        if let Some(current) = self.teams.team_mut(team) {
+            if current.board_flush_at.is_none() {
+                current.board_flush_at = Some(now + crate::team::board::flush_interval_ms());
+            }
+        }
+        Ok((json!({ "rev": rev }), false))
+    }
+
+    fn announce_board(&self, team: &str, rev: u64) {
+        self.send_to_frontends(&json!({
+            "jsonrpc": "2.0",
+            "method": "team.board_changed",
+            "params": { "team": team, "rev": rev },
+        }));
+    }
+
+    /// Write the board if it changed since the last persistence. Returns the
+    /// persisted rev.
+    fn persist_board(&mut self, team: &str) -> Option<u64> {
+        let persist = self.teams.take_board_persist(team, crate::team::now_ms())?;
+        let rev = persist.rev;
+        self.recorder.save_board(
+            team,
+            persist.rev,
+            persist.json,
+            persist.history,
+            persist.cleared,
+        );
+        Some(rev)
+    }
+
+    fn flush_pending_board(&mut self, team: &str, announce: bool) {
+        if let Some(rev) = self.persist_board(team) {
+            if announce {
+                self.announce_board(team, rev);
+            }
+        }
+    }
+
+    pub(crate) fn flush_due_boards(&mut self) {
+        let now = crate::team::now_ms();
+        for team in self.teams.due_board_flushes(now) {
+            self.flush_pending_board(&team, true);
+        }
+    }
+
+    pub(crate) fn flush_all_boards(&mut self, announce: bool) {
+        for team in self.teams.pending_boards() {
+            self.flush_pending_board(&team, announce);
+        }
+    }
+
     /// `bus.spawn`: a worktree spawn answers after git finished, so the reply
     /// is sent here instead of returning a value.
     fn bus_spawn(&mut self, conn: u64, id: &Value, team: &str, params: &Value) {
+        let mut assigned_name: Option<String> = None;
         let result = (|| -> Result<Option<(Value, bool)>, TeamError> {
             let template = required_team_string(params, "template")?;
             let name = optional_string(params, "name")?;
@@ -675,6 +796,7 @@ impl Hub {
                 .request_spawn(team, &template, name.as_deref(), task.as_deref())?
             {
                 SpawnOutcome::Started(spawn) => {
+                    assigned_name = Some(spawn.name.clone());
                     let opts = StartOptions {
                         reply: Some((conn, id.clone(), SpawnReplyKind::Bus)),
                         ..StartOptions::default()
@@ -687,24 +809,52 @@ impl Hub {
                         StartResult::Deferred | StartResult::Replied => Ok(None),
                     }
                 }
-                SpawnOutcome::Awaiting { request, name: _ } => Ok(Some((
-                    json!({
-                        "status": "awaiting_approval",
-                        "request": request,
-                    }),
-                    false,
-                ))),
+                SpawnOutcome::Awaiting { request, name } => {
+                    assigned_name = Some(name);
+                    Ok(Some((
+                        json!({
+                            "status": "awaiting_approval",
+                            "request": request,
+                        }),
+                        false,
+                    )))
+                }
             }
         })();
         match result {
             Ok(Some((value, delivery))) => {
+                self.teams.note_bus_call(
+                    team,
+                    "leader",
+                    "bus.spawn",
+                    params,
+                    &value,
+                    crate::team::now_ms(),
+                );
                 self.drain_team_events();
                 if delivery {
                     self.team_deliveries();
                 }
                 self.send_to(conn, &success(id, value));
             }
-            Ok(None) => {}
+            Ok(None) => {
+                // The worktree spawn answers later; the call itself is still
+                // the leader's latest activity, named after the worker the
+                // service actually assigned.
+                let named = assigned_name
+                    .as_ref()
+                    .map(|name| json!({ "name": name }))
+                    .unwrap_or(Value::Null);
+                self.teams.note_bus_call(
+                    team,
+                    "leader",
+                    "bus.spawn",
+                    params,
+                    &named,
+                    crate::team::now_ms(),
+                );
+                self.drain_team_events();
+            }
             Err(error) => self.send_error(conn, id, &error),
         }
     }
@@ -1744,6 +1894,13 @@ impl Hub {
         let Some(update) = params.get("update") else {
             return;
         };
+        let session = params.get("sessionId").and_then(Value::as_str);
+        if self
+            .teams
+            .observe_activity_update(instance, session, update, crate::team::now_ms())
+        {
+            self.drain_team_events();
+        }
         if update.get("sessionUpdate").and_then(Value::as_str) != Some("agent_message_chunk") {
             return;
         }
@@ -1754,8 +1911,12 @@ impl Hub {
         else {
             return;
         };
-        let session = params.get("sessionId").and_then(Value::as_str);
         self.teams.observe_chunk(instance, session, text);
+    }
+
+    pub(crate) fn flush_due_activities(&mut self) {
+        self.teams.flush_due_activities(crate::team::now_ms());
+        self.drain_team_events();
     }
 
     pub(crate) fn instance_left_team(&mut self, instance: &str, reason: &str) {
@@ -1879,6 +2040,10 @@ impl Hub {
     }
 
     pub(crate) fn expire_teams(&mut self) {
+        // A pending worker write is persisted here even when its 10 s timer has
+        // not fired yet. It must be announced too: clearing the timer without
+        // `team.board_changed` would hide that rev from the front end.
+        self.flush_all_boards(true);
         let ttl = team_ttl_ms();
         let expired = self.teams.expire_suspended(crate::team::now_ms(), ttl);
         for id in expired {

@@ -408,6 +408,322 @@ fn resume(
     wait_active(client, team)
 }
 
+fn mcp_call(server: &TestServer, token: &str, tool: &str, arguments: Value) -> Value {
+    use std::io::Write;
+    let frames = [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test"}}}),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":arguments}}),
+    ];
+    let mut child = std::process::Command::new(common::BINARY)
+        .arg("mcp")
+        .env("ADE_TEAM_TOKEN", token)
+        .env("NVIM_ADE_SERVER_DIR", server.dir())
+        .env("HOME", server.dir())
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn mcp");
+    {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        for frame in &frames {
+            writeln!(stdin, "{frame}").expect("write mcp frame");
+        }
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("mcp exits");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("id") == Some(&json!(2)) {
+            return value.get("result").cloned().unwrap_or(value);
+        }
+    }
+    panic!(
+        "no MCP response: stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn mcp_text(result: &Value) -> String {
+    result["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn database_path(fixture: &Fixture) -> PathBuf {
+    fixture.dir.path().join("nvim_ade_server.events.sqlite3")
+}
+
+fn stored_board_rev(fixture: &Fixture, team: &str) -> Option<u64> {
+    let conn = rusqlite::Connection::open(database_path(fixture)).ok()?;
+    conn.query_row(
+        "SELECT rev FROM boards WHERE team_id = ?1",
+        rusqlite::params![team],
+        |row| row.get::<_, i64>(0),
+    )
+    .ok()
+    .and_then(|rev| u64::try_from(rev).ok())
+}
+
+fn wait_stored_board(fixture: &Fixture, team: &str, rev: u64) {
+    wait_for(
+        || (stored_board_rev(fixture, team) == Some(rev)).then_some(()),
+        "the board to reach the database",
+    );
+}
+
+fn board_update(server: &TestServer, token: &str, workflow_name: &str) -> u64 {
+    let result = mcp_call(
+        server,
+        token,
+        "board_update",
+        json!({
+            "workflow_name": workflow_name,
+            "workflow": "one flow",
+            "columns": ["todo", "doing"],
+            "upsert": [
+                {"id": "T1", "title": "one", "column": "todo", "stage": "S1"},
+                {"id": "T2", "title": "two", "column": "doing", "stage": "S1"}
+            ]
+        }),
+    );
+    assert_eq!(result["isError"], false, "{result}");
+    serde_json::from_str::<Value>(&mcp_text(&result)).expect("board_update JSON")["rev"]
+        .as_u64()
+        .expect("board rev")
+}
+
+/// Build a team, write a board, restart the service (graceful or SIGKILL),
+/// check the suspended board, resume and inspect `bus.status`, then close the
+/// team and check that its board and history rows are gone.
+fn board_restart_scenario(label: &str, sigkill: bool) {
+    let fixture = Fixture::new(label);
+    let mut server = fixture.start("a", &[]);
+    let mut client = fixture.connect(&server);
+    fixture.configure(&mut client, &fixture.work, &server, true);
+    let (_instance, leader_session, token, bound) =
+        fixture.attach_leader(&server, &mut client, &fixture.work, None);
+    let team = bound["result"]["team"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("bind: {bound}"))
+        .to_string();
+    board_update(&server, &token, "default");
+    // One more write leaves a history version for T1 before the restart.
+    let changed = mcp_call(
+        &server,
+        &token,
+        "board_update",
+        json!({"upsert": [{"id": "T1", "title": "renamed"}]}),
+    );
+    assert_eq!(changed["isError"], false, "{changed}");
+    let rev = serde_json::from_str::<Value>(&mcp_text(&changed)).expect("board_update JSON")["rev"]
+        .as_u64()
+        .expect("board rev");
+    let board = client.request(50, "team.board", json!({"team": team}));
+    assert_eq!(board["result"]["board"]["rev"], rev, "{board}");
+    assert_eq!(
+        board["result"]["board"]["workflow_name"], "default",
+        "{board}"
+    );
+    let history = client.request(53, "team.card_history", json!({"team": team, "card": "T1"}));
+    assert_eq!(
+        history["result"]["versions"].as_array().map(Vec::len),
+        Some(1),
+        "{history}"
+    );
+    assert_eq!(
+        history["result"]["versions"][0]["title"], "one",
+        "{history}"
+    );
+
+    if sigkill {
+        // The write is queued to the store thread; wait until it is durable so
+        // SIGKILL cannot interrupt it.
+        wait_stored_board(&fixture, &team, rev);
+        server.kill();
+        kill_fixture_processes(fixture.dir.path());
+    } else {
+        Fixture::shutdown(&mut server);
+    }
+    drop(server);
+
+    let mut restarted = fixture.start("b", &[]);
+    let mut second = fixture.connect(&restarted);
+    let suspended = wait_suspended(&mut second, &team);
+    assert_eq!(suspended["board_rev"], rev, "{suspended}");
+    assert_eq!(suspended["workflow_name"], "default", "{suspended}");
+    assert_eq!(
+        suspended["stages"],
+        json!([{"stage": "S1", "open": 2, "archived": 0}]),
+        "{suspended}"
+    );
+    for participant in suspended["participants"].as_array().expect("participants") {
+        assert!(
+            participant["state_since"].as_u64().is_some_and(|at| at > 0),
+            "a recovered participant sets state_since: {participant}"
+        );
+        assert!(
+            participant["activity"].is_null(),
+            "activity is not persisted: {participant}"
+        );
+    }
+    let board = second.request(51, "team.board", json!({"team": team}));
+    assert_eq!(board["result"]["board"]["rev"], rev, "{board}");
+    assert_eq!(
+        board["result"]["board"]["cards"].as_array().map(Vec::len),
+        Some(2),
+        "{board}"
+    );
+    let history = second.request(54, "team.card_history", json!({"team": team, "card": "T1"}));
+    assert_eq!(
+        history["result"]["versions"].as_array().map(Vec::len),
+        Some(1),
+        "history survives the restart: {history}"
+    );
+    assert_eq!(
+        history["result"]["versions"][0]["title"], "one",
+        "{history}"
+    );
+
+    fixture.configure(&mut second, &fixture.work, &restarted, true);
+    let (_instance, session, token, bound) = fixture.attach_leader(
+        &restarted,
+        &mut second,
+        &fixture.work,
+        Some(&leader_session),
+    );
+    assert_eq!(session, leader_session);
+    assert_eq!(bound["result"]["team"]["id"], team, "{bound}");
+    wait_active(&mut second, &team);
+    let status = mcp_call(&restarted, &token, "bus_status", json!({}));
+    let status: Value = serde_json::from_str(&mcp_text(&status)).expect("bus.status JSON");
+    assert_eq!(status["board"]["rev"], rev, "{status}");
+    assert_eq!(status["board"]["workflow_name"], "default", "{status}");
+    assert_eq!(
+        status["board"]["cards"].as_array().map(Vec::len),
+        Some(2),
+        "{status}"
+    );
+
+    let closed = second.request(52, "team.close", json!({"team": team}));
+    assert!(closed["result"].is_object(), "{closed}");
+    Fixture::shutdown(&mut restarted);
+    drop(second);
+    drop(restarted);
+
+    // The recorder joined its writer on shutdown, so the rows are gone.
+    let conn = rusqlite::Connection::open(database_path(&fixture)).expect("database");
+    let rows: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM boards WHERE team_id = ?1",
+            rusqlite::params![team],
+            |row| row.get(0),
+        )
+        .expect("boards count");
+    assert_eq!(rows, 0, "team.close deletes the board row");
+    let rows: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM card_history WHERE team_id = ?1",
+            rusqlite::params![team],
+            |row| row.get(0),
+        )
+        .expect("card history count");
+    assert_eq!(rows, 0, "team.close deletes the card history rows");
+}
+
+#[test]
+fn an_unreadable_board_row_stays_untouched_and_refuses_writes() {
+    let fixture = Fixture::new("restart-board-corrupt");
+    let mut server = fixture.start("a", &[]);
+    let mut client = fixture.connect(&server);
+    fixture.configure(&mut client, &fixture.work, &server, true);
+    let (_instance, leader_session, token, bound) =
+        fixture.attach_leader(&server, &mut client, &fixture.work, None);
+    let team = bound["result"]["team"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("bind: {bound}"))
+        .to_string();
+    board_update(&server, &token, "default");
+    Fixture::shutdown(&mut server);
+    drop(server);
+
+    // Corrupt only the board row; the team must still load.
+    {
+        let conn = rusqlite::Connection::open(database_path(&fixture)).expect("database");
+        conn.execute(
+            "UPDATE boards SET json = '{broken' WHERE team_id = ?1",
+            rusqlite::params![team],
+        )
+        .expect("corrupt the board");
+    }
+
+    let mut restarted = fixture.start("b", &[]);
+    let mut second = fixture.connect(&restarted);
+    wait_suspended(&mut second, &team);
+    let board = second.request(60, "team.board", json!({"team": team}));
+    assert_eq!(board["result"]["board"]["unavailable"], true, "{board}");
+    assert_eq!(
+        board["result"]["board"]["cards"].as_array().map(Vec::len),
+        Some(0),
+        "{board}"
+    );
+
+    fixture.configure(&mut second, &fixture.work, &restarted, true);
+    let (_instance, session, token, bound) = fixture.attach_leader(
+        &restarted,
+        &mut second,
+        &fixture.work,
+        Some(&leader_session),
+    );
+    assert_eq!(session, leader_session);
+    assert_eq!(bound["result"]["team"]["id"], team, "{bound}");
+    wait_active(&mut second, &team);
+
+    let status = mcp_call(&restarted, &token, "bus_status", json!({}));
+    let status: Value = serde_json::from_str(&mcp_text(&status)).expect("bus.status JSON");
+    assert_eq!(status["board"]["unavailable"], true, "{status}");
+
+    let refused = mcp_call(
+        &restarted,
+        &token,
+        "board_update",
+        json!({"workflow_name": "new"}),
+    );
+    assert_eq!(refused["isError"], true, "{refused}");
+    let message = mcp_text(&refused);
+    assert!(message.contains("-32061"), "{message}");
+    assert!(message.contains("board unavailable"), "{message}");
+
+    Fixture::shutdown(&mut restarted);
+    drop(second);
+    drop(restarted);
+    let conn = rusqlite::Connection::open(database_path(&fixture)).expect("database");
+    let json: String = conn
+        .query_row(
+            "SELECT json FROM boards WHERE team_id = ?1",
+            rusqlite::params![team],
+            |row| row.get(0),
+        )
+        .expect("board row");
+    assert_eq!(json, "{broken", "the unreadable row is never overwritten");
+}
+
+#[test]
+fn a_gracefully_stopped_team_keeps_its_board() {
+    board_restart_scenario("restart-board-graceful", false);
+}
+
+#[test]
+fn a_sigkilled_team_keeps_its_board() {
+    board_restart_scenario("restart-board-sigkill", true);
+}
+
 // ---------------------------------------------------------------------------
 // scenarios
 // ---------------------------------------------------------------------------

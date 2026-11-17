@@ -41,6 +41,16 @@ fn team_ttl_ms() -> u64 {
         .unwrap_or(7 * 24 * 60 * 60 * 1000)
 }
 
+/// How often expired teams and pending boards are checked (18.15); tests
+/// shorten it so the expiry tick can be exercised.
+fn team_expiry_tick_ms() -> u64 {
+    std::env::var("NVIM_ADE_SERVER_TEAM_EXPIRY_TICK_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(60 * 60 * 1000)
+}
+
 /// Maximum bytes queued for one connection (PROTOCOL.md section 7).
 pub const MAX_OUTBOX_BYTES: usize = 64 * 1024 * 1024;
 /// Frames that may sit in the writer queue before the connection counts as
@@ -581,6 +591,31 @@ impl Hub {
             for id in expired {
                 self.recorder.delete_team(&id);
             }
+            // Boards and card history live in their own tables (19.11); load
+            // them together with the suspended teams they belong to.
+            for id in &stored {
+                match self.recorder.load_board(id) {
+                    Ok(Some(board)) => {
+                        if let Err(error) =
+                            self.teams
+                                .restore_board(id, board.rev, &board.json, board.history)
+                        {
+                            eprintln!(
+                                "nvim_ade_server: cannot read the board of {id}: {error}; \
+                                 keeping its database row and refusing board writes"
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "nvim_ade_server: cannot load the board of {id}: {error:#}; \
+                             keeping its database row and refusing board writes"
+                        );
+                        self.teams.mark_board_unavailable(id);
+                    }
+                }
+            }
             let (max_team, max_inbox) = self.teams.counters();
             for id in stored {
                 if let Some(snapshot) = self.teams.snapshot_team(&id) {
@@ -598,8 +633,12 @@ impl Hub {
         #[cfg(unix)]
         let mut install_events =
             std::mem::replace(&mut self.install_events, mpsc::unbounded_channel().1);
-        let mut expiry = tokio::time::interval(Duration::from_secs(3600));
+        let mut expiry = tokio::time::interval(Duration::from_millis(team_expiry_tick_ms()));
         expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Worker board writes coalesce (19.2); this tick persists the ones whose
+        // timer fired and sends one `team.board_changed` each.
+        let mut board_tick = tokio::time::interval(Duration::from_millis(100));
+        board_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             #[cfg(unix)]
             let install_event = install_events.recv();
@@ -630,6 +669,10 @@ impl Hub {
                 _ = expiry.tick() => {
                     self.expire_teams();
                     self.update_busy();
+                }
+                _ = board_tick.tick() => {
+                    self.flush_due_boards();
+                    self.flush_due_activities();
                 }
                 event = install_event => {
                     #[cfg(unix)]
@@ -741,6 +784,7 @@ impl Hub {
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 // Teams must come back with their queues and in-flight marks,
                 // not with the participant exits caused by this shutdown.
+                self.flush_all_boards(false);
                 self.persist_all_teams();
                 self.persist_paused = true;
                 let instances: Vec<(String, ProcControl, Arc<Exited>)> = self

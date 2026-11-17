@@ -5,6 +5,8 @@
 //! layer. I/O (spawning agents, sending frames, broadcasts) is done by
 //! `hub::teams`, which owns the hub and calls these methods.
 
+pub mod activity;
+pub mod board;
 pub mod mcp;
 pub mod worktree;
 
@@ -388,6 +390,18 @@ pub struct Participant {
     pub turns: VecDeque<TurnText>,
     /// The worktree this worker runs in (18.12); kept after the worker exits.
     pub worktree: Option<worktree::WorktreeInfo>,
+    /// Latest extracted one-line activity (19.9); not persisted.
+    #[serde(skip)]
+    pub activity: Option<activity::Activity>,
+    /// The activity-only notification gate (19.9).
+    #[serde(skip)]
+    pub activity_throttle: activity::ActivityThrottle,
+    /// A non-fallback activity source was seen during this bus turn.
+    #[serde(skip)]
+    pub turn_activity: bool,
+    /// When `state` last changed, in ms since the epoch (19.9).
+    #[serde(skip)]
+    pub state_since: u64,
 }
 
 impl Participant {
@@ -416,6 +430,10 @@ impl Participant {
             reported: false,
             turns: VecDeque::new(),
             worktree: None,
+            activity: None,
+            activity_throttle: activity::ActivityThrottle::default(),
+            turn_activity: false,
+            state_since: now_ms(),
         }
     }
 
@@ -454,6 +472,10 @@ pub struct Team {
     pub pending_items: HashMap<(String, String), String>,
     /// Creation time in ms; worktree names embed its UTC stamp (18.12).
     pub created_at: u64,
+    /// The team's board (19.2).
+    pub board: board::Board,
+    /// When the pending worker board write is persisted and announced (19.2).
+    pub board_flush_at: Option<u64>,
 }
 
 impl Team {
@@ -878,7 +900,7 @@ impl Teams {
             if let Some(leader) = team.participants.get_mut("leader") {
                 leader.instance = Some(instance.to_string());
                 leader.session = Some(session.to_string());
-                leader.state = ParticipantState::Idle;
+                leader.set_state(ParticipantState::Idle);
                 leader.starting = false;
             }
         }
@@ -1022,6 +1044,8 @@ impl Teams {
             watchers: HashMap::new(),
             pending_items: HashMap::new(),
             created_at: now_ms(),
+            board: board::Board::default(),
+            board_flush_at: None,
         };
         let mut leader = Participant::new("leader", Role::Leader);
         leader.instance = Some(instance.to_string());
@@ -1377,7 +1401,7 @@ impl Teams {
                 }
             }
         }
-        participant.state = ParticipantState::WaitingHuman;
+        participant.set_state(ParticipantState::WaitingHuman);
         let item = InboxItem {
             id: id.clone(),
             team: team.id.clone(),
@@ -1453,6 +1477,7 @@ impl Teams {
                 .config
                 .max_workers
                 .saturating_sub(team.live_workers() as u64));
+            out["board"] = team.board.status();
         }
         Ok(out)
     }
@@ -1723,7 +1748,7 @@ impl Teams {
         if let Some(team) = self.teams.get_mut(&team_id) {
             if let Some(participant) = team.participants.get_mut(&name) {
                 if participant.state != ParticipantState::Exited {
-                    participant.state = ParticipantState::Working;
+                    participant.set_state(ParticipantState::Working);
                 }
             }
             self.events.push(TeamEvent::Changed(team_id));
@@ -1742,11 +1767,11 @@ impl Teams {
         });
         if let Some(participant) = team.participants.get_mut(&name) {
             if participant.state != ParticipantState::Exited {
-                participant.state = if waiting {
+                participant.set_state(if waiting {
                     ParticipantState::WaitingHuman
                 } else {
                     ParticipantState::Idle
-                };
+                });
             }
         }
         self.events.push(TeamEvent::Changed(team_id));
@@ -1770,7 +1795,7 @@ impl Teams {
         let Some(participant) = team.participants.get_mut(name) else {
             return;
         };
-        participant.state = ParticipantState::Exited;
+        participant.set_state(ParticipantState::Exited);
         participant.reason = Some(reason.to_string());
         participant.starting = false;
         participant.bus_turn = false;
@@ -1878,12 +1903,13 @@ impl Teams {
         }
         let first_prompt = participant.first_prompt;
         participant.first_prompt = false;
-        participant.state = ParticipantState::Working;
+        participant.set_state(ParticipantState::Working);
         participant.bus_turn = true;
         participant.turn_text.clear();
         participant.turn_task = participant.task.clone();
         participant.turn_sender = participant.task_sender.clone();
         participant.reported = false;
+        participant.turn_activity = false;
         let instance = participant.instance.clone()?;
         let session = participant.session.clone()?;
         self.events.push(TeamEvent::Changed(team_id.to_string()));
@@ -1917,7 +1943,7 @@ impl Teams {
             participant.mailbox.push_front(message);
         }
         participant.first_prompt |= first_prompt;
-        participant.state = ParticipantState::Idle;
+        participant.set_state(ParticipantState::Idle);
         participant.bus_turn = false;
         participant.reported = false;
         self.events.push(TeamEvent::Changed(team_id.to_string()));
@@ -1976,17 +2002,19 @@ impl Teams {
         let sender = participant.turn_sender.clone();
         let reported = participant.reported;
         let was_waiting = participant.state == ParticipantState::WaitingHuman;
+        let bus_turn = participant.bus_turn;
         participant.bus_turn = false;
         let turn_text = if text.is_empty() {
             participant.turn_text.clone()
         } else {
             text
         };
-        participant.state = if was_waiting {
+        participant.finish_turn_activity(&turn_text, bus_turn, now_ms());
+        participant.set_state(if was_waiting {
             ParticipantState::WaitingHuman
         } else {
             ParticipantState::Idle
-        };
+        });
         participant.turns_total += 1;
         participant.turn_text.clear();
         participant.turns.push_back(TurnText {
@@ -2207,13 +2235,13 @@ impl Teams {
                 let answer = text.or(option).unwrap_or_default();
                 validate_body(&answer)?;
                 if let Some(participant) = team.participants.get_mut(&from) {
-                    participant.state = if still_waiting {
+                    participant.set_state(if still_waiting {
                         ParticipantState::WaitingHuman
                     } else if participant.bus_turn {
                         ParticipantState::Working
                     } else {
                         ParticipantState::Idle
-                    };
+                    });
                     let message = Message {
                         id: answer_message_id,
                         from: "human".to_string(),
@@ -2428,7 +2456,7 @@ impl Teams {
         if participant.state == ParticipantState::Exited {
             return;
         }
-        participant.state = ParticipantState::Exited;
+        participant.set_state(ParticipantState::Exited);
         participant.reason = Some(reason.to_string());
         participant.bus_turn = false;
         participant.mailbox.clear();
@@ -2492,7 +2520,7 @@ impl Teams {
         };
         team.leaderless = true;
         if let Some(leader) = team.participants.get_mut("leader") {
-            leader.state = ParticipantState::Exited;
+            leader.set_state(ParticipantState::Exited);
             leader.reason = Some(reason.to_string());
         }
         let team_id = team.id.clone();
@@ -2526,7 +2554,7 @@ impl Teams {
         };
         team.leaderless = true;
         if let Some(leader) = team.participants.get_mut("leader") {
-            leader.state = ParticipantState::Exited;
+            leader.set_state(ParticipantState::Exited);
             leader.reason = Some("session closed".to_string());
         }
         let team_id = team.id.clone();
@@ -2715,6 +2743,8 @@ fn team_entry(team: &Team) -> Value {
                 "queued": participant.queued(),
                 "paused": participant.paused,
                 "turns": { "task": task_count, "total": participant.turns_total },
+                "activity": participant.activity,
+                "state_since": participant.state_since,
             });
             if let Some(reason) = &participant.reason {
                 out["reason"] = json!(reason);
@@ -2755,6 +2785,9 @@ fn team_entry(team: &Team) -> Value {
             "max_turns_total": team.config.max_turns_total,
             "turns_total": team.total_turns,
         },
+        "board_rev": team.board.rev,
+        "workflow_name": team.board.workflow_name,
+        "stages": team.board.stages(),
     });
     if let Some(at) = team.suspended_at {
         entry["suspended_at"] = json!(at);
@@ -3017,6 +3050,12 @@ impl Teams {
                     ParticipantState::Working => ParticipantState::Idle,
                     other => other,
                 };
+                // Recovered participants start their state clock at restore
+                // time (19.9).
+                participant.state_since = now;
+                participant.activity = None;
+                participant.activity_throttle = activity::ActivityThrottle::default();
+                participant.turn_activity = false;
                 participants.insert(participant.name.clone(), participant);
             }
             let inbox: Vec<InboxItem> = snapshot
@@ -3061,6 +3100,8 @@ impl Teams {
                 watchers: HashMap::new(),
                 pending_items: HashMap::new(),
                 created_at: snapshot.created_at,
+                board: board::Board::default(),
+                board_flush_at: None,
             };
             self.by_cwd.insert(team.cwd.clone(), team.id.clone());
             self.teams.insert(team.id.clone(), team);
