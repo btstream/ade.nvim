@@ -47,7 +47,7 @@ impl Agent {
     /// instance identity, so two calls create a second attachment to one agent.
     fn attach(server: &TestServer, label: &str, extra_env: &[(&str, &str)]) -> Self {
         let mut client = server.connect();
-        let hello = client.hello(&server.token(), 4);
+        let hello = client.hello(&server.token(), nvim_ade_server::API_VERSION);
         assert!(hello["result"].is_object(), "hello: {hello}");
         let key = json!({
             "agent": "policy",

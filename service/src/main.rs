@@ -15,13 +15,11 @@ use nvim_ade_server::output::{
 };
 use nvim_ade_server::paths::Paths;
 use nvim_ade_server::server::{self, ServeOptions, ServeStatus};
+use nvim_ade_server::team::mcp;
 use nvim_ade_server::SERVER_VERSION;
 
 /// Exit code for a failed start (the contract fixes this at 1).
 const EXIT_FAILURE: u8 = 1;
-/// Exit code used when the `mcp` subcommand is called before it is implemented.
-const EXIT_NOT_IMPLEMENTED: u8 = 3;
-
 #[derive(Debug, Parser)]
 #[command(
     name = "nvim_ade_server",
@@ -76,12 +74,8 @@ enum Command {
     /// Print the service version and the protocol version as JSON.
     Version,
 
-    /// MCP server for agents (placeholder, not implemented yet).
-    Mcp {
-        /// Token of the participating agent.
-        #[arg(long, value_name = "TOKEN")]
-        token: String,
-    },
+    /// MCP server for a team participant (reads ADE_TEAM_TOKEN).
+    Mcp,
 }
 
 fn main() -> ExitCode {
@@ -90,12 +84,7 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(&error, false),
         },
-        Command::Mcp { token } => {
-            // Never echo the token: it is a credential.
-            let _ = token;
-            eprintln!("nvim_ade_server: mcp is not implemented yet");
-            ExitCode::from(EXIT_NOT_IMPLEMENTED)
-        }
+        Command::Mcp => mcp::run(),
         Command::Serve {
             socket,
             idle_timeout,

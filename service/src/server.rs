@@ -17,6 +17,7 @@ use crate::paths::Paths;
 use crate::protocol::{self, Local};
 use crate::recorder::Recorder;
 use crate::runtime::StopTimeouts;
+use crate::team::{self, SharedTokens};
 use crate::transport::{self, Listener, Stream};
 use crate::{token, API_VERSION};
 
@@ -188,6 +189,7 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
     let stopped = Arc::new(Notify::new());
     let (hub_commands, hub_commands_rx) = mpsc::channel::<Command>(256);
     let (hub_events, mut hub_events_rx) = mpsc::unbounded_channel::<HubEvent>();
+    let tokens = team::new_shared_tokens();
 
     let hub = Hub::new(
         hub_commands_rx,
@@ -197,7 +199,8 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
         stop_timeouts,
     )
     .with_event_log(options.event_log, options.event_log_max_mb, recorder)
-    .with_limits(crate::hub::Limits::from_env());
+    .with_limits(crate::hub::Limits::from_env())
+    .with_teams(Arc::clone(&tokens));
     let hub_task = tokio::spawn(hub.run());
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<ConnectionEvent>();
@@ -253,6 +256,7 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
                             hub_commands.clone(),
                             events_tx.clone(),
                             options.event_log,
+                            Arc::clone(&tokens),
                         );
                     }
                     Err(error) => {
@@ -356,6 +360,7 @@ async fn termination_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_connection(
     conn: u64,
     stream: Stream,
@@ -364,10 +369,11 @@ fn spawn_connection(
     hub: mpsc::Sender<Command>,
     events: mpsc::UnboundedSender<ConnectionEvent>,
     event_log: bool,
+    tokens: SharedTokens,
 ) {
     tokio::spawn(async move {
         if let Err(error) =
-            handle_connection(conn, stream, &token, &shutdown, &hub, event_log).await
+            handle_connection(conn, stream, &token, &shutdown, &hub, event_log, &tokens).await
         {
             eprintln!("nvim_ade_server: connection error: {error}");
         }
@@ -376,6 +382,7 @@ fn spawn_connection(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     conn: u64,
     stream: Stream,
@@ -383,6 +390,7 @@ async fn handle_connection(
     shutdown: &Notify,
     hub: &mpsc::Sender<Command>,
     event_log: bool,
+    tokens: &SharedTokens,
 ) -> io::Result<()> {
     let (reader, writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
@@ -401,6 +409,7 @@ async fn handle_connection(
     });
 
     let mut handshake = protocol::Handshake::default();
+    let mut reported: Option<Option<String>> = None;
     let _ = hub
         .send(Command::Register {
             conn,
@@ -453,10 +462,30 @@ async fn handle_connection(
         };
 
         let was_authenticated = handshake.is_authenticated();
-        match protocol::handle_local_with(&mut handshake, token, &frame, event_log) {
+        match protocol::handle_local_with_tokens(
+            &mut handshake,
+            token,
+            &frame,
+            event_log,
+            Some(tokens),
+        ) {
             Local::Reply(response) => {
                 if handshake.is_authenticated() && !was_authenticated {
                     log_authenticated(&handshake);
+                }
+                if handshake.is_authenticated() {
+                    let current = handshake
+                        .participant()
+                        .map(|participant| participant.token_id.clone());
+                    if reported.as_ref() != Some(&current) {
+                        reported = Some(current.clone());
+                        let _ = hub
+                            .send(Command::Authenticated {
+                                conn,
+                                participant: current,
+                            })
+                            .await;
+                    }
                 }
                 // A null response means "no reply" (notification).
                 if !response.is_null() {
@@ -479,6 +508,20 @@ async fn handle_connection(
             Local::Route => {
                 if handshake.is_authenticated() && !was_authenticated {
                     log_authenticated(&handshake);
+                }
+                if handshake.is_authenticated() {
+                    let current = handshake
+                        .participant()
+                        .map(|participant| participant.token_id.clone());
+                    if reported.as_ref() != Some(&current) {
+                        reported = Some(current.clone());
+                        let _ = hub
+                            .send(Command::Authenticated {
+                                conn,
+                                participant: current,
+                            })
+                            .await;
+                    }
                 }
                 if hub.send(Command::Frame { conn, frame }).await.is_err() {
                     break Ok(());

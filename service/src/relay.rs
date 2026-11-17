@@ -263,10 +263,20 @@ pub struct Retracted {
     pub id: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Origin {
+    Frontend {
+        conn: ConnId,
+        frontend_id: Value,
+    },
+    /// A request the service sent itself (the team driver). Its response is
+    /// consumed by the team layer and never forwarded.
+    Service,
+}
+
 #[derive(Debug)]
 struct Outgoing {
-    conn: ConnId,
-    frontend_id: Value,
+    origin: Origin,
     method: String,
     /// `params.sessionId`, when the request carried one.
     session_id: Option<String>,
@@ -383,6 +393,12 @@ pub enum AgentAction {
         message: Value,
         target: Option<ConnId>,
     },
+    /// The response to a request the service sent itself (team driver).
+    ServiceResponse {
+        agent_id: u64,
+        seq: u64,
+        message: Value,
+    },
     /// Nothing to deliver (for example a response whose connection is gone).
     Drop,
     /// A message that is not valid JSON-RPC; logged and dropped.
@@ -400,6 +416,10 @@ pub struct FinishedTurn {
     pub adopters: Vec<ConnId>,
     /// `seq` for each `_ade/turn_finished` message.
     pub seq: u64,
+    /// True for an adopted front-end turn (which must stop counting); false
+    /// for a bus turn, whose held human prompt may already have a new outgoing
+    /// entry for the same session (18.11).
+    pub adoption: bool,
 }
 
 /// One event the relay wants recorded (PROTOCOL.md 10). The recorder stamps it
@@ -465,6 +485,8 @@ pub struct AgentOutcome {
     pub events: Vec<PendingEvent>,
     /// The same requests the action delivers, so the hub can remember them.
     pub delivered: Vec<Delivery>,
+    /// A front end closed or deleted this session successfully.
+    pub closed_session: Option<String>,
 }
 
 impl AgentOutcome {
@@ -613,7 +635,10 @@ impl Relay {
         self.outgoing.values().any(|outgoing| {
             outgoing.method == "session/prompt"
                 && outgoing.session_id.as_deref() == Some(session_id)
-                && !attached.contains(&outgoing.conn)
+                && match &outgoing.origin {
+                    Origin::Frontend { conn, .. } => !attached.contains(conn),
+                    Origin::Service => false,
+                }
         })
     }
 
@@ -672,9 +697,9 @@ impl Relay {
     /// Whether `conn` has a `session/prompt` in flight for this session.
     pub fn prompt_active(&self, conn: ConnId, session_id: &str) -> bool {
         self.outgoing.values().any(|outgoing| {
-            outgoing.conn == conn
-                && outgoing.method == "session/prompt"
+            outgoing.method == "session/prompt"
                 && outgoing.session_id.as_deref() == Some(session_id)
+                && matches!(&outgoing.origin, Origin::Frontend { conn: owner, .. } if *owner == conn)
         })
     }
 
@@ -731,8 +756,10 @@ impl Relay {
         self.outgoing.insert(
             agent_id,
             Outgoing {
-                conn,
-                frontend_id: id.clone(),
+                origin: Origin::Frontend {
+                    conn,
+                    frontend_id: id.clone(),
+                },
                 method,
                 session_id: params
                     .and_then(|params| params.get("sessionId"))
@@ -746,6 +773,65 @@ impl Relay {
         );
         self.by_frontend.insert((conn, id_key(&id)), agent_id);
         FrontendAction::Forward(forwarded)
+    }
+
+    /// Send a request the service makes to the agent (PROTOCOL.md 18.3).
+    ///
+    /// It uses the same agent-side id counter as front-end requests, but the
+    /// response is marked [`AgentAction::ServiceResponse`] and is never
+    /// forwarded to a connection.
+    pub fn service_request(&mut self, method: &str, params: Value) -> (u64, Value) {
+        self.next_agent_id += 1;
+        let agent_id = self.next_agent_id;
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": agent_id,
+            "method": method,
+            "params": params,
+        });
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let cwd = params
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        self.outgoing.insert(
+            agent_id,
+            Outgoing {
+                origin: Origin::Service,
+                method: method.to_string(),
+                session_id,
+                cwd,
+            },
+        );
+        (agent_id, frame)
+    }
+
+    /// A bus-delivered prompt (18.4): allocate its agent id, a synthetic
+    /// `user_prompt` event and the `seq` the `_ade/turn_started` notification
+    /// uses. The caller records the event and sends the frame.
+    pub fn service_prompt(
+        &mut self,
+        session_id: &str,
+        params: Value,
+    ) -> (u64, Value, u64, Option<PendingEvent>) {
+        self.touch_session(session_id);
+        self.seq += 1;
+        let seq = self.seq;
+        let event = if self.log_enabled {
+            Some(PendingEvent {
+                seq,
+                session_id: Some(session_id.to_string()),
+                synthetic: true,
+                message: user_prompt_event(Some(&params)),
+            })
+        } else {
+            None
+        };
+        let (agent_id, frame) = self.service_request("session/prompt", params);
+        (agent_id, frame, seq, event)
     }
 
     /// The `tunnel.recv` messages for a replay: each recorded event in its
@@ -769,6 +855,16 @@ impl Relay {
             }
         }
         messages
+    }
+
+    /// Answer a pending agent request from the team layer (18.5/18.11): the
+    /// item is gone, every watcher that received it is told to retract it, and
+    /// the caller sends the response frame itself.
+    pub fn answer_pending(&mut self, agent_id: u64) -> Vec<Retracted> {
+        let key = id_key(&json!(agent_id));
+        let retractions = self.retractions_except(&key, u64::MAX);
+        self.remove_pending(&key);
+        retractions
     }
 
     /// Retract the pending request `key` from every connection that received it
@@ -826,7 +922,10 @@ impl Relay {
     pub fn turns_running(&self) -> usize {
         self.outgoing
             .values()
-            .filter(|outgoing| outgoing.method == "session/prompt")
+            .filter(|outgoing| {
+                outgoing.method == "session/prompt"
+                    && matches!(outgoing.origin, Origin::Frontend { .. })
+            })
             .count()
     }
 
@@ -912,8 +1011,10 @@ impl Relay {
         self.outgoing.insert(
             agent_id,
             Outgoing {
-                conn,
-                frontend_id: id.clone(),
+                origin: Origin::Frontend {
+                    conn,
+                    frontend_id: id.clone(),
+                },
                 method: method.to_string(),
                 // Remember the request's own session id and cwd: a successful
                 // `session/new`/`load`/`resume` response registers the session
@@ -1196,8 +1297,14 @@ impl Relay {
             // A response with no mapping is not something a front end can use.
             return AgentOutcome::with(AgentAction::Invalid);
         };
-        self.by_frontend
-            .remove(&(outgoing.conn, id_key(&outgoing.frontend_id)));
+        let origin = outgoing.origin.clone();
+        let frontend = match &origin {
+            Origin::Frontend { conn, frontend_id } => Some((*conn, frontend_id.clone())),
+            Origin::Service => None,
+        };
+        if let Some((conn, frontend_id)) = &frontend {
+            self.by_frontend.remove(&(*conn, id_key(frontend_id)));
+        }
 
         // The first successful `initialize` is cached for the instance's life.
         if outgoing.method == "initialize" {
@@ -1208,11 +1315,15 @@ impl Relay {
 
         // Session bookkeeping for the methods that change the session table
         // (PROTOCOL.md 11).
-        self.track_session_response(&outgoing, object);
+        let closed_session = self.track_session_response(&outgoing, object);
 
-        let mut outcome = AgentOutcome::default();
+        let mut outcome = AgentOutcome {
+            closed_session,
+            ..AgentOutcome::default()
+        };
         // Synthetic config/mode events for the replay log (PROTOCOL.md 10).
-        if self.log_enabled {
+        // The team layer's own requests and responses are not logged (18.11).
+        if self.log_enabled && frontend.is_some() {
             if let Some(session_id) = &outgoing.session_id {
                 let synthetic = match outgoing.method.as_str() {
                     "session/set_config_option" => object
@@ -1254,55 +1365,85 @@ impl Relay {
         }
 
         // A prompt that finished ends the turn for its adopters, whether or not
-        // its requester is still there (PROTOCOL.md 13).
+        // its requester is still there (PROTOCOL.md 13). A bus prompt is not an
+        // adoption: its `_ade/turn_finished` goes to every attached/watching
+        // connection (18.4 and 18.11).
         if outgoing.method == "session/prompt" {
             if let Some(session_id) = &outgoing.session_id {
-                outcome.prompt_finished = Some(PromptFinished {
-                    conn: outgoing.conn,
-                    session_id: session_id.clone(),
-                });
-                if let Some(adopters) = self.adopters.remove(session_id) {
-                    outcome.finished_turn = Some(FinishedTurn {
-                        session_id: session_id.clone(),
-                        params: finished_params(session_id, object),
-                        adopters,
-                        seq,
-                    });
+                match &frontend {
+                    Some((conn, _)) => {
+                        outcome.prompt_finished = Some(PromptFinished {
+                            conn: *conn,
+                            session_id: session_id.clone(),
+                        });
+                        if let Some(adopters) = self.adopters.remove(session_id) {
+                            outcome.finished_turn = Some(FinishedTurn {
+                                session_id: session_id.clone(),
+                                params: finished_params(session_id, object),
+                                adopters,
+                                seq,
+                                adoption: true,
+                            });
+                        }
+                    }
+                    None => {
+                        outcome.finished_turn = Some(FinishedTurn {
+                            session_id: session_id.clone(),
+                            params: finished_params(session_id, object),
+                            adopters: attached.to_vec(),
+                            seq,
+                            adoption: false,
+                        });
+                    }
                 }
             }
         }
 
-        // Answers for an `agent.attach` session summary need the current table.
-        if !attached.contains(&outgoing.conn) {
-            outcome.action = Some(AgentAction::Drop);
-            return outcome;
+        match origin {
+            Origin::Frontend { conn, frontend_id } => {
+                // Answers for an `agent.attach` session summary need the current
+                // table.
+                if !attached.contains(&conn) {
+                    outcome.action = Some(AgentAction::Drop);
+                    return outcome;
+                }
+                let mut mapped = message.clone();
+                mapped["id"] = frontend_id;
+                outcome.action = Some(AgentAction::Response {
+                    conn,
+                    seq,
+                    message: mapped,
+                });
+            }
+            Origin::Service => {
+                outcome.action = Some(AgentAction::ServiceResponse {
+                    agent_id,
+                    seq,
+                    message: message.clone(),
+                });
+            }
         }
-        let mut mapped = message.clone();
-        mapped["id"] = outgoing.frontend_id;
-        outcome.action = Some(AgentAction::Response {
-            conn: outgoing.conn,
-            seq,
-            message: mapped,
-        });
         outcome
     }
 
     /// Register, refresh or forget a session from a successful response
     /// (PROTOCOL.md 11).
-    fn track_session_response(&mut self, outgoing: &Outgoing, object: &Map<String, Value>) {
+    fn track_session_response(
+        &mut self,
+        outgoing: &Outgoing,
+        object: &Map<String, Value>,
+    ) -> Option<String> {
         if !self.log_enabled {
-            return;
+            return None;
         }
         let Some(result) = object.get("result") else {
             // Failed requests change nothing.
-            return;
+            return None;
         };
         let now = (self.now)();
         match outgoing.method.as_str() {
             "session/new" => {
-                let Some(session_id) = result.get("sessionId").and_then(Value::as_str) else {
-                    return;
-                };
+                let session_id = result.get("sessionId").and_then(Value::as_str)?;
                 let cwd = outgoing.cwd.clone().unwrap_or_default();
                 self.sessions.insert(
                     session_id.to_string(),
@@ -1317,7 +1458,7 @@ impl Relay {
             }
             "session/load" | "session/resume" => {
                 let Some(session_id) = &outgoing.session_id else {
-                    return;
+                    return None;
                 };
                 let cwd = outgoing.cwd.clone().unwrap_or_default();
                 self.sessions.insert(
@@ -1333,17 +1474,17 @@ impl Relay {
             }
             "session/close" | "session/delete" => {
                 if let Some(session_id) = &outgoing.session_id {
-                    self.sessions.remove(session_id);
-                    self.adopters.remove(session_id);
+                    let session_id = session_id.clone();
+                    self.sessions.remove(&session_id);
+                    self.adopters.remove(&session_id);
+                    return Some(session_id);
                 }
             }
             "session/set_config_option" => {
                 let Some(session_id) = &outgoing.session_id else {
-                    return;
+                    return None;
                 };
-                let Some(config_options) = result.get("configOptions") else {
-                    return;
-                };
+                let config_options = result.get("configOptions")?;
                 if let Some(session) = self.sessions.get_mut(session_id) {
                     session.set_config_options(config_options);
                     session.updated_at = now;
@@ -1356,6 +1497,7 @@ impl Relay {
             }
             _ => {}
         }
+        None
     }
 
     fn touch_session(&mut self, session_id: &str) {

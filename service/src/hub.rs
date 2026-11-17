@@ -6,7 +6,7 @@
 //! instance table are only touched from here, which keeps the relay rules
 //! easy to reason about.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -28,6 +28,10 @@ use crate::relay::{
 };
 use crate::runtime::{self, Exited, ProcControl, RuntimeEvent, SpawnSpec, StopTimeouts};
 use crate::store::EventKind;
+
+mod teams;
+
+use teams::{ServiceCall, TeamResult};
 
 /// Maximum bytes queued for one connection (PROTOCOL.md section 7).
 pub const MAX_OUTBOX_BYTES: usize = 64 * 1024 * 1024;
@@ -145,6 +149,16 @@ pub enum Command {
     },
     Disconnected {
         conn: u64,
+    },
+    /// A connection completed `hello`; `participant` is its team token id.
+    Authenticated {
+        conn: u64,
+        participant: Option<String>,
+    },
+    /// The 30 s grace period after cancelling a bus prompt ended (18.11).
+    TeamDeadline {
+        instance: String,
+        session: String,
     },
     /// Stop every instance. The hub notifies [`Hub::stopped`] when done.
     Shutdown,
@@ -335,6 +349,10 @@ type MethodError = (i64, String);
 struct Instance {
     id: String,
     key: InstanceKey,
+    /// Recorder key. The instance identity for a front-end instance; a unique
+    /// per-instance key for a team worker, whose identity is shared by every
+    /// worker from the same template (PROTOCOL.md 10 and 18).
+    log_key: String,
     pid: u32,
     started_at: u64,
     control: ProcControl,
@@ -405,6 +423,19 @@ pub struct Hub {
     install_event_sender: mpsc::UnboundedSender<InstallEvent>,
     /// Permission rules installed by front ends (PROTOCOL.md 17).
     policy: Policy,
+    /// Teams and the bus (PROTOCOL.md 18).
+    teams: crate::team::Teams,
+    /// Participant connections by connection id, holding the token id.
+    participant_conns: HashMap<u64, String>,
+    /// Front-end connections that completed `hello` with the user token.
+    frontend_conns: HashSet<u64>,
+    /// Responses to service-originated requests, by (instance, agent id).
+    driver: HashMap<(String, u64), ServiceCall>,
+    /// Front-end prompts held while a cancelled bus prompt on the leader is
+    /// answered (18.11).
+    held_prompts: HashMap<(String, String), VecDeque<(u64, Value)>>,
+    team_sender: mpsc::UnboundedSender<TeamResult>,
+    team_results: mpsc::UnboundedReceiver<TeamResult>,
 }
 
 impl Hub {
@@ -417,6 +448,7 @@ impl Hub {
     ) -> Self {
         let (runtime_sender, runtime_events) = mpsc::unbounded_channel::<RuntimeEvent>();
         let (load_sender, load_results) = mpsc::unbounded_channel::<LoadResult>();
+        let (team_sender, team_results) = mpsc::unbounded_channel::<TeamResult>();
         #[cfg(unix)]
         let (install_event_sender, install_events) = mpsc::unbounded_channel::<InstallEvent>();
         Self {
@@ -451,12 +483,25 @@ impl Hub {
             #[cfg(unix)]
             install_event_sender,
             policy: Policy::new(),
+            teams: crate::team::Teams::new(crate::team::new_shared_tokens()),
+            participant_conns: HashMap::new(),
+            frontend_conns: HashSet::new(),
+            driver: HashMap::new(),
+            held_prompts: HashMap::new(),
+            team_sender,
+            team_results,
         }
     }
 
     /// Override the section 12 bounds (tests, or a future flag).
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Share the participant token registry with the connection layer.
+    pub fn with_teams(mut self, tokens: crate::team::SharedTokens) -> Self {
+        self.teams = crate::team::Teams::new(tokens);
         self
     }
 
@@ -498,6 +543,11 @@ impl Hub {
                     self.finish_load(result);
                     self.update_busy();
                 }
+                result = self.team_results.recv() => {
+                    let Some(result) = result else { return };
+                    self.finish_team_result(result);
+                    self.update_busy();
+                }
                 event = install_event => {
                     #[cfg(unix)]
                     match event {
@@ -518,8 +568,28 @@ impl Hub {
             Command::Register { conn, outbox } => {
                 self.conns.insert(conn, outbox);
             }
+            Command::TeamDeadline { instance, session } => {
+                self.team_deadline(&instance, &session);
+                self.update_busy();
+            }
+            Command::Authenticated { conn, participant } => {
+                if let Some(token) = participant {
+                    self.participant_conns.insert(conn, token);
+                    self.frontend_conns.remove(&conn);
+                } else {
+                    self.participant_conns.remove(&conn);
+                    self.frontend_conns.insert(conn);
+                }
+            }
             Command::Disconnected { conn } => {
                 self.conns.remove(&conn);
+                self.participant_conns.remove(&conn);
+                self.frontend_conns.remove(&conn);
+                self.teams.forget_connection(conn);
+                for queue in self.held_prompts.values_mut() {
+                    queue.retain(|(owner, _)| *owner != conn);
+                }
+                self.held_prompts.retain(|_, queue| !queue.is_empty());
                 // A connection that vanishes during a replay must not leave a
                 // gate behind (nothing would ever release it).
                 self.gates.remove(&conn);
@@ -536,6 +606,7 @@ impl Hub {
                     return;
                 }
                 self.handle_frame(conn, frame);
+                self.update_busy();
             }
             Command::Stopped => {
                 self.finished = true;
@@ -686,6 +757,29 @@ impl Hub {
         let id = request_id(&frame);
         let is_request = object.get("id").is_some();
 
+        if let Some(token) = self.participant_conns.get(&conn).cloned() {
+            if method.starts_with("bus.") {
+                self.handle_participant(conn, &token, &method, &params, &id, is_request);
+            } else if is_request {
+                self.send_to(
+                    conn,
+                    &failure(
+                        &id,
+                        crate::team::PARTICIPANT_METHOD,
+                        "method not available on a participant connection",
+                    ),
+                );
+            }
+            return;
+        }
+
+        if method.starts_with("team.") {
+            if is_request {
+                self.handle_team_method(conn, &method, &params, &id);
+            }
+            return;
+        }
+
         match method.as_str() {
             "agent.attach" => match self.attach(conn, &params) {
                 Ok((result, replay)) => {
@@ -718,9 +812,15 @@ impl Hub {
                 if is_request {
                     let instances: Vec<Value> = self
                         .instances
-                        .values()
-                        .map(|instance| {
-                            instance_summary(instance, self.log_bytes(&instance.key.identity()))
+                        .iter()
+                        .map(|(id, instance)| {
+                            let mut summary =
+                                instance_summary(instance, self.log_bytes(&instance.log_key));
+                            if let Some((team, participant)) = self.teams.membership(id) {
+                                summary["team"] = json!(team);
+                                summary["participant"] = json!(participant);
+                            }
+                            summary
                         })
                         .collect();
                     self.send_to(conn, &success(&id, json!({ "instances": instances })));
@@ -1218,6 +1318,40 @@ impl Hub {
         env: Option<Vec<(String, String)>>,
         #[cfg(unix)] launch: Option<install::Launch>,
     ) -> Result<String, String> {
+        self.spawn_inner(
+            Some(identity),
+            key,
+            env,
+            #[cfg(unix)]
+            launch,
+        )
+    }
+
+    /// Spawn a team worker: not in the identity table and with its own log key
+    /// (PROTOCOL.md 18.3). Every worker from one template has the same identity,
+    /// so the recorder key must be the instance id instead.
+    fn spawn_worker(
+        &mut self,
+        key: InstanceKey,
+        env: Option<Vec<(String, String)>>,
+        #[cfg(unix)] launch: Option<install::Launch>,
+    ) -> Result<String, String> {
+        self.spawn_inner(
+            None,
+            key,
+            env,
+            #[cfg(unix)]
+            launch,
+        )
+    }
+
+    fn spawn_inner(
+        &mut self,
+        listed_identity: Option<String>,
+        key: InstanceKey,
+        env: Option<Vec<(String, String)>>,
+        #[cfg(unix)] launch: Option<install::Launch>,
+    ) -> Result<String, String> {
         self.next_instance += 1;
         let instance_id = format!("i{}", self.next_instance);
         // 16.4: write the lease first, then re-check the release, then spawn.
@@ -1285,9 +1419,20 @@ impl Hub {
             "nvim_ade_server: spawned agent instance {instance_id} (pid {})",
             started.pid
         );
-        // A fresh process starts from a clean log (PROTOCOL.md 10).
-        self.recorder.forget_instance(&identity);
-        self.by_identity.insert(identity, instance_id.clone());
+        let log_key = match &listed_identity {
+            Some(identity) => {
+                // A fresh process starts from a clean log (PROTOCOL.md 10).
+                self.recorder.forget_instance(identity);
+                self.by_identity
+                    .insert(identity.clone(), instance_id.clone());
+                identity.clone()
+            }
+            None => {
+                let key = format!("team:{instance_id}");
+                self.recorder.forget_instance(&key);
+                key
+            }
+        };
         self.instances.insert(
             instance_id.clone(),
             Instance {
@@ -1297,7 +1442,8 @@ impl Hub {
                 started_at: now_ms(),
                 control: started.control,
                 exited,
-                relay: Relay::with_log(key.capabilities, self.event_log),
+                relay: Relay::with_log(key.capabilities.clone(), self.event_log),
+                log_key,
                 attached: Vec::new(),
                 stopping: false,
                 #[cfg(unix)]
@@ -1358,8 +1504,9 @@ impl Hub {
         if !instance.stopping {
             instance.stopping = true;
             let identity = instance.key.identity();
+            let log_key = instance.log_key.clone();
             // The log lives exactly as long as its instance (PROTOCOL.md 10).
-            self.recorder.forget_instance(&identity);
+            self.recorder.forget_instance(&log_key);
             if self
                 .by_identity
                 .get(&identity)
@@ -1422,6 +1569,10 @@ impl Hub {
     }
 
     fn tunnel_send(&mut self, conn: u64, params: &Value) {
+        self.tunnel_send_inner(conn, params, true);
+    }
+
+    fn tunnel_send_inner(&mut self, conn: u64, params: &Value, allow_hold: bool) {
         let instance_param = params.get("instance").and_then(Value::as_str);
         let message = params.get("message").cloned();
         let message_id = message
@@ -1463,7 +1614,9 @@ impl Hub {
             );
             return;
         };
-        if !handle.attached.contains(&conn) {
+        let watcher = self.is_watcher(conn, instance_id);
+        let attached = handle.attached.contains(&conn);
+        if !watcher && !attached {
             self.send_tunnel_error(
                 conn,
                 instance_id,
@@ -1503,11 +1656,42 @@ impl Hub {
             .get("method")
             .and_then(Value::as_str)
             .map(str::to_string);
+        if watcher && method.is_some() && object.get("id").is_some() {
+            self.send_tunnel_error(
+                conn,
+                instance_id,
+                crate::team::WATCHER_REQUEST,
+                "a watcher cannot send requests; use team.send",
+                message_id,
+            );
+            return;
+        }
         let session = object
             .get("params")
             .and_then(|params| params.get("sessionId"))
             .and_then(Value::as_str)
             .map(str::to_string);
+        if allow_hold && method.as_deref() == Some("session/prompt") {
+            if let Some(session) = &session {
+                if self.hold_leader_prompt(conn, instance_id, session, &message) {
+                    return;
+                }
+            }
+        }
+        let answered_key = if watcher {
+            if method.is_none() {
+                message.get("id").map(crate::relay::id_key)
+            } else if method.as_deref() == Some("$/cancel_request") {
+                object
+                    .get("params")
+                    .and_then(|params| params.get("id"))
+                    .map(crate::relay::id_key)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let action = {
             let handle = self.instances.get_mut(instance_id).expect("checked above");
             handle.relay.frontend_message(conn, &message)
@@ -1560,6 +1744,11 @@ impl Hub {
             }
             FrontendAction::Drop => {}
         }
+        if let Some(key) = answered_key {
+            self.teams.mark_item_answered_by_instance(instance_id, &key);
+            self.drain_team_events();
+            self.team_deliveries();
+        }
         self.update_busy();
     }
 
@@ -1594,7 +1783,7 @@ impl Hub {
         let Some(instance) = self.instances.get(instance_id) else {
             return;
         };
-        let key = instance.key.identity();
+        let key = instance.log_key.clone();
         let ts_ms = now_ms() as i64;
         for event in events {
             self.recorder.record(RecordedEvent {
@@ -1624,7 +1813,7 @@ impl Hub {
         let Some(instance) = self.instances.get(instance_id) else {
             return;
         };
-        let key = instance.key.identity();
+        let key = instance.log_key.clone();
         // The replay must fit the outbound queue: above the ceiling the request
         // is forwarded instead, before anything is read into memory
         // (PROTOCOL.md 12).
@@ -1816,10 +2005,10 @@ impl Hub {
         match event {
             RuntimeEvent::Stdout { instance, text } => self.agent_line(&instance, &text),
             RuntimeEvent::StdoutTooLong { instance } => {
-                let attached = match self.instances.get(&instance) {
-                    Some(handle) => handle.attached.clone(),
-                    None => return,
-                };
+                if !self.instances.contains_key(&instance) {
+                    return;
+                }
+                let attached = self.delivery_conns(&instance);
                 for conn in attached {
                     self.send_tunnel_error(
                         conn,
@@ -1858,7 +2047,7 @@ impl Hub {
                 return;
             };
             let agent = instance.key.agent.clone();
-            let attached = instance.attached.clone();
+            let attached = self.delivery_conns(instance_id);
             let params = value.get("params").cloned().unwrap_or_else(|| json!({}));
             let session_id = params
                 .get("sessionId")
@@ -1906,13 +2095,17 @@ impl Hub {
             }
         }
 
+        if !self.instances.contains_key(instance_id) {
+            return;
+        }
+        let attached = self.delivery_conns(instance_id);
         let Some(instance) = self.instances.get_mut(instance_id) else {
             return;
         };
-        let attached = instance.attached.clone();
         let outcome = instance.relay.agent_message_full(&value, &attached);
         // Record what the agent said before anything is delivered: the log is
         // the source of later replays (PROTOCOL.md 10).
+        let had_prompt_finished = outcome.prompt_finished.is_some();
         let events = outcome.events.clone();
         self.record_events(instance_id, events);
 
@@ -1936,18 +2129,71 @@ impl Hub {
                 message,
                 target: Some(conn),
             }) => {
-                self.send_tunnel_recv(conn, instance_id, seq, &message);
-                // Remember that this connection saw the request, so it can be
-                // retracted if another one answers (PROTOCOL.md 14).
-                if let Some(id) = message.get("id") {
-                    let id = id.clone();
-                    if let Some(instance) = self.instances.get_mut(instance_id) {
-                        instance.relay.mark_delivered(&id, conn);
+                let worker = self
+                    .teams
+                    .team_of_instance(instance_id)
+                    .and_then(|team| team.is_worker_instance(instance_id).map(str::to_string));
+                let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+                if let Some(_worker) = worker {
+                    if method.starts_with("fs/") || method.starts_with("terminal/") {
+                        if let Some(id) = message.get("id").cloned() {
+                            self.worker_error_response(instance_id, &id);
+                            if let Some(agent_id) = id.as_u64() {
+                                if let Some(handle) = self.instances.get_mut(instance_id) {
+                                    handle.relay.answer_pending(agent_id);
+                                }
+                            }
+                        }
+                    } else {
+                        self.note_worker_request(instance_id, &message);
+                    }
+                } else {
+                    self.send_tunnel_recv(conn, instance_id, seq, &message);
+                    // Remember that this connection saw the request, so it can
+                    // be retracted if another one answers (PROTOCOL.md 14).
+                    if let Some(id) = message.get("id") {
+                        let id = id.clone();
+                        if let Some(instance) = self.instances.get_mut(instance_id) {
+                            instance.relay.mark_delivered(&id, conn);
+                        }
                     }
                 }
             }
             // No attached connection: the request stays in the pending set.
-            Some(AgentAction::Request { target: None, .. }) => {}
+            Some(AgentAction::Request {
+                seq,
+                message,
+                target: None,
+            }) => {
+                if self
+                    .teams
+                    .team_of_instance(instance_id)
+                    .and_then(|team| team.is_worker_instance(instance_id).map(str::to_string))
+                    .is_some()
+                {
+                    let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+                    if method.starts_with("fs/") || method.starts_with("terminal/") {
+                        if let Some(id) = message.get("id").cloned() {
+                            self.worker_error_response(instance_id, &id);
+                            if let Some(agent_id) = id.as_u64() {
+                                if let Some(handle) = self.instances.get_mut(instance_id) {
+                                    handle.relay.answer_pending(agent_id);
+                                }
+                            }
+                        }
+                    } else {
+                        self.note_worker_request(instance_id, &message);
+                    }
+                }
+                let _ = seq;
+            }
+            Some(AgentAction::ServiceResponse {
+                agent_id,
+                seq,
+                message,
+            }) => {
+                self.handle_service_response(instance_id, agent_id, seq, &message);
+            }
             Some(AgentAction::Drop) | None => {}
             Some(AgentAction::Invalid) => {
                 eprintln!(
@@ -1956,15 +2202,41 @@ impl Hub {
             }
         }
 
+        // Bus turns feed `bus.read` and the report fallback.
+        if value.get("method").and_then(Value::as_str) == Some("session/update") {
+            self.note_worker_chunk(instance_id, &value);
+        }
+        if value.get("method").and_then(Value::as_str) == Some("$/cancel_request") {
+            if let Some(id) = value
+                .get("params")
+                .and_then(|params| params.get("id"))
+                .cloned()
+            {
+                self.teams
+                    .mark_item_answered_by_instance(instance_id, &crate::relay::id_key(&id));
+                self.drain_team_events();
+            }
+        }
+        if let Some(session) = &outcome.closed_session {
+            self.leader_session_closed(instance_id, session);
+        }
+
         if let Some(finished) = &outcome.prompt_finished {
             self.policy
                 .prompt_finished(finished.conn, &finished.session_id);
         }
         // A prompt that finished while adopted: the adopters hear it and the
         // turn stops counting (PROTOCOL.md 13).
+        if had_prompt_finished {
+            // A human prompt on the leader ended: bus messages that queued
+            // behind it may now be delivered (18.4).
+            self.team_deliveries();
+        }
         if let Some(finished) = outcome.finished_turn {
-            if let Some(instance) = self.instances.get_mut(instance_id) {
-                instance.relay.forget_turn(&finished.session_id);
+            if finished.adoption {
+                if let Some(instance) = self.instances.get_mut(instance_id) {
+                    instance.relay.forget_turn(&finished.session_id);
+                }
             }
             for conn in &finished.adopters {
                 self.send_tunnel_recv(
@@ -1982,6 +2254,7 @@ impl Hub {
     }
 
     fn instance_exited(&mut self, instance_id: &str) {
+        let delivery = self.delivery_conns(instance_id);
         let Some(instance) = self.instances.remove(instance_id) else {
             return;
         };
@@ -1992,10 +2265,10 @@ impl Hub {
         // newer instance with the same key may be registered there. Only delete
         // an entry that still points at this instance.
         let identity = instance.key.identity();
-        self.recorder.forget_instance(&identity);
+        self.recorder.forget_instance(&instance.log_key);
         forget_identity(&mut self.by_identity, &identity, instance_id);
         let info = instance.exited.get().unwrap_or_default();
-        for conn in &instance.attached {
+        for conn in &delivery {
             self.send_to(
                 *conn,
                 &json!({
@@ -2023,12 +2296,26 @@ impl Hub {
         {
             self.send_to(conn, &success(&id, stop_reply(&info)));
         }
+        let reason = if !info.stderr_tail.is_empty() {
+            info.stderr_tail.clone()
+        } else if info.code.is_some() || info.signal.is_some() {
+            format!("code {:?}, signal {:?}", info.code, info.signal)
+        } else {
+            "exited".to_string()
+        };
+        self.instance_left_team(instance_id, &reason);
+        // Every token for this instance stops working when it exits (18.6);
+        // the team cleanup above handles active teams, this covers a team that
+        // was already closed or a start failure.
+        self.teams.revoke_instance_tokens(instance_id);
     }
 
     fn update_busy(&mut self) {
-        let busy = self.instances.values().any(|instance| {
-            instance.relay.turns_running() > 0 || instance.relay.pending_requests() > 0
-        }) || self.install_busy();
+        let busy = !self.teams.is_empty()
+            || self.instances.values().any(|instance| {
+                instance.relay.turns_running() > 0 || instance.relay.pending_requests() > 0
+            })
+            || self.install_busy();
         if busy != self.busy {
             self.busy = busy;
             let _ = self.events.send(HubEvent::Busy(busy));
@@ -2585,6 +2872,7 @@ mod tests {
             control: ProcControl::dummy(42),
             exited: Exited::new(),
             relay: Relay::new(json!({})),
+            log_key: "i1".to_string(),
             attached: vec![1, 2],
             stopping: false,
             #[cfg(unix)]

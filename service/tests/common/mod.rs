@@ -212,6 +212,13 @@ impl TestServer {
     }
 
     /// Wait for the process to exit on its own and return its exit code.
+    /// Kill the service immediately (for the "socket closed" MCP lifecycle).
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.socket);
+    }
+
     pub fn wait_for_exit(&mut self, timeout: Duration) -> Option<i32> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -290,6 +297,16 @@ impl Client {
                 writer: Box::new(pipe),
                 pending: Vec::new(),
             })
+        }
+    }
+
+    /// Close the connection without waiting for a reply; the server sees EOF.
+    pub fn disconnect(&mut self) {
+        self.reader = BufReader::new(Box::new(std::io::empty()));
+        self.writer = Box::new(std::io::sink());
+        #[cfg(unix)]
+        {
+            self.stream = None;
         }
     }
 
@@ -390,6 +407,16 @@ impl Client {
             }
             // Notifications and foreign responses are kept for the caller.
             self.pending.push(frame);
+        }
+    }
+
+    /// Read one frame (response or notification) with a timeout, without
+    /// buffering it. Useful when a test sent a notification and expects a
+    /// response whose id it cannot ask `request` for.
+    pub fn try_recv(&mut self, timeout: Duration) -> Option<Value> {
+        match self.recv_with_timeout(timeout) {
+            ReadOutcome::Frame(frame) => Some(frame),
+            ReadOutcome::Timeout | ReadOutcome::Closed => None,
         }
     }
 

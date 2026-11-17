@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""A scriptable ACP agent for the team integration tests.
+
+It is deliberately small: it speaks initialize/session/new/load/prompt, keeps
+the `mcpServers` entry from `session/new`, and can call the real
+`nvim_ade_server mcp` subprocess from a prompt. Prompt text and environment
+choose the behavior; every prompt, request and MCP result is appended to
+TEAM_AGENT_LOG as one JSON line.
+
+Leader prompts (sent by the front end in the tests) may start with:
+
+  spawn            call team_spawn (TEAM_AGENT_TEMPLATE, TEAM_AGENT_NAME)
+  idle             just end the turn
+
+Worker task bodies may contain:
+
+  [report]         send a report to the leader
+  [ask]            call bus_ask_human and end the turn
+  [permission]     ask the client for permission and log the outcome
+  [request]        send a custom client request and log the response
+  [slow]           wait for TEAM_AGENT_GATE (or a cancel)
+  [cancel]         wait for session/cancel, then end cancelled
+"""
+
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+
+LOG = os.environ.get("TEAM_AGENT_LOG")
+PID = os.getpid()
+GATE = os.environ.get("TEAM_AGENT_GATE")
+TEMPLATE = os.environ.get("TEAM_AGENT_TEMPLATE", "dev")
+NAME = os.environ.get("TEAM_AGENT_NAME")
+CANCEL = threading.Event()
+NEXT_ID = [7000]
+PENDING = {}
+LOCK = threading.Lock()
+SESSIONS = {}
+MCP = {}
+COUNT = [0]
+
+
+def log(event):
+    if not LOG:
+        return
+    with LOCK:
+        event = {"pid": PID, **event}
+        with open(LOG, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event) + "\n")
+
+
+def send(message):
+    with LOCK:
+        print(json.dumps(message), flush=True)
+
+
+def result(ident, value):
+    send({"jsonrpc": "2.0", "id": ident, "result": value})
+
+
+def error(ident, message):
+    send({"jsonrpc": "2.0", "id": ident, "error": {"code": -32603, "message": message}})
+
+
+def request_client(method, params, timeout=20):
+    with LOCK:
+        NEXT_ID[0] += 1
+        ident = NEXT_ID[0]
+        slot = {"event": threading.Event(), "response": None}
+        PENDING[ident] = slot
+    send({"jsonrpc": "2.0", "id": ident, "method": method, "params": params})
+    slot["event"].wait(timeout)
+    return slot["response"]
+
+
+def wait_gate(timeout=20):
+    if not GATE:
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and not CANCEL.is_set():
+        if os.path.exists(GATE):
+            return
+        time.sleep(0.02)
+
+
+def mcp_call(session, tool, arguments):
+    entry = MCP.get(session)
+    if not entry:
+        log({"event": "mcp-missing", "session": session})
+        return {"isError": True, "content": [{"type": "text", "text": "no mcp server"}]}
+    env = dict(os.environ)
+    for item in entry.get("env") or []:
+        if isinstance(item, dict) and "name" in item:
+            env[item["name"]] = item.get("value", "")
+    command = [entry["command"], *(entry.get("args") or [])]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        env=env,
+    )
+    frames = [
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "team-test"}},
+        },
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": tool, "arguments": arguments}},
+    ]
+    try:
+        for frame in frames:
+            process.stdin.write(json.dumps(frame) + "\n")
+        process.stdin.flush()
+        process.stdin.close()
+        response = None
+        for line in process.stdout:
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if value.get("id") == 2:
+                response = value
+                break
+        process.wait(timeout=10)
+    except Exception as problem:  # noqa: BLE001
+        log({"event": "mcp-error", "tool": tool, "message": repr(problem)})
+        return {"isError": True, "content": [{"type": "text", "text": repr(problem)}]}
+    log({"event": "mcp", "tool": tool, "arguments": arguments, "response": response})
+    if response is None:
+        return {"isError": True, "content": [{"type": "text", "text": "no mcp response"}]}
+    return response.get("result") or {"isError": True, "content": response.get("error")}
+
+
+def mcp_list(session):
+    entry = MCP.get(session)
+    if not entry:
+        return []
+    env = dict(os.environ)
+    for item in entry.get("env") or []:
+        if isinstance(item, dict) and "name" in item:
+            env[item["name"]] = item.get("value", "")
+    process = subprocess.Popen(
+        [entry["command"], *(entry.get("args") or [])],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        env=env,
+    )
+    frames = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "team-test"}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+    ]
+    try:
+        for frame in frames:
+            process.stdin.write(json.dumps(frame) + "\n")
+        process.stdin.flush()
+        process.stdin.close()
+        for line in process.stdout:
+            value = json.loads(line)
+            if value.get("id") == 2:
+                names = [tool.get("name") for tool in (value.get("result") or {}).get("tools") or []]
+                log({"event": "tools", "session": session, "names": names})
+                return names
+        process.wait(timeout=10)
+    except Exception as problem:  # noqa: BLE001
+        log({"event": "tools-error", "message": repr(problem)})
+    return []
+
+
+def run_prompt(ident, text, session):
+    log({"event": "prompt", "session": session, "text": text})
+    send({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": session,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "working on it"},
+            },
+        },
+    })
+    try:
+        if text.startswith("spawn"):
+            response = mcp_call(session, "team_spawn", {"template": TEMPLATE, **({"name": NAME} if NAME else {}), "task": "do [report]"})
+            log({"event": "spawn-response", "response": response})
+        elif "[control-tool]" in text:
+            response = mcp_call(session, "bus_send", {"to": "leader", "kind": "control", "body": "pause"})
+            log({"event": "control-tool-response", "response": response})
+        elif "[spawn-tool]" in text:
+            response = mcp_call(session, "team_spawn", {"template": TEMPLATE})
+            log({"event": "spawn-tool-response", "response": response})
+        elif "[read-tool]" in text:
+            response = mcp_call(session, "bus_read", {"participant": "leader"})
+            log({"event": "read-tool-response", "response": response})
+        elif "[ask-slow]" in text:
+            response = mcp_call(session, "bus_ask_human", {"question": "worker needs input", "options": ["yes", "no"]})
+            log({"event": "ask-response", "response": response})
+            wait_gate()
+        elif "[ask]" in text:
+            response = mcp_call(session, "bus_ask_human", {"question": "worker needs input", "options": ["yes", "no"]})
+            log({"event": "ask-response", "response": response})
+        elif "[permission]" in text:
+            response = request_client(
+                "session/request_permission",
+                {
+                    "sessionId": session,
+                    "toolCall": {"toolCallId": "perm", "kind": "edit", "title": "Edit file"},
+                    "options": [
+                        {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "reject", "name": "Reject", "kind": "reject_once"},
+                    ],
+                },
+            )
+            log({"event": "permission-response", "response": response})
+        elif "[request]" in text:
+            response = request_client("custom/thing", {"sessionId": session, "value": 1})
+            log({"event": "custom-response", "response": response})
+        elif "[fs]" in text:
+            response = request_client("fs/read_text_file", {"sessionId": session, "path": "/etc/hostname"})
+            log({"event": "fs-response", "response": response})
+        elif "[slow]" in text:
+            wait_gate()
+        elif "[cancel]" in text:
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and not CANCEL.is_set():
+                time.sleep(0.02)
+        elif "[report]" in text:
+            response = mcp_call(session, "bus_send", {"to": "leader", "kind": "report", "body": "worker report"})
+            log({"event": "report-response", "response": response})
+        if CANCEL.is_set():
+            result(ident, {"stopReason": "cancelled"})
+        else:
+            result(ident, {"stopReason": "end_turn"})
+        log({"event": "done", "session": session})
+    except Exception as problem:  # noqa: BLE001
+        log({"event": "error", "message": repr(problem)})
+        error(ident, repr(problem))
+
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        message = json.loads(line)
+        method = message.get("method")
+        ident = message.get("id")
+        params = message.get("params") or {}
+        if method is None:
+            slot = PENDING.get(ident)
+            if slot is not None:
+                slot["response"] = message
+                slot["event"].set()
+            continue
+        if method == "initialize":
+            log({"event": "initialize", "params": params})
+            result(ident, {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}, "authMethods": []})
+        elif method in ("session/new", "session/load", "session/resume"):
+            if method == "session/new":
+                COUNT[0] += 1
+                session = f"team_sess_{os.getpid()}_{COUNT[0]}"
+            else:
+                session = params.get("sessionId", "team_sess")
+            SESSIONS[session] = True
+            for entry in params.get("mcpServers") or []:
+                if entry.get("name") == "ade-team":
+                    MCP[session] = entry
+            entry = MCP.get(session)
+            safe_entry = None
+            if entry:
+                safe_entry = {
+                    "name": entry.get("name"),
+                    "command": entry.get("command"),
+                    "args": entry.get("args"),
+                    "env_names": [item.get("name") for item in entry.get("env") or []],
+                }
+            log({
+                "event": "session",
+                "session": session,
+                "mcp": bool(entry),
+                "cwd": params.get("cwd"),
+                "mcp_entry": safe_entry,
+            })
+            if MCP.get(session):
+                mcp_list(session)
+            result(
+                ident,
+                {
+                    "sessionId": session,
+                    "configOptions": [
+                        {"id": "model", "options": [{"value": "m1", "name": "M1"}, {"value": "m2", "name": "M2"}]}
+                    ],
+                },
+            )
+        elif method == "session/prompt":
+            session = params.get("sessionId", "")
+            text = "".join(
+                block.get("text", "")
+                for block in (params.get("prompt") or [])
+                if isinstance(block, dict)
+            )
+            threading.Thread(target=run_prompt, args=(ident, text, session), daemon=True).start()
+        elif method == "session/cancel":
+            CANCEL.set()
+            log({"event": "cancel", "session": params.get("sessionId")})
+        elif method == "session/set_config_option":
+            log({"event": "set_config", "params": params})
+            result(ident, {"configOptions": [{"id": "model", "currentValue": params.get("value")}]})
+        else:
+            if ident is not None:
+                result(ident, {})
+
+
+if __name__ == "__main__":
+    main()

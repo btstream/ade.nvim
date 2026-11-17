@@ -10,6 +10,8 @@ use std::io;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::team::{ParticipantAuth, SharedTokens, PARTICIPANT_METHOD};
+
 /// Standard JSON-RPC errors.
 pub const PARSE_ERROR: i64 = -32700;
 pub const INVALID_REQUEST: i64 = -32600;
@@ -38,9 +40,9 @@ pub const FEATURES: &[&str] = &["tunnel", "policy"];
 /// Features advertised by `hello` with the event log enabled (PROTOCOL.md 3.1
 /// and 10).
 #[cfg(unix)]
-pub const FEATURES_WITH_LOG: &[&str] = &["tunnel", "install", "policy", "log"];
+pub const FEATURES_WITH_LOG: &[&str] = &["tunnel", "install", "policy", "log", "teams"];
 #[cfg(not(unix))]
-pub const FEATURES_WITH_LOG: &[&str] = &["tunnel", "policy", "log"];
+pub const FEATURES_WITH_LOG: &[&str] = &["tunnel", "policy", "log", "teams"];
 
 /// The `features` list for one service configuration.
 pub fn features(log_enabled: bool) -> &'static [&'static str] {
@@ -176,6 +178,8 @@ pub struct Handshake {
     authenticated: bool,
     client: Option<String>,
     client_version: Option<String>,
+    /// Set for a team participant connection (`hello.participant_token`).
+    participant: Option<ParticipantAuth>,
 }
 
 impl Handshake {
@@ -189,6 +193,10 @@ impl Handshake {
 
     pub fn client_version(&self) -> Option<&str> {
         self.client_version.as_deref()
+    }
+
+    pub fn participant(&self) -> Option<&ParticipantAuth> {
+        self.participant.as_ref()
     }
 }
 
@@ -220,6 +228,17 @@ pub fn handle_local_with(
     frame: &Value,
     log_enabled: bool,
 ) -> Local {
+    handle_local_with_tokens(handshake, token, frame, log_enabled, None)
+}
+
+/// Like [`handle_local_with`], with the team participant token registry.
+pub fn handle_local_with_tokens(
+    handshake: &mut Handshake,
+    token: &str,
+    frame: &Value,
+    log_enabled: bool,
+    participants: Option<&SharedTokens>,
+) -> Local {
     let Some(object) = frame.as_object() else {
         return Local::Reply(failure(&Value::Null, PARSE_ERROR, "parse error"));
     };
@@ -240,8 +259,25 @@ pub fn handle_local_with(
         return reject(is_notification, &id, HELLO_REQUIRED, "hello required");
     }
 
+    if handshake.participant.is_some() && method != "hello" && !method.starts_with("bus.") {
+        return reject(
+            is_notification,
+            &id,
+            PARTICIPANT_METHOD,
+            "method not available on a participant connection",
+        );
+    }
+
     match method {
-        "hello" => hello(handshake, token, object, &id, is_notification, log_enabled),
+        "hello" => hello(
+            handshake,
+            token,
+            object,
+            &id,
+            is_notification,
+            log_enabled,
+            participants,
+        ),
         "ping" => Local::Reply(success(&id, json!({}))),
         "shutdown" => {
             if is_notification {
@@ -273,18 +309,34 @@ fn hello(
     id: &Value,
     is_notification: bool,
     log_enabled: bool,
+    participants: Option<&SharedTokens>,
 ) -> Local {
     let Some(params) = object.get("params").and_then(Value::as_object) else {
         return reject(is_notification, id, INVALID_PARAMS, "invalid params");
     };
-    let Some(candidate) = params.get("token").and_then(Value::as_str) else {
-        // A missing token is as bad as a wrong one: the contract closes the
-        // connection in both cases.
-        return Local::Close(failure(id, INVALID_TOKEN, "invalid token"));
+    let participant_token = params.get("participant_token").and_then(Value::as_str);
+    let participant = match participant_token {
+        Some(candidate) => {
+            let Some(participants) = participants else {
+                return Local::Close(failure(id, INVALID_TOKEN, "invalid token"));
+            };
+            match crate::team::authenticate(participants, candidate) {
+                Some(auth) => Some(auth),
+                None => return Local::Close(failure(id, INVALID_TOKEN, "invalid token")),
+            }
+        }
+        None => {
+            let Some(candidate) = params.get("token").and_then(Value::as_str) else {
+                // A missing token is as bad as a wrong one: the contract closes
+                // the connection in both cases.
+                return Local::Close(failure(id, INVALID_TOKEN, "invalid token"));
+            };
+            if !crate::token::tokens_match(token, candidate) {
+                return Local::Close(failure(id, INVALID_TOKEN, "invalid token"));
+            }
+            None
+        }
     };
-    if !crate::token::tokens_match(token, candidate) {
-        return Local::Close(failure(id, INVALID_TOKEN, "invalid token"));
-    }
     let Some(requested) = params.get("api_version").and_then(Value::as_i64) else {
         return reject(is_notification, id, INVALID_PARAMS, "invalid params");
     };
@@ -312,18 +364,25 @@ fn hello(
         .get("client_version")
         .and_then(Value::as_str)
         .map(str::to_string);
+    handshake.participant = participant;
 
     if is_notification {
         return Local::Reply(Value::Null);
     }
-    Local::Reply(success(
-        id,
-        json!({
-            "server_version": crate::SERVER_VERSION,
-            "api_version": crate::API_VERSION,
-            "features": features(log_enabled),
-        }),
-    ))
+    let mut result = json!({
+        "server_version": crate::SERVER_VERSION,
+        "api_version": crate::API_VERSION,
+        "features": if handshake.participant.is_some() { json!([]) } else { json!(features(log_enabled)) },
+    });
+    if let Some(participant) = &handshake.participant {
+        result["participant"] = json!({
+            "token_id": participant.token_id,
+            "role": participant.role.as_str(),
+            "name": participant.name,
+            "team": participant.team,
+        });
+    }
+    Local::Reply(success(id, result))
 }
 
 /// The JSON-RPC error code of a failing response, if it is one.

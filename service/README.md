@@ -5,7 +5,7 @@ Neovim, one process per user, and holds ACP agent processes so they outlive the
 front end. It relays raw ACP JSON-RPC between an agent and whichever front end
 is attached; it is not an ACP client itself.
 
-The protocol (api_version 4) is specified in [`PROTOCOL.md`](PROTOCOL.md). That
+The protocol (api_version 5) is specified in [`PROTOCOL.md`](PROTOCOL.md). That
 document is the contract: socket and token paths are in "Where things live"
 below, everything else is there.
 
@@ -14,8 +14,8 @@ below, everything else is there.
 | Command | What it does |
 |---|---|
 | `nvim_ade_server serve [--socket <path>] [--idle-timeout <secs>] [--print-paths] [--event-log on\|off] [--event-log-max-mb <n>]` | Run the service. `--idle-timeout` overrides `NVIM_ADE_SERVER_IDLE_TIMEOUT_SECS` (default 1800); `--print-paths` prints the resolved paths and exits without binding. `--event-log` (default `on`) and `--event-log-max-mb` (default 256, 16–4096) are the event log flags of PROTOCOL.md section 15. |
-| `nvim_ade_server version` | Print `{"version":"0.5.0","api_version":4}` on one line. |
-| `nvim_ade_server mcp --token <t>` | Placeholder for the per-agent MCP server; prints "not implemented yet" to stderr and exits 3. |
+| `nvim_ade_server version` | Print `{"version":"0.6.0","api_version":5}` on one line. |
+| `nvim_ade_server mcp` | MCP over stdio for a team participant. Reads `ADE_TEAM_TOKEN` from the environment (never from argv) and connects to the service socket; it never prints the token. |
 
 `serve` prints exactly one line on stdout:
 
@@ -136,9 +136,11 @@ is kept for `agent.exited`.
 [`PROTOCOL.md`](PROTOCOL.md) is normative; this is a short orientation.
 
 JSON-RPC 2.0, one UTF-8 JSON object per line, terminated by `\n`, max 64 MiB.
-The current `api_version` is **4** and `hello` reports `features: ["tunnel",
-"install", "policy", "log"]` on unix (`"install"` is absent on Windows; with
-`--event-log off` `"log"` is absent too).
+The current `api_version` is **5** and `hello` reports `features: ["tunnel",
+"install", "policy", "log", "teams"]` on unix (`"install"` is absent on Windows;
+with `--event-log off` `"log"` and `"teams"` are absent too, because teams need
+the event log). A participant connection (`hello.participant_token`) gets an
+empty `features` list and may call only `bus.*`.
 
 | Method | Direction | Purpose |
 |---|---|---|
@@ -147,6 +149,9 @@ The current `api_version` is **4** and `hello` reports `features: ["tunnel",
 | `install.resolve / run / uninstall` | front end → service | managed npm installs, unix only (PROTOCOL.md 16) |
 | `policy.set / clear / list` | front end → service | permission rule sets (PROTOCOL.md 17) |
 | `policy.applied` (notification) | service → attached front ends | a request the policy answered itself |
+| `team.configure / leader_server / bind_leader / list / send / read / answer / watch / unwatch / reset_limits / close` | front end → service | teams and the bus (PROTOCOL.md 18) |
+| `bus.spawn / send / ask_human / status / read` | participant (MCP) → service | tools for a team agent (PROTOCOL.md 18.6) |
+| `team.changed`, `team.inbox` (notifications) | service → every front end | team state and inbox changes |
 | `install.progress` (notification) | service → every front end | install/uninstall progress |
 | `$/cancel_request` (notification) | front end → service | cancel that connection's running install request |
 | `tunnel.send` (notification) | front end → service | one ACP message for an instance |
@@ -254,9 +259,32 @@ dependencies. Each one is listed here as required:
 |---|---|---|
 | `random` | `src/lib.rs`, used in `src/token.rs` | `std::random::random` generates the 32 random bytes of the front-end token, so no `rand`/`getrandom` dependency is needed. Remove it once `std::random` is stabilised. |
 
+## Teams (api_version 5)
+
+With the event log on, `hello` also offers `"teams"` (PROTOCOL.md section 18).
+A team is one leader agent plus up to `max_workers` worker agents that talk
+through a bus the service owns, with `human` as a participant. The front end
+configures templates, asks for a leader server entry, binds the leader session
+and drives the team with `team.*`; the agents call the `nvim_ade_server mcp`
+subprocess, which speaks MCP over stdio and translates its tools to `bus.*`.
+
+Workers are spawned by the service and are deliberately **not** in the
+`agent.attach` identity table: a front end can only watch one with
+`team.watch`. Watchers receive the worker's notifications and pending requests,
+may answer responses, and receive replays with `team.watch {replay: true}`.
+Bus messages are delivered as `<bus ...>` prompt blocks; the service records
+the delivered prompt and the agent's notifications in the worker's own event
+log (`team:<instance>`), which is what a watcher replay reads.
+
+Teams live in memory. After a service restart there are none, and a front end
+treats every team it knew as ended. Worktrees for workers, teams started from
+configuration and restart recovery are S4c. Participant tokens are at least 128
+random bits and kept only as hashes; neither tokens nor template environments
+are written to the event log, `team.list` or stderr.
+
 ## Known limitations
 
-Behaviour that is deliberately not implemented in api_version 4 (or not
+Behaviour that is deliberately not implemented in api_version 5 (or not
 verified on every platform). None of these break the contract in
 [`PROTOCOL.md`](PROTOCOL.md); they are the places where the front end or a later
 stage has to compensate.

@@ -41,7 +41,7 @@ impl Agent {
 
     fn attach_with(server: &TestServer, label: &str, env: HashMap<String, String>) -> Self {
         let mut client = server.connect();
-        client.hello(&server.token(), 4);
+        client.hello(&server.token(), nvim_ade_server::API_VERSION);
         let key = json!({
             "agent": "mock",
             "command": "python3",
@@ -161,7 +161,7 @@ fn a_second_attach_reuses_the_instance_and_caches_initialize() {
 
     // A second connection with the same key finds the running instance.
     let mut second = server.connect();
-    second.hello(&server.token(), 4);
+    second.hello(&server.token(), nvim_ade_server::API_VERSION);
     let response = second.request(
         2,
         "agent.attach",
@@ -207,7 +207,7 @@ fn two_connections_get_their_own_responses() {
     first.initialize(json!(1));
 
     let mut second = server.connect();
-    second.hello(&server.token(), 4);
+    second.hello(&server.token(), nvim_ade_server::API_VERSION);
     second.request(
         2,
         "agent.attach",
@@ -339,7 +339,7 @@ fn a_pending_permission_is_replayed_to_a_reconnecting_frontend() {
     // The agent keeps running; the request stays pending. The disconnect is
     // processed asynchronously, so wait for the service to notice it.
     let mut second = server.connect();
-    second.hello(&server.token(), 4);
+    second.hello(&server.token(), nvim_ade_server::API_VERSION);
     let deadline = Instant::now() + Duration::from_secs(10);
     let summary = loop {
         let list = second.request(2, "agent.list", json!({}));
@@ -485,7 +485,7 @@ fn write_stubborn_agent(dir: &Path, name: &str, script: &str) -> PathBuf {
 
 fn attach_custom(server: &TestServer, command: &Path, args: &[&str]) -> (common::Client, String) {
     let mut client = server.connect();
-    client.hello(&server.token(), 4);
+    client.hello(&server.token(), nvim_ade_server::API_VERSION);
     let response = client.request(
         2,
         "agent.attach",
@@ -664,7 +664,7 @@ fn tunnel_send_requires_an_attached_connection() {
     owner.initialize(json!(1));
 
     let mut stranger = server.connect();
-    stranger.hello(&server.token(), 4);
+    stranger.hello(&server.token(), nvim_ade_server::API_VERSION);
     stranger.notify(
         "tunnel.send",
         json!({
@@ -684,7 +684,7 @@ fn the_stop_reply_arrives_after_the_instance_is_gone() {
     // that sends `agent.list` right after it never sees the instance again.
     let server = TestServer::start("agent-stop-order");
     let mut client = server.connect();
-    client.hello(&server.token(), 4);
+    client.hello(&server.token(), nvim_ade_server::API_VERSION);
     let script = write_stubborn_agent(
         server.dir(),
         "exits-on-stdin.sh",
@@ -731,7 +731,7 @@ fn detach_keeps_the_agent_running_and_reconnect_finds_it() {
 
     // A new connection attaches to the same instance, created = false.
     let mut second = server.connect();
-    second.hello(&server.token(), 4);
+    second.hello(&server.token(), nvim_ade_server::API_VERSION);
     let attached = second.request(
         2,
         "agent.attach",
@@ -806,7 +806,7 @@ fn idle_exit_waits_for_a_running_turn() {
     // Give the idle timeout several chances to fire.
     std::thread::sleep(Duration::from_millis(1500));
     let mut probe = server.connect();
-    probe.hello(&server.token(), 4);
+    probe.hello(&server.token(), nvim_ade_server::API_VERSION);
     let list = probe.request(2, "agent.list", json!({}));
     assert!(
         !list["result"]["instances"].as_array().unwrap().is_empty(),
@@ -839,7 +839,7 @@ for line in sys.stdin:
     );
 
     let mut client = server.connect();
-    client.hello(&server.token(), 4);
+    client.hello(&server.token(), nvim_ade_server::API_VERSION);
     let mut env = HashMap::new();
     env.insert("AGENT_VISIBLE", "yes");
     let response = client.request(
@@ -888,7 +888,7 @@ for line in sys.stdin:
 fn agent_list_starts_empty_and_never_touches_other_servers() {
     let server = TestServer::start("agent-list-empty");
     let mut client = server.connect();
-    client.hello(&server.token(), 4);
+    client.hello(&server.token(), nvim_ade_server::API_VERSION);
     let list = client.request(2, "agent.list", json!({}));
     assert_eq!(list["result"]["instances"], json!([]));
     // The service directory holds its socket, token and lock, nothing else.
@@ -988,7 +988,7 @@ fn a_new_connection_still_receives_pending_requests() {
     }
 
     let mut second = server.connect();
-    second.hello(&server.token(), 4);
+    second.hello(&server.token(), nvim_ade_server::API_VERSION);
     let attached = second.request(
         2,
         "agent.attach",
@@ -1043,7 +1043,7 @@ fn a_turn_that_outlives_its_connection_keeps_the_service_alive_until_it_ends() {
     drop(agent.client);
 
     let mut probe = server.connect();
-    probe.hello(&server.token(), 4);
+    probe.hello(&server.token(), nvim_ade_server::API_VERSION);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let list = probe.request(2, "agent.list", json!({}));
@@ -1181,7 +1181,7 @@ fn stop_frees_the_identity_immediately() {
     );
     let script = slow_to_die_agent(&server);
     let mut client = server.connect();
-    client.hello(&server.token(), 4);
+    client.hello(&server.token(), nvim_ade_server::API_VERSION);
 
     let attached = attach_key(&server, &mut client, &script);
     let old_instance = attached["result"]["instance"].as_str().unwrap().to_string();
@@ -1330,7 +1330,7 @@ fn repeated_stop_and_attach_cycles_do_not_leak_processes() {
     );
     let script = slow_to_die_agent(&server);
     let mut client = server.connect();
-    client.hello(&server.token(), 4);
+    client.hello(&server.token(), nvim_ade_server::API_VERSION);
 
     let mut seen: Vec<(String, u64)> = Vec::new();
     let mut current = attach_key(&server, &mut client, &script);
@@ -1427,7 +1427,7 @@ struct Peer {
 impl Peer {
     fn attach(server: &TestServer, label: &str) -> Self {
         let mut client = server.connect();
-        client.hello(&server.token(), 4);
+        client.hello(&server.token(), nvim_ade_server::API_VERSION);
         let key = json!({
             "agent": "mock",
             "command": "python3",
@@ -1551,7 +1551,7 @@ fn sessions_are_tracked_and_reported() {
 
     // A fresh attach reports the tracked session with its cwd and state.
     let mut second = server.connect();
-    second.hello(&server.token(), 4);
+    second.hello(&server.token(), nvim_ade_server::API_VERSION);
     let attached = second.request(
         2,
         "agent.attach",
@@ -1600,7 +1600,7 @@ fn the_tracked_state_follows_config_and_mode_updates() {
     // Re-attach and compare the reported state with what `session/new` gave,
     // now carrying the changes.
     let mut second = server.connect();
-    second.hello(&server.token(), 4);
+    second.hello(&server.token(), nvim_ade_server::API_VERSION);
     let attached = second.request(
         2,
         "agent.attach",
@@ -1634,7 +1634,7 @@ fn closing_a_session_removes_it_from_the_list() {
     assert_eq!(list["result"]["instances"][0]["sessions"], 0);
 
     let mut second = server.connect();
-    second.hello(&server.token(), 4);
+    second.hello(&server.token(), nvim_ade_server::API_VERSION);
     let attached = second.request(
         2,
         "agent.attach",
@@ -1665,7 +1665,7 @@ fn answering_a_permission_retracts_it_from_the_other_connection() {
 
     // A second connection attaches and receives the pending request again.
     let mut second = server.connect();
-    second.hello(&server.token(), 4);
+    second.hello(&server.token(), nvim_ade_server::API_VERSION);
     second.request(
         2,
         "agent.attach",
@@ -1751,7 +1751,7 @@ fn the_event_log_flag_off_reports_no_sessions() {
     assert_eq!(list["result"]["instances"][0]["log_bytes"], 0);
 
     let mut second = server.connect();
-    second.hello(&server.token(), 4);
+    second.hello(&server.token(), nvim_ade_server::API_VERSION);
     let attached = second.request(
         2,
         "agent.attach",
@@ -1782,7 +1782,7 @@ fn an_agent_withdrawal_reaches_each_connection_once() {
 
     // A second connection attaches and receives the pending request again.
     let mut second = server.connect();
-    second.hello(&server.token(), 4);
+    second.hello(&server.token(), nvim_ade_server::API_VERSION);
     second.request(
         2,
         "agent.attach",
@@ -1856,7 +1856,7 @@ fn an_agent_withdrawal_reaches_each_connection_once() {
 /// A peer whose mock agent is configured by environment (profile etc.).
 fn peer_with_env(server: &TestServer, label: &str, extra_env: &[(&str, &str)]) -> Peer {
     let mut client = server.connect();
-    client.hello(&server.token(), 4);
+    client.hello(&server.token(), nvim_ade_server::API_VERSION);
     let key = json!({
         "agent": "mock",
         "command": "python3",
