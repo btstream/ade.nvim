@@ -1137,3 +1137,103 @@ Notifications to every connection: `team.changed {team}` (one entry of
 | -32063 | unknown or already answered inbox item |
 | -32064 | unknown team or participant, or the participant exited |
 | -32065 | method not available on a participant connection |
+
+### 18.11 Clarifications (normative; they take precedence over 18.1–18.10)
+
+**States.** A participant's `state` is `idle`, `working`, `waiting_human` or
+`exited`; `paused` is a separate boolean that only stops deliveries. `team.list`
+participants carry `paused`, and `turns = {task, total}` (bus-delivered turns
+for the current task label, and in total). `team.reset_limits` resets the
+counters and clears `paused` for limits it caused.
+
+**Ids.** Message ids are integers increasing per team (`bus.read.since` takes
+one). Inbox item ids are `i<n>` and token ids `k<n>`, unique in the service.
+
+**Results.** `bus.send` → `{id}`; `bus.ask_human` → `{request}`; `bus.status` →
+`{self: {name, role, state, paused}, members: [{name, role, state, paused,
+task, queued}], templates?: [name], workers_left?: n}` (the last two for the
+leader); `bus.read` and `team.read` → `{messages: [message], turns: [{at,
+text}]}` where `messages` are those to or from the participant after `since`
+(at most 100) and `turns` the `agent_message_chunk` text of its last 3
+bus-delivered turns, 64 KiB in total, the end kept.
+
+**Who may send what.** Workers may `bus_send` to the leader, to other workers
+and to `human`, any kind but `control`. The leader may send any kind to anyone
+but itself; `control` to `human` is refused (`-32060`). The service checks the
+role of the token for every `bus.*` call, whatever `tools/list` showed. Only
+values the service validated appear in `<bus ...>` attributes (names, kinds,
+task labels contain no quotes). Role cards come from the front end's
+configuration and are not escaped.
+
+**First prompt.** A worker's first prompt is one `session/prompt`: the role
+card block, then the `<bus kind="task">` block of `team_spawn`'s `task` if
+any, then anything else queued.
+
+**Inbox items per kind** (besides `{id, team, kind, from, body, at, state}`):
+`question {options?}`, `spawn {template, name, task?}`, `permission {instance,
+sessionId, toolCall, options}`, `request {instance, method, params}`,
+`message {message}` (the message id), `limit {participant?, scope: "task" |
+"total", task?}`. `team.inbox {item}` is sent again whenever an item's
+`state` changes. Answers are taken in the order the service receives them:
+the first wins, a later `team.answer` gets `-32063`, a later `tunnel.send`
+response is dropped silently (section 5.1).
+
+**Ordering.** Notifications caused by a request (`team.inbox`, `team.changed`,
+deliveries) are sent before that request's response. `team.changed` is sent
+whenever the participant's entry in `team.list` changes, including `queued`;
+when the team ends, a last `team.changed` has `state: "closed"`.
+
+**Bus turns are not adoption.** `_ade/turn_started` / `_ade/turn_finished`
+(the latter with section 13's shape) go to every connection attached to the
+leader's instance or watching the participant; `_ade/turn_adopted` is never
+sent for a bus prompt. Section 17's `turn_end` sets bind only to prompts of
+front ends, never to bus prompts; on a worker session only sets without
+`until` can apply.
+
+**The person's prompt on the leader.** While the service waits for a bus
+prompt it cancelled (18.4), the front end's prompt is held: it is not running,
+not counted in `turns_running`, and further front-end prompts queue behind it
+in arrival order, all before any bus delivery. The service's own
+`session/cancel` does not make section 17 sets cancelling. If the bus prompt
+was already answered when the front end's prompt arrives, no cancel is sent.
+If the agent has not answered the cancelled bus prompt after 30 s, the held
+prompts are relayed anyway. A held prompt whose connection closes is dropped.
+
+**Turns that end badly.** A bus turn answered with `stopReason: "cancelled"` or
+with an error counts towards the limits, triggers no report fallback, and the
+sender of the participant's current task receives a `notice` from the service
+(`from` is the participant's name, body `"turn ended: cancelled"` or
+`"turn ended: error: <message>"`). The leader's turns never produce a report
+fallback. Nothing is delivered again.
+
+**A worker that exits** (crash, stop, `team.close`): its queued messages are
+dropped; the sender of its current task and the leader receive a `notice`
+(`"worker <name> exited: <reason>"`, `refs = [<task>]`); its open inbox items
+become `orphaned` (answers get `-32063`); its tokens stop working. A missing
+name for `team_spawn` takes the lowest free `w<n>`.
+
+**`team.close`**: the team stops accepting `bus.*` (`"team closed"`), open
+`spawn` items become `orphaned`, workers are stopped, messages queued for the
+leader are dropped, then the last `team.changed`. The leader's session and
+instance are left alone. `team.bind_leader` for an existing team with a
+different session is `-32061`: to change the leader, close the team.
+
+**Watchers.** For a worker instance the watchers play the role of the attached
+connections of sections 5.3–5.4 and 14: every pending agent request is sent to
+every watcher (and redelivered on `team.watch`), the first answer wins, the
+others get `$/cancel_request` (section 14). With no watcher a request waits as
+an inbox item; inbox and watchers share one pending set. Watchers do not count
+in `attached`. A watcher sends no requests at all (`-32062`); instead
+`team.watch {team, participant, replay?}` with `replay: true` sends, before
+its response, the replay section 12 would produce (`tunnel.recv` with the
+recorded updates). A session the service created is complete from its
+`session/new` (the team layer's own requests and responses are not logged).
+If the replay would exceed section 12's ceiling the result is
+`{instance, sessionId, replayed: false}` and nothing is sent.
+
+**Secrets.** Participant tokens are at least 128 random bits, kept only as
+hashes, and never written to the event log (which records no request params,
+section 10) or to the service's stderr; neither are template environments.
+`team.list` never contains templates or environments. A worker's token stops
+working when its session or instance ends. Participant connections receive
+no notifications at all (`team.changed`, `team.inbox`, `tunnel.recv`).
