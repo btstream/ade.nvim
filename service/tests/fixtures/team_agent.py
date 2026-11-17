@@ -361,6 +361,41 @@ def run_prompt(ident, text, session):
             for call in calls:
                 response = mcp_call(session, "card_update", call)
                 log({"event": "card-update-response", "arguments": call, "response": response})
+        elif "[board-create]" in text:
+            response = mcp_call(
+                session,
+                "board_update",
+                {
+                    "workflow_name": "dev",
+                    "workflow": "flow text",
+                    "columns": ["todo", "doing"],
+                    "upsert": [
+                        {"id": "T1", "title": "fix reconnect", "column": "doing", "owner": "w1"},
+                        {"id": "T2", "title": "write docs", "column": "todo", "owner": "w1"},
+                    ],
+                },
+            )
+            log({"event": "board-create-response", "response": response})
+        elif "[workflow-save]" in text:
+            response = mcp_call(
+                session,
+                "workflow_save",
+                {
+                    "workflow": {
+                        "name": "review_by_pi",
+                        "summary": "w1 写代码，reviewer 审查",
+                        "text": "1. w1 实现\n2. reviewer 审查",
+                        "team": [{"name": "w1", "template": TEMPLATE}],
+                        "columns": ["todo", "doing"],
+                    },
+                    "replace": True,
+                },
+            )
+            log({"event": "workflow-save-response", "response": response})
+        elif "[spawn-two]" in text:
+            for _ in range(2):
+                response = mcp_call(session, "team_spawn", {"template": TEMPLATE, "task": "do [report]"})
+                log({"event": "spawn-response", "response": response})
         elif "[board-update]" in text:
             response = mcp_call(session, "board_update", {})
             log({"event": "board-update-response", "response": response})
