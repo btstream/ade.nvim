@@ -103,6 +103,15 @@ enum Job {
         bytes: usize,
     },
     TeamDelete(String),
+    /// One board write plus the history changes it caused (19.11).
+    BoardSave {
+        team_id: String,
+        rev: u64,
+        json: String,
+        history: Vec<(String, String, i64, i64)>,
+        cleared: Vec<String>,
+        bytes: usize,
+    },
     /// Complete the receiver once every earlier job is written.
     Barrier(oneshot::Sender<()>),
 }
@@ -445,6 +454,46 @@ impl Recorder {
         self.send(Job::TeamDelete(id.to_string()));
     }
 
+    /// Queue one board write. Every write is kept (not coalesced): each one
+    /// carries the card history versions it turned into current state.
+    pub fn save_board(
+        &self,
+        team_id: &str,
+        rev: u64,
+        json: String,
+        history: Vec<(String, String, i64, i64)>,
+        cleared: Vec<String>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let bytes = team_id.len()
+            + json.len()
+            + history
+                .iter()
+                .map(|(_, json, _, _)| json.len())
+                .sum::<usize>();
+        self.inner.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if !self.send(Job::BoardSave {
+            team_id: team_id.to_string(),
+            rev,
+            json,
+            history,
+            cleared,
+            bytes,
+        }) {
+            self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Read one stored board. Startup only: blocks on the database.
+    pub fn load_board(&self, team_id: &str) -> Result<Option<crate::store::StoredBoard>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        self.inner.store.load_board(team_id)
+    }
+
     /// Read the stored teams. Startup only: blocks on the database.
     pub fn load_teams(&self) -> Result<Vec<(String, String)>> {
         if !self.enabled {
@@ -698,6 +747,16 @@ impl Writer {
                         self.flush_team_saves();
                         self.delete_team(&id);
                     }
+                    Job::BoardSave {
+                        team_id,
+                        rev,
+                        json,
+                        history,
+                        cleared,
+                        bytes,
+                    } => {
+                        self.save_board(&team_id, rev, &json, &history, &cleared, bytes);
+                    }
                     Job::Barrier(sender) => {
                         self.write(&mut batch);
                         self.flush_team_saves();
@@ -747,6 +806,16 @@ impl Writer {
                 Job::TeamDelete(id) => {
                     self.flush_team_saves();
                     self.delete_team(&id);
+                }
+                Job::BoardSave {
+                    team_id,
+                    rev,
+                    json,
+                    history,
+                    cleared,
+                    bytes,
+                } => {
+                    self.save_board(&team_id, rev, &json, &history, &cleared, bytes);
                 }
                 Job::Barrier(sender) => {
                     self.write(&mut batch);
@@ -1025,6 +1094,22 @@ impl Writer {
             }
         }
         self.flush_team_saves();
+    }
+
+    fn save_board(
+        &mut self,
+        team_id: &str,
+        rev: u64,
+        json: &str,
+        history: &[(String, String, i64, i64)],
+        cleared: &[String],
+        bytes: usize,
+    ) {
+        let result = self.store.save_board(team_id, rev, json, history, cleared);
+        self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        if let Err(error) = result {
+            self.report_team_failure(&error);
+        }
     }
 
     fn delete_team(&mut self, id: &str) {

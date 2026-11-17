@@ -1196,13 +1196,14 @@ fn a_version_one_log_migrates_without_losing_events() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let tables: i64 = conn
         .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('teams', 'team_meta')",
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table'
+             AND name IN ('teams', 'team_meta', 'boards', 'card_history')",
             [],
             |row| row.get(0),
         )
         .expect("tables");
-    assert_eq!(tables, 2);
+    assert_eq!(tables, 4);
 }

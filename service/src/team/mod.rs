@@ -5,6 +5,7 @@
 //! layer. I/O (spawning agents, sending frames, broadcasts) is done by
 //! `hub::teams`, which owns the hub and calls these methods.
 
+pub mod board;
 pub mod mcp;
 pub mod worktree;
 
@@ -454,6 +455,10 @@ pub struct Team {
     pub pending_items: HashMap<(String, String), String>,
     /// Creation time in ms; worktree names embed its UTC stamp (18.12).
     pub created_at: u64,
+    /// The team's board (19.2).
+    pub board: board::Board,
+    /// When the pending worker board write is persisted and announced (19.2).
+    pub board_flush_at: Option<u64>,
 }
 
 impl Team {
@@ -1022,6 +1027,8 @@ impl Teams {
             watchers: HashMap::new(),
             pending_items: HashMap::new(),
             created_at: now_ms(),
+            board: board::Board::default(),
+            board_flush_at: None,
         };
         let mut leader = Participant::new("leader", Role::Leader);
         leader.instance = Some(instance.to_string());
@@ -1453,6 +1460,7 @@ impl Teams {
                 .config
                 .max_workers
                 .saturating_sub(team.live_workers() as u64));
+            out["board"] = team.board.status();
         }
         Ok(out)
     }
@@ -2755,6 +2763,9 @@ fn team_entry(team: &Team) -> Value {
             "max_turns_total": team.config.max_turns_total,
             "turns_total": team.total_turns,
         },
+        "board_rev": team.board.rev,
+        "workflow_name": team.board.workflow_name,
+        "stages": team.board.stages(),
     });
     if let Some(at) = team.suspended_at {
         entry["suspended_at"] = json!(at);
@@ -3061,6 +3072,8 @@ impl Teams {
                 watchers: HashMap::new(),
                 pending_items: HashMap::new(),
                 created_at: snapshot.created_at,
+                board: board::Board::default(),
+                board_flush_at: None,
             };
             self.by_cwd.insert(team.cwd.clone(), team.id.clone());
             self.teams.insert(team.id.clone(), team);

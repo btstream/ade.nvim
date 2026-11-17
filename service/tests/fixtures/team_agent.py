@@ -341,6 +341,13 @@ def run_prompt(ident, text, session):
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline and not (event and event.is_set()):
                 time.sleep(0.02)
+        elif "[card-update" in text:
+            rest = text.split("[card-update", 1)[1].lstrip()
+            arguments, _ = json.JSONDecoder().raw_decode(rest)
+            calls = arguments if isinstance(arguments, list) else [arguments]
+            for call in calls:
+                response = mcp_call(session, "card_update", call)
+                log({"event": "card-update-response", "arguments": call, "response": response})
         elif "[report]" in text:
             response = mcp_call(session, "bus_send", {"to": "leader", "kind": "report", "body": "worker report"})
             log({"event": "report-response", "response": response})

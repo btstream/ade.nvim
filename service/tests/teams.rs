@@ -244,6 +244,78 @@ impl Harness {
     fn events(&self) -> Vec<Value> {
         read_log(&self.log)
     }
+
+    fn board(&mut self) -> Value {
+        self.client
+            .request(96, "team.board", json!({ "team": self.team }))
+            .get("result")
+            .and_then(|result| result.get("board"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    fn card_history(&mut self, card: &str) -> Value {
+        self.client
+            .request(
+                97,
+                "team.card_history",
+                json!({ "team": self.team, "card": card }),
+            )
+            .get("result")
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// The next `team.board_changed` rev for this team, skipping other
+    /// notifications.
+    fn next_board_changed(&mut self, timeout: Duration) -> Option<u64> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let frame = self.client.try_next_notification(remaining)?;
+            if frame["method"] == "team.board_changed" && frame["params"]["team"] == self.team {
+                return frame["params"]["rev"].as_u64();
+            }
+        }
+    }
+
+    fn spawn_worker(&mut self, name: &str, task: &str) {
+        let spawn = mcp_call(
+            &self.server,
+            &self.token,
+            "team_spawn",
+            json!({"template": "dev", "name": name, "task": task}),
+        );
+        assert_eq!(spawn["isError"], false, "{spawn}");
+        self.wait_participant(name, |entry| entry["state"] == "idle");
+    }
+
+    fn wait_board_card(&mut self, card: &str, check: impl Fn(&Value) -> bool) -> Value {
+        wait_for(
+            || {
+                let board = self.board();
+                board["cards"]
+                    .as_array()?
+                    .iter()
+                    .find(|entry| entry["id"] == card && check(entry))
+                    .cloned()
+            },
+            &format!("board card {card}"),
+        )
+    }
+
+    fn wait_board_rev(&mut self, rev: u64) -> Value {
+        wait_for(
+            || {
+                let board = self.board();
+                (board["rev"].as_u64() == Some(rev)).then_some(board)
+            },
+            &format!("board rev {rev}"),
+        )
+    }
 }
 
 fn merge(base: &mut Value, extra: Value) {
@@ -377,6 +449,10 @@ fn mcp_text(result: &Value) -> String {
         .as_str()
         .unwrap_or_default()
         .to_string()
+}
+
+fn mcp_json(result: &Value) -> Value {
+    serde_json::from_str(&mcp_text(result)).unwrap_or(Value::Null)
 }
 
 fn team_instance(harness: &mut Harness, participant: &str) -> (String, String) {
@@ -577,6 +653,291 @@ fn leader_binds_and_spawns_through_mcp() {
             .iter()
             .all(|message| message["id"].as_u64().is_some_and(|id| id > 1))),
         "{since}"
+    );
+}
+
+#[test]
+fn boards_are_written_by_the_leader_and_the_owning_worker() {
+    let mut harness = Harness::new(
+        "team-board",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    harness.spawn_worker("w1", "do work");
+    harness.spawn_worker("w2", "do work");
+    let created = mcp_call(
+        &harness.server,
+        &harness.token,
+        "board_update",
+        json!({
+            "workflow_name": "default",
+            "workflow": "do things",
+            "columns": ["todo", "doing"],
+            "upsert": [
+                {"id": "T1", "title": "one", "column": "todo", "owner": "w1",
+                 "stage": "S1", "fields": {"branch": "ade/w1"}},
+                {"id": "T2", "title": "two", "column": "todo", "owner": "w2",
+                 "stage": "S1"}
+            ]
+        }),
+    );
+    assert_eq!(created["isError"], false, "{created}");
+    assert_eq!(mcp_json(&created)["rev"], 1, "{created}");
+    assert_eq!(
+        harness.next_board_changed(Duration::from_secs(10)),
+        Some(1),
+        "the leader write is announced at once"
+    );
+    let board = harness.board();
+    assert_eq!(board["rev"], 1, "{board}");
+    assert_eq!(board["workflow_name"], "default");
+    assert_eq!(board["columns"], json!(["todo", "doing"]));
+    assert_eq!(board["cards"].as_array().map(Vec::len), Some(2), "{board}");
+    assert_eq!(board["cards"][0]["owner"], "w1");
+    let entry = harness.team();
+    assert_eq!(entry["board_rev"], 1, "{entry}");
+    assert_eq!(entry["workflow_name"], "default", "{entry}");
+    assert_eq!(
+        entry["stages"],
+        json!([{"stage": "S1", "open": 2, "archived": 0}]),
+        "{entry}"
+    );
+
+    let worker_task = r#"do [card-update {"card":"T1","body":"from w1","fields":{"tests":"ok"}}]"#;
+    harness.send("w1", "task", worker_task);
+    let card = harness.wait_board_card("T1", |card| card["body"] == "from w1");
+    assert_eq!(card["fields"]["tests"], "ok", "{card}");
+    assert_eq!(card["updated_by"], "w1", "{card}");
+
+    let rejected_task = r#"do [card-update {"card":"T2","body":"nope"}]"#;
+    harness.send("w1", "task", rejected_task);
+    let rejected = wait_for(
+        || {
+            harness.events().into_iter().find(|event| {
+                event["event"] == "card-update-response" && event["arguments"]["card"] == "T2"
+            })
+        },
+        "the worker's rejected card write",
+    );
+    assert_eq!(rejected["response"]["isError"], true, "{rejected}");
+    assert!(
+        mcp_text(&rejected["response"]).contains("not your card"),
+        "{rejected}"
+    );
+    let board = harness.board();
+    let other = board["cards"]
+        .as_array()
+        .and_then(|cards| cards.iter().find(|card| card["id"] == "T2"))
+        .expect("T2");
+    assert!(other.get("body").is_none(), "{other}");
+
+    // Settle the reports caused by the worker turns, then prove a board write
+    // starts no bus turn for anyone.
+    std::thread::sleep(Duration::from_millis(500));
+    harness.wait_participant("leader", |entry| entry["state"] == "idle");
+    let prompts = harness
+        .events()
+        .iter()
+        .filter(|event| event["event"] == "prompt")
+        .count();
+    let renamed = mcp_call(
+        &harness.server,
+        &harness.token,
+        "board_update",
+        json!({"workflow_name": "renamed"}),
+    );
+    assert_eq!(renamed["isError"], false, "{renamed}");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        harness
+            .events()
+            .iter()
+            .filter(|event| event["event"] == "prompt")
+            .count(),
+        prompts,
+        "board changes must not be delivered to a participant"
+    );
+}
+
+#[test]
+fn worker_board_writes_coalesce_into_one_notification() {
+    let mut harness = Harness::new_with_env(
+        "team-board-coalesce",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+        &[("NVIM_ADE_SERVER_BOARD_FLUSH_MS", "2000")],
+    );
+    harness.spawn_worker("w1", "do work");
+    let created = mcp_call(
+        &harness.server,
+        &harness.token,
+        "board_update",
+        json!({
+            "columns": ["todo"],
+            "upsert": [{"id": "T1", "title": "one", "column": "todo", "owner": "w1"}]
+        }),
+    );
+    assert_eq!(created["isError"], false, "{created}");
+    assert_eq!(harness.next_board_changed(Duration::from_secs(10)), Some(1));
+    harness.send(
+        "w1",
+        "task",
+        r#"do [card-update [{"card":"T1","body":"a"},{"card":"T1","body":"b"}]]"#,
+    );
+    let board = harness.wait_board_rev(3);
+    assert_eq!(board["cards"][0]["body"], "b", "{board}");
+    assert_eq!(
+        harness.next_board_changed(Duration::from_secs(10)),
+        Some(3),
+        "one notification with the current rev"
+    );
+    assert!(
+        harness
+            .next_board_changed(Duration::from_millis(800))
+            .is_none(),
+        "coalesced writes must not notify again"
+    );
+}
+
+#[test]
+fn a_leader_write_flushes_a_pending_worker_write() {
+    let mut harness = Harness::new_with_env(
+        "team-board-flush",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+        &[("NVIM_ADE_SERVER_BOARD_FLUSH_MS", "10000")],
+    );
+    harness.spawn_worker("w1", "do work");
+    let created = mcp_call(
+        &harness.server,
+        &harness.token,
+        "board_update",
+        json!({
+            "columns": ["todo"],
+            "upsert": [{"id": "T1", "title": "one", "column": "todo", "owner": "w1"}]
+        }),
+    );
+    assert_eq!(created["isError"], false, "{created}");
+    assert_eq!(harness.next_board_changed(Duration::from_secs(10)), Some(1));
+    harness.send(
+        "w1",
+        "task",
+        r#"do [card-update {"card":"T1","body":"pending"}]"#,
+    );
+    harness.wait_board_rev(2);
+    assert!(
+        harness
+            .next_board_changed(Duration::from_millis(400))
+            .is_none(),
+        "the worker write waits for its 10 s timer"
+    );
+
+    let leader = mcp_call(
+        &harness.server,
+        &harness.token,
+        "board_update",
+        json!({"upsert": [{"id": "T2", "title": "two", "column": "todo"}]}),
+    );
+    assert_eq!(leader["isError"], false, "{leader}");
+    assert_eq!(mcp_json(&leader)["rev"], 3, "{leader}");
+    assert_eq!(
+        harness.next_board_changed(Duration::from_secs(5)),
+        Some(2),
+        "the pending worker write is flushed first"
+    );
+    assert_eq!(
+        harness.next_board_changed(Duration::from_secs(5)),
+        Some(3),
+        "the leader write is announced at once"
+    );
+}
+
+#[test]
+fn card_messages_and_history_follow_the_board() {
+    let mut harness = Harness::new("team-board-history", json!({}), None);
+    let created = mcp_call(
+        &harness.server,
+        &harness.token,
+        "board_update",
+        json!({
+            "columns": ["doing"],
+            "upsert": [{
+                "id": "T3", "title": "fix reconnect", "column": "doing",
+                "fields": {"tests": "ok"}
+            }]
+        }),
+    );
+    assert_eq!(created["isError"], false, "{created}");
+
+    let sent = harness.client.request(
+        98,
+        "team.send",
+        json!({
+            "team": harness.team, "to": "leader", "kind": "notice",
+            "body": "what now?", "card": "T3"
+        }),
+    );
+    assert!(sent["result"].is_object(), "{sent}");
+    let prompt = wait_for(
+        || {
+            harness.events().into_iter().find(|event| {
+                event["event"] == "prompt"
+                    && event["text"].as_str().is_some_and(|text| {
+                        text.contains("[card T3 · fix reconnect · doing · - · tests=ok]")
+                    })
+            })
+        },
+        "the card summary line",
+    );
+    let text = prompt["text"].as_str().expect("prompt text");
+    assert!(text.contains("what now?"), "{text}");
+    assert!(text.contains("task=\"T3\""), "{text}");
+
+    let unknown = harness.client.request(
+        99,
+        "team.send",
+        json!({
+            "team": harness.team, "to": "leader", "kind": "notice",
+            "body": "x", "card": "missing"
+        }),
+    );
+    assert_eq!(unknown["error"]["code"], -32060, "{unknown}");
+
+    for title in ["second", "third"] {
+        let updated = mcp_call(
+            &harness.server,
+            &harness.token,
+            "board_update",
+            json!({"upsert": [{"id": "T3", "title": title}]}),
+        );
+        assert_eq!(updated["isError"], false, "{updated}");
+    }
+    let history = harness.card_history("T3");
+    let titles: Vec<&str> = history["versions"]
+        .as_array()
+        .expect("versions")
+        .iter()
+        .filter_map(|version| version["title"].as_str())
+        .collect();
+    assert_eq!(titles, ["second", "fix reconnect"], "{history}");
+
+    let archived = mcp_call(
+        &harness.server,
+        &harness.token,
+        "board_update",
+        json!({"archive": ["T3"]}),
+    );
+    assert_eq!(archived["isError"], false, "{archived}");
+    let history = harness.card_history("T3");
+    assert_eq!(history["versions"], json!([]), "{history}");
+    let unknown_history = harness.client.request(
+        100,
+        "team.card_history",
+        json!({ "team": harness.team, "card": "missing" }),
+    );
+    assert_eq!(
+        unknown_history["error"]["code"], -32060,
+        "{unknown_history}"
     );
 }
 
