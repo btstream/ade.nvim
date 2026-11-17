@@ -76,7 +76,7 @@ local function release(inv)
     if policy and policy.clear_inline then
       pcall(policy.clear_inline, policy, inv.session and inv.session.id or nil)
     end
-    inv.policy_set, inv.policy_requested, inv.policy_connection = nil, nil, nil
+    inv.policy_set, inv.policy_requested, inv.policy_connection, inv.policy_client = nil, nil, nil, nil
   end
   if inv.group then
     pcall(vim.api.nvim_del_augroup_by_id, inv.group)
@@ -204,7 +204,7 @@ function M.service_owned(interaction)
   if interaction.session_id ~= inv.session.id or inv.session.turn ~= inv.turn then
     return false
   end
-  if inv.policy_set ~= true or not inv.policy_connection then
+  if inv.policy_set ~= true or not inv.policy_client then
     return false
   end
   local S = state()
@@ -213,7 +213,8 @@ function M.service_owned(interaction)
     return false
   end
   local ok, raw = pcall(app.service_connection, app)
-  return ok and raw == inv.policy_connection and raw:is_connected()
+  local client = ok and raw and raw.client
+  return client ~= nil and client == inv.policy_client and client:is_ready()
 end
 
 function M.policy(interaction)

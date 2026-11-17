@@ -30,6 +30,7 @@ local Policy = {}
 Policy.__index = Policy
 
 ---@param opts {config: fun(): table, connection: fun(): table|nil,
+---  has_agent?: fun(): boolean,
 ---  notify?: fun(message: string, level: integer|nil),
 ---  on_applied?: fun(payload: table)|nil}
 ---@return table
@@ -37,6 +38,9 @@ function M.new(opts)
   return setmetatable({
     config = opts.config,
     connection = opts.connection,
+    -- Whether this Neovim currently has an agent client at all. The client
+    -- lives in `state().conn.client`, not on the app Connection object.
+    has_agent = opts.has_agent,
     notify = opts.notify or function() end,
     on_applied = opts.on_applied,
     -- The set last installed successfully, so a reconfiguration does not spam
@@ -133,7 +137,8 @@ function Policy:should_install_config()
   if not app then
     return false
   end
-  return app.backend_service == true or app.client == nil
+  local has_agent = self.has_agent and self.has_agent() or false
+  return app.backend_service == true or not has_agent
 end
 
 ---The `config` set for `permissions.auto_allow`, or nil when empty (17.6).
@@ -204,14 +209,21 @@ function Policy:reconcile(force)
       log.warn("%s", message)
       self.notify(message, vim.log.levels.WARN)
     end
+  else
+    -- A later bad kind must be reported again, not suppressed by an old list.
+    self.warned_kinds = nil
   end
   if not set then
     if force or self.sent ~= false then
       raw:request_tracked("policy.clear", { name = "config" }, function(ok, value)
         if ok then
           self.sent = false
+          self.warned_config = false
         else
           self.sent = nil
+          if closed_error(value) then
+            return
+          end
           log.warn("policy.clear config failed: %s", tostring(value and (value.message or value) or "unknown"))
           if not self.warned_config then
             self.warned_config = true
@@ -319,6 +331,7 @@ function Policy:set_inline(inv, cb)
       -- Remember which connection holds the turn_end set: a reconnect between
       -- this reply and the prompt would otherwise bind it to a new prompt.
       inv.policy_connection = raw
+      inv.policy_client = raw.client
       cb(true, value)
       return
     end
@@ -347,14 +360,26 @@ function Policy:prepare_inline(inv)
   -- The set belongs to the connection that installed it. If `ensure()`
   -- reconnected while we waited, the service dropped it; do not send the
   -- prompt under the illusion that the rules are in place.
-  local raw = self:_raw()
-  if not raw or raw ~= inv.policy_connection or not raw:is_connected() then
+  if not self:inline_connection_ok(inv) then
     inv.policy_set = nil
     inv.policy_fallback = true
     log.warn("inline policy connection changed before the prompt; falling back to Lua")
     return false
   end
   return true
+end
+
+---Whether the socket that holds an inline turn's set is still the live one.
+---
+---Compare the *socket client*, not the wrapper: a reconnect replaces
+---`raw.client` while `service_connection()` keeps returning the same object,
+---and the turn_end set was dropped with the old socket.
+---@param inv table
+---@return boolean
+function Policy:inline_connection_ok(inv)
+  local raw = self:_raw()
+  local client = raw and raw.client
+  return client ~= nil and client == inv.policy_client and client:is_ready()
 end
 
 ---Remove a turn-scoped set whose prompt was never sent.

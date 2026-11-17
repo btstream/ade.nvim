@@ -250,10 +250,17 @@ check("cancelled inline settles before the next turn", function()
 end)
 
 check("a failed inline turn unlocks the source", function()
-  start("write", "INLINE_DELETE replace the marker")
+  start("write", "INLINE_FAIL replace the marker")
   wait(function()
     return not require("ade.inline").is_active() and st.session.status == "idle"
   end, 10000, "failed turn settlement")
+  local failed = false
+  for _, block in ipairs(st.session.blocks or {}) do
+    if block.kind == "error" and (block.text or ""):find("inline failure requested", 1, true) then
+      failed = true
+    end
+  end
+  assert(failed, "the inline turn did not fail as requested")
   assert(vim.bo[source_buf].modifiable, "the failure path left the source locked")
   assert_writable()
 end)

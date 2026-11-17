@@ -724,20 +724,14 @@ local function reduce(session, update, tx)
       tostring(update.outcome or ""),
       tostring(update.optionId or ""),
     }, "|")
+    -- Without a tool call id two different decisions would look identical;
+    -- only deduplicate when the identity is actually present.
+    local dedupe = tool.toolCallId ~= nil and tool.toolCallId ~= ""
     local seen = session.policy_seen
-    if not seen then
-      seen = { map = {}, order = {} }
-      session.policy_seen = seen
-    end
-    if seen.map[key] then
+    if dedupe and seen and seen.map[key] then
       -- The same decision arrives live (policy.applied) and again through a
       -- replay of the event log; render it once.
       return false
-    end
-    seen.map[key] = true
-    seen.order[#seen.order + 1] = key
-    if #seen.order > 512 then
-      seen.map[table.remove(seen.order, 1)] = nil
     end
     local kind_name = update.kind or tool.kind or "permission"
     local title = type(tool.title) == "string" and tool.title or ""
@@ -759,6 +753,19 @@ local function reduce(session, update, tx)
       },
     }, tx)
     tx:block(block)
+    if dedupe then
+      -- Record only after the append succeeded; a rolled-back update must be
+      -- replayable.
+      if not seen then
+        seen = { map = {}, order = {} }
+        session.policy_seen = seen
+      end
+      seen.map[key] = true
+      seen.order[#seen.order + 1] = key
+      if #seen.order > 512 then
+        seen.map[table.remove(seen.order, 1)] = nil
+      end
+    end
     return true
   end
 

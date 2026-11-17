@@ -492,10 +492,22 @@ return function(t)
       t.eq(before_live, #session.blocks)
 
       local before = #session.blocks
+      -- No tool call id: two decisions cannot be told apart, so they must not
+      -- be deduplicated (a real replay repeats the whole event).
+      local anonymous = {
+        sessionUpdate = "_ade_policy",
+        set = { name = "inline:" .. session.id },
+        outcome = "selected",
+        optionId = "allow_once",
+        kind = "read",
+      }
+      t.eq(true, select(2, S.sess.runtime:apply(session.id, anonymous)))
+      t.eq(true, select(2, S.sess.runtime:apply(session.id, anonymous)))
+
       local applied = { sessionUpdate = "_ade_policy", set = { name = "inline:" .. session.id }, outcome = "cancelled" }
       local _, changed = S.sess.runtime:apply(session.id, applied)
       t.eq(true, changed, "the reducer must accept _ade_policy")
-      t.eq(before + 1, #session.blocks)
+      t.eq(before + 3, #session.blocks)
       t.match("auto%-cancelled", transcript())
 
       -- A genuinely unknown update is still ignored quietly.
@@ -572,6 +584,9 @@ return function(t)
       end)
       t.truthy(ready)
       t.eq(true, connection:has_feature("policy"))
+      -- Give a misbehaving reconcile time to install before asserting.
+      vim.wait(300)
+      t.eq(nil, set_for(service, "config"), "a direct agent must not install auto_allow for the service")
 
       local interaction = {
         type = "permission",
@@ -676,7 +691,16 @@ return function(t)
 
     t.it("a connection swap between policy.set and the prompt falls back to Lua", function()
       local ServicePolicy = require("ade.service.policy")
+      local ready_client = function()
+        return {
+          is_ready = function()
+            return true
+          end,
+        }
+      end
+      local client_a, client_b = ready_client(), ready_client()
       local raw_a = {
+        client = client_a,
         on_hello = function() end,
         subscribe = function() end,
         is_connected = function()
@@ -685,15 +709,7 @@ return function(t)
         has_feature = function()
           return true
         end,
-        request_tracked = function(_, _, _, cb)
-          vim.defer_fn(function()
-            cb(true, {})
-          end, 20)
-          return { id = 1 }
-        end,
       }
-      local raw_b = { is_connected = function() end, has_feature = function() end }
-      local current_raw = raw_a
       local policy = ServicePolicy.new({
         config = function()
           return Config.defaults
@@ -702,7 +718,7 @@ return function(t)
           return {
             backend_service = true,
             service_connection = function()
-              return current_raw
+              return raw_a
             end,
           }
         end,
@@ -713,20 +729,14 @@ return function(t)
         copy = "/tmp/.ade-inline-swap.lua",
         config = Config.defaults,
       }
-      local done, ok = false, true
-      async.run(function()
-        ok = policy:prepare_inline(inv)
-        done = true
-      end)
-      -- The service reconnects while the reply is in flight.
-      vim.defer_fn(function()
-        current_raw = raw_b
-      end, 10)
-      wait(function()
-        return done
-      end, 5000, "prepare_inline after the swap")
-      t.eq(false, ok)
-      t.eq(true, inv.policy_fallback)
+      t.eq(true, policy:active())
+      t.eq(true, raw_a.has_feature())
+      inv.policy_client = client_a
+      t.eq(true, policy:inline_connection_ok(inv))
+      -- The wrapper object is unchanged on reconnect; only the socket client
+      -- is replaced. The check must follow the socket.
+      raw_a.client = client_b
+      t.eq(false, policy:inline_connection_ok(inv))
     end)
 
     t.it("defaults the backend to auto and falls back to direct", function()

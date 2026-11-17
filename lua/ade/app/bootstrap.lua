@@ -218,6 +218,9 @@ function M.build(ctx, opts, action)
     connection = function()
       return S.conn.service
     end,
+    has_agent = function()
+      return S.conn.client ~= nil
+    end,
     notify = notify,
     on_applied = function(payload)
       if not payload or type(payload.sessionId) ~= "string" then

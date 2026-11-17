@@ -598,6 +598,14 @@ def run_prompt(msg_id, text):
     if text.startswith("INLINE_BUFFER_EDIT:"):
         import re
 
+        # A deterministic failing inline turn, so the failure path (unlock,
+        # settle, no result applied) is covered independently of permissions.
+        if "INLINE_FAIL" in text:
+            error(msg_id, -32099, "inline failure requested by INLINE_FAIL")
+            with permissions_lock:
+                active_prompts.pop(msg_id, None)
+            return
+
         # An irreversible tool kind: `inline.allow_commands` must not cover it,
         # so the client should answer "reject". Handled before the ordinary
         # copy/permission probe below, which would otherwise decide for it.
