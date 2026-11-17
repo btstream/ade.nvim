@@ -42,6 +42,8 @@ pub const MAX_ROLE_BYTES: usize = 16 * 1024;
 pub const MAX_READ_MESSAGES: usize = 100;
 /// The text of the last three bus turns, 64 KiB in total (18.11).
 pub const MAX_TURN_TEXT: usize = 64 * 1024;
+/// At most this many stored workflows per (scope, project) (19.5).
+pub const MAX_STORED_WORKFLOWS: usize = 100;
 
 #[derive(Debug, Clone)]
 pub struct TeamError {
@@ -891,6 +893,11 @@ impl Teams {
         }
         if self.workflows.get(scope, project, &stored.name).is_some() && !replace {
             return Err(TeamError::not_allowed("workflow exists"));
+        }
+        if self.workflows.count(scope, project) >= MAX_STORED_WORKFLOWS
+            && self.workflows.get(scope, project, &stored.name).is_none()
+        {
+            return Err(TeamError::not_allowed("too many workflows"));
         }
         self.workflows.insert(project, stored.clone());
         Ok(stored)
@@ -2654,10 +2661,25 @@ impl Teams {
                 "no open inbox item in that group",
             ));
         }
+        // Not atomic on purpose: an item that cannot be answered is skipped so
+        // the effects of the items already answered are never lost (their
+        // workers would stay in `starting` forever).
         let mut answered = Vec::new();
+        let mut first_error: Option<TeamError> = None;
         for id in ids {
-            let (effect, _) = self.answer(&id, None, None, allow)?;
-            answered.push((id, effect));
+            match self.answer(&id, None, None, allow) {
+                Ok((effect, _)) => answered.push((id, effect)),
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if answered.is_empty() {
+            if let Some(error) = first_error {
+                return Err(error);
+            }
         }
         Ok(answered)
     }
@@ -3359,6 +3381,7 @@ impl Teams {
         let mut expired = Vec::new();
         let mut highest_team = max_team;
         let mut highest_inbox = max_inbox;
+        let mut highest_group = 0u64;
         for (id, json) in rows {
             let mut snapshot: TeamSnapshot = match serde_json::from_str(&json) {
                 Ok(snapshot) => snapshot,
@@ -3389,6 +3412,17 @@ impl Teams {
                     .and_then(|rest| rest.parse::<u64>().ok())
                 {
                     highest_inbox = highest_inbox.max(number);
+                }
+                // Open spawn items keep their group across a restart; the
+                // counter must continue after them, or a new item would reuse
+                // an id and `team.answer_group` would answer both (19.6).
+                if let Some(number) = item
+                    .group
+                    .as_deref()
+                    .and_then(|group| group.strip_prefix('g'))
+                    .and_then(|rest| rest.parse::<u64>().ok())
+                {
+                    highest_group = highest_group.max(number);
                 }
             }
             let suspended_at = snapshot.suspended_at.unwrap_or(now);
@@ -3516,6 +3550,7 @@ impl Teams {
         }
         self.next_team = self.next_team.max(highest_team);
         self.next_inbox = self.next_inbox.max(highest_inbox);
+        self.next_group = self.next_group.max(highest_group);
         (stored, expired)
     }
 
@@ -4854,6 +4889,67 @@ mod tests {
     }
 
     #[test]
+    fn restore_continues_spawn_group_numbers() {
+        let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}, "max_workers": 8}));
+        let mut groups = Vec::new();
+        for name in ["w1", "w2"] {
+            let SpawnOutcome::Awaiting { request, .. } = teams
+                .request_spawn(&team, "dev", Some(name), None, None, None)
+                .unwrap()
+            else {
+                panic!("expected approval");
+            };
+            groups.push(teams.item(&team, &request).unwrap().group.unwrap());
+        }
+        assert_eq!(groups, vec!["g1".to_string(), "g2".to_string()]);
+        let rows = vec![(team.clone(), teams.snapshot_team(&team).expect("snapshot"))];
+        let mut restored = Teams::new(new_shared_tokens());
+        let (stored, expired) = restored.restore(rows, 0, 0, now_ms(), None);
+        assert_eq!(stored, vec![team.clone()]);
+        assert!(expired.is_empty());
+        // A restored team is suspended until its leader resumes it, and the
+        // resume takes the configuration the front end sends again.
+        restored
+            .configure("/p", config(json!({"spawn_confirm": {"auto": []}})))
+            .expect("configure");
+        restored.start_resume(&team, "i1", "s1");
+        let SpawnOutcome::Awaiting { request, .. } = restored
+            .request_spawn(&team, "dev", Some("w3"), None, None, None)
+            .unwrap()
+        else {
+            panic!("expected approval");
+        };
+        assert_eq!(
+            restored.item(&team, &request).unwrap().group.as_deref(),
+            Some("g3"),
+            "a restored open item must not share its group with a new one"
+        );
+    }
+
+    #[test]
+    fn a_leader_exit_ends_the_current_spawn_group() {
+        let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}, "max_workers": 8}));
+        teams
+            .send_message(&team, "human", "leader", Kind::Task, "do", None, vec![])
+            .unwrap();
+        teams.take_deliveries(&HashSet::new());
+        assert!(teams.team(&team).unwrap().current_group.is_some());
+        teams.leader_exited("i1", "crash");
+        assert!(teams.team(&team).unwrap().current_group.is_none());
+        let SpawnOutcome::Awaiting { request, .. } = teams
+            .request_spawn(&team, "dev", Some("w1"), None, None, None)
+            .unwrap()
+        else {
+            panic!("expected approval");
+        };
+        assert_eq!(
+            teams.item(&team, &request).unwrap().group.as_deref(),
+            Some("g2"),
+            "a spawn after the leader exits gets a group of its own"
+        );
+    }
+
+    #[test]
     fn a_frontend_prompt_opens_and_closes_a_group_too() {
         let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}, "max_workers": 8}));
         teams
@@ -4903,6 +4999,32 @@ mod tests {
             teams.answer_group(&group, Some(true)).is_err(),
             "nothing open any more"
         );
+    }
+
+    #[test]
+    fn stored_workflows_are_capped_per_scope_and_project() {
+        let (mut teams, team) = fixture(json!({}));
+        for index in 1..=MAX_STORED_WORKFLOWS {
+            let workflow = json!({"name": format!("wf{index}"), "summary": "many"});
+            teams
+                .workflow_save(&team, "/p", &workflow, workflow::Scope::Project, false)
+                .unwrap_or_else(|error| panic!("workflow {index}: {error:?}"));
+        }
+        let extra = json!({"name": "toomany", "summary": "one too many"});
+        let error = teams
+            .workflow_save(&team, "/p", &extra, workflow::Scope::Project, false)
+            .unwrap_err();
+        assert_eq!(error.code, NOT_ALLOWED);
+        assert_eq!(error.message, "too many workflows");
+        // Replacing an existing one is still allowed at the cap.
+        let replace = json!({"name": "wf1", "summary": "replaced"});
+        teams
+            .workflow_save(&team, "/p", &replace, workflow::Scope::Project, true)
+            .expect("replace at the cap");
+        // Another project has its own budget.
+        teams
+            .workflow_save(&team, "/other", &extra, workflow::Scope::Project, false)
+            .expect("another project's own cap");
     }
 
     #[test]

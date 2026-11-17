@@ -1305,3 +1305,90 @@ fn a_saved_workflow_outlives_the_team_and_a_suspended_team_refuses_to_start() {
     );
     Fixture::shutdown(&mut restarted);
 }
+
+fn spawn_groups(client: &mut Client, team: &str) -> Vec<(String, String)> {
+    let listed = client.request(90, "team.list", json!({}));
+    listed["result"]["teams"]
+        .as_array()
+        .and_then(|teams| teams.iter().find(|entry| entry["id"] == team).cloned())
+        .and_then(|entry| entry["inbox"].as_array().cloned())
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item["kind"] == "spawn")
+                .filter_map(|item| {
+                    Some((
+                        item["name"].as_str()?.to_string(),
+                        item["group"].as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn spawn_groups_continue_after_a_restart() {
+    let fixture = Fixture::new("restart-groups");
+    let mut server = fixture.start("restart-groups-1", &[]);
+    let mut client = fixture.connect(&server);
+    let mut config = fixture.config(&server, true);
+    // Approval spawns, so open items exist across the restart.
+    config["spawn_confirm"]["auto"] = json!([]);
+    let configured = client.request(
+        2,
+        "team.configure",
+        json!({"cwd": fixture.work.to_string_lossy(), "config": config.clone()}),
+    );
+    assert!(configured["result"].is_object(), "{configured}");
+    let (_instance, session, token, bound) =
+        fixture.attach_leader(&server, &mut client, &fixture.work, None);
+    let team = bound["result"]["team"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("bind: {bound}"))
+        .to_string();
+    for name in ["w1", "w2", "w3"] {
+        let spawned = mcp_call(
+            &server,
+            &token,
+            "team_spawn",
+            json!({"template": "dev", "name": name}),
+        );
+        assert_eq!(spawned["isError"], false, "{spawned}");
+    }
+    let old = spawn_groups(&mut client, &team);
+    let old_groups: Vec<String> = old.iter().map(|(_, group)| group.clone()).collect();
+    assert_eq!(old_groups, vec!["g1", "g2", "g3"], "{old:?}");
+    Fixture::shutdown(&mut server);
+
+    let mut restarted = fixture.start("restart-groups-2", &[]);
+    let mut client = fixture.connect(&restarted);
+    let configured = client.request(
+        2,
+        "team.configure",
+        json!({"cwd": fixture.work.to_string_lossy(), "config": config}),
+    );
+    assert!(configured["result"].is_object(), "{configured}");
+    let (_instance, _session, token, bound) =
+        fixture.attach_leader(&restarted, &mut client, &fixture.work, Some(&session));
+    assert!(bound["result"].is_object(), "{bound}");
+    // The stored items keep their groups; a new spawn must not reuse one of
+    // them, or team.answer_group would answer an old and a new item together.
+    let second = mcp_call(
+        &restarted,
+        &token,
+        "team_spawn",
+        json!({"template": "dev", "name": "w4"}),
+    );
+    assert_eq!(second["isError"], false, "{second}");
+    let groups = spawn_groups(&mut client, &team);
+    assert_eq!(groups.len(), 4, "{groups:?}");
+    let restored: Vec<String> = groups[..3].iter().map(|(_, group)| group.clone()).collect();
+    assert_eq!(restored, old_groups, "the stored items keep their groups");
+    let new_group = &groups[3].1;
+    assert!(
+        !old_groups.contains(new_group),
+        "a new group must not collide with a restored one: {groups:?}"
+    );
+    Fixture::shutdown(&mut restarted);
+}

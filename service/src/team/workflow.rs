@@ -408,6 +408,21 @@ impl StoredWorkflows {
         self.rows.remove(&(scope, project, name.to_string()))
     }
 
+    /// Stored workflows of one scope and project (19.5's cap).
+    pub fn count(&self, scope: Scope, project: &str) -> usize {
+        let project = if scope == Scope::User {
+            String::new()
+        } else {
+            project.to_string()
+        };
+        self.rows
+            .keys()
+            .filter(|(stored_scope, stored_project, _)| {
+                *stored_scope == scope && *stored_project == project
+            })
+            .count()
+    }
+
     pub fn get(&self, scope: Scope, project: &str, name: &str) -> Option<&Workflow> {
         let project = if scope == Scope::User {
             String::new()
@@ -517,10 +532,16 @@ pub fn short_list(config: &TeamConfig, stored: &StoredWorkflows, project: &str) 
 /// `git rev-parse --git-common-dir`, or the canonical cwd when that fails
 /// (19.1). Worktrees of one repository therefore share project workflows.
 pub async fn project_key(cwd: &str) -> String {
-    if let Some(key) = git_common_dir(cwd).await {
-        return key;
+    match git_project_key(cwd).await {
+        Some(key) => key,
+        None => canonical_cwd(cwd),
     }
-    canonical_cwd(cwd)
+}
+
+/// The project key git reports, when it does. Only this answer is worth
+/// caching: a fallback caused by a transient git failure must be recomputed.
+pub async fn git_project_key(cwd: &str) -> Option<String> {
+    git_common_dir(cwd).await
 }
 
 /// The canonical cwd; the documented fallback project key.

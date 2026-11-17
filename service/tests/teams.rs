@@ -2994,6 +2994,34 @@ fn a_spawn_model_must_be_allowed_and_offered() {
     );
     assert!(prompt.contains("card_update"), "{prompt}");
     let _ = instance;
+
+    // The template's own model is checked exactly like a spawn's (19.6).
+    let mut template_harness = Harness::new(
+        "team-model-template",
+        json!({"templates": {"dev": {"model": "m9", "models": ["m2", "m9"]}}}),
+        None,
+    );
+    let spawned = template_harness.spawn(json!({"name": "w1"}));
+    assert_eq!(spawned["result"]["name"], "w1", "{spawned}");
+    let entry = template_harness.wait_participant("w1", |entry| entry["state"] == "exited");
+    assert_eq!(entry["reason"], "model unavailable: m9");
+    wait_for(
+        || {
+            let messages = template_harness.read("leader")["messages"]
+                .as_array()?
+                .clone();
+            messages
+                .into_iter()
+                .find(|message| {
+                    message["kind"] == "notice"
+                        && message["body"]
+                            .as_str()
+                            .is_some_and(|body| body.contains("m9"))
+                })
+                .map(|_| ())
+        },
+        "the template model notice",
+    );
 }
 
 #[test]
@@ -3028,6 +3056,23 @@ fn spawns_from_one_leader_prompt_share_a_group_and_are_approved_together() {
     );
     harness.wait_participant("w1", |entry| entry["state"] == "idle");
     harness.wait_participant("w2", |entry| entry["state"] == "idle");
+    // Every worker started through the group gets the same approval notice as
+    // team.answer (19.6).
+    wait_for(
+        || {
+            let messages = harness.read("leader")["messages"].as_array()?.clone();
+            let approved = |name: &str| {
+                messages.iter().any(|message| {
+                    message["kind"] == "notice"
+                        && message["body"]
+                            .as_str()
+                            .is_some_and(|body| body.contains(&format!("approved: {name}")))
+                })
+            };
+            (approved("w1") && approved("w2")).then_some(())
+        },
+        "the approval notices of both group members",
+    );
 
     // An item created outside a leader prompt gets a group of its own.
     let alone = mcp_call(
@@ -3108,5 +3153,83 @@ fn leader_instructions_and_tools_follow_the_role() {
     assert!(
         tools["instructions"].is_null(),
         "workers get no instructions: {tools}"
+    );
+}
+
+#[test]
+fn team_start_boundary_and_a_leaderless_team() {
+    // One existing worker plus one missing member is exactly max_workers: the
+    // workflow starts.
+    let boundary = json!({
+        "max_workers": 2,
+        "spawn_confirm": {"auto": []},
+        "workflows": {
+            "pair": {
+                "summary": "two workers",
+                "team": [
+                    {"name": "w1", "template": "dev"},
+                    {"name": "w2", "template": "dev"}
+                ]
+            }
+        }
+    });
+    let mut harness = Harness::new("team-start-boundary", boundary, None);
+    let spawned = harness.spawn(json!({"name": "w1"}));
+    assert_eq!(spawned["result"]["name"], "w1", "{spawned}");
+    harness.wait_participant("w1", |entry| entry["state"] == "idle");
+    let started = harness.start("pair", None);
+    assert_eq!(started["result"]["started"], json!(["w2"]), "{started}");
+    assert_eq!(started["result"]["skipped"], json!(["w1"]), "{started}");
+    harness.wait_participant("w2", |entry| entry["state"] == "idle");
+
+    // A leaderless team still starts its members; the notice queues (19.7).
+    let mut leaderless = Harness::new(
+        "team-start-leaderless",
+        json!({
+            "max_workers": 2,
+            "spawn_confirm": {"auto": []},
+            "workflows": {
+                "pair": {
+                    "summary": "two workers",
+                    "team": [
+                        {"name": "w1", "template": "dev"},
+                        {"name": "w2", "template": "dev"}
+                    ]
+                }
+            }
+        }),
+        None,
+    );
+    let stopped =
+        leaderless
+            .client
+            .request(99, "agent.stop", json!({"instance": leaderless.instance}));
+    assert!(stopped["result"].is_object(), "{stopped}");
+    wait_for(
+        || (leaderless.team()["state"] == "leaderless").then_some(()),
+        "the leaderless team",
+    );
+    let started = leaderless.start("pair", Some("ship it"));
+    assert_eq!(
+        started["result"]["started"],
+        json!(["w1", "w2"]),
+        "{started}"
+    );
+    leaderless.wait_participant("w1", |entry| entry["state"] == "idle");
+    wait_for(
+        || {
+            let messages = leaderless.read("leader")["messages"].as_array()?.clone();
+            messages
+                .into_iter()
+                .find(|message| {
+                    message["kind"] == "notice"
+                        && message["from"] == "human"
+                        && message["body"].as_str().is_some_and(|body| {
+                            body.contains("流程：pair") && body.contains("ship it")
+                        })
+                })
+                .map(|_| ())
+        },
+        "the queued team.start notice",
     );
 }

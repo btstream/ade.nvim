@@ -95,6 +95,8 @@ pub enum TeamResult {
         call: DeferredTeam,
         cwd: String,
         project: String,
+        /// Whether git itself answered (only that is worth caching).
+        cache: bool,
     },
 }
 
@@ -505,35 +507,7 @@ impl Hub {
         let allow = optional_bool(params, "allow")?;
         let before = self.teams.item_by_id(&request);
         let (effect, team) = self.teams.answer(&request, text, option, allow)?;
-        let spawned = matches!(&effect, AnswerEffect::Spawn(_));
-        match effect {
-            AnswerEffect::Spawn(spawn) => {
-                // The approval notice waits for the worktree result so a
-                // dirty tree can be named (18.16).
-                self.start_worker(
-                    &spawn,
-                    StartOptions {
-                        approved_request: Some(request.clone()),
-                        ..StartOptions::default()
-                    },
-                );
-            }
-            AnswerEffect::Permission {
-                instance,
-                agent_id,
-                response,
-            } => {
-                self.answer_pending(&instance, agent_id, response);
-            }
-            AnswerEffect::Request {
-                instance,
-                agent_id,
-                result,
-            } => {
-                self.answer_pending(&instance, agent_id, result);
-            }
-            AnswerEffect::Question | AnswerEffect::Ack => {}
-        }
+        let spawned = self.apply_answer_effect(&request, effect);
         if let Some(item) = before {
             if item.kind == ItemKind::Spawn && !spawned {
                 self.team_spawn_notice(&team, &request, false, item.name.as_deref().unwrap_or(""));
@@ -690,8 +664,11 @@ impl Hub {
                 call,
                 cwd,
                 project,
+                cache,
             } => {
-                self.teams.set_project_key(&cwd, &project);
+                if cache {
+                    self.teams.set_project_key(&cwd, &project);
+                }
                 self.run_deferred(conn, &frontend_id, call, &project);
             }
         }
@@ -1015,13 +992,18 @@ impl Hub {
         let cwd = cwd.to_string();
         let frontend_id = id.clone();
         tokio::spawn(async move {
-            let project = workflow::project_key(&cwd).await;
+            let (project, cache) = match workflow::git_project_key(&cwd).await {
+                Some(project) => (project, true),
+                // A git failure is not cached: the next call tries again.
+                None => (workflow::canonical_cwd(&cwd), false),
+            };
             let _ = sender.send(TeamResult::ProjectKey {
                 conn,
                 frontend_id,
                 call,
                 cwd,
                 project,
+                cache,
             });
         });
     }
@@ -1257,7 +1239,9 @@ impl Hub {
                 })
                 .collect();
             let body = brief::start_notice(&workflow, &members, task.as_deref());
-            let _ = self.teams.send_message(
+            // A team.start whose notice cannot be queued is not a success: the
+            // leader would never learn the workflow it is supposed to follow.
+            self.teams.send_message(
                 team_id,
                 "human",
                 "leader",
@@ -1265,7 +1249,7 @@ impl Hub {
                 &body,
                 None,
                 vec![],
-            );
+            )?;
             Ok(json!({
                 "workflow": workflow.name,
                 "started": started,
@@ -1298,27 +1282,61 @@ impl Hub {
         let answers = self.teams.answer_group(&group, allow)?;
         let mut answered = Vec::new();
         for (id, effect) in answers {
-            match effect {
-                AnswerEffect::Spawn(spawn) => {
-                    self.start_worker(&spawn, StartOptions::default());
-                }
-                AnswerEffect::Permission { .. } | AnswerEffect::Request { .. } => {}
-                AnswerEffect::Question | AnswerEffect::Ack => {
-                    if let Some(item) = self.teams.item_by_id(&id) {
-                        if item.kind == ItemKind::Spawn {
-                            self.team_spawn_notice(
-                                &item.team,
-                                &id,
-                                false,
-                                item.name.as_deref().unwrap_or(""),
-                            );
-                        }
+            // Exactly what team.answer does, including the approval notice
+            // (and its dirty-tree warning) for each started worker.
+            let spawned = self.apply_answer_effect(&id, effect);
+            if !spawned {
+                if let Some(item) = self.teams.item_by_id(&id) {
+                    if item.kind == ItemKind::Spawn {
+                        self.team_spawn_notice(
+                            &item.team,
+                            &id,
+                            false,
+                            item.name.as_deref().unwrap_or(""),
+                        );
                     }
                 }
             }
             answered.push(id);
         }
         Ok((json!({ "answered": answered }), true))
+    }
+
+    /// Apply one answered inbox item. `team.answer` and `team.answer_group`
+    /// share this so both start workers with the approval notice (19.6).
+    /// Returns whether the item was a spawn.
+    fn apply_answer_effect(&mut self, request: &str, effect: AnswerEffect) -> bool {
+        match effect {
+            AnswerEffect::Spawn(spawn) => {
+                // The approval notice waits for the worktree result so a
+                // dirty tree can be named (18.16).
+                self.start_worker(
+                    &spawn,
+                    StartOptions {
+                        approved_request: Some(request.to_string()),
+                        ..StartOptions::default()
+                    },
+                );
+                true
+            }
+            AnswerEffect::Permission {
+                instance,
+                agent_id,
+                response,
+            } => {
+                self.answer_pending(&instance, agent_id, response);
+                false
+            }
+            AnswerEffect::Request {
+                instance,
+                agent_id,
+                result,
+            } => {
+                self.answer_pending(&instance, agent_id, result);
+                false
+            }
+            AnswerEffect::Question | AnswerEffect::Ack => false,
+        }
     }
 
     fn team_spawn_notice(&mut self, team: &str, request: &str, approved: bool, name: &str) {

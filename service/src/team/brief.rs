@@ -38,6 +38,13 @@ pub fn start_notice(
 ) -> String {
     let mut body = String::from(LEADER_INSTRUCTIONS);
     body.push_str("\n\n组队开始，本次流程如下。\n");
+    // The task comes before the flow and the members: when the notice exceeds
+    // one message and is trimmed from the end, the person's task must survive.
+    if let Some(task) = task {
+        if !task.trim().is_empty() {
+            body.push_str(&format!("本次任务：{task}\n"));
+        }
+    }
     body.push_str(&format!("流程：{}\n", workflow.name));
     if !workflow.summary.is_empty() {
         body.push_str(&format!("说明：{}\n", workflow.summary));
@@ -65,11 +72,6 @@ pub fn start_notice(
     }
     if let Some(columns) = &workflow.columns {
         body.push_str(&format!("看板列：{}\n", columns.join(" / ")));
-    }
-    if let Some(task) = task {
-        if !task.trim().is_empty() {
-            body.push_str(&format!("本次任务：{task}\n"));
-        }
     }
     trim_to(body, MAX_BODY_BYTES)
 }
@@ -179,6 +181,12 @@ mod tests {
         );
         assert!(notice.contains("待开发 / 进行中"), "{notice}");
         assert!(notice.contains("do the thing"), "{notice}");
+        // The task precedes the flow text and the members: trimming the tail
+        // can only lose roles and flow text, never the person's task.
+        assert!(
+            notice.find("do the thing") < notice.find("step 1, step 2"),
+            "task before the flow: {notice}"
+        );
     }
 
     #[test]
