@@ -1375,7 +1375,7 @@ impl Hub {
                     started.push(name);
                 }
             }
-            self.start_board_hook(team_id, &workflow);
+            self.start_board_hook(team_id, &workflow)?;
             let members: Vec<(workflow::WorkflowMember, String)> = workflow
                 .team
                 .iter()
@@ -1418,12 +1418,23 @@ impl Hub {
 
     /// Step 4 of `team.start` (19.7): write the workflow onto the board.
     ///
-    /// TODO(W0 集成时接入 board): once the board module lands (W0b), a team
-    /// whose board has no `workflow_name` gets `workflow_name`, `workflow`
+    /// When the board has no `workflow_name`, `workflow_name`, `workflow`
     /// (the text) and — when the board has no columns and the workflow has
-    /// them — `columns` in one write with `updated_by: "service"`.
-    fn start_board_hook(&mut self, team: &str, workflow: &workflow::Workflow) {
-        let _ = (team, workflow);
+    /// them — `columns` are written as one service write, then persisted and
+    /// announced like a leader write.
+    fn start_board_hook(
+        &mut self,
+        team: &str,
+        workflow: &workflow::Workflow,
+    ) -> Result<(), TeamError> {
+        // A pending worker write must reach the database before this one.
+        self.flush_pending_board(team, true);
+        let Some(rev) = self.teams.start_board_workflow(team, workflow)? else {
+            return Ok(());
+        };
+        self.persist_board(team);
+        self.announce_board(team, rev);
+        Ok(())
     }
 
     fn team_answer_group(&mut self, params: &Value) -> Result<(Value, bool), TeamError> {

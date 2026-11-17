@@ -303,6 +303,39 @@ impl Board {
         Ok(self.rev)
     }
 
+    /// Step 4 of `team.start` (19.7): the service writes the workflow onto a
+    /// board that has none. One atomic write; `None` when the board already
+    /// names a workflow (nothing is written then).
+    pub fn apply_workflow(
+        &mut self,
+        name: &str,
+        text: &str,
+        columns: Option<&[String]>,
+    ) -> Result<Option<u64>, TeamError> {
+        if self.unavailable {
+            return Err(TeamError::not_allowed("board unavailable"));
+        }
+        if self.workflow_name.is_some() {
+            return Ok(None);
+        }
+        let mut next = self.writable_clone();
+        next.workflow_name = Some(name.to_string());
+        next.workflow = Some(text.to_string());
+        // The workflow's columns only fill an empty board: what the leader
+        // already put there wins.
+        if next.columns.is_empty() {
+            if let Some(columns) = columns {
+                if !columns.is_empty() {
+                    next.columns = columns.to_vec();
+                }
+            }
+        }
+        next.enforce_limits()?;
+        next.rev += 1;
+        self.adopt(next);
+        Ok(Some(self.rev))
+    }
+
     /// Apply one `bus.card_update` atomically (19.2). The board is unchanged on
     /// any error.
     pub fn apply_worker(
@@ -893,6 +926,24 @@ impl Teams {
         }
         let workers: HashSet<String> = team.workers().map(|worker| worker.name.clone()).collect();
         team.board.apply_leader(params, &workers, now)
+    }
+
+    /// Step 4 of `team.start` (19.7): write the workflow onto an unnamed board.
+    /// Returns the new rev when something was written.
+    pub fn start_board_workflow(
+        &mut self,
+        team_id: &str,
+        workflow: &super::workflow::Workflow,
+    ) -> Result<Option<u64>, TeamError> {
+        let team = self
+            .teams
+            .get_mut(team_id)
+            .ok_or_else(|| TeamError::unknown("unknown team"))?;
+        if team.closed {
+            return Err(TeamError::unknown("team closed"));
+        }
+        team.board
+            .apply_workflow(&workflow.name, &workflow.text, workflow.columns.as_deref())
     }
 
     pub fn card_update(

@@ -292,6 +292,22 @@ impl Harness {
         self.client.request(98, "team.spawn", params)
     }
 
+    /// Wait for one `team.board_changed` notification and return its params.
+    fn wait_board_changed(&mut self) -> Value {
+        let deadline = Instant::now() + WAIT;
+        while Instant::now() < deadline {
+            if let Some(frame) = self
+                .client
+                .try_next_notification(Duration::from_millis(200))
+            {
+                if frame["method"] == "team.board_changed" {
+                    return frame["params"].clone();
+                }
+            }
+        }
+        panic!("timed out waiting for team.board_changed");
+    }
+
     fn worker_names(&mut self) -> Vec<String> {
         self.team()["participants"]
             .as_array()
@@ -3796,4 +3812,68 @@ fn team_start_boundary_and_a_leaderless_team() {
         },
         "the queued team.start notice",
     );
+}
+
+#[test]
+fn team_start_writes_the_workflow_onto_an_empty_board() {
+    let mut harness = Harness::new(
+        "team-start-board",
+        json!({
+            "spawn_confirm": {"auto": []},
+            "workflows": {
+                "flow": {
+                    "summary": "a flow with a board",
+                    "text": "1. write 2. review",
+                    "columns": ["待开发", "审查中"],
+                    "team": []
+                }
+            }
+        }),
+        None,
+    );
+    let started = harness.start("flow", None);
+    assert_eq!(started["result"]["started"], json!([]), "{started}");
+    let changed = harness.wait_board_changed();
+    assert_eq!(changed["team"], harness.team);
+    let board = harness.board();
+    assert_eq!(board["workflow_name"], "flow", "{board}");
+    assert_eq!(board["workflow"], "1. write 2. review", "{board}");
+    assert_eq!(board["columns"], json!(["待开发", "审查中"]), "{board}");
+    assert_eq!(board["rev"], 1, "{board}");
+    assert_eq!(changed["rev"], 1, "{changed}");
+
+    // A board that already names a workflow is not overwritten.
+    let again = harness.start("flow", None);
+    assert_eq!(again["result"]["started"], json!([]), "{again}");
+    let board = harness.board();
+    assert_eq!(board["rev"], 1, "no second service write: {board}");
+
+    // What the leader already put on the board wins over the workflow's columns.
+    let mut leader = Harness::new(
+        "team-start-board-columns",
+        json!({
+            "spawn_confirm": {"auto": []},
+            "workflows": {
+                "flow": {
+                    "summary": "a flow",
+                    "text": "the text",
+                    "columns": ["workflow column"],
+                    "team": []
+                }
+            }
+        }),
+        None,
+    );
+    let updated = mcp_call(
+        &leader.server,
+        &leader.token,
+        "board_update",
+        json!({"columns": ["mine"]}),
+    );
+    assert_eq!(updated["isError"], false, "{updated}");
+    let started = leader.start("flow", None);
+    assert!(started["result"].is_object(), "{started}");
+    let board = leader.board();
+    assert_eq!(board["workflow_name"], "flow", "{board}");
+    assert_eq!(board["columns"], json!(["mine"]), "{board}");
 }
