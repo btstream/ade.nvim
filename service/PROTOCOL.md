@@ -1255,3 +1255,46 @@ false when no replay was asked for or it was too large). A closed team is
 gone from `team.list` once its last `team.changed` was sent. Worker names are
 unique for the team's lifetime: a default name never reuses an exited
 worker's name.
+
+### 18.12 Worktrees for workers (S4c)
+
+A template may set `"worktree": true`, and `config` may carry
+`"worktree_root"` (absolute; the front end sends
+`stdpath("data") .. "/ade/worktrees"`). Starting a worker of such a template:
+
+- the team's `cwd` must be inside a git work tree (`git -C <cwd> rev-parse
+  --show-toplevel`), and `worktree_root` must be set; otherwise the spawn fails
+  (`-32061`, and a `notice` to the leader for an approved request);
+- the service runs, without a shell and with the template's environment,
+  `git -C <toplevel> worktree add -b ade/<team>/<name> <worktree_root>/<repo>-<hash8>/<team>-<name> HEAD`,
+  where `<repo>` is the toplevel's last path component (characters outside
+  `[A-Za-z0-9._-]` replaced by `_`) and `<hash8>` the first 8 hex digits of
+  SHA-256 of the toplevel's absolute path. An existing branch or directory of
+  that name is an error (`-32061`), never reused;
+- the worker's `cwd` is the worktree directory, plus the same relative
+  subdirectory the team's `cwd` has inside the toplevel.
+
+The worktree and its branch are **kept** when the worker exits or the team
+closes: they hold the worker's work. `team.list` participants carry
+`worktree: {path, branch}`. `team.remove_worktree {team, participant, force?}`
+`<- {}` removes an exited worker's worktree (`git worktree remove [--force]`)
+and deletes its branch only when it is merged into the toplevel's current
+`HEAD` (`git branch -d`); a running worker is `-32061`, a failing git command
+`-32060` with git's stderr (at most 4 KiB) in `data.stderr`. While a team
+lives, `team.read` of a worker also returns `worktree`.
+
+### 18.13 Workers started by the person (S4c)
+
+`team.spawn {team, template, name?, task?}` `<- {name}` starts a worker on
+behalf of `human`: no inbox item, no confirmation (the person asked), the
+same limits as 18.3. The leader receives a `notice` from `human`
+(`"worker <name> started from template <template>"`). Front ends use it for
+teams defined in their configuration (`teams.enabled`): after `team.bind_leader`
+created the team, they start the configured workers once.
+
+### 18.14 Version restarts and teams (S4c)
+
+A front end that finds a service of another version (its version check) must
+treat a service with any team as **busy**: it must not restart it, whatever
+the instances' states. `agent.list` result entries are unchanged; the front
+end learns about teams with `team.list` when the service offers `"teams"`.
