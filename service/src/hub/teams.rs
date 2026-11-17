@@ -7,8 +7,8 @@
 
 use super::*;
 use crate::team::{
-    worktree, AnswerEffect, ItemKind, Kind, Role, SpawnOutcome, SpawnPlan, SpawnRequest, TeamError,
-    TeamEvent, INVALID_TEAM_PARAM, MAX_BODY_BYTES,
+    brief, workflow, worktree, AnswerEffect, ItemKind, Kind, Role, SpawnOutcome, SpawnPlan,
+    SpawnRequest, TeamError, TeamEvent, INVALID_TEAM_PARAM, MAX_BODY_BYTES,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +87,51 @@ pub enum TeamResult {
         /// `None` means the replay was declined (incomplete or too large).
         messages: Option<Vec<(u64, Value)>>,
     },
+    /// A team call that needed the cwd's project key first (19.1): computing it
+    /// runs git, so it happens off the hub loop.
+    ProjectKey {
+        conn: u64,
+        frontend_id: Value,
+        call: DeferredTeam,
+        cwd: String,
+        project: String,
+    },
+}
+
+/// A `bus.*`/`team.*` call whose resolution needs a project key (19.1/19.5).
+#[derive(Debug)]
+pub(crate) enum DeferredTeam {
+    Status {
+        team: String,
+        name: String,
+    },
+    Workflows {
+        cwd: String,
+    },
+    WorkflowSave {
+        team: String,
+        value: Value,
+        scope: Option<String>,
+        replace: bool,
+    },
+    WorkflowGet {
+        team: String,
+        name: String,
+    },
+    WorkflowDelete {
+        team: String,
+        name: String,
+        scope: Option<String>,
+    },
+    WorkflowDeleteCwd {
+        name: String,
+        scope: String,
+    },
+    Start {
+        team: String,
+        workflow: String,
+        task: Option<String>,
+    },
 }
 
 impl Hub {
@@ -149,10 +194,41 @@ impl Hub {
             }
             return;
         }
+        if method == "bus.status" {
+            // The leader's status carries workflows, which need the project key
+            // (19.3); the worker's is unchanged.
+            match self.teams.team(&team).map(|team| team.cwd.clone()) {
+                Some(cwd) => self.run_or_defer(
+                    conn,
+                    id,
+                    &cwd,
+                    DeferredTeam::Status {
+                        team: team.clone(),
+                        name: name.clone(),
+                    },
+                ),
+                None => self.send_error(conn, id, &TeamError::unknown("unknown team")),
+            }
+            return;
+        }
+        if matches!(
+            method,
+            "bus.workflow_save" | "bus.workflow_get" | "bus.workflow_delete"
+        ) {
+            if role != Role::Leader {
+                self.send_error(
+                    conn,
+                    id,
+                    &TeamError::not_allowed("workflow tools are leader only"),
+                );
+            } else {
+                self.bus_workflow(conn, id, method, &team, params);
+            }
+            return;
+        }
         let result = match method {
             "bus.send" => self.bus_send(conn, &team, &name, params),
             "bus.ask_human" => self.bus_ask_human(&team, &name, params),
-            "bus.status" => self.teams.status(&team, &name).map(|value| (value, false)),
             "bus.read" => {
                 if role != Role::Leader {
                     Err(TeamError::not_allowed("bus_read is leader only"))
@@ -189,6 +265,11 @@ impl Hub {
             self.team_remove_worktree(conn, id, params);
             return;
         }
+        if method == "team.workflows" || method == "team.workflow_delete" || method == "team.start"
+        {
+            self.team_deferred(conn, id, method, params);
+            return;
+        }
         let result = match method {
             "team.configure" => self.team_configure(params).map(|value| (value, false)),
             "team.leader_server" => self.team_leader_server(params).map(|value| (value, false)),
@@ -197,6 +278,7 @@ impl Hub {
             "team.send" => self.team_send(params),
             "team.read" => self.team_read(params).map(|value| (value, false)),
             "team.answer" => self.team_answer(params),
+            "team.answer_group" => self.team_answer_group(params),
             "team.watch" => {
                 self.team_watch(conn, id, params);
                 return;
@@ -303,6 +385,8 @@ impl Hub {
             }
             let resume_session = participant.session.clone();
             let worktree = participant.worktree.clone();
+            let resume_model = participant.model.clone();
+            let resume_role = participant.spawn_role.clone();
             let leader_cwd = team.cwd.clone();
             let template_worktree = team
                 .config
@@ -357,6 +441,8 @@ impl Hub {
                 team: team_id.to_string(),
                 name: name.clone(),
                 template: template_name,
+                model: resume_model,
+                role: resume_role,
                 task: None,
             };
             let opts = StartOptions {
@@ -598,6 +684,16 @@ impl Hub {
                 );
                 self.release_gate(conn);
             }
+            TeamResult::ProjectKey {
+                conn,
+                frontend_id,
+                call,
+                cwd,
+                project,
+            } => {
+                self.teams.set_project_key(&cwd, &project);
+                self.run_deferred(conn, &frontend_id, call, &project);
+            }
         }
     }
 
@@ -669,11 +765,17 @@ impl Hub {
         let result = (|| -> Result<Option<(Value, bool)>, TeamError> {
             let template = required_team_string(params, "template")?;
             let name = optional_string(params, "name")?;
+            let model = optional_string(params, "model")?;
+            let role = optional_string(params, "role")?;
             let task = optional_string(params, "task")?;
-            match self
-                .teams
-                .request_spawn(team, &template, name.as_deref(), task.as_deref())?
-            {
+            match self.teams.request_spawn(
+                team,
+                &template,
+                name.as_deref(),
+                model.as_deref(),
+                role.as_deref(),
+                task.as_deref(),
+            )? {
                 SpawnOutcome::Started(spawn) => {
                     let opts = StartOptions {
                         reply: Some((conn, id.clone(), SpawnReplyKind::Bus)),
@@ -715,9 +817,17 @@ impl Hub {
             let team = required_team_string(params, "team")?;
             let template = required_team_string(params, "template")?;
             let name = optional_string(params, "name")?;
+            let model = optional_string(params, "model")?;
+            let role = optional_string(params, "role")?;
             let task = optional_string(params, "task")?;
-            self.teams
-                .request_spawn_human(&team, &template, name.as_deref(), task.as_deref())
+            self.teams.request_spawn_human(
+                &team,
+                &template,
+                name.as_deref(),
+                model.as_deref(),
+                role.as_deref(),
+                task.as_deref(),
+            )
         })();
         match result {
             Ok(spawn) => {
@@ -797,6 +907,418 @@ impl Hub {
         if let Err(error) = result {
             self.send_error(conn, id, &error);
         }
+    }
+
+    /// `team.workflows`, `team.workflow_delete` and `team.start` (19.5/19.7):
+    /// they need the cwd's project key, which is computed off the hub loop.
+    fn team_deferred(&mut self, conn: u64, id: &Value, method: &str, params: &Value) {
+        let result = (|| -> Result<(String, DeferredTeam), TeamError> {
+            match method {
+                "team.workflows" => {
+                    let cwd = absolute_cwd(params)?;
+                    Ok((cwd.clone(), DeferredTeam::Workflows { cwd }))
+                }
+                "team.workflow_delete" => {
+                    let cwd = absolute_cwd(params)?;
+                    let name = required_team_string(params, "name")?;
+                    let scope = required_team_string(params, "scope")?;
+                    Ok((cwd, DeferredTeam::WorkflowDeleteCwd { name, scope }))
+                }
+                "team.start" => {
+                    let team = required_team_string(params, "team")?;
+                    let workflow = required_team_string(params, "workflow")?;
+                    let task = optional_string(params, "task")?;
+                    let cwd = self
+                        .teams
+                        .team(&team)
+                        .ok_or_else(|| TeamError::unknown("unknown team"))?
+                        .cwd
+                        .clone();
+                    Ok((
+                        cwd,
+                        DeferredTeam::Start {
+                            team,
+                            workflow,
+                            task,
+                        },
+                    ))
+                }
+                _ => Err(TeamError::new(METHOD_NOT_FOUND, "method not found")),
+            }
+        })();
+        match result {
+            Ok((cwd, call)) => self.run_or_defer(conn, id, &cwd, call),
+            Err(error) => self.send_error(conn, id, &error),
+        }
+    }
+
+    /// `bus.workflow_save/get/delete` from a leader (19.5).
+    fn bus_workflow(&mut self, conn: u64, id: &Value, method: &str, team: &str, params: &Value) {
+        let result = (|| -> Result<(String, DeferredTeam), TeamError> {
+            let cwd = self
+                .teams
+                .team(team)
+                .ok_or_else(|| TeamError::unknown("unknown team"))?
+                .cwd
+                .clone();
+            let call = match method {
+                "bus.workflow_save" => {
+                    let value = params
+                        .get("workflow")
+                        .cloned()
+                        .ok_or_else(|| TeamError::invalid("workflow is required"))?;
+                    if !value.is_object() {
+                        return Err(TeamError::invalid("workflow must be an object"));
+                    }
+                    // `scope` is accepted both inside the workflow and next to
+                    // it; the protocol describes it either way.
+                    let scope = params
+                        .get("scope")
+                        .and_then(Value::as_str)
+                        .or_else(|| value.get("scope").and_then(Value::as_str))
+                        .map(str::to_string);
+                    let replace = optional_bool(params, "replace")?.unwrap_or(false);
+                    DeferredTeam::WorkflowSave {
+                        team: team.to_string(),
+                        value,
+                        scope,
+                        replace,
+                    }
+                }
+                "bus.workflow_get" => DeferredTeam::WorkflowGet {
+                    team: team.to_string(),
+                    name: required_team_string(params, "name")?,
+                },
+                "bus.workflow_delete" => DeferredTeam::WorkflowDelete {
+                    team: team.to_string(),
+                    name: required_team_string(params, "name")?,
+                    scope: optional_string(params, "scope")?,
+                },
+                _ => return Err(TeamError::new(METHOD_NOT_FOUND, "method not found")),
+            };
+            Ok((cwd, call))
+        })();
+        match result {
+            Ok((cwd, call)) => self.run_or_defer(conn, id, &cwd, call),
+            Err(error) => self.send_error(conn, id, &error),
+        }
+    }
+
+    /// Run a deferred call now if the project key is cached, else compute it in
+    /// a task and answer from [`TeamResult::ProjectKey`].
+    fn run_or_defer(&mut self, conn: u64, id: &Value, cwd: &str, call: DeferredTeam) {
+        if let Some(project) = self.teams.project_key(cwd).map(str::to_string) {
+            self.run_deferred(conn, id, call, &project);
+            return;
+        }
+        let sender = self.team_sender.clone();
+        let cwd = cwd.to_string();
+        let frontend_id = id.clone();
+        tokio::spawn(async move {
+            let project = workflow::project_key(&cwd).await;
+            let _ = sender.send(TeamResult::ProjectKey {
+                conn,
+                frontend_id,
+                call,
+                cwd,
+                project,
+            });
+        });
+    }
+
+    fn run_deferred(&mut self, conn: u64, id: &Value, call: DeferredTeam, project: &str) {
+        match call {
+            DeferredTeam::Status { team, name } => match self.teams.status(&team, &name, project) {
+                Ok(value) => self.send_to(conn, &success(id, value)),
+                Err(error) => self.send_error(conn, id, &error),
+            },
+            DeferredTeam::Workflows { cwd } => {
+                let value = self.teams.workflows_for_cwd(&cwd, project);
+                self.send_to(conn, &success(id, value));
+            }
+            DeferredTeam::WorkflowSave {
+                team,
+                value,
+                scope,
+                replace,
+            } => {
+                if !self.recorder.enabled() {
+                    self.send_error(conn, id, &TeamError::not_allowed("no database"));
+                    return;
+                }
+                let scope = match stored_scope(scope.as_deref()) {
+                    Ok(scope) => scope,
+                    Err(error) => {
+                        self.send_error(conn, id, &error);
+                        return;
+                    }
+                };
+                match self
+                    .teams
+                    .workflow_save(&team, project, &value, scope, replace)
+                {
+                    Ok(stored) => {
+                        self.persist_workflow(&stored, project);
+                        self.send_to(conn, &success(id, json!({ "name": stored.name })));
+                    }
+                    Err(error) => self.send_error(conn, id, &error),
+                }
+            }
+            DeferredTeam::WorkflowGet { team, name } => {
+                match self.teams.workflow_get(&team, project, &name) {
+                    Ok(value) => self.send_to(conn, &success(id, value)),
+                    Err(error) => self.send_error(conn, id, &error),
+                }
+            }
+            DeferredTeam::WorkflowDelete { team, name, scope } => {
+                if !self.recorder.enabled() {
+                    self.send_error(conn, id, &TeamError::not_allowed("no database"));
+                    return;
+                }
+                let scope = match scope.map(|scope| stored_scope(Some(&scope))).transpose() {
+                    Ok(scope) => scope,
+                    Err(error) => {
+                        self.send_error(conn, id, &error);
+                        return;
+                    }
+                };
+                match self.teams.workflow_delete(&team, project, &name, scope) {
+                    Ok(removed) => {
+                        self.forget_workflow(&removed, project);
+                        self.send_to(conn, &success(id, json!({})));
+                    }
+                    Err(error) => self.send_error(conn, id, &error),
+                }
+            }
+            DeferredTeam::WorkflowDeleteCwd { name, scope } => {
+                if !self.recorder.enabled() {
+                    self.send_error(conn, id, &TeamError::not_allowed("no database"));
+                    return;
+                }
+                let scope = match stored_scope(Some(&scope)) {
+                    Ok(scope) => scope,
+                    Err(error) => {
+                        self.send_error(conn, id, &error);
+                        return;
+                    }
+                };
+                match self.teams.workflow_delete_for_cwd(project, &name, scope) {
+                    Ok(removed) => {
+                        self.forget_workflow(&removed, project);
+                        self.send_to(conn, &success(id, json!({})));
+                    }
+                    Err(error) => self.send_error(conn, id, &error),
+                }
+            }
+            DeferredTeam::Start {
+                team,
+                workflow,
+                task,
+            } => self.team_start_now(conn, id, &team, &workflow, task, project),
+        }
+    }
+
+    /// The database key of a stored workflow: `("user", "", name)` or
+    /// `("project", <project key>, name)`.
+    fn workflow_db_key(stored: &workflow::Workflow, project: &str) -> (String, String, String) {
+        let project = if stored.scope == workflow::Scope::User {
+            String::new()
+        } else {
+            project.to_string()
+        };
+        (
+            stored.scope.as_str().to_string(),
+            project,
+            stored.name.clone(),
+        )
+    }
+
+    fn persist_workflow(&self, stored: &workflow::Workflow, project: &str) {
+        let (scope, project, name) = Self::workflow_db_key(stored, project);
+        let json = serde_json::to_string(stored).unwrap_or_else(|_| "{}".to_string());
+        self.recorder
+            .save_workflow(&scope, &project, &name, json, workflow::updated_ms());
+    }
+
+    fn forget_workflow(&self, stored: &workflow::Workflow, project: &str) {
+        let (scope, project, name) = Self::workflow_db_key(stored, project);
+        self.recorder.delete_workflow(&scope, &project, &name);
+    }
+
+    /// `team.start` (19.7): steps 1, 2, 3 and 5; step 4 is the board hook.
+    fn team_start_now(
+        &mut self,
+        conn: u64,
+        id: &Value,
+        team_id: &str,
+        name: &str,
+        task: Option<String>,
+        project: &str,
+    ) {
+        let result = (|| -> Result<Value, TeamError> {
+            if self.teams.team(team_id).is_none() {
+                return Err(TeamError::unknown("unknown team"));
+            }
+            if self.teams.is_suspended(team_id) {
+                return Err(TeamError::not_allowed("team suspended"));
+            }
+            let workflow = self.teams.resolve_workflow(team_id, project, name)?;
+            let (participants, reserved, live, max_workers, config) = {
+                let team = self.teams.team(team_id).expect("checked above");
+                (
+                    team.participants
+                        .keys()
+                        .cloned()
+                        .collect::<HashSet<String>>(),
+                    team.reserved_names.clone(),
+                    team.live_workers() as u64,
+                    team.config.max_workers,
+                    team.config.clone(),
+                )
+            };
+            let mut skipped = Vec::new();
+            let mut pending: Vec<workflow::WorkflowMember> = Vec::new();
+            for member in &workflow.team {
+                if participants.contains(&member.name) {
+                    skipped.push(member.name.clone());
+                } else {
+                    pending.push(member.clone());
+                }
+            }
+            if live + pending.len() as u64 > max_workers {
+                return Err(TeamError::not_allowed(format!(
+                    "the workflow needs {} workers, the team allows {max_workers}",
+                    live + pending.len() as u64
+                )));
+            }
+            let mut seen: HashSet<String> = HashSet::new();
+            for member in &pending {
+                if !crate::team::valid_name(&member.name)
+                    || member.name == "leader"
+                    || member.name == "human"
+                {
+                    return Err(TeamError::invalid(format!(
+                        "member name {} is not a valid worker name",
+                        member.name
+                    )));
+                }
+                if !seen.insert(member.name.clone()) || reserved.contains(&member.name) {
+                    return Err(TeamError::invalid(format!(
+                        "name {} is already in use",
+                        member.name
+                    )));
+                }
+                let Some(template) = config.templates.get(&member.template) else {
+                    return Err(TeamError::not_allowed(format!(
+                        "unknown template {}",
+                        member.template
+                    )));
+                };
+                if let Some(model) = &member.model {
+                    if !template.models.is_empty()
+                        && !template.models.iter().any(|allowed| allowed == model)
+                    {
+                        return Err(TeamError::invalid(format!(
+                            "model {model} is not allowed by template {}",
+                            member.template
+                        )));
+                    }
+                }
+            }
+            let mut started = Vec::new();
+            for member in &pending {
+                let spawn = self.teams.request_spawn_human(
+                    team_id,
+                    &member.template,
+                    Some(&member.name),
+                    member.model.as_deref(),
+                    member.role.as_deref(),
+                    member.task.as_deref(),
+                )?;
+                let name = spawn.name.clone();
+                if !matches!(
+                    self.start_worker(&spawn, StartOptions::default()),
+                    StartResult::Replied
+                ) {
+                    started.push(name);
+                }
+            }
+            self.start_board_hook(team_id, &workflow);
+            let members: Vec<(workflow::WorkflowMember, String)> = workflow
+                .team
+                .iter()
+                .map(|member| {
+                    let agent = config
+                        .templates
+                        .get(&member.template)
+                        .map(|template| template.key.agent.clone())
+                        .unwrap_or_default();
+                    (member.clone(), agent)
+                })
+                .collect();
+            let body = brief::start_notice(&workflow, &members, task.as_deref());
+            let _ = self.teams.send_message(
+                team_id,
+                "human",
+                "leader",
+                Kind::Notice,
+                &body,
+                None,
+                vec![],
+            );
+            Ok(json!({
+                "workflow": workflow.name,
+                "started": started,
+                "skipped": skipped,
+            }))
+        })();
+        match result {
+            Ok(value) => {
+                self.drain_team_events();
+                self.team_deliveries();
+                self.send_to(conn, &success(id, value));
+            }
+            Err(error) => self.send_error(conn, id, &error),
+        }
+    }
+
+    /// Step 4 of `team.start` (19.7): write the workflow onto the board.
+    ///
+    /// TODO(W0 集成时接入 board): once the board module lands (W0b), a team
+    /// whose board has no `workflow_name` gets `workflow_name`, `workflow`
+    /// (the text) and — when the board has no columns and the workflow has
+    /// them — `columns` in one write with `updated_by: "service"`.
+    fn start_board_hook(&mut self, team: &str, workflow: &workflow::Workflow) {
+        let _ = (team, workflow);
+    }
+
+    fn team_answer_group(&mut self, params: &Value) -> Result<(Value, bool), TeamError> {
+        let group = required_team_string(params, "group")?;
+        let allow = optional_bool(params, "allow")?;
+        let answers = self.teams.answer_group(&group, allow)?;
+        let mut answered = Vec::new();
+        for (id, effect) in answers {
+            match effect {
+                AnswerEffect::Spawn(spawn) => {
+                    self.start_worker(&spawn, StartOptions::default());
+                }
+                AnswerEffect::Permission { .. } | AnswerEffect::Request { .. } => {}
+                AnswerEffect::Question | AnswerEffect::Ack => {
+                    if let Some(item) = self.teams.item_by_id(&id) {
+                        if item.kind == ItemKind::Spawn {
+                            self.team_spawn_notice(
+                                &item.team,
+                                &id,
+                                false,
+                                item.name.as_deref().unwrap_or(""),
+                            );
+                        }
+                    }
+                }
+            }
+            answered.push(id);
+        }
+        Ok((json!({ "answered": answered }), true))
     }
 
     fn team_spawn_notice(&mut self, team: &str, request: &str, approved: bool, name: &str) {
@@ -945,7 +1467,7 @@ impl Hub {
             team: spawn.team.clone(),
             participant: spawn.name.clone(),
             server,
-            model: plan.template.model.clone(),
+            model: spawn.model.clone().or_else(|| plan.template.model.clone()),
             resume: opts.resume.clone(),
         };
         if !self.send_service_request(&instance, "initialize", params, call) {
@@ -1342,11 +1864,43 @@ impl Hub {
                     .and_then(|result| result.get("configOptions"))
                     .cloned()
                     .unwrap_or(Value::Null);
+                if let Some(model) = &model {
+                    let offered = model_values(&config_options);
+                    if !offered.iter().any(|value| value == model) {
+                        // 19.6: never go on silently with a model the agent does
+                        // not offer; stop the worker and tell the leader.
+                        self.teams.revoke_instance_tokens(instance);
+                        self.stop_worker_instance(instance);
+                        let reason = format!("model unavailable: {model}");
+                        self.teams.worker_start_failed(&team, &participant, &reason);
+                        let listed: Vec<String> = offered.into_iter().take(50).collect();
+                        let body = if listed.is_empty() {
+                            format!(
+                                "worker {participant} cannot use model {model}: \
+                                 the agent offers no model values"
+                            )
+                        } else {
+                            format!(
+                                "worker {participant} cannot use model {model}: \
+                                 the agent offers {}",
+                                listed.join(", ")
+                            )
+                        };
+                        let _ = self.teams.send_message(
+                            &team,
+                            "human",
+                            "leader",
+                            Kind::Notice,
+                            &body,
+                            None,
+                            vec![],
+                        );
+                        self.drain_team_events();
+                        return;
+                    }
+                }
                 self.teams.worker_session_set(&team, &participant, &session);
-                let wants_model = model
-                    .as_deref()
-                    .is_some_and(|model| offers_model(&config_options, model));
-                if let (Some(model), true) = (model, wants_model) {
+                if let Some(model) = model {
                     let params = json!({
                         "sessionId": session,
                         "configId": "model",
@@ -2051,34 +2605,55 @@ fn turn_outcome(message: &Value) -> (bool, Option<String>) {
     }
 }
 
-fn offers_model(config_options: &Value, model: &str) -> bool {
+/// The model values an agent's `configOptions` offers (19.6), in order.
+fn model_values(config_options: &Value) -> Vec<String> {
+    let mut values = Vec::new();
     let Some(options) = config_options.as_array() else {
-        return false;
+        return values;
     };
     for option in options {
         if option.get("id").and_then(Value::as_str) != Some("model") {
             continue;
         }
-        if let Some(values) = option.get("options").and_then(Value::as_array) {
-            for entry in values {
-                if entry.get("value").and_then(Value::as_str) == Some(model) {
-                    return true;
+        if let Some(entries) = option.get("options").and_then(Value::as_array) {
+            for entry in entries {
+                if let Some(value) = entry.get("value").and_then(Value::as_str) {
+                    values.push(value.to_string());
                 }
                 if let Some(children) = entry.get("options").and_then(Value::as_array) {
-                    if children
-                        .iter()
-                        .any(|child| child.get("value").and_then(Value::as_str) == Some(model))
-                    {
-                        return true;
+                    for child in children {
+                        if let Some(value) = child.get("value").and_then(Value::as_str) {
+                            values.push(value.to_string());
+                        }
                     }
                 }
             }
         }
-        if let Some(values) = option.get("values").and_then(Value::as_array) {
-            if values.iter().any(|value| value.as_str() == Some(model)) {
-                return true;
+        if let Some(entries) = option.get("values").and_then(Value::as_array) {
+            for entry in entries {
+                if let Some(value) = entry.as_str() {
+                    values.push(value.to_string());
+                }
             }
         }
     }
-    false
+    values
+}
+
+/// The `scope` a `workflow_save`/`workflow_delete` asked for (19.5).
+fn stored_scope(scope: Option<&str>) -> Result<workflow::Scope, TeamError> {
+    match scope {
+        None => Ok(workflow::Scope::Project),
+        Some(scope) => workflow::Scope::parse_stored(scope)
+            .ok_or_else(|| TeamError::invalid("scope must be project or user")),
+    }
+}
+
+/// A required absolute `cwd` parameter (19.5).
+fn absolute_cwd(params: &Value) -> Result<String, TeamError> {
+    let cwd = required_team_string(params, "cwd")?;
+    if !std::path::Path::new(&cwd).is_absolute() {
+        return Err(TeamError::invalid("cwd must be an absolute path"));
+    }
+    Ok(cwd)
 }

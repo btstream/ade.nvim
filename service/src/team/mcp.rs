@@ -202,14 +202,20 @@ impl Mcp {
                 } else {
                     "2025-06-18"
                 };
-                Ok(json!({
+                let mut result = json!({
                     "protocolVersion": version,
                     "capabilities": { "tools": {} },
                     "serverInfo": {
                         "name": "nvim_ade_server",
                         "version": crate::SERVER_VERSION,
                     },
-                }))
+                });
+                if self.role() == "leader" {
+                    // 19.8: only a leader gets the base instructions; they are
+                    // the same text `team.start`'s notice repeats.
+                    result["instructions"] = json!(crate::team::brief::leader_instructions());
+                }
+                Ok(result)
             }
             "ping" => Ok(json!({})),
             "tools/list" => Ok(self.tools_list()),
@@ -255,6 +261,16 @@ impl Mcp {
             .and_then(|socket| socket.request("bus.status", json!({})).ok())
             .and_then(|value| value.get("templates").cloned())
             .and_then(|value| value.as_array().cloned())
+            .map(|templates| {
+                templates
+                    .iter()
+                    .filter_map(|template| match template {
+                        Value::String(name) => Some(json!(name)),
+                        Value::Object(_) => template.get("name").cloned(),
+                        _ => None,
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -268,6 +284,14 @@ impl Mcp {
                 "properties": {
                     "template": { "type": "string" },
                     "name": { "type": "string" },
+                    "model": {
+                        "type": "string",
+                        "description": "A model from the template's models list; omitted = the template's model."
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Extra role text appended to the template's role (max 16 KiB)."
+                    },
                     "task": { "type": "string" },
                 },
                 "required": ["template"],
@@ -330,6 +354,76 @@ impl Mcp {
                     "required": ["participant"],
                 },
             }));
+            tools.push(json!({
+                "name": "workflow_save",
+                "description": "Save a named workflow for this project (or every project with scope \"user\").",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "workflow": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string", "description": "[a-z0-9][a-z0-9_-]{0,31}" },
+                                "summary": { "type": "string", "description": "One line, 1..120 characters." },
+                                "text": { "type": "string", "description": "The flow text, up to 4 KiB; omitted = the built-in default flow." },
+                                "leader": {
+                                    "type": "object",
+                                    "properties": {
+                                        "agent": { "type": "string" },
+                                        "model": { "type": "string" },
+                                        "role": { "type": "string" },
+                                    },
+                                },
+                                "team": {
+                                    "type": "array",
+                                    "maxItems": 8,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "name": { "type": "string" },
+                                            "template": { "type": "string" },
+                                            "model": { "type": "string" },
+                                            "role": { "type": "string" },
+                                            "task": { "type": "string" },
+                                        },
+                                        "required": ["name", "template"],
+                                    },
+                                },
+                                "columns": {
+                                    "type": "array",
+                                    "maxItems": 16,
+                                    "items": { "type": "string" },
+                                },
+                            },
+                            "required": ["name", "summary"],
+                        },
+                        "scope": { "type": "string", "enum": ["project", "user"] },
+                        "replace": { "type": "boolean" },
+                    },
+                    "required": ["workflow"],
+                },
+            }));
+            tools.push(json!({
+                "name": "workflow_get",
+                "description": "Read a workflow by name, resolved as config, project, user, builtin.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "name": { "type": "string" } },
+                    "required": ["name"],
+                },
+            }));
+            tools.push(json!({
+                "name": "workflow_delete",
+                "description": "Delete a stored workflow (not a configured or built-in one).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "scope": { "type": "string", "enum": ["project", "user"] },
+                    },
+                    "required": ["name"],
+                },
+            }));
         }
         json!({ "tools": tools })
     }
@@ -349,9 +443,31 @@ impl Mcp {
                 json!({
                     "template": arguments.get("template"),
                     "name": arguments.get("name"),
+                    "model": arguments.get("model"),
+                    "role": arguments.get("role"),
                     "task": arguments.get("task"),
                 }),
             ),
+            "workflow_save" if leader => {
+                let mut call = json!({
+                    "workflow": arguments.get("workflow"),
+                    "replace": arguments.get("replace"),
+                });
+                if let Some(scope) = arguments.get("scope") {
+                    call["scope"] = scope.clone();
+                }
+                ("bus.workflow_save", call)
+            }
+            "workflow_get" if leader => {
+                ("bus.workflow_get", json!({ "name": arguments.get("name") }))
+            }
+            "workflow_delete" if leader => {
+                let mut call = json!({ "name": arguments.get("name") });
+                if let Some(scope) = arguments.get("scope") {
+                    call["scope"] = scope.clone();
+                }
+                ("bus.workflow_delete", call)
+            }
             "bus_send" => (
                 "bus.send",
                 json!({
@@ -377,7 +493,7 @@ impl Mcp {
                     "since": arguments.get("since"),
                 }),
             ),
-            "team_spawn" | "bus_read" => {
+            "team_spawn" | "bus_read" | "workflow_save" | "workflow_get" | "workflow_delete" => {
                 return Ok(error_result("this tool is only available to the leader"))
             }
             _ => return Err((-32602, format!("unknown tool {name}"))),

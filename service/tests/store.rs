@@ -1196,13 +1196,58 @@ fn a_version_one_log_migrates_without_losing_events() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let tables: i64 = conn
         .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('teams', 'team_meta')",
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('teams', 'team_meta', 'workflows')",
             [],
             |row| row.get(0),
         )
         .expect("tables");
-    assert_eq!(tables, 2);
+    assert_eq!(tables, 3);
+}
+
+#[test]
+fn workflows_are_stored_per_scope_and_project_and_survive_reopening() {
+    let dir = TempDir::new("workflows");
+    let path = dir.db();
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    let workflow =
+        r#"{"name":"review","summary":"by pi","text":"step","team":[],"scope":"project"}"#;
+    {
+        let store = Store::open(&path).expect("open");
+        store
+            .save_workflow("project", "/repo/.git", "review", workflow, 1)
+            .expect("save");
+        store
+            .save_workflow("user", "", "review", workflow, 2)
+            .expect("save user");
+        store
+            .save_workflow("project", "/repo/.git", "dev", workflow, 3)
+            .expect("save dev");
+    }
+    let store = Store::open(&path).expect("reopen");
+    let rows = store.load_workflows().expect("load");
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert!(rows.iter().any(|(scope, project, name, json)| {
+        scope == "project" && project == "/repo/.git" && name == "review" && json == workflow
+    }));
+    assert!(rows.iter().any(|(scope, project, name, _)| scope == "user"
+        && project.is_empty()
+        && name == "review"));
+    // Replacing keeps one row per key; deleting is exact.
+    store
+        .save_workflow(
+            "project",
+            "/repo/.git",
+            "review",
+            "{\"name\":\"review\"}",
+            4,
+        )
+        .expect("replace");
+    assert_eq!(store.load_workflows().expect("load").len(), 3);
+    store.delete_workflow("user", "", "review").expect("delete");
+    let rows = store.load_workflows().expect("load");
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|(scope, _, _, _)| scope == "project"));
 }

@@ -8,7 +8,9 @@
 
 mod common;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -1188,4 +1190,118 @@ fn a_suspended_team_expires_after_the_configured_ttl() {
         "the expired team",
     );
     Fixture::shutdown(&mut third);
+}
+
+fn mcp_call(server: &TestServer, token: &str, tool: &str, arguments: Value) -> Value {
+    let mut child = Command::new(common::BINARY)
+        .arg("mcp")
+        .env("ADE_TEAM_TOKEN", token)
+        .env("NVIM_ADE_SERVER_DIR", server.dir())
+        .env("HOME", server.dir())
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp");
+    {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        for frame in [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test"}}}),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":arguments}}),
+        ] {
+            writeln!(stdin, "{}", frame).expect("write mcp frame");
+        }
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("mcp exits on stdin EOF");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("id") == Some(&json!(2)) {
+            return value
+                .get("result")
+                .cloned()
+                .unwrap_or_else(|| value.clone());
+        }
+    }
+    panic!(
+        "no MCP response: stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+#[test]
+fn a_saved_workflow_outlives_the_team_and_a_suspended_team_refuses_to_start() {
+    let fixture = Fixture::new("restart-workflow");
+    let mut server = fixture.start("restart-workflow-1", &[]);
+    let mut client = fixture.connect(&server);
+    fixture.configure(&mut client, &fixture.work, &server, true);
+    let (_instance, _session, token, bound) =
+        fixture.attach_leader(&server, &mut client, &fixture.work, None);
+    let team = bound["result"]["team"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("bind: {bound}"))
+        .to_string();
+    let saved = mcp_call(
+        &server,
+        &token,
+        "workflow_save",
+        json!({"workflow": {
+            "name": "saved_flow",
+            "summary": "outlives the team",
+            "text": "the flow",
+            "team": [{"name": "w9", "template": "dev"}],
+        }}),
+    );
+    assert_eq!(saved["isError"], false, "{saved}");
+    let text = saved["content"][0]["text"].as_str().unwrap_or_default();
+    let saved: Value = serde_json::from_str(text).expect("workflow_save JSON");
+    assert_eq!(saved["name"], "saved_flow");
+    Fixture::shutdown(&mut server);
+
+    let mut restarted = fixture.start("restart-workflow-2", &[]);
+    let mut client = fixture.connect(&restarted);
+    let listed = client.request(2, "team.list", json!({}));
+    let suspended = listed["result"]["teams"]
+        .as_array()
+        .and_then(|teams| teams.iter().find(|entry| entry["id"] == team.as_str()))
+        .cloned()
+        .expect("the suspended team survived");
+    assert_eq!(suspended["state"], "suspended");
+    let started = client.request(
+        3,
+        "team.start",
+        json!({"team": team, "workflow": "saved_flow"}),
+    );
+    assert_eq!(started["error"]["code"], -32061, "{started}");
+
+    let workflows = client.request(
+        4,
+        "team.workflows",
+        json!({"cwd": fixture.work.to_string_lossy()}),
+    );
+    let names: Vec<(String, String)> = workflows["result"]["workflows"]
+        .as_array()
+        .expect("workflows")
+        .iter()
+        .map(|workflow| {
+            (
+                workflow["name"].as_str().unwrap_or_default().to_string(),
+                workflow["scope"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    assert!(
+        names.contains(&("saved_flow".to_string(), "project".to_string())),
+        "{names:?}"
+    );
+    assert!(
+        names.contains(&("default".to_string(), "builtin".to_string())),
+        "{names:?}"
+    );
+    Fixture::shutdown(&mut restarted);
 }
