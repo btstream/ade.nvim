@@ -1546,7 +1546,11 @@ are flushed (and announced) when the team ends, before the expiry check of
 `NVIM_ADE_SERVER_BOARD_FLUSH_MS` milliseconds (default 10000), for tests.
 
 **`team.board {team}`** `<- {board}` for front ends (`-32064` for an unknown
-team). **`team.board_changed {team, rev}`** is sent to front-end connections
+team). When the stored board cannot be read (bad JSON or a database error at
+startup) the board is **unavailable**: it shows as empty with
+`"unavailable": true` (in `team.board` and the leader's `bus.status.board`;
+the field is absent otherwise), every write is `-32061` (`"board
+unavailable"`), and the stored row is never overwritten. **`team.board_changed {team, rev}`** is sent to front-end connections
 only. Board changes are never delivered to any participant.
 
 ### 19.3 What agents see of the board
