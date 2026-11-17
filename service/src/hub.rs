@@ -159,6 +159,7 @@ pub enum Command {
     TeamDeadline {
         instance: String,
         session: String,
+        generation: u64,
     },
     /// Stop every instance. The hub notifies [`Hub::stopped`] when done.
     Shutdown,
@@ -434,6 +435,9 @@ pub struct Hub {
     /// Front-end prompts held while a cancelled bus prompt on the leader is
     /// answered (18.11).
     held_prompts: HashMap<(String, String), VecDeque<(u64, Value)>>,
+    held_generation: HashMap<(String, String), u64>,
+    held_timed_out: HashSet<(String, String)>,
+    next_held_generation: u64,
     team_sender: mpsc::UnboundedSender<TeamResult>,
     team_results: mpsc::UnboundedReceiver<TeamResult>,
 }
@@ -488,6 +492,9 @@ impl Hub {
             frontend_conns: HashSet::new(),
             driver: HashMap::new(),
             held_prompts: HashMap::new(),
+            held_generation: HashMap::new(),
+            held_timed_out: HashSet::new(),
+            next_held_generation: 0,
             team_sender,
             team_results,
         }
@@ -568,8 +575,12 @@ impl Hub {
             Command::Register { conn, outbox } => {
                 self.conns.insert(conn, outbox);
             }
-            Command::TeamDeadline { instance, session } => {
-                self.team_deadline(&instance, &session);
+            Command::TeamDeadline {
+                instance,
+                session,
+                generation,
+            } => {
+                self.team_deadline(&instance, &session, generation);
                 self.update_busy();
             }
             Command::Authenticated { conn, participant } => {
@@ -586,6 +597,9 @@ impl Hub {
                 self.participant_conns.remove(&conn);
                 self.frontend_conns.remove(&conn);
                 self.teams.forget_connection(conn);
+                for instance in self.instances.values_mut() {
+                    instance.relay.forget_delivered(conn);
+                }
                 for queue in self.held_prompts.values_mut() {
                     queue.retain(|(owner, _)| *owner != conn);
                 }
@@ -774,7 +788,13 @@ impl Hub {
         }
 
         if method.starts_with("team.") {
-            if is_request {
+            if !self.event_log {
+                // Teams are advertised only together with "log"; without it
+                // the methods do not exist.
+                if is_request {
+                    self.send_to(conn, &failure(&id, METHOD_NOT_FOUND, "method not found"));
+                }
+            } else if is_request {
                 self.handle_team_method(conn, &method, &params, &id);
             }
             return;
@@ -930,10 +950,7 @@ impl Hub {
             "method": "install.progress",
             "params": params,
         });
-        let conns: Vec<u64> = self.conns.keys().copied().collect();
-        for conn in conns {
-            self.send_to(conn, &frame);
-        }
+        self.send_to_frontends(&frame);
     }
 
     #[cfg(unix)]
@@ -1671,6 +1688,19 @@ impl Hub {
             .and_then(|params| params.get("sessionId"))
             .and_then(Value::as_str)
             .map(str::to_string);
+        if !watcher && method.as_deref() == Some("$/cancel_request") {
+            if let Some(target) = object.get("params").and_then(|params| params.get("id")) {
+                if self.cancel_held_target(conn, instance_id, target) {
+                    return;
+                }
+            }
+        }
+        if method.as_deref() == Some("session/cancel") {
+            if let Some(session) = &session {
+                // A human cancel also withdraws this session's held prompts.
+                self.cancel_held_session(instance_id, session);
+            }
+        }
         if allow_hold && method.as_deref() == Some("session/prompt") {
             if let Some(session) = &session {
                 if self.hold_leader_prompt(conn, instance_id, session, &message) {
@@ -1678,17 +1708,12 @@ impl Hub {
                 }
             }
         }
-        let answered_key = if watcher {
-            if method.is_none() {
-                message.get("id").map(crate::relay::id_key)
-            } else if method.as_deref() == Some("$/cancel_request") {
-                object
-                    .get("params")
-                    .and_then(|params| params.get("id"))
-                    .map(crate::relay::id_key)
-            } else {
-                None
-            }
+        // Only a response that the relay actually forwarded closes the inbox
+        // item. A watcher has no front-end request mapping, so its
+        // `$/cancel_request` is dropped by the relay and must not answer an
+        // item.
+        let response_key = if watcher && method.is_none() {
+            message.get("id").map(crate::relay::id_key)
         } else {
             None
         };
@@ -1705,7 +1730,9 @@ impl Hub {
             if let Some(session) = &session {
                 match method.as_deref() {
                     Some("session/prompt") => {
-                        self.policy.on_prompt(conn, instance_id, session, &agent)
+                        self.policy.on_prompt(conn, instance_id, session, &agent);
+                        self.teams.frontend_prompt_started(instance_id);
+                        self.drain_team_events();
                     }
                     Some("session/cancel") => self.policy.on_cancel(session),
                     _ => {}
@@ -1744,10 +1771,12 @@ impl Hub {
             }
             FrontendAction::Drop => {}
         }
-        if let Some(key) = answered_key {
-            self.teams.mark_item_answered_by_instance(instance_id, &key);
-            self.drain_team_events();
-            self.team_deliveries();
+        if forwarded {
+            if let Some(key) = response_key {
+                self.teams.mark_item_answered_by_instance(instance_id, &key);
+                self.drain_team_events();
+                self.team_deliveries();
+            }
         }
         self.update_busy();
     }
@@ -2001,6 +2030,21 @@ impl Hub {
         );
     }
 
+    fn send_turn_finished(&mut self, instance_id: &str, finished: &crate::relay::FinishedTurn) {
+        for conn in &finished.adopters {
+            self.send_tunnel_recv(
+                *conn,
+                instance_id,
+                finished.seq,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "_ade/turn_finished",
+                    "params": finished.params,
+                }),
+            );
+        }
+    }
+
     fn handle_runtime(&mut self, event: RuntimeEvent) {
         match event {
             RuntimeEvent::Stdout { instance, text } => self.agent_line(&instance, &text),
@@ -2115,6 +2159,15 @@ impl Hub {
         for retraction in &retractions {
             self.send_cancel_request(instance_id, retraction);
         }
+        let service_response = matches!(outcome.action, Some(AgentAction::ServiceResponse { .. }));
+        let finished_turn = outcome.finished_turn.clone();
+        if service_response {
+            if let Some(finished) = &finished_turn {
+                // The old bus turn must be finished before the next bus
+                // delivery's `_ade/turn_started` (18.11 ordering).
+                self.send_turn_finished(instance_id, finished);
+            }
+        }
         match outcome.action {
             Some(AgentAction::Response { conn, seq, message }) => {
                 self.send_tunnel_recv(conn, instance_id, seq, &message);
@@ -2138,10 +2191,8 @@ impl Hub {
                     if method.starts_with("fs/") || method.starts_with("terminal/") {
                         if let Some(id) = message.get("id").cloned() {
                             self.worker_error_response(instance_id, &id);
-                            if let Some(agent_id) = id.as_u64() {
-                                if let Some(handle) = self.instances.get_mut(instance_id) {
-                                    handle.relay.answer_pending(agent_id);
-                                }
+                            if let Some(handle) = self.instances.get_mut(instance_id) {
+                                handle.relay.answer_pending(&id);
                             }
                         }
                     } else {
@@ -2175,10 +2226,8 @@ impl Hub {
                     if method.starts_with("fs/") || method.starts_with("terminal/") {
                         if let Some(id) = message.get("id").cloned() {
                             self.worker_error_response(instance_id, &id);
-                            if let Some(agent_id) = id.as_u64() {
-                                if let Some(handle) = self.instances.get_mut(instance_id) {
-                                    handle.relay.answer_pending(agent_id);
-                                }
+                            if let Some(handle) = self.instances.get_mut(instance_id) {
+                                handle.relay.answer_pending(&id);
                             }
                         }
                     } else {
@@ -2230,31 +2279,25 @@ impl Hub {
         if had_prompt_finished {
             // A human prompt on the leader ended: bus messages that queued
             // behind it may now be delivered (18.4).
+            self.teams.frontend_prompt_finished(instance_id);
+            self.drain_team_events();
             self.team_deliveries();
         }
-        if let Some(finished) = outcome.finished_turn {
+        if let Some(finished) = finished_turn {
             if finished.adoption {
                 if let Some(instance) = self.instances.get_mut(instance_id) {
                     instance.relay.forget_turn(&finished.session_id);
                 }
             }
-            for conn in &finished.adopters {
-                self.send_tunnel_recv(
-                    *conn,
-                    instance_id,
-                    finished.seq,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "method": "_ade/turn_finished",
-                        "params": finished.params,
-                    }),
-                );
+            if !service_response {
+                self.send_turn_finished(instance_id, &finished);
             }
         }
     }
 
     fn instance_exited(&mut self, instance_id: &str) {
         let delivery = self.delivery_conns(instance_id);
+        self.fail_held_prompts(instance_id);
         let Some(instance) = self.instances.remove(instance_id) else {
             return;
         };

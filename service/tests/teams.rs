@@ -55,9 +55,18 @@ struct Harness {
 
 impl Harness {
     fn new(label: &str, extra_config: Value, idle: Option<&str>) -> Self {
+        Self::new_with_env(label, extra_config, idle, &[])
+    }
+
+    fn new_with_env(
+        label: &str,
+        extra_config: Value,
+        idle: Option<&str>,
+        env: &[(&str, &str)],
+    ) -> Self {
         let server = match idle {
-            Some(idle) => TestServer::start_with(label, &["--idle-timeout", idle], &[]),
-            None => TestServer::start(label),
+            Some(idle) => TestServer::start_with(label, &["--idle-timeout", idle], env),
+            None => TestServer::start_with(label, &[], env),
         };
         let work = server.dir().join("work");
         std::fs::create_dir_all(&work).expect("work dir");
@@ -94,6 +103,8 @@ impl Harness {
             json!({"protocolVersion": 1, "clientCapabilities": {}}),
         );
 
+        let mut delayed_env = env.clone();
+        delayed_env["TEAM_AGENT_SET_CONFIG_DELAY"] = json!("0.5");
         let mut config = json!({
             "max_workers": 3,
             "spawn_confirm": { "auto": [] },
@@ -104,6 +115,12 @@ impl Harness {
                     "env": env,
                     "model": "m2",
                     "role": "Do the task carefully and report.",
+                },
+                "delayed": {
+                    "key": { "agent": "team-test", "command": "python3", "args": [agent()] },
+                    "env": delayed_env,
+                    "model": "m2",
+                    "role": "Do the task after a slow model configuration.",
                 }
             }
         });
@@ -548,6 +565,19 @@ fn leader_binds_and_spawns_through_mcp() {
     assert!(read["turns"]
         .as_array()
         .is_some_and(|turns| turns.iter().any(|turn| turn["text"] == "working on it")));
+    let since = mcp_call(
+        &harness.server,
+        &harness.token,
+        "bus_read",
+        json!({"participant":"w1","since":1}),
+    );
+    let since: Value = serde_json::from_str(&mcp_text(&since)).expect("bus_read since JSON");
+    assert!(
+        since["messages"].as_array().is_some_and(|messages| messages
+            .iter()
+            .all(|message| message["id"].as_u64().is_some_and(|id| id > 1))),
+        "{since}"
+    );
 }
 
 #[test]
@@ -776,6 +806,21 @@ fn watchers_see_requests_and_cannot_send_requests() {
         }
     }
     let permission_id = permission_id.expect("watcher did not see the permission request");
+
+    harness.client.notify(
+        "tunnel.send",
+        json!({
+            "instance": worker_instance,
+            "message": {"jsonrpc":"2.0","method":"$/cancel_request","params":{"id":permission_id}},
+        }),
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        harness.team()["inbox"].as_array().is_some_and(|items| items
+            .iter()
+            .any(|item| item["kind"] == "permission" && item["state"] == "open")),
+        "a watcher's $/cancel_request must not answer the inbox item"
+    );
 
     harness.client.notify(
         "tunnel.send",
@@ -1175,11 +1220,6 @@ fn team_survives_without_a_front_end_and_closes() {
     );
     let closed_tools = mcp_call(&harness.server, &harness.token, "bus_status", json!({}));
     assert_eq!(closed_tools["isError"], true, "{closed_tools}");
-    assert!(
-        mcp_text(&closed_tools).contains("team closed"),
-        "{}",
-        mcp_text(&closed_tools)
-    );
     client.disconnect();
     assert!(
         harness
@@ -1472,6 +1512,11 @@ fn bus_mail_waits_for_a_human_prompt_on_the_leader() {
         },
         "the human slow prompt",
     );
+    assert_eq!(
+        harness.participant("leader").unwrap()["state"],
+        "working",
+        "a running human prompt must show as working"
+    );
     harness.send("leader", "task", "after the human");
     let list = harness.client.request(106, "agent.list", json!({}));
     let leader = list["result"]["instances"]
@@ -1496,6 +1541,7 @@ fn bus_mail_waits_for_a_human_prompt_on_the_leader() {
         }
     }
     assert!(response, "the human prompt did not finish");
+    harness.wait_participant("leader", |entry| entry["state"] == "idle");
     wait_for(
         || {
             harness
@@ -1568,4 +1614,933 @@ fn an_answer_waits_for_the_running_turn_to_end() {
         "the answer delivered after the turn",
     );
     assert!(prompt["text"].as_str().unwrap().contains("yes"));
+}
+
+#[test]
+fn primary_is_the_most_recently_attached_connection() {
+    let server = TestServer::start("team-primary");
+    let work = server.dir().join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let log = server.dir().join("primary-agent.log");
+    let gate = server.dir().join("primary-agent.gate");
+    let env = child_env(&server, &log, &gate);
+
+    let mut first = server.connect();
+    first.hello(&server.token(), nvim_ade_server::API_VERSION);
+    let mut second = server.connect();
+    second.hello(&server.token(), nvim_ade_server::API_VERSION);
+
+    let key = json!({
+        "agent": "primary-test",
+        "command": "python3",
+        "args": [agent()],
+        "cwd": work.to_string_lossy(),
+    });
+    // `second` is the higher connection number but attaches first.
+    let attached = second.request(
+        1,
+        "agent.attach",
+        json!({"key": key, "client_capabilities": {}, "env": env}),
+    );
+    let instance = attached["result"]["instance"].as_str().unwrap().to_string();
+    // `first` connected earlier (lower connection number) and attaches later;
+    // it must become the primary, not `second`.
+    let again = first.request(
+        1,
+        "agent.attach",
+        json!({"key": key, "client_capabilities": {}, "env": env}),
+    );
+    assert_eq!(again["result"]["created"], false, "{again}");
+    assert_eq!(again["result"]["attached"], 2, "{again}");
+
+    tunnel_call(
+        &mut second,
+        &instance,
+        10,
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    let session = tunnel_call(
+        &mut second,
+        &instance,
+        11,
+        "session/new",
+        json!({"cwd": work.to_string_lossy(), "mcpServers": []}),
+    );
+    let session = session["result"]["sessionId"].as_str().unwrap().to_string();
+    second.notify(
+        "tunnel.send",
+        json!({
+            "instance": instance,
+            "message": {
+                "jsonrpc": "2.0", "id": 12, "method": "session/prompt",
+                "params": {"sessionId": session, "prompt": [{"type":"text","text":"[permission]"}]},
+            },
+        }),
+    );
+    let permission = loop {
+        let received = first.next_tunnel_recv(Duration::from_secs(15));
+        if received["message"]["method"] == "session/request_permission" {
+            break received;
+        }
+    };
+    first.notify(
+        "tunnel.send",
+        json!({
+            "instance": instance,
+            "message": {
+                "jsonrpc": "2.0",
+                "id": permission["message"]["id"],
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow"}},
+            },
+        }),
+    );
+}
+
+#[test]
+fn bad_turns_have_the_documented_notices_and_normal_stop_reasons_do_not() {
+    let mut harness = Harness::new(
+        "team-turn-outcomes",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    for (name, marker) in [
+        ("w1", "[cancelled]"),
+        ("w2", "[error]"),
+        ("w3", "[max-tokens]"),
+    ] {
+        let spawned = mcp_call(
+            &harness.server,
+            &harness.token,
+            "team_spawn",
+            json!({"template":"dev","name":name,"task":format!("do {marker}")}),
+        );
+        assert_eq!(spawned["isError"], false, "{spawned}");
+        harness.wait_participant(name, |entry| {
+            entry["state"] == "idle"
+                && entry["turns"]["total"]
+                    .as_u64()
+                    .is_some_and(|turns| turns >= 1)
+        });
+    }
+    let messages = harness.read("leader")["messages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let from = |name: &str, kind: &str| {
+        messages
+            .iter()
+            .filter(|message| message["from"] == name && message["kind"] == kind)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let cancelled = wait_for(
+        || {
+            let messages = harness.read("leader")["messages"].as_array()?.clone();
+            let notices: Vec<Value> = messages
+                .iter()
+                .filter(|message| message["from"] == "w1" && message["kind"] == "notice")
+                .cloned()
+                .collect();
+            (!notices.is_empty()).then_some(notices)
+        },
+        "the cancelled notice",
+    );
+    assert!(
+        cancelled
+            .iter()
+            .any(|message| message["body"] == "turn ended: cancelled"),
+        "{cancelled:?}"
+    );
+    assert!(from("w1", "report").is_empty(), "no fallback on cancelled");
+    let error = from("w2", "notice");
+    assert!(
+        error
+            .iter()
+            .any(|message| message["body"] == "turn ended: error: boom"),
+        "{error:?}"
+    );
+    assert!(from("w2", "report").is_empty(), "no fallback on error");
+    assert!(
+        from("w3", "notice").is_empty(),
+        "max_tokens is a normal stop reason"
+    );
+    assert!(
+        from("w3", "report")
+            .iter()
+            .any(|message| message["body"] == "working on it"),
+        "a normal stop reason triggers the report fallback"
+    );
+}
+
+#[test]
+fn per_task_limit_applies_to_workers_not_the_leader() {
+    let mut harness = Harness::new(
+        "team-task-limit",
+        json!({
+            "spawn_confirm": {"auto": ["dev"]},
+            "limits": {"max_turns_per_task": 1},
+        }),
+        None,
+    );
+    // A leader bus turn with task label `_`: it must not pause the leader.
+    harness.send("leader", "task", "leader turn");
+    let leader = harness.wait_participant("leader", |entry| {
+        entry["state"] == "idle"
+            && entry["turns"]["total"]
+                .as_u64()
+                .is_some_and(|turns| turns >= 1)
+    });
+    assert_eq!(leader["paused"], false, "{leader}");
+    assert!(
+        !harness.team()["inbox"].as_array().is_some_and(|items| items
+            .iter()
+            .any(
+                |item| item["kind"] == "limit" && item.get("participant") == Some(&json!("leader"))
+            )),
+        "the leader must not hit the per-task limit"
+    );
+    let spawn = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template":"dev","name":"w1","task":"worker turn"}),
+    );
+    assert_eq!(spawn["isError"], false, "{spawn}");
+    let worker = harness.wait_participant("w1", |entry| entry["paused"] == true);
+    assert_eq!(worker["state"], "idle");
+}
+
+#[test]
+fn the_finished_notice_precedes_the_next_turn_started() {
+    let mut harness = Harness::new("team-order", json!({}), None);
+    harness.send("leader", "task", "[slow]");
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .any(|event| {
+                    event["event"] == "prompt"
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("[slow]"))
+                })
+                .then_some(())
+        },
+        "the first bus prompt",
+    );
+    harness.send("leader", "task", "next");
+    std::fs::write(harness.server.dir().join("team-agent.gate"), b"go").expect("gate");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut order = Vec::new();
+    while Instant::now() < deadline {
+        let Some(frame) = harness.client.try_recv(Duration::from_millis(200)) else {
+            continue;
+        };
+        if frame["method"] != "tunnel.recv" {
+            continue;
+        }
+        match frame["params"]["message"]["method"].as_str() {
+            Some("_ade/turn_finished") => order.push("finished"),
+            Some("_ade/turn_started") => order.push("started"),
+            _ => {}
+        }
+        if order.iter().filter(|entry| **entry == "finished").count() >= 1
+            && order.iter().filter(|entry| **entry == "started").count() >= 1
+        {
+            break;
+        }
+    }
+    let finished_at = order.iter().position(|entry| *entry == "finished");
+    let started_at = order.iter().rposition(|entry| *entry == "started");
+    assert!(
+        finished_at.is_some() && started_at.is_some(),
+        "missing frames: {order:?}"
+    );
+    assert!(
+        finished_at < started_at,
+        "the next turn started before the previous finished: {order:?}"
+    );
+}
+
+#[test]
+fn the_first_prompt_waits_for_the_model_configuration() {
+    let mut harness = Harness::new(
+        "team-model-start",
+        json!({"spawn_confirm": {"auto": ["dev", "delayed"]}}),
+        None,
+    );
+    let spawned = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template":"delayed","name":"w1","task":"one"}),
+    );
+    assert_eq!(spawned["isError"], false, "{spawned}");
+    let (_instance, session) = team_instance(&mut harness, "w1");
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .any(|event| event["event"] == "set_config")
+                .then_some(())
+        },
+        "the model configuration request",
+    );
+    harness.send("w1", "task", "early");
+    let state = harness.participant("w1").expect("worker");
+    assert_ne!(
+        state["state"], "working",
+        "the worker must still be starting while set_config is in flight: {state}"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let state = harness.participant("w1").expect("worker");
+    assert_ne!(state["state"], "working", "{state}");
+    let events = wait_for(
+        || {
+            let events = harness.events();
+            events
+                .iter()
+                .any(|event| {
+                    event["event"] == "prompt"
+                        && event["session"] == session
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("one"))
+                })
+                .then_some(events)
+        },
+        "the first prompt after set_config",
+    );
+    let set_config_at = events
+        .iter()
+        .position(|event| event["event"] == "set_config")
+        .expect("set_config");
+    let prompt_at = events
+        .iter()
+        .position(|event| {
+            event["event"] == "prompt"
+                && event["session"] == session
+                && event["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("one"))
+        })
+        .expect("prompt");
+    assert!(
+        set_config_at < prompt_at,
+        "prompt before set_config completed"
+    );
+    let prompt = events[prompt_at]["text"].as_str().unwrap();
+    assert!(prompt.contains("early"), "{prompt}");
+}
+
+#[test]
+fn string_agent_request_ids_work_for_fs_and_permissions() {
+    let mut harness = Harness::new(
+        "team-string-id",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let fs = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template":"dev","name":"w1","task":"do [fs-string]"}),
+    );
+    assert_eq!(fs["isError"], false, "{fs}");
+    let fs_response = wait_for(
+        || {
+            harness
+                .events()
+                .into_iter()
+                .find(|event| event["event"] == "fs-string-response")
+        },
+        "the string-id fs response",
+    );
+    assert_eq!(fs_response["response"]["id"], "fs-1", "{fs_response}");
+    assert_eq!(fs_response["response"]["error"]["code"], -32601);
+    assert!(
+        !harness.team()["inbox"].as_array().is_some_and(|items| items
+            .iter()
+            .any(|item| item["kind"] == "request" && item["state"] == "open")),
+        "the fs pending entry must be removed"
+    );
+
+    let permission = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template":"dev","name":"w2","task":"do [permission-string]"}),
+    );
+    assert_eq!(permission["isError"], false, "{permission}");
+    let item = wait_for(
+        || {
+            harness.team()["inbox"]
+                .as_array()?
+                .iter()
+                .find(|item| item["kind"] == "permission")
+                .cloned()
+        },
+        "the string-id permission item",
+    );
+    let request = item["id"].as_str().unwrap().to_string();
+    let answered = harness.answer(&request, json!({"option": "allow"}));
+    assert!(answered["result"].is_object(), "{answered}");
+    let response = wait_for(
+        || {
+            harness
+                .events()
+                .into_iter()
+                .find(|event| event["event"] == "permission-string-response")
+        },
+        "the string-id permission response",
+    );
+    assert_eq!(response["response"]["id"], "perm-1", "{response}");
+    assert_eq!(
+        response["response"]["result"]["outcome"]["optionId"],
+        "allow"
+    );
+}
+
+#[test]
+fn a_held_prompt_times_out_without_cancelling_again() {
+    let mut harness = Harness::new_with_env(
+        "team-held-timeout",
+        json!({}),
+        None,
+        &[("NVIM_ADE_SERVER_HELD_TIMEOUT_MS", "300")],
+    );
+    harness.send("leader", "task", "[slow-ignore-cancel]");
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .any(|event| {
+                    event["event"] == "prompt"
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("[slow-ignore-cancel]"))
+                })
+                .then_some(())
+        },
+        "the uncancellable bus prompt",
+    );
+
+    for id in [30, 31] {
+        harness.client.notify(
+            "tunnel.send",
+            json!({
+                "instance": harness.instance,
+                "message": {
+                    "jsonrpc": "2.0", "id": id, "method": "session/prompt",
+                    "params": {"sessionId": harness.session, "prompt": [{"type":"text","text":"idle"}]},
+                },
+            }),
+        );
+        let mut answered = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let Some(frame) = harness.client.try_recv(Duration::from_millis(100)) else {
+                continue;
+            };
+            if frame["method"] == "tunnel.recv" && frame["params"]["message"]["id"] == id {
+                answered = true;
+                break;
+            }
+        }
+        assert!(answered, "held prompt {id} was not released");
+    }
+    let cancels = harness
+        .events()
+        .iter()
+        .filter(|event| event["event"] == "cancel")
+        .count();
+    assert_eq!(cancels, 1, "a timed-out hold must not cancel again");
+    std::fs::write(harness.server.dir().join("team-agent.gate"), b"go").expect("gate");
+}
+
+#[test]
+fn a_held_prompt_can_be_withdrawn_by_the_human() {
+    let mut harness = Harness::new("team-held-cancel", json!({}), None);
+    harness.send("leader", "task", "[slow-ignore-cancel]");
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .any(|event| {
+                    event["event"] == "prompt"
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("[slow-ignore-cancel]"))
+                })
+                .then_some(())
+        },
+        "the uncancellable bus prompt",
+    );
+    harness.client.notify(
+        "tunnel.send",
+        json!({
+            "instance": harness.instance,
+            "message": {
+                "jsonrpc": "2.0", "id": 40, "method": "session/prompt",
+                "params": {"sessionId": harness.session, "prompt": [{"type":"text","text":"idle"}]},
+            },
+        }),
+    );
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .any(|event| event["event"] == "cancel")
+                .then_some(())
+        },
+        "the bus cancel",
+    );
+    harness.client.notify(
+        "tunnel.send",
+        json!({
+            "instance": harness.instance,
+            "message": {"jsonrpc":"2.0","method":"$/cancel_request","params":{"id":40}},
+        }),
+    );
+    wait_for(
+        || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                let Some(frame) = harness.client.try_recv(Duration::from_millis(100)) else {
+                    continue;
+                };
+                if frame["method"] == "tunnel.recv"
+                    && frame["params"]["message"]["id"] == 40
+                    && frame["params"]["message"]["error"]["code"] == -32800
+                {
+                    return Some(());
+                }
+            }
+            None
+        },
+        "the -32800 for the withdrawn prompt",
+    );
+    assert!(
+        !harness
+            .events()
+            .iter()
+            .any(|event| event["event"] == "prompt" && event["text"] == "idle"),
+        "a withdrawn held prompt must not reach the agent"
+    );
+
+    harness.client.notify(
+        "tunnel.send",
+        json!({
+            "instance": harness.instance,
+            "message": {
+                "jsonrpc": "2.0", "id": 41, "method": "session/prompt",
+                "params": {"sessionId": harness.session, "prompt": [{"type":"text","text":"idle2"}]},
+            },
+        }),
+    );
+    harness.client.notify(
+        "tunnel.send",
+        json!({
+            "instance": harness.instance,
+            "message": {"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":harness.session}},
+        }),
+    );
+    wait_for(
+        || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                let Some(frame) = harness.client.try_recv(Duration::from_millis(100)) else {
+                    continue;
+                };
+                if frame["method"] == "tunnel.recv"
+                    && frame["params"]["message"]["id"] == 41
+                    && frame["params"]["message"]["error"]["code"] == -32800
+                {
+                    return Some(());
+                }
+            }
+            None
+        },
+        "the -32800 for the session-cancelled prompt",
+    );
+    assert!(
+        !harness
+            .events()
+            .iter()
+            .any(|event| event["event"] == "prompt" && event["text"] == "idle2"),
+        "a session-cancelled held prompt must not reach the agent"
+    );
+    std::fs::write(harness.server.dir().join("team-agent.gate"), b"go").expect("gate");
+}
+
+#[test]
+fn an_exiting_leader_fails_its_held_prompt() {
+    let mut harness = Harness::new("team-held-exit", json!({}), None);
+    harness.send("leader", "task", "[slow-ignore-cancel]");
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .any(|event| {
+                    event["event"] == "prompt"
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("[slow-ignore-cancel]"))
+                })
+                .then_some(())
+        },
+        "the uncancellable bus prompt",
+    );
+    harness.client.notify(
+        "tunnel.send",
+        json!({
+            "instance": harness.instance,
+            "message": {
+                "jsonrpc": "2.0", "id": 50, "method": "session/prompt",
+                "params": {"sessionId": harness.session, "prompt": [{"type":"text","text":"idle"}]},
+            },
+        }),
+    );
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .any(|event| event["event"] == "cancel")
+                .then_some(())
+        },
+        "the bus cancel",
+    );
+    harness.client.request(
+        107,
+        "agent.stop",
+        json!({"instance": harness.instance, "force": true}),
+    );
+    wait_for(
+        || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                let Some(frame) = harness
+                    .client
+                    .try_next_notification(Duration::from_millis(100))
+                else {
+                    continue;
+                };
+                if frame["method"] == "tunnel.recv"
+                    && frame["params"]["message"]["id"] == 50
+                    && frame["params"]["message"]["error"]["code"] == -32800
+                {
+                    return Some(());
+                }
+            }
+            None
+        },
+        "the held prompt's error when the leader exits",
+    );
+}
+
+#[test]
+fn reports_and_chunks_while_waiting_human_are_kept() {
+    let mut harness = Harness::new(
+        "team-waiting-report",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let spawn = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template":"dev","name":"w1","task":"do [ask-report-slow]"}),
+    );
+    assert_eq!(spawn["isError"], false, "{spawn}");
+    let item = wait_for(
+        || {
+            harness.team()["inbox"]
+                .as_array()?
+                .iter()
+                .find(|item| item["kind"] == "question" && item["state"] == "open")
+                .cloned()
+        },
+        "the first question",
+    );
+    harness.answer(item["id"].as_str().unwrap(), json!({"text": "yes"}));
+    std::fs::write(harness.server.dir().join("team-agent.gate"), b"go").expect("gate");
+    harness.wait_participant("w1", |entry| {
+        entry["turns"]["total"]
+            .as_u64()
+            .is_some_and(|turns| turns >= 1)
+    });
+    let messages = harness.read("leader")["messages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let reports: Vec<&Value> = messages
+        .iter()
+        .filter(|message| message["from"] == "w1" && message["kind"] == "report")
+        .collect();
+    assert!(
+        reports
+            .iter()
+            .all(|message| message["body"] != "working on it"),
+        "no fallback may be added for the waiting turn: {reports:?}"
+    );
+    assert!(
+        reports
+            .iter()
+            .any(|message| message["body"] == "report while waiting"),
+        "{reports:?}"
+    );
+
+    std::fs::remove_file(harness.server.dir().join("team-agent.gate")).ok();
+    let spawn = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template":"dev","name":"w2","task":"do [ask-chunk-slow]"}),
+    );
+    assert_eq!(spawn["isError"], false, "{spawn}");
+    let item = wait_for(
+        || {
+            harness.team()["inbox"]
+                .as_array()?
+                .iter()
+                .find(|item| item["kind"] == "question" && item["state"] == "open")
+                .cloned()
+        },
+        "the second question",
+    );
+    harness.answer(item["id"].as_str().unwrap(), json!({"text": "yes"}));
+    std::fs::write(harness.server.dir().join("team-agent.gate"), b"go").expect("gate");
+    harness.wait_participant("w2", |entry| {
+        entry["turns"]["total"]
+            .as_u64()
+            .is_some_and(|turns| turns >= 1)
+    });
+    let messages = harness.read("leader")["messages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let fallback = messages
+        .iter()
+        .find(|message| message["from"] == "w2" && message["kind"] == "report")
+        .expect("w2 fallback");
+    assert!(
+        fallback["body"]
+            .as_str()
+            .is_some_and(|body| body.contains("late chunk")),
+        "{fallback}"
+    );
+}
+
+#[test]
+fn team_close_tells_connected_participants_and_revokes_new_handshakes() {
+    let mut harness = Harness::new("team-close-token", json!({}), None);
+    let mut participant = harness.server.connect();
+    let hello = participant.hello_raw(json!({
+        "participant_token": harness.token,
+        "client": "mcp",
+        "client_version": "test",
+        "api_version": nvim_ade_server::API_VERSION,
+    }));
+    assert_eq!(hello["result"]["participant"]["role"], "leader");
+    let closed = harness
+        .client
+        .request(108, "team.close", json!({"team": harness.team}));
+    assert!(closed["result"].is_object(), "{closed}");
+    let status = participant.request(1, "bus.status", json!({}));
+    assert_eq!(status["error"]["code"], -32064, "{status}");
+    assert!(
+        status["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("team closed")),
+        "{status}"
+    );
+    let new_handshake = mcp_call(&harness.server, &harness.token, "bus_status", json!({}));
+    assert_eq!(new_handshake["isError"], true, "{new_handshake}");
+}
+
+#[test]
+fn invalid_parameter_types_and_team_errors_have_the_documented_codes() {
+    let mut harness = Harness::new(
+        "team-errors",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let cases = [
+        (
+            "team.send task",
+            json!({"team": harness.team, "to": "leader", "kind": "task", "body": "x", "task": 12}),
+            -32060,
+        ),
+        (
+            "team.send refs",
+            json!({"team": harness.team, "to": "leader", "kind": "task", "body": "x", "refs": "x"}),
+            -32060,
+        ),
+        (
+            "team.read since",
+            json!({"team": harness.team, "participant": "leader", "since": "x"}),
+            -32060,
+        ),
+        (
+            "team.answer allow",
+            json!({"request": "i1", "allow": "yes"}),
+            -32060,
+        ),
+        (
+            "team.watch replay",
+            json!({"team": harness.team, "participant": "leader", "replay": "yes"}),
+            -32060,
+        ),
+        (
+            "unknown team",
+            json!({"team": "t999", "to": "leader", "kind": "task", "body": "x"}),
+            -32064,
+        ),
+        (
+            "unknown inbox",
+            json!({"request": "i999", "text": "x"}),
+            -32063,
+        ),
+    ];
+    for (label, params, code) in cases {
+        let method = if label.starts_with("team.send") {
+            "team.send"
+        } else if label.starts_with("team.read") {
+            "team.read"
+        } else if label.starts_with("team.answer") || label == "unknown inbox" {
+            "team.answer"
+        } else if label.starts_with("team.watch") {
+            "team.watch"
+        } else {
+            "team.send"
+        };
+        let response = harness.client.request(109, method, params);
+        assert_eq!(response["error"]["code"], code, "{label}: {response}");
+    }
+    let status = mcp_call(&harness.server, &harness.token, "bus_status", json!({}));
+    assert_eq!(status["isError"], false, "{status}");
+    let value: Value = serde_json::from_str(&mcp_text(&status)).expect("status");
+    assert_eq!(value["workers_left"], 3);
+    let spawn = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template":"dev","name":"w1","task":"one"}),
+    );
+    assert_eq!(spawn["isError"], false, "{spawn}");
+    let status = mcp_call(&harness.server, &harness.token, "bus_status", json!({}));
+    let value: Value = serde_json::from_str(&mcp_text(&status)).expect("status");
+    assert_eq!(value["workers_left"], 2);
+}
+
+#[test]
+fn a_refused_spawn_sends_the_documented_notice() {
+    let mut harness = Harness::new("team-spawn-refused", json!({}), None);
+    let spawn = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template":"dev","name":"w1","task":"one"}),
+    );
+    let text = mcp_text(&spawn);
+    assert!(text.contains("awaiting_approval"), "{text}");
+    let item = harness.team()["inbox"]
+        .as_array()
+        .and_then(|items| items.first())
+        .cloned()
+        .expect("spawn item");
+    let request = item["id"].as_str().unwrap().to_string();
+    let answered = harness.answer(&request, json!({"allow": false}));
+    assert!(answered["result"].is_object(), "{answered}");
+    assert!(harness.participant("w1").is_none());
+    let messages = harness.read("leader")["messages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        messages.iter().any(|message| {
+            message["kind"] == "notice"
+                && message["body"]
+                    .as_str()
+                    .is_some_and(|body| body == format!("spawn request {request} refused"))
+        }),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn team_close_still_lets_the_person_preempt_a_running_bus_prompt() {
+    let mut harness = Harness::new("team-close-priority", json!({}), None);
+    harness.send("leader", "task", "[slow-ignore-cancel]");
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .any(|event| {
+                    event["event"] == "prompt"
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("[slow-ignore-cancel]"))
+                })
+                .then_some(())
+        },
+        "the bus prompt",
+    );
+    harness
+        .client
+        .request(110, "team.close", json!({"team": harness.team}));
+    harness.client.notify(
+        "tunnel.send",
+        json!({
+            "instance": harness.instance,
+            "message": {
+                "jsonrpc": "2.0", "id": 60, "method": "session/prompt",
+                "params": {"sessionId": harness.session, "prompt": [{"type":"text","text":"idle"}]},
+            },
+        }),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !harness
+            .events()
+            .iter()
+            .any(|event| event["event"] == "prompt" && event["text"] == "idle"),
+        "the human prompt must be held until the bus prompt is cancelled"
+    );
+    harness.client.notify(
+        "tunnel.send",
+        json!({
+            "instance": harness.instance,
+            "message": {"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":harness.session}},
+        }),
+    );
+    wait_for(
+        || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                let Some(frame) = harness.client.try_recv(Duration::from_millis(100)) else {
+                    continue;
+                };
+                if frame["method"] == "tunnel.recv"
+                    && frame["params"]["message"]["id"] == 60
+                    && frame["params"]["message"]["error"]["code"] == -32800
+                {
+                    return Some(());
+                }
+            }
+            None
+        },
+        "the withdrawn held prompt after close",
+    );
+    std::fs::write(harness.server.dir().join("team-agent.gate"), b"go").expect("gate");
 }

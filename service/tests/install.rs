@@ -1824,3 +1824,72 @@ print(vim.json.encode({
     );
     assert_eq!(value["tree_in_use"], true, "{value}");
 }
+
+#[test]
+fn install_progress_does_not_reach_participant_connections() {
+    let server = TestServer::start("participant-progress");
+    let mut owner = connect(&server);
+    let root = Root::new("participant-progress");
+    let attached = owner.request(
+        1,
+        "agent.attach",
+        json!({
+            "key": {
+                "agent": "dummy",
+                "command": "python3",
+                "args": ["-c", "import time; time.sleep(30)"],
+                "cwd": server.dir().to_string_lossy(),
+            },
+            "client_capabilities": {},
+        }),
+    );
+    let instance = attached["result"]["instance"]
+        .as_str()
+        .expect("dummy instance")
+        .to_string();
+    let leader = owner.request(
+        2,
+        "team.leader_server",
+        json!({"instance": instance, "cwd": server.dir().to_string_lossy()}),
+    );
+    let token = leader["result"]["server"]["env"][0]["value"]
+        .as_str()
+        .expect("participant token")
+        .to_string();
+    let mut participant = server.connect();
+    let hello = participant.hello_raw(json!({
+        "participant_token": token,
+        "client": "mcp",
+        "client_version": "test",
+        "api_version": nvim_ade_server::API_VERSION,
+    }));
+    assert_eq!(hello["result"]["features"], json!([]), "{hello}");
+    assert_eq!(hello["result"]["participant"]["role"], "leader");
+
+    let (response, progress) = one_request(
+        &mut owner,
+        json!(10),
+        "install.run",
+        run_params(
+            root.path(),
+            "pi",
+            "participant-progress",
+            "install",
+            "1.2.3",
+            &[],
+        ),
+    );
+    assert!(response["error"].is_null(), "{response}");
+    assert!(!progress.is_empty(), "the owner must see progress");
+    assert!(
+        participant
+            .try_next_notification(Duration::from_millis(300))
+            .is_none(),
+        "install.progress must not be sent to participant connections"
+    );
+    owner.request(
+        3,
+        "agent.stop",
+        json!({"instance": instance, "force": true}),
+    );
+}

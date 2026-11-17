@@ -191,6 +191,9 @@ impl Hub {
 
     fn team_bind_leader(&mut self, params: &Value) -> Result<Value, TeamError> {
         let instance = required_team_string(params, "instance")?;
+        if !self.instances.contains_key(&instance) {
+            return Err(TeamError::new(UNKNOWN_INSTANCE, "unknown instance"));
+        }
         let session = required_team_string(params, "sessionId")?;
         let token_id = required_team_string(params, "token_id")?;
         let entry = self.teams.bind_leader(&instance, &session, &token_id)?;
@@ -206,11 +209,11 @@ impl Hub {
                 .ok_or_else(|| TeamError::invalid("kind is required"))?,
         )?;
         let body = required_team_string(params, "body")?;
-        let task = params.get("task").and_then(Value::as_str);
+        let task = optional_string(params, "task")?;
         let refs = team_refs(params)?;
-        let id = self
-            .teams
-            .send_message(&team, "human", &to, kind, &body, task, refs)?;
+        let id =
+            self.teams
+                .send_message(&team, "human", &to, kind, &body, task.as_deref(), refs)?;
         if kind == Kind::Control && body == "cancel" {
             self.cancel_participant_turn(&team, &to);
         }
@@ -220,21 +223,15 @@ impl Hub {
     fn team_read(&mut self, params: &Value) -> Result<Value, TeamError> {
         let team = required_team_string(params, "team")?;
         let participant = required_team_string(params, "participant")?;
-        let since = params.get("since").and_then(Value::as_u64);
+        let since = optional_u64(params, "since")?;
         self.teams.read(&team, &participant, since)
     }
 
     fn team_answer(&mut self, params: &Value) -> Result<(Value, bool), TeamError> {
         let request = required_team_string(params, "request")?;
-        let text = params
-            .get("text")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let option = params
-            .get("option")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let allow = params.get("allow").and_then(Value::as_bool);
+        let text = optional_string(params, "text")?;
+        let option = optional_string(params, "option")?;
+        let allow = optional_bool(params, "allow")?;
         let before = self.teams.item_by_id(&request);
         let (effect, team) = self.teams.answer(&request, text, option, allow)?;
         let spawned = matches!(&effect, AnswerEffect::Spawn(_));
@@ -270,7 +267,13 @@ impl Hub {
     fn team_unwatch(&mut self, conn: u64, params: &Value) -> Result<Value, TeamError> {
         let team = required_team_string(params, "team")?;
         let participant = required_team_string(params, "participant")?;
+        let instance = self.teams.participant_instance(&team, &participant);
         self.teams.unwatch(&team, &participant, conn)?;
+        if let Some(instance) = instance {
+            if let Some(handle) = self.instances.get_mut(&instance) {
+                handle.relay.forget_delivered(conn);
+            }
+        }
         Ok(json!({}))
     }
 
@@ -301,10 +304,10 @@ impl Hub {
         let result = (|| -> Result<(), TeamError> {
             let team = required_team_string(params, "team")?;
             let participant = required_team_string(params, "participant")?;
-            let replay = params
-                .get("replay")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+            let replay = optional_bool(params, "replay")?.unwrap_or(false);
+            if replay && self.gates.contains_key(&conn) {
+                return Err(TeamError::invalid("a replay is already in progress"));
+            }
             let (instance, session) = self.teams.watch(&team, &participant, conn)?;
             if replay {
                 self.gates.insert(conn, Gate::new(self.limits.gate_bytes));
@@ -420,11 +423,11 @@ impl Hub {
                 .ok_or_else(|| TeamError::invalid("kind is required"))?,
         )?;
         let body = required_team_string(params, "body")?;
-        let task = params.get("task").and_then(Value::as_str);
+        let task = optional_string(params, "task")?;
         let refs = team_refs(params)?;
         let id = self
             .teams
-            .send_message(team, name, &to, kind, &body, task, refs)?;
+            .send_message(team, name, &to, kind, &body, task.as_deref(), refs)?;
         if kind == Kind::Control && body == "cancel" {
             self.cancel_participant_turn(team, &to);
         }
@@ -461,15 +464,18 @@ impl Hub {
 
     fn bus_read(&mut self, team: &str, params: &Value) -> Result<(Value, bool), TeamError> {
         let participant = required_team_string(params, "participant")?;
-        let since = params.get("since").and_then(Value::as_u64);
+        let since = optional_u64(params, "since")?;
         Ok((self.teams.read(team, &participant, since)?, false))
     }
 
     fn bus_spawn(&mut self, team: &str, params: &Value) -> Result<(Value, bool), TeamError> {
         let template = required_team_string(params, "template")?;
-        let name = params.get("name").and_then(Value::as_str);
-        let task = params.get("task").and_then(Value::as_str);
-        match self.teams.request_spawn(team, &template, name, task)? {
+        let name = optional_string(params, "name")?;
+        let task = optional_string(params, "task")?;
+        match self
+            .teams
+            .request_spawn(team, &template, name.as_deref(), task.as_deref())?
+        {
             SpawnOutcome::Started(spawn) => {
                 self.start_worker(&spawn);
                 Ok((json!({ "status": "started", "name": spawn.name }), true))
@@ -685,7 +691,7 @@ impl Hub {
                         "configId": "model",
                         "value": model,
                     });
-                    self.send_service_request(
+                    if !self.send_service_request(
                         instance,
                         "session/set_config_option",
                         params,
@@ -693,14 +699,18 @@ impl Hub {
                             team: team.clone(),
                             participant: participant.clone(),
                         },
-                    );
+                    ) {
+                        self.teams.worker_started(&team, &participant);
+                        self.team_deliveries();
+                    }
                 } else {
+                    self.teams.worker_started(&team, &participant);
                     self.team_deliveries();
                 }
                 self.drain_team_events();
             }
             ServiceCall::SetModel { team, participant } => {
-                let _ = (team, participant);
+                self.teams.worker_started(&team, &participant);
                 self.team_deliveries();
                 self.drain_team_events();
             }
@@ -716,15 +726,14 @@ impl Hub {
                     .and_then(Value::as_str)
                     == Some("cancelled");
                 let success = success && !cancelled;
-                let error = if cancelled {
-                    Some("cancelled".to_string())
-                } else {
-                    error
-                };
+                // A cancelled turn is a bad end with the documented
+                // "turn ended: cancelled" text; the error field is only for
+                // JSON-RPC errors / stopReason "error".
+                let error = if cancelled { None } else { error };
                 self.teams
                     .turn_finished(instance, success, error, String::new());
                 self.drain_team_events();
-                self.release_held_prompts(instance, &session);
+                self.release_held_prompts(instance, &session, false);
                 let _ = (team, participant, seq);
                 self.team_deliveries();
             }
@@ -743,45 +752,62 @@ impl Hub {
         }
         let requests = self.teams.take_deliveries(&busy);
         for request in requests {
+            let crate::team::DeliveryRequest {
+                team,
+                participant,
+                instance,
+                session,
+                blocks,
+                messages,
+                first_prompt,
+            } = request;
             let params = json!({
-                "sessionId": request.session,
-                "prompt": request.blocks,
+                "sessionId": session,
+                "prompt": blocks,
             });
             let Some((agent_id, frame, seq, event)) = self
                 .instances
-                .get_mut(&request.instance)
-                .map(|handle| handle.relay.service_prompt(&request.session, params))
+                .get_mut(&instance)
+                .map(|handle| handle.relay.service_prompt(&session, params))
             else {
+                self.teams
+                    .delivery_failed(&team, &participant, messages, first_prompt);
                 continue;
             };
-            if let Some(event) = event {
-                self.record_events(&request.instance, vec![event]);
-            }
-            let Some(handle) = self.instances.get_mut(&request.instance) else {
+            let Some(handle) = self.instances.get_mut(&instance) else {
+                self.teams
+                    .delivery_failed(&team, &participant, messages, first_prompt);
                 continue;
             };
             if !handle.control.send_frame(frame) {
+                // Put the messages back and leave the participant idle; no
+                // synthetic user_prompt is recorded for a send that failed.
+                self.teams
+                    .delivery_failed(&team, &participant, messages, first_prompt);
                 continue;
             }
+            if let Some(event) = event {
+                self.record_events(&instance, vec![event]);
+            }
             self.driver.insert(
-                (request.instance.clone(), agent_id),
+                (instance.clone(), agent_id),
                 ServiceCall::Prompt {
-                    team: request.team.clone(),
-                    participant: request.participant.clone(),
-                    session: request.session.clone(),
+                    team,
+                    participant,
+                    session: session.clone(),
                 },
             );
             let started = json!({
                 "jsonrpc": "2.0",
                 "method": "_ade/turn_started",
                 "params": {
-                    "sessionId": request.session,
+                    "sessionId": session,
                     "origin": "bus",
-                    "prompt": request.blocks,
+                    "prompt": blocks,
                 },
             });
-            for conn in self.delivery_conns(&request.instance) {
-                self.send_tunnel_recv(conn, &request.instance, seq, &started);
+            for conn in self.delivery_conns(&instance) {
+                self.send_tunnel_recv(conn, &instance, seq, &started);
             }
         }
         self.drain_team_events();
@@ -795,65 +821,80 @@ impl Hub {
         session: &str,
         message: &Value,
     ) -> bool {
-        let Some(team) = self.teams.team_of_instance(instance) else {
-            return false;
-        };
-        if !team.is_leader_instance(instance) {
-            return false;
-        }
+        // Any service prompt on an attached instance is a leader bus prompt;
+        // after `team.close` the team is gone but the running prompt is still
+        // cancelled/handled the same way.
         if !self.bus_prompt_active(instance, session) {
             return false;
         }
         let key = (instance.to_string(), session.to_string());
+        if self.held_timed_out.contains(&key) {
+            // The 30 s grace period already expired for this running bus
+            // prompt: forward now instead of a second cancel+hold cycle.
+            return false;
+        }
         self.held_prompts
-            .entry(key)
+            .entry(key.clone())
             .or_default()
             .push_back((conn, message.clone()));
-        if self
+        let first = self
             .held_prompts
-            .contains_key(&(instance.to_string(), session.to_string()))
-        {
-            let first = self
-                .held_prompts
-                .get(&(instance.to_string(), session.to_string()))
-                .is_some_and(|queue| queue.len() == 1);
-            if first {
-                let cancel = json!({
-                    "jsonrpc": "2.0",
-                    "method": "session/cancel",
-                    "params": { "sessionId": session },
-                });
-                if let Some(handle) = self.instances.get(instance) {
-                    handle.control.send_frame(cancel);
-                }
-                let sender = self.command_sender.clone();
-                let instance = instance.to_string();
-                let session = session.to_string();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                    let _ = sender
-                        .send(Command::TeamDeadline { instance, session })
-                        .await;
-                });
+            .get(&key)
+            .is_some_and(|queue| queue.len() == 1);
+        if first {
+            self.next_held_generation += 1;
+            let generation = self.next_held_generation;
+            self.held_generation.insert(key.clone(), generation);
+            let cancel = json!({
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": { "sessionId": session },
+            });
+            if let Some(handle) = self.instances.get(instance) {
+                handle.control.send_frame(cancel);
             }
+            let sender = self.command_sender.clone();
+            let instance = instance.to_string();
+            let session = session.to_string();
+            let timeout = std::env::var("NVIM_ADE_SERVER_HELD_TIMEOUT_MS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(30_000);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(timeout)).await;
+                let _ = sender
+                    .send(Command::TeamDeadline {
+                        instance,
+                        session,
+                        generation,
+                    })
+                    .await;
+            });
         }
         true
     }
 
-    pub(crate) fn team_deadline(&mut self, instance: &str, session: &str) {
-        if self
-            .held_prompts
-            .contains_key(&(instance.to_string(), session.to_string()))
-        {
-            self.release_held_prompts(instance, session);
+    pub(crate) fn team_deadline(&mut self, instance: &str, session: &str, generation: u64) {
+        let key = (instance.to_string(), session.to_string());
+        if self.held_generation.get(&key) != Some(&generation) {
+            return;
         }
+        if !self.bus_prompt_active(instance, session) {
+            return;
+        }
+        self.held_timed_out.insert(key);
+        self.release_held_prompts(instance, session, true);
     }
 
-    fn release_held_prompts(&mut self, instance: &str, session: &str) {
-        let Some(queue) = self
-            .held_prompts
-            .remove(&(instance.to_string(), session.to_string()))
-        else {
+    fn release_held_prompts(&mut self, instance: &str, session: &str, timed_out: bool) {
+        let key = (instance.to_string(), session.to_string());
+        self.held_generation.remove(&key);
+        if !timed_out {
+            // The bus prompt answered normally: a later bus turn may cancel
+            // and hold again with a fresh generation.
+            self.held_timed_out.remove(&key);
+        }
+        let Some(queue) = self.held_prompts.remove(&key) else {
             return;
         };
         for (conn, message) in queue {
@@ -862,6 +903,89 @@ impl Hub {
             }
             let params = json!({ "instance": instance, "message": message });
             self.tunnel_send_inner(conn, &params, false);
+        }
+    }
+
+    fn send_held_error(&mut self, conn: u64, instance: &str, message: &Value) {
+        let seq = self
+            .instances
+            .get_mut(instance)
+            .map(|handle| handle.relay.allocate_seq())
+            .unwrap_or(0);
+        let id = message.get("id").cloned().unwrap_or(Value::Null);
+        self.send_tunnel_recv(
+            conn,
+            instance,
+            seq,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32800, "message": "request cancelled" },
+            }),
+        );
+    }
+
+    pub(crate) fn cancel_held_target(&mut self, conn: u64, instance: &str, target: &Value) -> bool {
+        let mut removed = Vec::new();
+        for (key, queue) in self.held_prompts.iter_mut() {
+            if key.0 != instance {
+                continue;
+            }
+            if let Some(position) = queue
+                .iter()
+                .position(|(owner, message)| *owner == conn && message.get("id") == Some(target))
+            {
+                removed.push(queue.remove(position).expect("position"));
+            }
+        }
+        let empty: Vec<(String, String)> = self
+            .held_prompts
+            .iter()
+            .filter(|(_, queue)| queue.is_empty())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in empty {
+            self.held_prompts.remove(&key);
+            self.held_generation.remove(&key);
+        }
+        let found = !removed.is_empty();
+        for (owner, message) in removed {
+            self.send_held_error(owner, instance, &message);
+        }
+        found
+    }
+
+    pub(crate) fn cancel_held_session(&mut self, instance: &str, session: &str) {
+        let key = (instance.to_string(), session.to_string());
+        let Some(queue) = self.held_prompts.remove(&key) else {
+            return;
+        };
+        self.held_generation.remove(&key);
+        for (conn, message) in queue {
+            if self.conns.contains_key(&conn) {
+                self.send_held_error(conn, instance, &message);
+            }
+        }
+    }
+
+    pub(crate) fn fail_held_prompts(&mut self, instance: &str) {
+        let keys: Vec<(String, String)> = self
+            .held_prompts
+            .keys()
+            .filter(|key| key.0 == instance)
+            .cloned()
+            .collect();
+        for key in keys {
+            self.held_generation.remove(&key);
+            self.held_timed_out.remove(&key);
+            let Some(queue) = self.held_prompts.remove(&key) else {
+                continue;
+            };
+            for (conn, message) in queue {
+                if self.conns.contains_key(&conn) {
+                    self.send_held_error(conn, instance, &message);
+                }
+            }
         }
     }
 
@@ -994,14 +1118,19 @@ impl Hub {
     // -- helpers -----------------------------------------------------------
 
     pub(crate) fn delivery_conns(&self, instance: &str) -> Vec<u64> {
-        let mut conns = self
-            .instances
-            .get(instance)
-            .map(|handle| handle.attached.clone())
-            .unwrap_or_default();
-        conns.extend(self.teams.watcher_conns(instance));
-        conns.sort_unstable();
-        conns.dedup();
+        let Some(handle) = self.instances.get(instance) else {
+            return Vec::new();
+        };
+        // `attached` is in attach order; its last element is the primary
+        // (PROTOCOL.md 5.3). Watchers follow it and do not change that order.
+        let mut conns = handle.attached.clone();
+        if self.teams.membership(instance).is_some() {
+            for watcher in self.teams.watcher_conns(instance) {
+                if !conns.contains(&watcher) {
+                    conns.push(watcher);
+                }
+            }
+        }
         conns
     }
 
@@ -1009,11 +1138,11 @@ impl Hub {
         self.teams.watches(conn, instance)
     }
 
-    fn answer_pending(&mut self, instance: &str, agent_id: u64, result: Value) {
+    fn answer_pending(&mut self, instance: &str, agent_id: Value, result: Value) {
         let retractions = self
             .instances
             .get_mut(instance)
-            .map(|handle| handle.relay.answer_pending(agent_id))
+            .map(|handle| handle.relay.answer_pending(&agent_id))
             .unwrap_or_default();
         for retraction in retractions {
             self.send_cancel_request(instance, &retraction);
@@ -1044,7 +1173,7 @@ impl Hub {
         );
     }
 
-    fn send_to_frontends(&self, value: &Value) {
+    pub(crate) fn send_to_frontends(&self, value: &Value) {
         let conns: Vec<u64> = self
             .frontend_conns
             .iter()
@@ -1104,6 +1233,36 @@ fn required_team_string(params: &Value, field: &str) -> Result<String, TeamError
         .ok_or_else(|| TeamError::new(INVALID_TEAM_PARAM, format!("{field} must be a string")))
 }
 
+fn optional_string(params: &Value, field: &str) -> Result<Option<String>, TeamError> {
+    match params.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(|value| Some(value.to_string()))
+            .ok_or_else(|| TeamError::invalid(format!("{field} must be a string"))),
+    }
+}
+
+fn optional_u64(params: &Value, field: &str) -> Result<Option<u64>, TeamError> {
+    match params.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| TeamError::invalid(format!("{field} must be a non-negative integer"))),
+    }
+}
+
+fn optional_bool(params: &Value, field: &str) -> Result<Option<bool>, TeamError> {
+    match params.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| TeamError::invalid(format!("{field} must be a boolean"))),
+    }
+}
+
 fn team_refs(params: &Value) -> Result<Vec<String>, TeamError> {
     match params.get("refs") {
         None | Some(Value::Null) => Ok(Vec::new()),
@@ -1145,7 +1304,7 @@ fn turn_outcome(message: &Value) -> (bool, Option<String>) {
         .and_then(Value::as_str)
     {
         Some("end_turn") | None => (true, None),
-        Some("cancelled") => (false, Some("cancelled".to_string())),
+        Some("cancelled") => (false, None),
         Some("error") => {
             let message = message
                 .get("result")
@@ -1154,7 +1313,10 @@ fn turn_outcome(message: &Value) -> (bool, Option<String>) {
                 .unwrap_or_else(|| "error".to_string());
             (false, Some(message))
         }
-        Some(other) => (false, Some(other.to_string())),
+        // max_tokens, max_turn_requests, refusal, ... are normal ends for the
+        // team layer: count the turn and run the report fallback, but do not
+        // send a bad-turn notice (18.11 only cancelled/error are bad).
+        Some(_) => (true, None),
     }
 }
 

@@ -65,10 +65,11 @@ def error(ident, message):
     send({"jsonrpc": "2.0", "id": ident, "error": {"code": -32603, "message": message}})
 
 
-def request_client(method, params, timeout=20):
+def request_client(method, params, timeout=20, ident=None):
     with LOCK:
-        NEXT_ID[0] += 1
-        ident = NEXT_ID[0]
+        if ident is None:
+            NEXT_ID[0] += 1
+            ident = NEXT_ID[0]
         slot = {"event": threading.Event(), "response": None}
         PENDING[ident] = slot
     send({"jsonrpc": "2.0", "id": ident, "method": method, "params": params})
@@ -81,6 +82,16 @@ def wait_gate(timeout=20):
         return
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline and not CANCEL.is_set():
+        if os.path.exists(GATE):
+            return
+        time.sleep(0.02)
+
+
+def wait_gate_ignore_cancel(timeout=20):
+    if not GATE:
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         if os.path.exists(GATE):
             return
         time.sleep(0.02)
@@ -190,6 +201,11 @@ def run_prompt(ident, text, session):
         },
     })
     try:
+        if 'kind="answer"' in text:
+            response = mcp_call(session, "bus_send", {"to": "leader", "kind": "report", "body": "answer report"})
+            log({"event": "answer-report-response", "response": response})
+            result(ident, {"stopReason": "end_turn"})
+            return
         if text.startswith("spawn"):
             response = mcp_call(session, "team_spawn", {"template": TEMPLATE, **({"name": NAME} if NAME else {}), "task": "do [report]"})
             log({"event": "spawn-response", "response": response})
@@ -202,6 +218,54 @@ def run_prompt(ident, text, session):
         elif "[read-tool]" in text:
             response = mcp_call(session, "bus_read", {"participant": "leader"})
             log({"event": "read-tool-response", "response": response})
+        elif "[cancelled]" in text:
+            result(ident, {"stopReason": "cancelled"})
+        elif "[error]" in text:
+            error(ident, "boom")
+        elif "[max-tokens]" in text:
+            result(ident, {"stopReason": "max_tokens"})
+        elif "[permission-string]" in text:
+            response = request_client(
+                "session/request_permission",
+                {
+                    "sessionId": session,
+                    "toolCall": {"toolCallId": "perm", "kind": "edit", "title": "Edit file"},
+                    "options": [
+                        {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "reject", "name": "Reject", "kind": "reject_once"},
+                    ],
+                },
+                ident="perm-1",
+            )
+            log({"event": "permission-string-response", "response": response})
+        elif "[fs-string]" in text:
+            response = request_client(
+                "fs/read_text_file",
+                {"sessionId": session, "path": "/etc/hostname"},
+                ident="fs-1",
+            )
+            log({"event": "fs-string-response", "response": response})
+        elif "[ask-report-slow]" in text:
+            response = mcp_call(session, "bus_ask_human", {"question": "worker needs input", "options": ["yes", "no"]})
+            log({"event": "ask-response", "response": response})
+            report = mcp_call(session, "bus_send", {"to": "leader", "kind": "report", "body": "report while waiting"})
+            log({"event": "report-response", "response": report})
+            wait_gate()
+        elif "[ask-chunk-slow]" in text:
+            response = mcp_call(session, "bus_ask_human", {"question": "worker needs input", "options": ["yes", "no"]})
+            log({"event": "ask-response", "response": response})
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "late chunk"},
+                    },
+                },
+            })
+            wait_gate()
         elif "[ask-slow]" in text:
             response = mcp_call(session, "bus_ask_human", {"question": "worker needs input", "options": ["yes", "no"]})
             log({"event": "ask-response", "response": response})
@@ -228,6 +292,8 @@ def run_prompt(ident, text, session):
         elif "[fs]" in text:
             response = request_client("fs/read_text_file", {"sessionId": session, "path": "/etc/hostname"})
             log({"event": "fs-response", "response": response})
+        elif "[slow-ignore-cancel]" in text:
+            wait_gate_ignore_cancel()
         elif "[slow]" in text:
             wait_gate()
         elif "[cancel]" in text:
@@ -315,6 +381,9 @@ def main():
             log({"event": "cancel", "session": params.get("sessionId")})
         elif method == "session/set_config_option":
             log({"event": "set_config", "params": params})
+            delay = float(os.environ.get("TEAM_AGENT_SET_CONFIG_DELAY", "0") or "0")
+            if delay > 0:
+                time.sleep(delay)
             result(ident, {"configOptions": [{"id": "model", "currentValue": params.get("value")}]})
         else:
             if ident is not None:

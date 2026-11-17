@@ -1061,7 +1061,10 @@ consumed by the team layer and never forwarded. Requests a worker's agent sends:
 `nvim_ade_server mcp` reads `ADE_TEAM_TOKEN` from its environment, connects to
 the service socket and sends `hello {participant_token, api_version}`. Such a
 connection may call only `bus.*` (anything else `-32065`); `features` in its
-`hello` result is empty. The role (leader or worker) comes from the token,
+`hello` result is empty. The result also carries
+`participant {token_id, role, name, team}` (name/team are null before
+`team.bind_leader`) so the MCP server can filter `tools/list` before the token is
+bound. The role (leader or worker) comes from the token,
 never from parameters. When the socket closes the `mcp` process answers
 further tool calls with an error and exits once stdin closes; it does not
 reconnect.
@@ -1214,8 +1217,10 @@ name for `team_spawn` takes the lowest free `w<n>`.
 
 **`team.close`**: the team stops accepting `bus.*` (`"team closed"`), open
 `spawn` items become `orphaned`, workers are stopped, messages queued for the
-leader are dropped, then the last `team.changed`. The leader's session and
-instance are left alone. `team.bind_leader` for an existing team with a
+leader are dropped, then the last `team.changed`. The stop of each worker is
+initiated before that notification; the command does not wait for the processes
+to exit, and the team is gone from `team.list` afterwards. The leader's session
+and instance are left alone. `team.bind_leader` for an existing team with a
 different session is `-32061`: to change the leader, close the team.
 
 **Watchers.** For a worker instance the watchers play the role of the attached

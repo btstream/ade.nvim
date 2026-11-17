@@ -164,6 +164,14 @@ impl Mcp {
                 }));
                 continue;
             };
+            if message.is_array() {
+                self.write(&json!({
+                    "jsonrpc": "2.0",
+                    "id": Value::Null,
+                    "error": { "code": -32600, "message": "batch requests are not supported" },
+                }));
+                continue;
+            }
             self.handle(message);
         }
     }

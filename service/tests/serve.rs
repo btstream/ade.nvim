@@ -57,6 +57,12 @@ fn mcp_serves_stdio_and_reports_a_missing_token() {
             json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"bus_status","arguments":{}}})
         )
         .expect("tools/call");
+        writeln!(
+            stdin,
+            "{}",
+            json!([{"jsonrpc":"2.0","id":3,"method":"ping"}])
+        )
+        .expect("batch");
     }
     drop(child.stdin.take());
     let output = child.wait_with_output().expect("mcp exits on stdin EOF");
@@ -72,6 +78,11 @@ fn mcp_serves_stdio_and_reports_a_missing_token() {
             .any(|value| value["result"]["serverInfo"]["name"] == "nvim_ade_server"),
         "initialize: {stdout}"
     );
+    let batch = values
+        .iter()
+        .find(|value| value["error"]["code"] == -32600)
+        .expect("batch error");
+    assert_eq!(batch["id"], serde_json::Value::Null);
     let tool = values
         .iter()
         .find(|value| value["id"] == 2)
@@ -628,5 +639,10 @@ fn features_follow_the_event_log_flag() {
     assert_eq!(
         hello["result"]["features"],
         json!(nvim_ade_server::protocol::features(false))
+    );
+    let team = client.request(2, "team.configure", json!({}));
+    assert_eq!(
+        team["error"]["code"], -32601,
+        "team.* must not exist without the event log: {team}"
     );
 }

@@ -666,6 +666,14 @@ impl Relay {
         })
     }
 
+    /// Drop a connection from the delivered sets of pending requests (an
+    /// unwatched or closed watcher must not receive later retractions).
+    pub fn forget_delivered(&mut self, conn: ConnId) {
+        for pending in &mut self.pending {
+            pending.delivered.retain(|delivered| *delivered != conn);
+        }
+    }
+
     /// Drop `conn` from every session it adopted (its connection closed).
     pub fn forget_adopter(&mut self, conn: ConnId) {
         for adopters in self.adopters.values_mut() {
@@ -860,8 +868,8 @@ impl Relay {
     /// Answer a pending agent request from the team layer (18.5/18.11): the
     /// item is gone, every watcher that received it is told to retract it, and
     /// the caller sends the response frame itself.
-    pub fn answer_pending(&mut self, agent_id: u64) -> Vec<Retracted> {
-        let key = id_key(&json!(agent_id));
+    pub fn answer_pending(&mut self, agent_id: &Value) -> Vec<Retracted> {
+        let key = id_key(agent_id);
         let retractions = self.retractions_except(&key, u64::MAX);
         self.remove_pending(&key);
         retractions

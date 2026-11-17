@@ -8,7 +8,6 @@
 pub mod mcp;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
@@ -240,7 +239,7 @@ pub struct InboxItem {
     pub scope: Option<String>,
     pub limit_task: Option<String>,
     /// The agent-side request id, for permission/request items. Never exposed.
-    pub agent_id: Option<u64>,
+    pub agent_id: Option<Value>,
 }
 
 impl InboxItem {
@@ -477,28 +476,43 @@ pub struct ParticipantAuth {
     pub name: Option<String>,
 }
 
-pub type SharedTokens = Arc<Mutex<HashMap<u64, ParticipantAuth>>>;
+pub type TokenHash = [u8; 32];
+pub type SharedTokens = Arc<Mutex<HashMap<TokenHash, ParticipantAuth>>>;
 
 pub fn new_shared_tokens() -> SharedTokens {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-/// A token is kept only as a hash. The service never needs to look at it again
-/// after writing it into the agent's environment.
-pub fn hash_token(token: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    token.hash(&mut hasher);
-    hasher.finish()
+/// A token is kept only as a SHA-256 hash. The service never needs to look at
+/// it again after writing it into the agent's environment.
+pub fn hash_token(token: &str) -> TokenHash {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hasher.finalize().into()
+}
+
+fn hashes_match(left: &TokenHash, right: &TokenHash) -> bool {
+    let mut differing = 0u8;
+    for (left, right) in left.iter().zip(right) {
+        differing |= left ^ right;
+    }
+    differing == 0
 }
 
 pub fn authenticate(tokens: &SharedTokens, token: &str) -> Option<ParticipantAuth> {
-    let hash = hash_token(token);
-    tokens.lock().ok()?.get(&hash).cloned()
+    let candidate = hash_token(token);
+    let map = tokens.lock().ok()?;
+    // Hash-map lookup would compare keys with an early exit; iterate and
+    // compare in constant time instead. The table is tiny (tokens per team).
+    map.iter()
+        .find(|(hash, _)| hashes_match(hash, &candidate))
+        .map(|(_, auth)| auth.clone())
 }
 
 #[derive(Debug)]
 struct TokenRecord {
-    hash: u64,
+    hash: TokenHash,
     role: Role,
     team: Option<String>,
     name: Option<String>,
@@ -514,6 +528,9 @@ pub struct DeliveryRequest {
     pub instance: String,
     pub session: String,
     pub blocks: Vec<Value>,
+    /// Consumed messages, so a failed send can put them back at the front.
+    pub messages: Vec<Message>,
+    pub first_prompt: bool,
 }
 
 #[derive(Debug)]
@@ -542,12 +559,12 @@ pub enum AnswerEffect {
     Spawn(SpawnRequest),
     Permission {
         instance: String,
-        agent_id: u64,
+        agent_id: Value,
         response: Value,
     },
     Request {
         instance: String,
-        agent_id: u64,
+        agent_id: Value,
         result: Value,
     },
     Ack,
@@ -559,6 +576,9 @@ pub struct Teams {
     configs: HashMap<String, TeamConfig>,
     teams: HashMap<String, Team>,
     by_cwd: HashMap<String, String>,
+    /// instance -> (team id, participant name); O(1) membership for every agent
+    /// frame instead of scanning all teams.
+    by_instance: HashMap<String, (String, String)>,
     next_team: u64,
     next_token: u64,
     next_inbox: u64,
@@ -574,6 +594,7 @@ impl Teams {
             configs: HashMap::new(),
             teams: HashMap::new(),
             by_cwd: HashMap::new(),
+            by_instance: HashMap::new(),
             next_team: 0,
             next_token: 0,
             next_inbox: 0,
@@ -607,22 +628,12 @@ impl Teams {
     }
 
     pub fn membership(&self, instance: &str) -> Option<(String, String)> {
-        for team in self.teams.values() {
-            if team.leader_instance.as_deref() == Some(instance) {
-                return Some((team.id.clone(), "leader".to_string()));
-            }
-            if let Some(name) = team.is_worker_instance(instance) {
-                return Some((team.id.clone(), name.to_string()));
-            }
-        }
-        None
+        self.by_instance.get(instance).cloned()
     }
 
     pub fn team_of_instance(&self, instance: &str) -> Option<&Team> {
-        self.teams.values().find(|team| {
-            team.leader_instance.as_deref() == Some(instance)
-                || team.is_worker_instance(instance).is_some()
-        })
+        let (team, _) = self.by_instance.get(instance)?;
+        self.teams.get(team)
     }
 
     pub fn drain_events(&mut self) -> Vec<TeamEvent> {
@@ -722,6 +733,20 @@ impl Teams {
     fn revoke(&mut self, token_id: &str) {
         if let Some(record) = self.token_records.remove(token_id) {
             if let Ok(mut map) = self.tokens.lock() {
+                map.remove(&record.hash);
+            }
+        }
+    }
+
+    /// Stop new participant handshakes for a closed team but keep the token
+    /// records so an already-connected participant gets "team closed" (18.11).
+    fn revoke_team_hashes(&mut self, team: &str) {
+        if let Ok(mut map) = self.tokens.lock() {
+            for record in self
+                .token_records
+                .values()
+                .filter(|record| record.team.as_deref() == Some(team))
+            {
                 map.remove(&record.hash);
             }
         }
@@ -848,6 +873,8 @@ impl Teams {
         team.participants.insert("leader".to_string(), leader);
         let entry = team_entry(&team);
         self.by_cwd.insert(cwd, id.clone());
+        self.by_instance
+            .insert(instance.to_string(), (id.clone(), "leader".to_string()));
         self.teams.insert(id.clone(), team);
         if let Some(record) = self.token_records.get_mut(token_id) {
             record.bound = true;
@@ -898,12 +925,18 @@ impl Teams {
         let mut entry = team_entry(team);
         entry["state"] = json!("closed");
         let id = team.id.clone();
+        for participant in team.participants.values() {
+            if let Some(instance) = &participant.instance {
+                self.by_instance.remove(instance);
+            }
+        }
         self.teams.remove(&id);
         self.by_cwd.retain(|_, value| *value != id);
         // Keep the token records so a participant connection gets the
         // documented "team closed" answer instead of "unknown token"; the
         // worker instances are stopped and revoke their own tokens on exit.
         self.closed_teams.insert(id.clone());
+        self.revoke_team_hashes(&id);
         for item in orphaned {
             self.events.push(TeamEvent::InboxJson(item));
         }
@@ -986,9 +1019,7 @@ impl Teams {
         }
         if kind == Kind::Report && from != "human" {
             if let Some(participant) = team.participants.get_mut(from) {
-                if participant.turn_sender.as_deref() == Some(to)
-                    && participant.state == ParticipantState::Working
-                {
+                if participant.turn_sender.as_deref() == Some(to) && participant.bus_turn {
                     participant.reported = true;
                 }
             }
@@ -1000,6 +1031,10 @@ impl Teams {
                     if let Some(target) = team.participants.get_mut(to) {
                         target.paused = body == "pause";
                         target.paused_by_limit = false;
+                        if body == "resume" {
+                            team.task_limit_hit.retain(|(name, _)| name != to);
+                            team.total_limit_hit = false;
+                        }
                     }
                     let team_id = team.id.clone();
                     self.events.push(TeamEvent::Changed(team_id));
@@ -1094,7 +1129,7 @@ impl Teams {
         permission: bool,
     ) -> Option<String> {
         let id = self.next_inbox_id();
-        let agent_id = message.get("id").and_then(Value::as_u64);
+        let agent_id = message.get("id").cloned();
         let params = message.get("params").cloned().unwrap_or(Value::Null);
         let tool_call = params.get("toolCall").cloned().unwrap_or(Value::Null);
         let options = params.get("options").cloned().unwrap_or_else(|| json!([]));
@@ -1113,6 +1148,9 @@ impl Teams {
         } else {
             method.clone()
         };
+        let pending_key = agent_id
+            .as_ref()
+            .map(|id| (instance.to_string(), crate::relay::id_key(id)));
         let item = InboxItem {
             id: id.clone(),
             team: team_id.to_string(),
@@ -1142,11 +1180,8 @@ impl Teams {
             agent_id,
         };
         let team = self.teams.get_mut(team_id)?;
-        if let Some(agent_id) = agent_id {
-            team.pending_items.insert(
-                (instance.to_string(), crate::relay::id_key(&json!(agent_id))),
-                id.clone(),
-            );
+        if let Some(key) = pending_key {
+            team.pending_items.insert(key, id.clone());
         }
         team.inbox.push(item);
         self.events
@@ -1415,12 +1450,64 @@ impl Teams {
                 participant.instance = Some(instance.to_string());
             }
         }
+        self.by_instance.insert(
+            instance.to_string(),
+            (team_id.to_string(), name.to_string()),
+        );
     }
 
     pub fn worker_session_set(&mut self, team_id: &str, name: &str, session: &str) {
         if let Some(team) = self.teams.get_mut(team_id) {
             if let Some(participant) = team.participants.get_mut(name) {
                 participant.session = Some(session.to_string());
+            }
+            self.events.push(TeamEvent::Changed(team_id.to_string()));
+        }
+    }
+
+    /// A front-end prompt on a team member starts/ends; this is only the
+    /// visible state (deliveries already use the relay's turn count).
+    pub fn frontend_prompt_started(&mut self, instance: &str) {
+        let Some((team_id, name)) = self.by_instance.get(instance).cloned() else {
+            return;
+        };
+        if let Some(team) = self.teams.get_mut(&team_id) {
+            if let Some(participant) = team.participants.get_mut(&name) {
+                if participant.state != ParticipantState::Exited {
+                    participant.state = ParticipantState::Working;
+                }
+            }
+            self.events.push(TeamEvent::Changed(team_id));
+        }
+    }
+
+    pub fn frontend_prompt_finished(&mut self, instance: &str) {
+        let Some((team_id, name)) = self.by_instance.get(instance).cloned() else {
+            return;
+        };
+        let Some(team) = self.teams.get_mut(&team_id) else {
+            return;
+        };
+        let waiting = team.inbox.iter().any(|item| {
+            item.kind == ItemKind::Question && item.from == name && item.state == ItemState::Open
+        });
+        if let Some(participant) = team.participants.get_mut(&name) {
+            if participant.state != ParticipantState::Exited {
+                participant.state = if waiting {
+                    ParticipantState::WaitingHuman
+                } else {
+                    ParticipantState::Idle
+                };
+            }
+        }
+        self.events.push(TeamEvent::Changed(team_id));
+    }
+
+    /// The worker's session and optional model configuration are ready; only
+    /// now may the first prompt be delivered (18.3).
+    pub fn worker_started(&mut self, team_id: &str, name: &str) {
+        if let Some(team) = self.teams.get_mut(team_id) {
+            if let Some(participant) = team.participants.get_mut(name) {
                 participant.starting = false;
             }
             self.events.push(TeamEvent::Changed(team_id.to_string()));
@@ -1537,6 +1624,7 @@ impl Teams {
         if blocks.is_empty() || (taken.is_empty() && !participant.first_prompt) {
             return None;
         }
+        let first_prompt = participant.first_prompt;
         participant.first_prompt = false;
         participant.state = ParticipantState::Working;
         participant.bus_turn = true;
@@ -1553,7 +1641,34 @@ impl Teams {
             instance,
             session,
             blocks,
+            messages: taken,
+            first_prompt,
         })
+    }
+
+    /// The prompt could not be sent. Put the consumed messages back in front
+    /// and leave the participant ready for the next delivery.
+    pub fn delivery_failed(
+        &mut self,
+        team_id: &str,
+        name: &str,
+        messages: Vec<Message>,
+        first_prompt: bool,
+    ) {
+        let Some(team) = self.teams.get_mut(team_id) else {
+            return;
+        };
+        let Some(participant) = team.participants.get_mut(name) else {
+            return;
+        };
+        for message in messages.into_iter().rev() {
+            participant.mailbox.push_front(message);
+        }
+        participant.first_prompt |= first_prompt;
+        participant.state = ParticipantState::Idle;
+        participant.bus_turn = false;
+        participant.reported = false;
+        self.events.push(TeamEvent::Changed(team_id.to_string()));
     }
 
     pub fn observe_chunk(&mut self, instance: &str, session: Option<&str>, text: &str) {
@@ -1573,7 +1688,7 @@ impl Teams {
         if session.is_some_and(|session| participant.session.as_deref() != Some(session)) {
             return;
         }
-        if participant.state == ParticipantState::Working {
+        if participant.bus_turn {
             participant.turn_text.push_str(text);
         }
     }
@@ -1678,7 +1793,7 @@ impl Teams {
             .get(&(name.clone(), task.clone()))
             .unwrap_or(&0);
         let mut task_limit = false;
-        if task_count >= per_task_limit {
+        if role == Role::Worker && task_count >= per_task_limit {
             if let Some(participant) = team.participants.get_mut(&name) {
                 if !participant.paused {
                     participant.paused = true;
@@ -1818,20 +1933,28 @@ impl Teams {
         let kind = item.kind.clone();
         let from = item.from.clone();
         let item_id = item.id.clone();
-        let agent_id = item.agent_id;
+        let still_waiting = team.inbox.iter().any(|other| {
+            other.id != item_id
+                && other.kind == ItemKind::Question
+                && other.from == from
+                && other.state == ItemState::Open
+        });
+        let agent_id = item.agent_id.clone();
         let answer_message_id = team.next_message();
 
         let effect = match kind {
             ItemKind::Question => {
-                let answer = text.unwrap_or_default();
+                let answer = text.or(option).unwrap_or_default();
                 validate_body(&answer)?;
                 if let Some(participant) = team.participants.get_mut(&from) {
-                    participant.state = if participant.bus_turn {
+                    participant.state = if still_waiting {
+                        ParticipantState::WaitingHuman
+                    } else if participant.bus_turn {
                         ParticipantState::Working
                     } else {
                         ParticipantState::Idle
                     };
-                    participant.mailbox.push_front(Message {
+                    let message = Message {
                         id: answer_message_id,
                         from: "human".to_string(),
                         to: from.clone(),
@@ -1840,7 +1963,9 @@ impl Teams {
                         body: answer,
                         refs: vec![],
                         at: now_ms(),
-                    });
+                    };
+                    team.messages.push(message.clone());
+                    participant.mailbox.push_front(message);
                 }
                 AnswerEffect::Question
             }
@@ -1887,13 +2012,16 @@ impl Teams {
                     .map_err(|_| TeamError::invalid("text must be a JSON result"))?;
                 AnswerEffect::Request {
                     instance: item.instance.clone().unwrap_or_default(),
-                    agent_id: agent_id.ok_or_else(|| TeamError::unknown("no pending request"))?,
+                    agent_id: agent_id
+                        .clone()
+                        .ok_or_else(|| TeamError::unknown("no pending request"))?,
                     result,
                 }
             }
             ItemKind::Message | ItemKind::Limit => AnswerEffect::Ack,
         };
         team.inbox[position].state = ItemState::Answered;
+        team.pending_items.retain(|_, pending| pending != &item_id);
         self.events.push(TeamEvent::Inbox(team_id.clone(), item_id));
         self.events.push(TeamEvent::Changed(team_id.clone()));
         Ok((effect, team_id))
@@ -2003,22 +2131,14 @@ impl Teams {
     }
 
     pub fn watcher_conns(&self, instance: &str) -> Vec<u64> {
-        let mut out = Vec::new();
-        for team in self.teams.values() {
-            for (name, watchers) in &team.watchers {
-                if team
-                    .participants
-                    .get(name)
-                    .and_then(|participant| participant.instance.as_deref())
-                    == Some(instance)
-                {
-                    out.extend(watchers.iter().copied());
-                }
-            }
-        }
-        out.sort_unstable();
-        out.dedup();
-        out
+        let Some((team_id, name)) = self.by_instance.get(instance) else {
+            return Vec::new();
+        };
+        self.teams
+            .get(team_id)
+            .and_then(|team| team.watchers.get(name))
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn participant_instance(&self, team_id: &str, name: &str) -> Option<String> {
@@ -2044,6 +2164,7 @@ impl Teams {
         let Some(participant) = team.participants.get_mut(&name) else {
             return;
         };
+        self.by_instance.remove(instance);
         if participant.state == ParticipantState::Exited {
             return;
         }
@@ -2115,6 +2236,7 @@ impl Teams {
             leader.reason = Some(reason.to_string());
         }
         let team_id = team.id.clone();
+        self.by_instance.remove(instance);
         self.revoke_instance_unbound(instance);
         if let Some(leader) = self.teams.get_mut(&team_id) {
             let items: Vec<String> = leader
@@ -2148,6 +2270,21 @@ impl Teams {
             leader.reason = Some("session closed".to_string());
         }
         let team_id = team.id.clone();
+        let orphaned: Vec<String> = team
+            .inbox
+            .iter()
+            .filter(|item| item.state == ItemState::Open && item.from == "leader")
+            .map(|item| item.id.clone())
+            .collect();
+        for item in &mut team.inbox {
+            if orphaned.contains(&item.id) {
+                item.state = ItemState::Orphaned;
+            }
+        }
+        for item in orphaned {
+            self.events.push(TeamEvent::Inbox(team_id.clone(), item));
+        }
+        self.revoke_instance_tokens(instance);
         self.events.push(TeamEvent::Changed(team_id));
     }
 
@@ -2191,7 +2328,7 @@ fn spawn_participant(
     if let Some(task) = task {
         validate_body(task)?;
         let id = team.next_message();
-        participant.mailbox.push_back(Message {
+        let message = Message {
             id,
             from: "leader".to_string(),
             to: name.to_string(),
@@ -2200,7 +2337,9 @@ fn spawn_participant(
             body: task.to_string(),
             refs: Vec::new(),
             at: now_ms(),
-        });
+        };
+        team.messages.push(message.clone());
+        participant.mailbox.push_back(message);
     }
     team.participants.insert(name.to_string(), participant);
     team.reserved_names.remove(name);
@@ -2628,6 +2767,7 @@ mod tests {
         let instance = format!("{name}-i");
         teams.worker_instance_set(team, name, &instance);
         teams.worker_session_set(team, name, &format!("{name}-s"));
+        teams.worker_started(team, name);
         instance
     }
 
@@ -2813,6 +2953,58 @@ mod tests {
     }
 
     #[test]
+    fn a_report_while_waiting_human_marks_the_turn_reported() {
+        let (mut teams, team) = fixture(json!({}));
+        add_worker(&mut teams, &team, "w1");
+        teams
+            .send_message(&team, "leader", "w1", Kind::Task, "do", Some("T1"), vec![])
+            .unwrap();
+        deliver(&mut teams, &team, "w1");
+        teams.ask_human(&team, "w1", "q?", None).unwrap();
+        teams
+            .send_message(&team, "w1", "leader", Kind::Report, "report", None, vec![])
+            .unwrap();
+        let participant = &teams.team(&team).unwrap().participants["w1"];
+        assert!(
+            participant.reported,
+            "report while waiting_human must set reported"
+        );
+    }
+
+    #[test]
+    fn a_resumed_total_limit_pauses_again_on_the_next_turn() {
+        let (mut teams, team) = fixture(json!({"limits": {"max_turns_total": 1}}));
+        add_worker(&mut teams, &team, "w1");
+        teams
+            .send_message(&team, "leader", "w1", Kind::Task, "one", Some("T1"), vec![])
+            .unwrap();
+        deliver(&mut teams, &team, "w1");
+        teams.turn_finished("w1-i", true, None, String::new());
+        assert!(teams.team(&team).unwrap().participants["leader"].paused);
+        teams
+            .send_message(
+                &team,
+                "human",
+                "leader",
+                Kind::Control,
+                "resume",
+                None,
+                vec![],
+            )
+            .unwrap();
+        assert!(!teams.team(&team).unwrap().participants["leader"].paused);
+        teams
+            .send_message(&team, "human", "leader", Kind::Task, "again", None, vec![])
+            .unwrap();
+        assert!(!deliver(&mut teams, &team, "leader").is_empty());
+        teams.turn_finished("i1", true, None, String::new());
+        assert!(
+            teams.team(&team).unwrap().participants["leader"].paused,
+            "the total limit must pause again after resume"
+        );
+    }
+
+    #[test]
     fn question_answer_is_delivered_before_other_mail() {
         let (mut teams, team) = fixture(json!({}));
         add_worker(&mut teams, &team, "w1");
@@ -2870,6 +3062,53 @@ mod tests {
             .send_message(&team, "human", "w1", Kind::Control, "resume", None, vec![])
             .unwrap();
         assert!(!teams.team(&team).unwrap().participants["w1"].paused);
+    }
+
+    #[test]
+    fn answering_one_of_two_questions_keeps_waiting() {
+        let (mut teams, team) = fixture(json!({}));
+        add_worker(&mut teams, &team, "w1");
+        let first = teams.ask_human(&team, "w1", "one", None).unwrap();
+        let second = teams.ask_human(&team, "w1", "two", None).unwrap();
+        teams
+            .answer(&first, Some("a".to_string()), None, None)
+            .unwrap();
+        assert_eq!(
+            teams.team(&team).unwrap().participants["w1"].state,
+            ParticipantState::WaitingHuman
+        );
+        teams
+            .answer(&second, Some("b".to_string()), None, None)
+            .unwrap();
+        assert_eq!(
+            teams.team(&team).unwrap().participants["w1"].state,
+            ParticipantState::Idle
+        );
+    }
+
+    #[test]
+    fn a_question_can_be_answered_with_an_option() {
+        let (mut teams, team) = fixture(json!({}));
+        add_worker(&mut teams, &team, "w1");
+        let request = teams
+            .ask_human(
+                &team,
+                "w1",
+                "pick",
+                Some(vec!["a".to_string(), "b".to_string()]),
+            )
+            .unwrap();
+        teams
+            .answer(&request, None, Some("a".to_string()), None)
+            .unwrap();
+        let participant = &teams.team(&team).unwrap().participants["w1"];
+        assert_eq!(
+            participant
+                .mailbox
+                .front()
+                .map(|message| message.body.as_str()),
+            Some("a")
+        );
     }
 
     #[test]
@@ -3025,6 +3264,20 @@ mod tests {
             teams.team(&team).unwrap().participants["w1"].state,
             ParticipantState::WaitingHuman
         );
+    }
+
+    #[test]
+    fn closing_the_leader_session_orphans_items_and_revokes_tokens() {
+        let (mut teams, team) = fixture(json!({}));
+        let request = teams.ask_human(&team, "leader", "question?", None).unwrap();
+        teams.leader_session_closed("i1", "s1");
+        assert!(!teams.is_closed(&team));
+        assert!(teams.team(&team).unwrap().leaderless);
+        assert_eq!(
+            teams.item(&team, &request).unwrap().state,
+            ItemState::Orphaned
+        );
+        assert!(teams.token_role("k1").is_none());
     }
 
     #[test]
