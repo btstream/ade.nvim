@@ -123,6 +123,8 @@ local function setup()
         ade.pick_agent(rest ~= "" and rest or nil)
       elseif sub == "agents" then
         ade.manage_agents()
+      elseif sub == "team" then
+        ade.open_team()
       elseif sub == "install" or sub == "update" then
         -- Like :MasonInstall, the window opens so the install is visible.
         local id, version = rest:match("^(%S+)%s*(%S*)$")
@@ -194,7 +196,7 @@ local function setup()
         vim.notify("ade.nvim: unknown subcommand " .. sub, vim.log.levels.WARN)
       end
     end,
-    "open|hide|toggle|new|stop|reconnect|login|logout|agent|agents|install|update|uninstall|config|disconnect|permission|sessions|delete|model|mode|file|files|image|inline|inline-stop|inline-reset|diagnostics|service",
+    "open|hide|toggle|new|stop|reconnect|login|logout|agent|agents|team|install|update|uninstall|config|disconnect|permission|sessions|delete|model|mode|file|files|image|inline|inline-stop|inline-reset|diagnostics|service",
     true,
     complete
   )

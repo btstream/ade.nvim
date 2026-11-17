@@ -25,6 +25,12 @@ function M.manage_agents()
   ensure().manage_agents()
 end
 
+---Open the team panel. With no team this shows nothing.
+---@return boolean opened
+function M.open_team()
+  return ensure().open_team()
+end
+
 ---Install one managed agent. Nothing is downloaded without user confirmation.
 ---@param id string
 ---@param opts {version?: string}|nil

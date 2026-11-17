@@ -136,6 +136,12 @@ function M:install_defaults()
   -- Turn adoption (PROTOCOL.md 13): a turn the service was already running when
   -- this front end attached. `deps.adoption` owns the state; these two events
   -- are only the route.
+  self.handlers.turn_started = function(payload)
+    if deps.team then
+      deps.team:turn_started(payload)
+    end
+  end
+
   self.handlers.turn_adopted = function(payload)
     if deps.adoption then
       deps.adoption:adopted_turn(payload)
@@ -143,6 +149,11 @@ function M:install_defaults()
   end
 
   self.handlers.turn_finished = function(payload)
+    -- Bus turns are not adoption (PROTOCOL.md 18.11); the team settles them,
+    -- and adoption keeps ignoring sessions it never adopted.
+    if deps.team then
+      deps.team:turn_finished(payload)
+    end
     if deps.adoption then
       deps.adoption:finished_turn(payload)
     end

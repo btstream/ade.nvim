@@ -354,6 +354,15 @@ function M.manage_agents()
   end
 end
 
+---Open the team panel. With no team this shows nothing (18.5).
+---@return boolean opened
+function M.open_team()
+  if not S.view.team_ui then
+    return false
+  end
+  return S.view.team_ui:open()
+end
+
 ---Open the picker for every session control the agent offers.
 function M.pick_config()
   if S.view.options then

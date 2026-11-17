@@ -574,6 +574,14 @@ function Client:install_handlers()
   -- `_ade/*` are ACP extension notifications from nvim_ade_server
   -- (PROTOCOL.md 13). A front end that does not know them ignores them, so they
   -- only ever add behaviour for a service that sends them.
+  self:on_agent_notification("_ade/turn_started", function(params)
+    params = type(params) == "table" and params or {}
+    self:emit("turn_started", {
+      session_id = params.sessionId,
+      origin = params.origin,
+      prompt = params.prompt,
+    })
+  end)
   self:on_agent_notification("_ade/turn_adopted", function(params)
     self:emit("turn_adopted", { session_id = type(params) == "table" and params.sessionId or nil })
   end)
@@ -728,9 +736,15 @@ end
 ---and SSE have to be advertised. Sending an unsupported transport would fail
 ---session creation for a configuration the agent never promised to handle.
 ---@return table[]
-function Client:mcp_servers()
-  local declared = self.declared_mcp_servers or {}
-  if type(declared) ~= "table" or #declared == 0 then
+function Client:mcp_servers(extra)
+  local declared = {}
+  for _, server in ipairs(self.declared_mcp_servers or {}) do
+    declared[#declared + 1] = server
+  end
+  for _, server in ipairs(extra or {}) do
+    declared[#declared + 1] = server
+  end
+  if #declared == 0 then
     return {}
   end
   local caps = self:agent_capabilities().mcpCapabilities
@@ -748,10 +762,10 @@ end
 ---Create a new session.
 ---@param cwd string
 ---@return boolean ok, any value
-function Client:new_session(cwd)
+function Client:new_session(cwd, extra_mcp)
   return self:request("session/new", {
     cwd = cwd,
-    mcpServers = self:mcp_servers(),
+    mcpServers = self:mcp_servers(extra_mcp),
   }, request_timeout(self, "session_new", REQUEST_TIMEOUT))
 end
 
@@ -759,11 +773,11 @@ end
 ---@param session_id string
 ---@param cwd string
 ---@return boolean ok, any value
-function Client:load_session(session_id, cwd)
+function Client:load_session(session_id, cwd, extra_mcp)
   return self:request("session/load", {
     sessionId = session_id,
     cwd = cwd,
-    mcpServers = self:mcp_servers(),
+    mcpServers = self:mcp_servers(extra_mcp),
   }, request_timeout(self, "session_load", REQUEST_TIMEOUT), true)
 end
 
@@ -772,11 +786,11 @@ end
 ---@param session_id string
 ---@param cwd string
 ---@return boolean ok, any value
-function Client:resume_session(session_id, cwd)
+function Client:resume_session(session_id, cwd, extra_mcp)
   return self:request("session/resume", {
     sessionId = session_id,
     cwd = cwd,
-    mcpServers = self:mcp_servers(),
+    mcpServers = self:mcp_servers(extra_mcp),
   }, request_timeout(self, "session_load", REQUEST_TIMEOUT))
 end
 

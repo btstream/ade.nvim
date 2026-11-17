@@ -125,6 +125,14 @@ class Server:
         self.pending_installs = {}
         # PROTOCOL.md 17: rule sets installed by front ends, keyed by name.
         self.policy_sets = {}
+        # PROTOCOL.md 18: teams are in-memory; the stand-in keeps the shapes.
+        self.teams = {}
+        self.team_configures = []
+        self.team_binds = []
+        self.team_sends = []
+        self.team_answers = []
+        self.team_watch_replay = []
+        self.team_counter = 0
         self.install_version = args.install_version
         self.latest_version = args.latest_version or args.install_version
 
@@ -241,7 +249,10 @@ class Server:
                 {
                     "server_version": self.args.server_version,
                     "api_version": self.args.api_version,
-                    "features": ["tunnel"] + (["install"] if self.args.api_version >= 3 else []),
+                    "features": ["tunnel"]
+                    + (["install"] if self.args.api_version >= 3 else [])
+                    + (["policy"] if self.args.api_version >= 4 else [])
+                    + (["teams"] if self.args.api_version >= 5 else []),
                 },
             )
         if self.args.require_hello and not attached and not self._greeted(conn):
@@ -292,6 +303,86 @@ class Server:
                 ]
             instances.sort(key=lambda item: item["instance"])
             return self.result(ident, {"instances": instances})
+        if method == "team.configure":
+            self.team_configures.append(copy.deepcopy(params))
+            threading.Thread(target=self.later_result, args=(conn, ident, {}), daemon=True).start()
+            return None
+        if method == "team.leader_server":
+            result = {
+                "server": {
+                    "name": "ade-team",
+                    "command": "/fake/nvim_ade_server",
+                    "args": ["mcp"],
+                    "env": [{"name": "ADE_TEAM_TOKEN", "value": "k-test-token"}],
+                },
+                "token_id": "k1",
+            }
+            threading.Thread(target=self.later_result, args=(conn, ident, result), daemon=True).start()
+            return None
+        if method == "team.bind_leader":
+            self.team_binds.append(copy.deepcopy(params))
+            team = {
+                "id": "t1",
+                "cwd": params.get("cwd") or "/",
+                "state": "active",
+                "leader": {"instance": params.get("instance"), "sessionId": params.get("sessionId")},
+                "participants": [],
+                "inbox": [],
+                "limits": {"max_workers": 3, "max_turns_per_task": 30, "max_turns_total": 200, "turns_total": 0},
+            }
+            self.teams.setdefault("t1", team)
+            threading.Thread(
+                target=self.later_result, args=(conn, ident, {"team": self.teams["t1"]}), daemon=True
+            ).start()
+            return None
+        if method == "team.list":
+            return self.result(ident, {"teams": [copy.deepcopy(team) for team in self.teams.values()]})
+        if method == "team.send":
+            self.team_sends.append(copy.deepcopy(params))
+            self.team_counter += 1
+            threading.Thread(
+                target=self.later_result, args=(conn, ident, {"id": self.team_counter}), daemon=True
+            ).start()
+            return None
+        if method == "team.read":
+            threading.Thread(
+                target=self.later_result, args=(conn, ident, {"messages": [], "turns": []}), daemon=True
+            ).start()
+            return None
+        if method == "team.answer":
+            self.team_answers.append(copy.deepcopy(params))
+            threading.Thread(target=self.later_result, args=(conn, ident, {}), daemon=True).start()
+            return None
+        if method == "team.watch":
+            for update in self.team_watch_replay:
+                self.emit(conn, "tunnel.recv", {
+                    "instance": "inst-w",
+                    "seq": 1,
+                    "message": {
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {"sessionId": "sess-w", "update": update},
+                    },
+                })
+            threading.Thread(
+                target=self.later_result,
+                args=(conn, ident, {
+                    "instance": "inst-w",
+                    "sessionId": "sess-w",
+                    "replayed": bool(self.team_watch_replay) and params.get("replay") is True,
+                }),
+                daemon=True,
+            ).start()
+            return None
+        if method in ("team.unwatch", "team.reset_limits"):
+            threading.Thread(target=self.later_result, args=(conn, ident, {}), daemon=True).start()
+            return None
+        if method == "team.close":
+            team = self.teams.get(params.get("team"))
+            if team:
+                team["state"] = "closed"
+            threading.Thread(target=self.later_result, args=(conn, ident, {}), daemon=True).start()
+            return None
         if method == "policy.set":
             return self.policy_set(params, conn, ident)
         if method == "policy.clear":
