@@ -38,6 +38,11 @@ Server.__index = Server
 ---  teams?: table, team_watch?: table, team_read?: table, team_leader_error?: table,
 ---  team_bind_error?: table, team_participants?: table, team_spawn_warning?: string,
 ---  team_spawn_error?: table, team_remove_result?: table, team_remove_error?: table,
+---  team_start_error?: table, team_start_result?: table,
+---  team_answer_group_error?: table, team_workflows?: table, team_workflows_error?: table,
+---  team_workflow_delete_error?: table, team_board?: table, team_boards?: table,
+---  team_board_error?: table, team_board_delay?: integer,
+---  team_card_history?: table, team_card_history_error?: table,
 ---  run_error?: table, uninstall_error?: table, canned_agent?: boolean}|nil
 ---@return FakeService
 function M.new(opts)
@@ -122,6 +127,22 @@ function M.new(opts)
     team_spawns = {},
     team_removals = {},
     team_resets = {},
+    team_starts = {},
+    team_answer_groups = {},
+    team_workflow_deletes = {},
+    team_board_requests = {},
+    team_start_error = opts.team_start_error,
+    team_start_result = opts.team_start_result,
+    team_answer_group_error = opts.team_answer_group_error,
+    team_workflows = opts.team_workflows,
+    team_workflows_error = opts.team_workflows_error,
+    team_workflow_delete_error = opts.team_workflow_delete_error,
+    team_board = opts.team_board,
+    team_boards = opts.team_boards,
+    team_board_error = opts.team_board_error,
+    team_board_delay = opts.team_board_delay or 5,
+    team_card_history = opts.team_card_history,
+    team_card_history_error = opts.team_card_history_error,
     team_counter = 0,
     policy_responses = 0,
     policy_before_prompt = nil,
@@ -258,6 +279,13 @@ function Server:resume_team(team, instance, session_id)
   end
 end
 
+---Publish a `team.board_changed` notification (19.2).
+---@param team_id string
+---@param rev integer
+function Server:emit_team_board_changed(team_id, rev)
+  self:broadcast("team.board_changed", { team = team_id, rev = rev })
+end
+
 ---@param message table
 ---@param client table
 ---@return table|nil
@@ -351,6 +379,7 @@ function Server:dispatch(message, client)
 
   if method == "team.configure" then
     self.team_configures[#self.team_configures + 1] = vim.deepcopy(params)
+    self.team_cwd = params.cwd
     if self.team_configure_error then
       return error_reply(
         ident,
@@ -429,7 +458,7 @@ function Server:dispatch(message, client)
     end
     local team = {
       id = "t1",
-      cwd = params.cwd or "/",
+      cwd = self.team_cwd or "/",
       state = "active",
       leader = { instance = params.instance, sessionId = params.sessionId },
       participants = vim.deepcopy(self.team_participants or {}),
@@ -544,6 +573,100 @@ function Server:dispatch(message, client)
   end
   if method == "team.answer" then
     self.team_answers[#self.team_answers + 1] = vim.deepcopy(params)
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
+    end, 5)
+    return nil
+  end
+  if method == "team.start" then
+    self.team_starts[#self.team_starts + 1] = vim.deepcopy(params)
+    if self.team_start_error then
+      return error_reply(ident, self.team_start_error.code, self.team_start_error.message, self.team_start_error.data)
+    end
+    local result = self.team_start_result and vim.deepcopy(self.team_start_result)
+      or { workflow = params.workflow, started = {}, skipped = {} }
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = result })
+    end, 5)
+    return nil
+  end
+  if method == "team.answer_group" then
+    self.team_answer_groups[#self.team_answer_groups + 1] = vim.deepcopy(params)
+    if self.team_answer_group_error then
+      return error_reply(
+        ident,
+        self.team_answer_group_error.code,
+        self.team_answer_group_error.message,
+        self.team_answer_group_error.data
+      )
+    end
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = { answered = {} } })
+    end, 5)
+    return nil
+  end
+  if method == "team.board" then
+    self.team_board_requests[#self.team_board_requests + 1] = vim.deepcopy(params)
+    if self.team_board_error then
+      return error_reply(ident, self.team_board_error.code, self.team_board_error.message, self.team_board_error.data)
+    end
+    local board
+    if type(self.team_boards) == "table" and #self.team_boards > 0 then
+      board = table.remove(self.team_boards, 1)
+    elseif type(self.team_board) == "table" then
+      board = vim.deepcopy(self.team_board)
+    else
+      board = { rev = #self.team_board_requests, columns = { "todo", "doing" }, cards = {} }
+    end
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = { board = board } })
+    end, self.team_board_delay or 5)
+    return nil
+  end
+  if method == "team.card_history" then
+    if self.team_card_history_error then
+      return error_reply(
+        ident,
+        self.team_card_history_error.code,
+        self.team_card_history_error.message,
+        self.team_card_history_error.data
+      )
+    end
+    local versions = vim.deepcopy(self.team_card_history or {})
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = { versions = versions } })
+    end, 5)
+    return nil
+  end
+  if method == "team.workflows" then
+    if self.team_workflows_error then
+      return error_reply(ident, self.team_workflows_error.code, self.team_workflows_error.message)
+    end
+    local workflows = vim.deepcopy(self.team_workflows or {
+      {
+        name = "default",
+        summary = "the built-in default flow",
+        text = "1. plan 2. work 3. review",
+        team = {},
+        columns = { "待开发", "进行中", "审查中", "等你决定" },
+        scope = "builtin",
+      },
+    })
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = { workflows = workflows } })
+    end, 5)
+    return nil
+  end
+  if method == "team.workflow_delete" then
+    self.team_workflow_deletes[#self.team_workflow_deletes + 1] = vim.deepcopy(params)
+    if self.team_workflow_delete_error then
+      return error_reply(
+        ident,
+        self.team_workflow_delete_error.code,
+        self.team_workflow_delete_error.message,
+        self.team_workflow_delete_error.data
+      )
+    end
     vim.defer_fn(function()
       self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
     end, 5)

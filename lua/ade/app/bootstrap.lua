@@ -26,6 +26,7 @@ local Prompts = require("ade.app.prompts")
 local PermissionPolicy = require("ade.service.policy")
 local Team = require("ade.app.team")
 local TeamUI = require("ade.ui.team")
+local TeamCommands = require("ade.app.team_commands")
 local Auth = require("ade.app.auth")
 local Connection = require("ade.app.connection")
 local Panel = require("ade.ui.panel")
@@ -865,6 +866,40 @@ function M.build(ctx, opts, action)
     -- second Chat or a second input area.
     leader_chat = function()
       return S.view.chat
+    end,
+  })
+
+  S.view.team_commands = TeamCommands.new({
+    state = function()
+      return S
+    end,
+    config = cfg,
+    notify = notify,
+    resolve_cwd = ctx.resolve_cwd,
+    open = function()
+      ctx.open()
+    end,
+    new_session = function()
+      ctx.new_session()
+    end,
+    connect = function()
+      ctx.connect()
+    end,
+    pick_agent = function(name)
+      ctx.pick_agent(name)
+    end,
+    options = function()
+      return S.view.options
+    end,
+    client = function()
+      return S.conn.client
+    end,
+    generation = function()
+      return ctx.Operations.generation
+    end,
+    report_error = Team.error_text,
+    open_team = function()
+      return ctx.open_team()
     end,
   })
 

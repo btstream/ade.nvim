@@ -241,6 +241,70 @@ impl Harness {
         self.client.request(93, "team.answer", params)
     }
 
+    fn answer_group(&mut self, group: &str, allow: bool) -> Value {
+        self.client.request(
+            94,
+            "team.answer_group",
+            json!({ "group": group, "allow": allow }),
+        )
+    }
+
+    fn workflows(&mut self) -> Value {
+        self.client.request(
+            96,
+            "team.workflows",
+            json!({ "cwd": self.work.to_string_lossy() }),
+        )
+    }
+
+    fn workflow_names(&mut self) -> Vec<(String, String)> {
+        self.workflows()["result"]["workflows"]
+            .as_array()
+            .map(|workflows| {
+                workflows
+                    .iter()
+                    .filter_map(|workflow| {
+                        Some((
+                            workflow["name"].as_str()?.to_string(),
+                            workflow["scope"].as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn start(&mut self, workflow: &str, task: Option<&str>) -> Value {
+        let mut params = json!({ "team": self.team, "workflow": workflow });
+        if let Some(task) = task {
+            params["task"] = json!(task);
+        }
+        self.client.request(97, "team.start", params)
+    }
+
+    fn spawn(&mut self, fields: Value) -> Value {
+        let mut params = json!({ "team": self.team, "template": "dev" });
+        if let Value::Object(map) = fields {
+            for (key, value) in map {
+                params[key] = value;
+            }
+        }
+        self.client.request(98, "team.spawn", params)
+    }
+
+    fn worker_names(&mut self) -> Vec<String> {
+        self.team()["participants"]
+            .as_array()
+            .map(|participants| {
+                participants
+                    .iter()
+                    .filter(|participant| participant["role"] == "worker")
+                    .filter_map(|participant| participant["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn events(&self) -> Vec<Value> {
         read_log(&self.log)
     }
@@ -1094,7 +1158,14 @@ fn mcp_handshake_and_leader_tools() {
     assert_eq!(value["self"]["role"], "leader");
     assert!(value["templates"]
         .as_array()
-        .is_some_and(|templates| templates.iter().any(|name| name == "dev")));
+        .is_some_and(|templates| templates
+            .iter()
+            .any(|template| template["name"] == "dev" && template["agent"] == "team-test")));
+    assert!(value["workflows"]
+        .as_array()
+        .is_some_and(|workflows| workflows
+            .iter()
+            .any(|workflow| workflow["name"] == "default")));
 }
 
 #[test]
@@ -2543,4 +2614,622 @@ fn team_close_still_lets_the_person_preempt_a_running_bus_prompt() {
         "the withdrawn held prompt after close",
     );
     std::fs::write(harness.server.dir().join("team-agent.gate"), b"go").expect("gate");
+}
+
+fn workflow_config(extra: Value) -> Value {
+    let mut base = json!({
+        "workflows": {
+            "pair": {
+                "summary": "two workers write code",
+                "text": "both write code, then the leader reviews",
+                "columns": ["待开发", "审查中"],
+                "team": [
+                    {"name": "w1", "template": "dev", "task": "do [report]"},
+                    {"name": "w2", "template": "dev", "task": "do [report]"}
+                ]
+            },
+            "one": {
+                "summary": "one worker",
+                "team": [{"name": "w1", "template": "dev"}]
+            },
+            "big": {
+                "summary": "more workers than max_workers",
+                "team": [
+                    {"name": "b1", "template": "dev"},
+                    {"name": "b2", "template": "dev"},
+                    {"name": "b3", "template": "dev"},
+                    {"name": "b4", "template": "dev"}
+                ]
+            },
+            "configured": {
+                "summary": "configured flow",
+                "team": [{"name": "c1", "template": "dev"}]
+            }
+        },
+        "default_workflow": "configured"
+    });
+    merge(&mut base, extra);
+    base
+}
+
+#[test]
+fn workflows_save_get_list_and_delete() {
+    let mut harness = Harness::new("team-workflow", workflow_config(json!({})), None);
+    let saved = mcp_call(
+        &harness.server,
+        &harness.token,
+        "workflow_save",
+        json!({"workflow": {
+            "name": "review_by_pi",
+            "summary": "opencode writes, pi reviews",
+            "text": "1. w1 writes 2. reviewer reviews",
+            "team": [{"name": "reviewer", "template": "dev", "model": "m2"}],
+            "columns": ["待开发", "审查中"],
+        }}),
+    );
+    assert_eq!(saved["isError"], false, "{saved}");
+    let saved: Value = serde_json::from_str(&mcp_text(&saved)).expect("save JSON");
+    assert_eq!(saved["name"], "review_by_pi");
+
+    let got = mcp_call(
+        &harness.server,
+        &harness.token,
+        "workflow_get",
+        json!({"name": "review_by_pi"}),
+    );
+    let got: Value = serde_json::from_str(&mcp_text(&got)).expect("get JSON");
+    assert_eq!(got["workflow"]["name"], "review_by_pi");
+    assert_eq!(got["workflow"]["scope"], "project");
+    assert_eq!(got["workflow"]["text"], "1. w1 writes 2. reviewer reviews");
+    assert_eq!(got["workflow"]["columns"], json!(["待开发", "审查中"]));
+
+    let names = harness.workflow_names();
+    assert!(
+        names.contains(&("review_by_pi".to_string(), "project".to_string())),
+        "{names:?}"
+    );
+    assert!(
+        names.contains(&("configured".to_string(), "config".to_string())),
+        "{names:?}"
+    );
+    assert!(
+        names.contains(&("default".to_string(), "builtin".to_string())),
+        "{names:?}"
+    );
+
+    let duplicate = mcp_call(
+        &harness.server,
+        &harness.token,
+        "workflow_save",
+        json!({"workflow": {"name": "review_by_pi", "summary": "again"}}),
+    );
+    assert_eq!(duplicate["isError"], true, "{duplicate}");
+    assert!(
+        mcp_text(&duplicate).contains("workflow exists"),
+        "{duplicate}"
+    );
+
+    let replaced = mcp_call(
+        &harness.server,
+        &harness.token,
+        "workflow_save",
+        json!({
+            "workflow": {"name": "review_by_pi", "summary": "replaced", "text": "new"},
+            "replace": true,
+        }),
+    );
+    assert_eq!(replaced["isError"], false, "{replaced}");
+    let got = mcp_call(
+        &harness.server,
+        &harness.token,
+        "workflow_get",
+        json!({"name": "review_by_pi"}),
+    );
+    let got: Value = serde_json::from_str(&mcp_text(&got)).expect("get JSON");
+    assert_eq!(got["workflow"]["summary"], "replaced");
+
+    // A configured workflow cannot be saved over or deleted: the configured
+    // one would hide the stored one.
+    let configured = mcp_call(
+        &harness.server,
+        &harness.token,
+        "workflow_save",
+        json!({"workflow": {"name": "configured", "summary": "shadowed"}}),
+    );
+    assert_eq!(configured["isError"], true, "{configured}");
+    assert!(
+        mcp_text(&configured).contains("workflow exists"),
+        "{configured}"
+    );
+    let configured = mcp_call(
+        &harness.server,
+        &harness.token,
+        "workflow_delete",
+        json!({"name": "configured"}),
+    );
+    assert_eq!(configured["isError"], true, "{configured}");
+
+    let builtin = mcp_call(
+        &harness.server,
+        &harness.token,
+        "workflow_delete",
+        json!({"name": "default"}),
+    );
+    assert_eq!(builtin["isError"], true, "{builtin}");
+    let missing = mcp_call(
+        &harness.server,
+        &harness.token,
+        "workflow_delete",
+        json!({"name": "nope"}),
+    );
+    assert_eq!(missing["isError"], true, "{missing}");
+    let unknown = mcp_call(
+        &harness.server,
+        &harness.token,
+        "workflow_get",
+        json!({"name": "nope"}),
+    );
+    assert_eq!(unknown["isError"], true, "{unknown}");
+    assert!(mcp_text(&unknown).contains("unknown workflow"), "{unknown}");
+
+    let deleted = mcp_call(
+        &harness.server,
+        &harness.token,
+        "workflow_delete",
+        json!({"name": "review_by_pi"}),
+    );
+    assert_eq!(deleted["isError"], false, "{deleted}");
+    assert!(!harness
+        .workflow_names()
+        .iter()
+        .any(|(name, _)| name == "review_by_pi"));
+
+    // The front end may delete a stored workflow by scope.
+    let user_saved = mcp_call(
+        &harness.server,
+        &harness.token,
+        "workflow_save",
+        json!({
+            "workflow": {"name": "everywhere", "summary": "all projects"},
+            "scope": "user",
+        }),
+    );
+    assert_eq!(user_saved["isError"], false, "{user_saved}");
+    assert!(harness
+        .workflow_names()
+        .contains(&("everywhere".to_string(), "user".to_string())));
+    let front_end = harness.client.request(
+        96,
+        "team.workflow_delete",
+        json!({"cwd": harness.work.to_string_lossy(), "name": "everywhere", "scope": "user"}),
+    );
+    assert!(front_end["result"].is_object(), "{front_end}");
+    assert!(!harness
+        .workflow_names()
+        .iter()
+        .any(|(name, _)| name == "everywhere"));
+    let again = harness.client.request(
+        96,
+        "team.workflow_delete",
+        json!({"cwd": harness.work.to_string_lossy(), "name": "everywhere", "scope": "user"}),
+    );
+    assert_eq!(again["error"]["code"], -32061, "{again}");
+    // An invalid scope names the field.
+    let bad_scope = harness.client.request(
+        96,
+        "team.workflow_delete",
+        json!({"cwd": harness.work.to_string_lossy(), "name": "x", "scope": "builtin"}),
+    );
+    assert_eq!(bad_scope["error"]["code"], -32060, "{bad_scope}");
+    assert!(bad_scope["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("scope")));
+    // A bad workflow names the field too.
+    let bad = mcp_call(
+        &harness.server,
+        &harness.token,
+        "workflow_save",
+        json!({"workflow": {"name": "Bad", "summary": "x"}}),
+    );
+    assert_eq!(bad["isError"], true, "{bad}");
+    assert!(mcp_text(&bad).contains("workflow.name"), "{bad}");
+}
+
+#[test]
+fn team_start_spawns_the_workflow_members_once() {
+    let mut harness = Harness::new("team-start", workflow_config(json!({})), None);
+    let started = harness.start("pair", Some("ship it"));
+    assert!(started["result"].is_object(), "{started}");
+    assert_eq!(started["result"]["workflow"], "pair");
+    assert_eq!(
+        started["result"]["started"],
+        json!(["w1", "w2"]),
+        "{started}"
+    );
+    assert_eq!(started["result"]["skipped"], json!([]), "{started}");
+    let mut workers = harness.worker_names();
+    workers.sort();
+    assert_eq!(workers, vec!["w1", "w2"]);
+
+    // The leader gets one notice: base instructions, flow text and members.
+    wait_for(
+        || {
+            let messages = harness.read("leader")["messages"].as_array()?.clone();
+            messages.into_iter().find(|message| {
+                message["kind"] == "notice"
+                    && message["from"] == "human"
+                    && message["body"]
+                        .as_str()
+                        .is_some_and(|body| body.contains("流程：pair"))
+            })
+        },
+        "the team.start notice",
+    );
+    let notice = harness.read("leader")["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|message| {
+            message["kind"] == "notice"
+                && message["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("流程：pair"))
+        })
+        .count();
+    assert_eq!(notice, 1, "one notice per team.start");
+    let body = harness.read("leader")["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| {
+            message["body"]
+                .as_str()
+                .is_some_and(|body| body.contains("流程：pair"))
+        })
+        .and_then(|message| message["body"].as_str())
+        .expect("notice body")
+        .to_string();
+    assert!(
+        body.starts_with(nvim_ade_server::team::brief::leader_instructions()),
+        "{body}"
+    );
+    assert!(
+        body.contains("both write code, then the leader reviews"),
+        "{body}"
+    );
+    assert!(body.contains("w1 · 模板 dev · agent team-test"), "{body}");
+    assert!(body.contains("待开发 / 审查中"), "{body}");
+    assert!(body.contains("ship it"), "{body}");
+
+    // Already existing names are skipped, nothing starts twice.
+    let again = harness.start("pair", None);
+    assert_eq!(again["result"]["started"], json!([]), "{again}");
+    assert_eq!(again["result"]["skipped"], json!(["w1", "w2"]), "{again}");
+
+    let mut workers = harness.worker_names();
+    workers.sort();
+    assert_eq!(workers, vec!["w1", "w2"]);
+
+    // Exceeding max_workers starts nothing at all.
+    let big = harness.start("big", None);
+    assert_eq!(big["error"]["code"], -32061, "{big}");
+    let mut workers = harness.worker_names();
+    workers.sort();
+    assert_eq!(workers, vec!["w1", "w2"], "nothing may start");
+
+    let unknown = harness.start("nope", None);
+    assert_eq!(unknown["error"]["code"], -32060, "{unknown}");
+}
+
+#[test]
+fn a_spawn_model_must_be_allowed_and_offered() {
+    let mut harness = Harness::new(
+        "team-model",
+        json!({"templates": {"dev": {"models": ["m2", "m9"]}}}),
+        None,
+    );
+    let refused = harness.spawn(json!({"name": "w1", "model": "m1"}));
+    assert_eq!(refused["error"]["code"], -32060, "{refused}");
+    assert!(refused["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("model")));
+
+    // The agent offers m1/m2 only: an m9 worker is stopped and reported.
+    let spawned = harness.spawn(json!({"name": "w9", "model": "m9"}));
+    assert_eq!(spawned["result"]["name"], "w9", "{spawned}");
+    let entry = harness.wait_participant("w9", |entry| entry["state"] == "exited");
+    assert_eq!(entry["reason"], "model unavailable: m9");
+    wait_for(
+        || {
+            let messages = harness.read("leader")["messages"].as_array()?.clone();
+            messages
+                .into_iter()
+                .find(|message| {
+                    message["kind"] == "notice"
+                        && message["body"].as_str().is_some_and(|body| {
+                            body.contains("m9") && body.contains("m1") && body.contains("m2")
+                        })
+                })
+                .map(|_| ())
+        },
+        "the model-unavailable notice",
+    );
+
+    // An offered model is applied with session/set_config_option.
+    let spawned =
+        harness.spawn(json!({"name": "w2", "model": "m2", "role": "You review the diff."}));
+    assert_eq!(spawned["result"]["name"], "w2", "{spawned}");
+    let (instance, session) = team_instance(&mut harness, "w2");
+    harness.wait_participant("w2", |entry| entry["state"] == "idle");
+    let events = harness.events();
+    let pid = events
+        .iter()
+        .find(|event| event["event"] == "session" && event["session"] == session)
+        .and_then(|event| event["pid"].as_u64())
+        .expect("worker session event");
+    assert!(
+        events.iter().any(|event| {
+            event["event"] == "set_config"
+                && event["pid"] == json!(pid)
+                && event["params"]["value"] == "m2"
+                && event["params"]["sessionId"] == session
+        }),
+        "the spawn model must be applied: {events:?}"
+    );
+    let prompt = events
+        .iter()
+        .find(|event| {
+            event["event"] == "prompt"
+                && event["session"] == session
+                && event["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("You are w2"))
+        })
+        .and_then(|event| event["text"].as_str())
+        .expect("worker first prompt")
+        .to_string();
+    assert!(
+        prompt.contains("<spawn_role>\nYou review the diff.\n</spawn_role>"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("card_update"), "{prompt}");
+    let _ = instance;
+
+    // The template's own model is checked exactly like a spawn's (19.6).
+    let mut template_harness = Harness::new(
+        "team-model-template",
+        json!({"templates": {"dev": {"model": "m9", "models": ["m2", "m9"]}}}),
+        None,
+    );
+    let spawned = template_harness.spawn(json!({"name": "w1"}));
+    assert_eq!(spawned["result"]["name"], "w1", "{spawned}");
+    let entry = template_harness.wait_participant("w1", |entry| entry["state"] == "exited");
+    assert_eq!(entry["reason"], "model unavailable: m9");
+    wait_for(
+        || {
+            let messages = template_harness.read("leader")["messages"]
+                .as_array()?
+                .clone();
+            messages
+                .into_iter()
+                .find(|message| {
+                    message["kind"] == "notice"
+                        && message["body"]
+                            .as_str()
+                            .is_some_and(|body| body.contains("m9"))
+                })
+                .map(|_| ())
+        },
+        "the template model notice",
+    );
+}
+
+#[test]
+fn spawns_from_one_leader_prompt_share_a_group_and_are_approved_together() {
+    let mut harness = Harness::new("team-group", json!({"spawn_confirm": {"auto": []}}), None);
+    harness.send("leader", "task", "spawn-pair");
+    let group = wait_for(
+        || {
+            let teams = harness.team();
+            let items: Vec<&Value> = teams["inbox"]
+                .as_array()?
+                .iter()
+                .filter(|item| item["kind"] == "spawn")
+                .collect();
+            if items.len() < 2 {
+                return None;
+            }
+            let first = items[0]["group"].as_str()?;
+            if items.iter().all(|item| item["group"] == items[0]["group"]) {
+                Some(first.to_string())
+            } else {
+                None
+            }
+        },
+        "two spawn items in one group",
+    );
+    let answered = harness.answer_group(&group, true);
+    assert_eq!(
+        answered["result"]["answered"].as_array().map(Vec::len),
+        Some(2),
+        "{answered}"
+    );
+    harness.wait_participant("w1", |entry| entry["state"] == "idle");
+    harness.wait_participant("w2", |entry| entry["state"] == "idle");
+    // Every worker started through the group gets the same approval notice as
+    // team.answer (19.6).
+    wait_for(
+        || {
+            let messages = harness.read("leader")["messages"].as_array()?.clone();
+            let approved = |name: &str| {
+                messages.iter().any(|message| {
+                    message["kind"] == "notice"
+                        && message["body"]
+                            .as_str()
+                            .is_some_and(|body| body.contains(&format!("approved: {name}")))
+                })
+            };
+            (approved("w1") && approved("w2")).then_some(())
+        },
+        "the approval notices of both group members",
+    );
+
+    // An item created outside a leader prompt gets a group of its own.
+    let alone = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template": "dev", "name": "w3"}),
+    );
+    assert_eq!(alone["isError"], false, "{alone}");
+    let other = harness.team()["inbox"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["name"] == "w3"))
+        .and_then(|item| item["group"].as_str())
+        .map(str::to_string)
+        .expect("a group even outside a prompt");
+    assert_ne!(other, group);
+    let none_open = harness.answer_group(&group, true);
+    assert_eq!(none_open["error"]["code"], -32063, "{none_open}");
+}
+
+#[test]
+fn leader_instructions_and_tools_follow_the_role() {
+    let harness = Harness::new(
+        "team-tools",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let initialize = mcp_session(
+        &harness.server,
+        &harness.token,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test"}}}),
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        ],
+        1,
+    );
+    let instructions = initialize["instructions"]
+        .as_str()
+        .expect("a leader gets instructions");
+    assert!(!instructions.is_empty());
+    assert!(instructions.len() <= 2048, "{} bytes", instructions.len());
+    assert!(instructions.contains("团队"));
+
+    let tools = mcp_tools(&harness.server, &harness.token);
+    for tool in [
+        "team_spawn",
+        "workflow_save",
+        "workflow_get",
+        "workflow_delete",
+        "bus_read",
+    ] {
+        assert!(
+            tools.contains(&tool.to_string()),
+            "{tool} missing from {tools:?}"
+        );
+    }
+    assert!(!tools.contains(&"card_update".to_string()), "{tools:?}");
+
+    // A worker's MCP session has no instructions and only its own tools.
+    let mut harness = harness;
+    let spawned = harness.spawn(json!({"name": "w1", "task": "do [report]"}));
+    assert_eq!(spawned["result"]["name"], "w1", "{spawned}");
+    let (_instance, session) = team_instance(&mut harness, "w1");
+    let tools = wait_for(
+        || {
+            harness
+                .events()
+                .into_iter()
+                .find(|event| event["event"] == "tools" && event["session"] == session.as_str())
+        },
+        "the worker's tools/list",
+    );
+    assert_eq!(
+        tools["names"],
+        json!(["bus_send", "bus_ask_human", "bus_status"]),
+        "{tools}"
+    );
+    assert!(
+        tools["instructions"].is_null(),
+        "workers get no instructions: {tools}"
+    );
+}
+
+#[test]
+fn team_start_boundary_and_a_leaderless_team() {
+    // One existing worker plus one missing member is exactly max_workers: the
+    // workflow starts.
+    let boundary = json!({
+        "max_workers": 2,
+        "spawn_confirm": {"auto": []},
+        "workflows": {
+            "pair": {
+                "summary": "two workers",
+                "team": [
+                    {"name": "w1", "template": "dev"},
+                    {"name": "w2", "template": "dev"}
+                ]
+            }
+        }
+    });
+    let mut harness = Harness::new("team-start-boundary", boundary, None);
+    let spawned = harness.spawn(json!({"name": "w1"}));
+    assert_eq!(spawned["result"]["name"], "w1", "{spawned}");
+    harness.wait_participant("w1", |entry| entry["state"] == "idle");
+    let started = harness.start("pair", None);
+    assert_eq!(started["result"]["started"], json!(["w2"]), "{started}");
+    assert_eq!(started["result"]["skipped"], json!(["w1"]), "{started}");
+    harness.wait_participant("w2", |entry| entry["state"] == "idle");
+
+    // A leaderless team still starts its members; the notice queues (19.7).
+    let mut leaderless = Harness::new(
+        "team-start-leaderless",
+        json!({
+            "max_workers": 2,
+            "spawn_confirm": {"auto": []},
+            "workflows": {
+                "pair": {
+                    "summary": "two workers",
+                    "team": [
+                        {"name": "w1", "template": "dev"},
+                        {"name": "w2", "template": "dev"}
+                    ]
+                }
+            }
+        }),
+        None,
+    );
+    let stopped =
+        leaderless
+            .client
+            .request(99, "agent.stop", json!({"instance": leaderless.instance}));
+    assert!(stopped["result"].is_object(), "{stopped}");
+    wait_for(
+        || (leaderless.team()["state"] == "leaderless").then_some(()),
+        "the leaderless team",
+    );
+    let started = leaderless.start("pair", Some("ship it"));
+    assert_eq!(
+        started["result"]["started"],
+        json!(["w1", "w2"]),
+        "{started}"
+    );
+    leaderless.wait_participant("w1", |entry| entry["state"] == "idle");
+    wait_for(
+        || {
+            let messages = leaderless.read("leader")["messages"].as_array()?.clone();
+            messages
+                .into_iter()
+                .find(|message| {
+                    message["kind"] == "notice"
+                        && message["from"] == "human"
+                        && message["body"].as_str().is_some_and(|body| {
+                            body.contains("流程：pair") && body.contains("ship it")
+                        })
+                })
+                .map(|_| ())
+        },
+        "the queued team.start notice",
+    );
 }

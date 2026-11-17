@@ -70,8 +70,10 @@ function M.new(opts)
     suspended_cwd = {},
     warned_suspended = {},
     notified = {},
-    -- team id -> {worker name: true} for the pre-built definition.
-    started_workers = {},
+    -- team id -> true once this front end started the enabled workflow.
+    enabled_teams = {},
+    -- team id -> {board, inflight, again} for the board cache (19.2).
+    boards = {},
     watching = nil,
     raw = nil,
   }, Team)
@@ -131,6 +133,9 @@ function Team:_attach(raw)
     raw:subscribe("teams", "team.inbox", function(payload)
       self:on_inbox_payload(payload)
     end)
+    raw:subscribe("teams", "team.board_changed", function(payload)
+      self:on_board_changed_payload(payload)
+    end)
     raw:subscribe("teams", "__disconnected", function()
       self:forget_connection()
     end)
@@ -157,6 +162,14 @@ function Team:forget_connection()
   self.bound = {}
   self.blocked = {}
   self.suspended_cwd = {}
+  -- A board request that was in flight when the connection died never answers;
+  -- clear the latch so the next `team.changed` can fetch it again.
+  for _, entry in pairs(self.boards) do
+    if type(entry) == "table" then
+      entry.inflight = false
+      entry.again = false
+    end
+  end
   -- `warned_blocked` / `warned_suspended` / `notified` survive a reconnect:
   -- a conflict that was already announced must not be announced again.
   self:unwatch(true)
@@ -167,7 +180,8 @@ end
 function Team:reset()
   self.teams = {}
   self.inbox = {}
-  self.started_workers = {}
+  self.enabled_teams = {}
+  self.boards = {}
   self:forget_connection()
 end
 
@@ -179,6 +193,9 @@ function Team:on_hello()
     self:configure(cwd, true)
   end
   self:refresh()
+  -- Warm the workflow cache for completion; failure only means the list stays
+  -- as it was, never an error the person has to read.
+  self:refresh_workflows()
 end
 
 ---Whether a known team is suspended (waiting for its leader session).
@@ -208,7 +225,7 @@ function M.worktree_root()
   return path
 end
 
----Resolve the configuration the service expects (18.2).
+---Resolve the configuration the service expects (18.2, 19.1).
 ---@param cwd string
 ---@return table|nil config
 ---@return table|nil skipped
@@ -216,6 +233,7 @@ function Team:service_config(cwd)
   local cfg = self.config() or {}
   local teams = type(cfg.teams) == "table" and cfg.teams or {}
   local store = self.store and self.store() or nil
+  local agents = require("ade.agents")
   local templates, skipped = {}, {}
   for name, template in pairs(teams.templates or {}) do
     local launch, err = Resolve.resolve(cfg, template.agent, cfg.launch_origin, store)
@@ -223,11 +241,19 @@ function Team:service_config(cwd)
       skipped[#skipped + 1] = string.format("%s: %s", name, tostring(err))
     else
       local key = { agent = template.agent, command = launch.command, args = launch.args or {} }
+      local models = template.models
+      if type(models) == "table" and #models == 0 then
+        models = nil
+      end
+      local profile = agents.get(cfg.agents and cfg.agents[template.agent] or nil, template.agent)
       local entry = {
         key = key,
         env = transport.child_env(launch.env or (cfg.agents[template.agent] or {}).env),
         model = template.model,
-        role = template.role,
+        role = template.role or "",
+        models = models,
+        -- pi reaches MCP tools through its own `mcp` proxy (19.6).
+        tool_style = profile and profile.name == "pi" and "mcp_proxy" or "direct",
         worktree = template.worktree == true,
       }
       if launch.source == "managed" and launch.install_id then
@@ -242,6 +268,21 @@ function Team:service_config(cwd)
   end
   local confirm = type(teams.spawn_confirm) == "table" and teams.spawn_confirm or {}
   local limits = type(teams.limits) == "table" and teams.limits or {}
+  local workflows = {}
+  for name, workflow in pairs(teams.workflows or {}) do
+    local copy = vim.deepcopy(workflow)
+    if type(copy.summary) ~= "string" or copy.summary == "" then
+      -- 19.1 requires a summary on the wire; a config entry may rely on its
+      -- text's first line instead (the draft's `default = { text = ... }`).
+      local first = tostring(copy.text or ""):match("^[^\r\n]*") or ""
+      first = vim.trim(first)
+      if vim.fn.strchars(first) > 120 then
+        first = vim.fn.strcharpart(first, 0, 120)
+      end
+      copy.summary = first ~= "" and first or name
+    end
+    workflows[name] = copy
+  end
   return {
     max_workers = teams.max_workers or 3,
     worktree_root = M.worktree_root(),
@@ -251,6 +292,10 @@ function Team:service_config(cwd)
       max_turns_total = limits.max_turns_total or 200,
     },
     templates = next(templates) and templates or vim.empty_dict(),
+    -- An empty Lua table encodes as a JSON array; the service expects an
+    -- object for `workflows` (19.1).
+    workflows = next(workflows) and workflows or vim.empty_dict(),
+    default_workflow = teams.default,
   },
     skipped
 end
@@ -492,17 +537,18 @@ function Team:bind_leader(instance, session_id, cwd)
     local team_id = type(value) == "table" and type(value.team) == "table" and value.team.id or nil
     self.bound[cwd] = { instance = instance, session_id = session_id, team = team_id }
     self:refresh()
-    self:start_defined_workers(team_id, type(value) == "table" and value.team or nil)
+    self:start_enabled_workers(team_id, type(value) == "table" and value.team or nil)
   end)
 end
 
----Start the workers of the configured default definition (18.13/18.16).
+---Start the enabled default workflow once per team (19.7).
 ---
----Only names that are absent from the returned team's participants are started,
----so a re-bind/reconnect or a second front end never starts them twice.
+---`teams.enabled = true` replaces the per-worker `team.spawn` loop: the
+---service starts the workflow's members and skips names that already exist, so
+---a re-bind, a reconnect or a second front end never starts them twice.
 ---@param team_id string|nil
 ---@param entry table|nil team.list entry returned by bind_leader
-function Team:start_defined_workers(team_id, entry)
+function Team:start_enabled_workers(team_id, entry)
   if type(team_id) ~= "string" then
     return
   end
@@ -511,47 +557,28 @@ function Team:start_defined_workers(team_id, entry)
   if teams.enabled ~= true then
     return
   end
-  local definition = type(teams.definitions) == "table" and teams.default and teams.definitions[teams.default] or nil
-  if type(definition) ~= "table" then
-    return
-  end
   if type(entry) == "table" and entry.state == "suspended" then
-    -- A resume still waiting for its configuration cannot take spawns; do not
-    -- mark the team as reconciled so the active team.changed can try later.
+    -- A resume still waiting for its configuration cannot take team.start; do
+    -- not mark the team so the active `team.changed` can try later.
     return
   end
-  local started = self.started_workers[team_id]
-  if started then
-    -- This team's definition was already reconciled by this front end.
+  if self.enabled_teams[team_id] then
     return
   end
-  started = {}
-  self.started_workers[team_id] = started
-  local present = {}
   for _, participant in ipairs(type(entry) == "table" and entry.participants or {}) do
-    present[participant.name] = true
-  end
-  for _, worker in ipairs(definition.workers or {}) do
-    if not present[worker.name] and not started[worker.name] then
-      started[worker.name] = true
-      self:spawn(team_id, worker.template, worker.name, worker.task, function(ok, value)
-        if not ok then
-          local code = type(value) == "table" and value.code or nil
-          if code == -32060 then
-            -- The service refuses a name an in-flight spawn already took:
-            -- not a failure the person needs to see, just a duplicate start.
-            log.debug("worker %s was already started: %s", tostring(worker.name), M.error_text(value))
-          else
-            self.notify(
-              "could not start worker " .. tostring(worker.name) .. ": " .. M.error_text(value),
-              vim.log.levels.WARN
-            )
-          end
-        end
-        self:refresh()
-      end)
+    if participant.name ~= "leader" and participant.name ~= "human" then
+      -- The team already has a worker: this is not its first start.
+      return
     end
   end
+  self.enabled_teams[team_id] = true
+  local workflow = teams.default or "default"
+  self:start(team_id, workflow, nil, function(ok, value)
+    if not ok then
+      self.notify("could not start workflow " .. tostring(workflow) .. ": " .. M.error_text(value), vim.log.levels.WARN)
+    end
+    self:refresh()
+  end)
 end
 
 ---Refresh the whole team list.
@@ -593,8 +620,71 @@ function Team:refresh(cb)
       self.inbox = {}
       self:changed()
     end
+    self:_sync_boards()
     if cb then
       cb()
+    end
+  end)
+end
+
+---Fetch the board of every known team whose cached revision is stale (19.2).
+function Team:_sync_boards()
+  for id, team in pairs(self.teams) do
+    local rev = tonumber(team.board_rev)
+    if rev ~= nil then
+      local entry = self.boards[id]
+      if not entry or type(entry.board) ~= "table" or tonumber(entry.board.rev) ~= rev then
+        self:request_board(id)
+      end
+    end
+  end
+end
+
+---The cached board of a team (19.2), or nil before the first fetch.
+---@param team_id string
+---@return table|nil
+function Team:board(team_id)
+  local entry = self.boards[team_id]
+  return type(entry) == "table" and entry.board or nil
+end
+
+---Fetch `team.board` once per team at a time.
+---
+---A `team.board_changed` that arrives while a request is in flight sets a latch;
+---the request's completion then fetches the current revision once more, so the
+---cache ends up at the latest state, never at an intermediate one.
+---@param team_id string
+---@param cb fun(ok: boolean, board: table|nil)|nil
+function Team:request_board(team_id, cb)
+  cb = cb or function() end
+  if type(team_id) ~= "string" then
+    cb(false, nil)
+    return
+  end
+  local entry = self.boards[team_id]
+  if type(entry) ~= "table" then
+    entry = { board = nil, inflight = false, again = false }
+    self.boards[team_id] = entry
+  end
+  if entry.inflight then
+    entry.again = true
+    return
+  end
+  if not self:available() then
+    cb(false, nil)
+    return
+  end
+  entry.inflight = true
+  self:_call("team.board", { team = team_id }, function(ok, value)
+    entry.inflight = false
+    if ok and type(value) == "table" and type(value.board) == "table" then
+      entry.board = value.board
+      self:changed()
+    end
+    cb(ok, ok and entry.board or nil)
+    if entry.again then
+      entry.again = false
+      self:request_board(team_id)
     end
   end)
 end
@@ -622,7 +712,8 @@ function Team:on_changed_payload(payload)
         self.notified[id] = nil
       end
     end
-    self.started_workers[team.id] = nil
+    self.enabled_teams[team.id] = nil
+    self.boards[team.id] = nil
     for cwd, id in pairs(self.suspended_cwd) do
       if id == team.id then
         self.suspended_cwd[cwd] = nil
@@ -676,6 +767,23 @@ function Team:on_inbox_payload(payload)
     pcall(self.on_inbox, item)
   end
   self:changed()
+end
+
+---@param payload table
+function Team:on_board_changed_payload(payload)
+  local team_id = type(payload) == "table" and (payload.team or (payload.board and payload.board.id)) or nil
+  if type(team_id) ~= "string" then
+    return
+  end
+  local entry = self.boards[team_id]
+  if type(entry) == "table" and type(entry.board) == "table" then
+    local rev = tonumber(payload.rev)
+    if rev ~= nil and tonumber(entry.board.rev) == rev then
+      -- Already at this revision (a duplicate notification).
+      return
+    end
+  end
+  self:request_board(team_id)
 end
 
 ---Every team, flattened for the panel.
@@ -742,6 +850,9 @@ function Team:send(team, to, kind, body, extra, cb)
     body = body,
     task = extra.task,
     refs = extra.refs,
+    -- 19.3: the service prefixes the card's summary line and uses `card` as
+    -- the task when `task` is absent.
+    card = extra.card,
   }, cb)
 end
 
@@ -822,6 +933,101 @@ end
 ---@param cb fun(ok: boolean, value: any)|nil
 function Team:reset_limits(team, cb)
   self:_call("team.reset_limits", { team = team }, cb)
+end
+
+---Start a named workflow on behalf of the person (19.7).
+---@param team string
+---@param workflow string
+---@param task string|nil
+---@param cb fun(ok: boolean, value: any)|nil
+function Team:start(team, workflow, task, cb)
+  self:_call("team.start", { team = team, workflow = workflow, task = task }, cb)
+end
+
+---Answer every open inbox item of a spawn group (19.6).
+---@param group string
+---@param allow boolean|nil
+---@param cb fun(ok: boolean, value: any)|nil
+function Team:answer_group(group, allow, cb)
+  self:_call("team.answer_group", { group = group, allow = allow }, cb)
+end
+
+---Read a card's stored versions, newest first (19.4).
+---@param team string
+---@param card string
+---@param cb fun(ok: boolean, value: any)|nil
+function Team:card_history(team, card, cb)
+  self:_call("team.card_history", { team = team, card = card }, cb)
+end
+
+---List every workflow visible from a cwd, resolved (19.5).
+---@param cwd string
+---@param cb fun(ok: boolean, value: any)|nil
+function Team:workflows(cwd, cb)
+  self:_call("team.workflows", { cwd = cwd }, function(ok, value)
+    if ok and type(value) == "table" and type(value.workflows) == "table" then
+      local names = {}
+      for _, workflow in ipairs(value.workflows) do
+        if type(workflow.name) == "string" then
+          names[#names + 1] = workflow.name
+        end
+      end
+      self.workflow_names = names
+    end
+    if cb then
+      cb(ok, value)
+    end
+  end)
+end
+
+---Workflow names known without asking the service again (completion).
+---@return string[]
+function Team:known_workflows()
+  local names, seen = {}, {}
+  local function add(name)
+    if type(name) == "string" and name ~= "" and not seen[name] then
+      seen[name] = true
+      names[#names + 1] = name
+    end
+  end
+  for _, name in ipairs(self.workflow_names or {}) do
+    add(name)
+  end
+  local cfg = self.config() or {}
+  local teams = type(cfg.teams) == "table" and cfg.teams or {}
+  for name in pairs(teams.workflows or {}) do
+    add(name)
+  end
+  add("default")
+  table.sort(names)
+  return names
+end
+
+---Ask the service for the workflow list once (completion cache warm-up).
+---@param cb fun()|nil
+function Team:refresh_workflows(cb)
+  cb = cb or function() end
+  if not self:available() then
+    cb()
+    return
+  end
+  local cwd = self.resolve_cwd and self.resolve_cwd() or nil
+  if not cwd then
+    cb()
+    return
+  end
+  self:workflows(cwd, function()
+    cb()
+  end)
+end
+
+---Delete a stored (project or user) workflow by name and scope (19.5).
+---@param cwd string
+---@param name string
+---@param scope "project"|"user"
+---@param cb fun(ok: boolean, value: any)|nil
+function Team:workflow_delete(cwd, name, scope, cb)
+  self:_call("team.workflow_delete", { cwd = cwd, name = name, scope = scope }, cb)
 end
 
 ---@param payload table
