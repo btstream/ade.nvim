@@ -48,6 +48,8 @@ local NAMES = {
   -- PROTOCOL.md 18.9: teams state pushed to every connection.
   "team.changed",
   "team.inbox",
+  -- PROTOCOL.md 19.2: the board revision changed; front ends fetch the board.
+  "team.board_changed",
 }
 
 ---@param opts {paths?: table, timeout?: integer, resolve_binary?: fun(): table|nil,string|nil,

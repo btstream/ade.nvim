@@ -174,40 +174,88 @@ return function(t)
 
   t.describe("teams front end", function()
     t.it("validates the teams configuration at setup", function()
-      local function valid(over)
+      local function validate(over)
         return Config.validate(vim.tbl_deep_extend("force", Config.defaults, over or {}))
       end
-      local cfg = valid({ teams = teams_config() })
+      local cfg = validate({ teams = teams_config() })
       t.eq(3, cfg.teams.max_workers)
-      local defined = valid({
+      t.eq(160, cfg.teams.dashboard.wide)
+      local named = validate({
         teams = teams_config({
           enabled = true,
           default = "dev",
-          definitions = { dev = { workers = { { name = "w1", template = "worker", task = "T1" } } } },
-          templates = { worker = { agent = "opencode", role = "You are a worker.", worktree = true } },
+          templates = {
+            worker = { agent = "opencode", models = { "m1", "m2" }, worktree = true },
+          },
+          workflows = {
+            dev = {
+              summary = "two workers",
+              text = "1. write 2. review",
+              team = { { name = "w1", template = "worker", model = "m1", task = "T1" } },
+              columns = { "todo", "review" },
+            },
+          },
         }),
       })
-      t.eq("dev", defined.teams.default)
-      t.eq(true, defined.teams.templates.worker.worktree)
+      t.eq("dev", named.teams.default)
+      t.eq(true, named.teams.templates.worker.worktree)
+      t.eq({ "m1", "m2" }, named.teams.templates.worker.models)
+      t.eq("todo", named.teams.workflows.dev.columns[1])
+      local no_role = validate({ teams = { templates = { worker = { agent = "opencode" } } } })
+      t.eq(nil, no_role.teams.templates.worker.role)
+
+      -- The old keys fail with the new syntax in the message (no migration).
+      local old_errors = {}
+      for _, over in ipairs({
+        { teams = teams_config({ definitions = { dev = { workers = {} } } }) },
+        { teams = teams_config({ workflow = "1. do things" }) },
+      }) do
+        local ok, err = pcall(validate, over)
+        t.eq(false, ok, "an old teams key must be refused")
+        old_errors[#old_errors + 1] = tostring(err)
+      end
+      t.match("teams.workflows", old_errors[1])
+      t.match("teams.workflows", old_errors[2])
+
       local bad = {
         { teams = teams_config({ max_workers = 0 }) },
         { teams = teams_config({ max_workers = 9 }) },
-        { teams = { templates = { Bad = { agent = "opencode", role = "" } } } },
-        { teams = { templates = { worker = { agent = "missing", role = "" } } } },
-        { teams = { templates = { worker = { agent = "opencode" } } } },
-        { teams = { templates = { worker = { agent = "opencode", role = "   " } } } },
+        { teams = teams_config({ dashboard = { wide = 10 } }) },
+        { teams = teams_config({ dashboard = { wide = "wide" } }) },
+        { teams = { templates = { Bad = { agent = "opencode" } } } },
+        { teams = { templates = { worker = { agent = "missing" } } } },
+        { teams = { templates = { worker = { agent = "opencode", role = 1 } } } },
+        { teams = { templates = { worker = { agent = "opencode", models = "m1" } } } },
+        { teams = { templates = { worker = { agent = "opencode", models = { "" } } } } },
         { teams = teams_config({ spawn_confirm = { auto = { "nope" } } }) },
         { teams = teams_config({ limits = { max_turns_per_task = 0, max_turns_total = 10 } }) },
         { teams = teams_config({ limits = { max_turns_per_task = 50, max_turns_total = 10 } }) },
-        { teams = teams_config({ enabled = true }) },
-        { teams = teams_config({ enabled = true, default = "nope", definitions = {} }) },
-        { teams = teams_config({ definitions = { dev = { workers = { { name = "Bad", template = "worker" } } } } }) },
-        { teams = teams_config({ definitions = { dev = { workers = { { name = "w1", template = "nope" } } } } }) },
+        { teams = teams_config({ default = "nope" }) },
+        { teams = teams_config({ workflows = { Bad = { summary = "x" } } }) },
+        { teams = teams_config({ workflows = { dev = "text" } }) },
+        { teams = teams_config({ workflows = { dev = { summary = "" } } }) },
+        { teams = teams_config({ workflows = { dev = { summary = "a\nb" } } }) },
+        { teams = teams_config({ workflows = { dev = { summary = string.rep("x", 121) } } }) },
+        { teams = teams_config({ workflows = { dev = { summary = "x", text = string.rep("x", 4 * 1024 + 1) } } }) },
+        { teams = teams_config({ workflows = { dev = { summary = "x", unknown = 1 } } }) },
+        { teams = teams_config({ workflows = { dev = { summary = "x", leader = "me" } } }) },
+        { teams = teams_config({ workflows = { dev = { summary = "x", leader = { role = 1 } } } }) },
         {
           teams = teams_config({
-            definitions = {
+            workflows = { dev = { summary = "x", team = { { name = "Bad", template = "worker" } } } },
+          }),
+        },
+        {
+          teams = teams_config({
+            workflows = { dev = { summary = "x", team = { { name = "leader", template = "worker" } } } },
+          }),
+        },
+        {
+          teams = teams_config({
+            workflows = {
               dev = {
-                workers = {
+                summary = "x",
+                team = {
                   { name = "w1", template = "worker" },
                   { name = "w1", template = "worker" },
                 },
@@ -217,27 +265,82 @@ return function(t)
         },
         {
           teams = teams_config({
-            max_workers = 1,
-            definitions = {
+            workflows = { dev = { summary = "x", team = { { name = "w1", template = "nope" } } } },
+          }),
+        },
+        {
+          teams = teams_config({
+            templates = { worker = { agent = "opencode", models = { "m1" } } },
+            workflows = {
+              dev = { summary = "x", team = { { name = "w1", template = "worker", model = "m2" } } },
+            },
+          }),
+        },
+        {
+          teams = teams_config({
+            workflows = { dev = { summary = "x", team = { { name = "w1", template = "worker", task = 1 } } } },
+          }),
+        },
+        {
+          teams = teams_config({
+            workflows = {
               dev = {
-                workers = {
+                summary = "x",
+                team = {
                   { name = "w1", template = "worker" },
                   { name = "w2", template = "worker" },
+                  { name = "w3", template = "worker" },
+                  { name = "w4", template = "worker" },
+                  { name = "w5", template = "worker" },
+                  { name = "w6", template = "worker" },
+                  { name = "w7", template = "worker" },
+                  { name = "w8", template = "worker" },
+                  { name = "w9", template = "worker" },
                 },
               },
             },
           }),
         },
+        { teams = teams_config({ workflows = { dev = { summary = "x", columns = {} } } }) },
+        { teams = teams_config({ workflows = { dev = { summary = "x", columns = { "a", "a" } } } }) },
         {
           teams = teams_config({
-            definitions = { dev = { workers = { { name = "w1", template = "worker", task = 1 } } } },
+            workflows = { dev = { summary = "x", columns = { string.rep("c", 41) } } },
           }),
         },
-        { teams = teams_config({ templates = { worker = { agent = "opencode", role = "x", worktree = "yes" } } }) },
+        {
+          teams = teams_config({
+            workflows = {
+              dev = {
+                summary = "x",
+                columns = {
+                  "c1",
+                  "c2",
+                  "c3",
+                  "c4",
+                  "c5",
+                  "c6",
+                  "c7",
+                  "c8",
+                  "c9",
+                  "c10",
+                  "c11",
+                  "c12",
+                  "c13",
+                  "c14",
+                  "c15",
+                  "c16",
+                  "c17",
+                },
+              },
+            },
+          }),
+        },
+        { teams = teams_config({ templates = { worker = { agent = "opencode", worktree = "yes" } } }) },
       }
       for _, over in ipairs(bad) do
         t.raises(function()
-          Config.validate(vim.tbl_deep_extend("force", Config.defaults, over))
+          validate(over)
         end)
       end
     end)
@@ -361,6 +464,11 @@ return function(t)
       wait(function()
         return state().sess.service.replaying ~= true
       end, 10000, "the load to finish")
+      -- The load's own bind recreates the team on the service; wait for it,
+      -- then drop the binding again so session/resume asks for a new server.
+      wait(function()
+        return team().bound[dir] ~= nil
+      end, 5000, "the load's bind")
       forget_binding()
       state().sess.service:resume("sess_mock", {})
       wait(function()
@@ -758,13 +866,14 @@ return function(t)
       t.eq(1, skipped)
     end)
 
-    local function defined_teams(over)
+    local function enabled_teams(over)
       return teams_config(vim.tbl_deep_extend("force", {
         enabled = true,
         default = "dev",
-        definitions = {
+        workflows = {
           dev = {
-            workers = {
+            summary = "two workers write code",
+            team = {
               { name = "w1", template = "worker", task = "T1" },
               { name = "w2", template = "worker" },
             },
@@ -786,124 +895,75 @@ return function(t)
       }
     end
 
-    t.it("starts configured workers once when the leader creates the team", function()
-      local service, dir = start_service(t, "defined", { team_spawn_warning = "dirty_tree" })
-      setup(t, "defined", service, dir, { teams = defined_teams() })
+    t.it("starts the enabled default workflow once when the leader creates the team", function()
+      local service, dir = start_service(t, "enabled", {})
+      setup(t, "enabled", service, dir, { teams = enabled_teams() })
       local notices = capture(t)
       controller.connect()
       wait_ready()
       wait(function()
-        return #service.team_spawns == 2
-      end, 10000, "the configured workers")
-      t.eq("t1", service.team_spawns[1].team)
-      t.eq("w1", service.team_spawns[1].name)
-      t.eq("worker", service.team_spawns[1].template)
-      t.eq("T1", service.team_spawns[1].task)
-      t.eq("w2", service.team_spawns[2].name)
-      t.eq(nil, service.team_spawns[2].task)
-      wait(function()
-        local found = false
-        for _, note in ipairs(notices) do
-          if note.message:find("last commit", 1, true) then
-            found = true
-          end
-        end
-        return found
-      end, 5000, "the dirty-tree warning")
-      -- A second bind/reconnect for the same team must not start them again.
-      team():start_defined_workers("t1", team():team("t1"))
+        return #service.team_starts == 1
+      end, 10000, "the enabled workflow")
+      t.eq("t1", service.team_starts[1].team)
+      t.eq("dev", service.team_starts[1].workflow)
+      t.eq(nil, service.team_starts[1].task)
+      -- A second bind/reconnect for the same team must not start it again.
+      team():start_enabled_workers("t1", team():team("t1"))
       vim.wait(100)
-      t.eq(2, #service.team_spawns, "workers start only once per team")
+      t.eq(1, #service.team_starts, "the workflow starts only once per team")
+      for _, note in ipairs(notices) do
+        t.falsy(note.message:find("could not start workflow", 1, true), note.message)
+      end
     end)
 
-    t.it("does not start a defined worker that is already in the team", function()
-      local service, dir = start_service(t, "defined-existing", {
+    t.it("does not start the enabled workflow when the team already has a worker", function()
+      local service, dir = start_service(t, "enabled-existing", {
         team_participants = {
           { name = "leader", state = "idle", task = "_", queued = 0, turns = {} },
           { name = "w1", state = "exited", task = "_", queued = 0, turns = {} },
         },
       })
-      setup(t, "defined-existing", service, dir, { teams = defined_teams() })
+      setup(t, "enabled-existing", service, dir, { teams = enabled_teams() })
       controller.connect()
       wait_ready()
       wait(function()
-        return #service.team_spawns >= 1
-      end, 10000, "the missing worker")
-      vim.wait(100)
-      t.eq(1, #service.team_spawns)
-      t.eq("w2", service.team_spawns[1].name)
+        return team().bound[dir] ~= nil
+      end, 10000, "the bind")
+      vim.wait(200)
+      t.eq(0, #service.team_starts, "a team that already ran a workflow is not started again")
     end)
 
-    t.it("reports each defined worker that could not start", function()
-      local service, dir = start_service(t, "defined-failed", {
-        team_spawn_error = { code = -32061, message = "worker limit reached" },
+    t.it("reports a failed enabled workflow once", function()
+      local service, dir = start_service(t, "enabled-failed", {
+        team_start_error = { code = -32061, message = "worker limit reached" },
       })
-      setup(t, "defined-failed", service, dir, { teams = defined_teams() })
-      local notices = capture(t)
-      controller.connect()
-      wait_ready()
-      wait(function()
-        local n = 0
-        for _, note in ipairs(notices) do
-          if note.message:find("could not start worker", 1, true) then
-            n = n + 1
-          end
-        end
-        return n == 2
-      end, 10000, "one warning per failed worker")
-    end)
-
-    t.it("shows git's stderr when a configured worker cannot start", function()
-      local service, dir = start_service(t, "defined-git-error", {
-        team_spawn_error = {
-          code = -32066,
-          message = "git worktree add failed",
-          data = { stderr = "fatal: invalid reference: HEAD" },
-        },
-      })
-      setup(t, "defined-git-error", service, dir, { teams = defined_teams() })
+      setup(t, "enabled-failed", service, dir, { teams = enabled_teams() })
       local notices = capture(t)
       controller.connect()
       wait_ready()
       wait(function()
         for _, note in ipairs(notices) do
-          if note.message:find("fatal: invalid reference: HEAD", 1, true) then
+          if note.message:find("could not start workflow dev", 1, true) then
             return true
           end
         end
         return false
-      end, 10000, "git's stderr in the auto-start warning")
+      end, 10000, "the failed workflow notice")
+      t.eq(1, #service.team_starts)
     end)
 
-    t.it("does not warn when a defined worker name was already taken", function()
-      local service, dir = start_service(t, "defined-duplicate", {
-        team_spawn_error = { code = -32060, message = "worker name is already used" },
-      })
-      setup(t, "defined-duplicate", service, dir, { teams = defined_teams() })
-      local notices = capture(t)
-      controller.connect()
-      wait_ready()
-      wait(function()
-        return #service.team_spawns == 2
-      end, 10000, "the duplicate spawn attempts")
-      vim.wait(100)
-      for _, note in ipairs(notices) do
-        t.falsy(note.message:find("could not start worker", 1, true), "a duplicate start is only logged")
-      end
-    end)
-
-    t.it("does not start configured workers when binding the leader fails", function()
-      local service, dir = start_service(t, "defined-bind-failed", {
+    t.it("does not start the enabled workflow when binding the leader fails", function()
+      local service, dir = start_service(t, "enabled-bind-failed", {
         team_bind_error = { code = -32061, message = "another session leads this team" },
       })
-      setup(t, "defined-bind-failed", service, dir, { teams = defined_teams() })
+      setup(t, "enabled-bind-failed", service, dir, { teams = enabled_teams() })
       controller.connect()
       wait_ready()
       wait(function()
         return team().blocked[dir] == true
       end, 5000, "the failed bind")
       vim.wait(200)
-      t.eq(0, #service.team_spawns)
+      t.eq(0, #service.team_starts)
     end)
 
     t.it("does not inject a leader when another instance already leads the cwd", function()
@@ -1799,23 +1859,23 @@ return function(t)
       end, 5000, "a failed refresh to clear the list")
     end)
 
-    t.it("does not start configured workers when bind leaves the team suspended", function()
+    t.it("does not start the enabled workflow for a suspended team", function()
       local service, dir = start_service(t, "suspended-bind", {})
-      setup(t, "suspended-bind", service, dir, { teams = defined_teams() })
+      setup(t, "suspended-bind", service, dir, { teams = enabled_teams() })
       controller.connect()
       wait_ready()
       wait(function()
-        return #service.team_spawns == 2
-      end, 10000, "the configured workers")
-      local before = #service.team_spawns
-      team():start_defined_workers("t-suspended", {
+        return #service.team_starts == 1
+      end, 10000, "the enabled workflow")
+      local before = #service.team_starts
+      team():start_enabled_workers("t-suspended", {
         id = "t-suspended",
         state = "suspended",
         participants = {},
       })
       vim.wait(100)
-      t.eq(before, #service.team_spawns)
-      t.eq(nil, team().started_workers["t-suspended"])
+      t.eq(before, #service.team_starts)
+      t.eq(nil, team().enabled_teams["t-suspended"])
     end)
 
     t.it("keeps teams across a disconnect and shows suspended teams after hello", function()
@@ -1857,11 +1917,7 @@ return function(t)
         { name = "leader", state = "idle", task = "_", queued = 0, turns = {} },
         { name = "w1", state = "idle", task = "_", queued = 0, turns = {}, template = "worker" },
       })
-      setup(t, "suspended-resume", service, dir, {
-        teams = defined_teams({
-          definitions = { dev = { workers = { { name = "w1", template = "worker" } } } },
-        }),
-      })
+      setup(t, "suspended-resume", service, dir, { teams = enabled_teams() })
       controller.connect()
       wait_ready()
       wait(function()
@@ -1890,7 +1946,7 @@ return function(t)
       t.truthy(configure_at and leader_at, "configure and leader_server")
       t.truthy(configure_at < leader_at, "configure must precede leader injection")
       vim.wait(100)
-      t.eq(0, #service.team_spawns, "recovered participants are not started again")
+      t.eq(0, #service.team_starts, "recovered participants are not started again")
 
       local session = state().sess.current
       local instance = state().conn.client.proc.instance
