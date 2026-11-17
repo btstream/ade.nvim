@@ -179,6 +179,16 @@ return function(t)
       end
       local cfg = valid({ teams = teams_config() })
       t.eq(3, cfg.teams.max_workers)
+      local defined = valid({
+        teams = teams_config({
+          enabled = true,
+          default = "dev",
+          definitions = { dev = { workers = { { name = "w1", template = "worker", task = "T1" } } } },
+          templates = { worker = { agent = "opencode", role = "You are a worker.", worktree = true } },
+        }),
+      })
+      t.eq("dev", defined.teams.default)
+      t.eq(true, defined.teams.templates.worker.worktree)
       local bad = {
         { teams = teams_config({ max_workers = 0 }) },
         { teams = teams_config({ max_workers = 9 }) },
@@ -189,6 +199,41 @@ return function(t)
         { teams = teams_config({ spawn_confirm = { auto = { "nope" } } }) },
         { teams = teams_config({ limits = { max_turns_per_task = 0, max_turns_total = 10 } }) },
         { teams = teams_config({ limits = { max_turns_per_task = 50, max_turns_total = 10 } }) },
+        { teams = teams_config({ enabled = true }) },
+        { teams = teams_config({ enabled = true, default = "nope", definitions = {} }) },
+        { teams = teams_config({ definitions = { dev = { workers = { { name = "Bad", template = "worker" } } } } }) },
+        { teams = teams_config({ definitions = { dev = { workers = { { name = "w1", template = "nope" } } } } }) },
+        {
+          teams = teams_config({
+            definitions = {
+              dev = {
+                workers = {
+                  { name = "w1", template = "worker" },
+                  { name = "w1", template = "worker" },
+                },
+              },
+            },
+          }),
+        },
+        {
+          teams = teams_config({
+            max_workers = 1,
+            definitions = {
+              dev = {
+                workers = {
+                  { name = "w1", template = "worker" },
+                  { name = "w2", template = "worker" },
+                },
+              },
+            },
+          }),
+        },
+        {
+          teams = teams_config({
+            definitions = { dev = { workers = { { name = "w1", template = "worker", task = 1 } } } },
+          }),
+        },
+        { teams = teams_config({ templates = { worker = { agent = "opencode", role = "x", worktree = "yes" } } }) },
       }
       for _, over in ipairs(bad) do
         t.raises(function()
@@ -199,7 +244,13 @@ return function(t)
 
     t.it("injects the leader MCP server, then binds the leader", function()
       local service, dir = start_service(t, "leader")
-      setup(t, "leader", service, dir)
+      setup(t, "leader", service, dir, {
+        teams = teams_config({
+          templates = {
+            worker = { agent = "opencode", role = "You are a worker. Report with bus_send.", worktree = true },
+          },
+        }),
+      })
       local connection = ServiceConnection.shared()
       t.truthy(connection)
       controller.connect()
@@ -250,6 +301,8 @@ return function(t)
       t.truthy(configured.templates.worker)
       t.eq("opencode", configured.templates.worker.key.agent)
       t.truthy(type(configured.templates.worker.role) == "string")
+      t.eq(true, configured.templates.worker.worktree)
+      t.match("/ade/worktrees$", configured.worktree_root)
       -- No environment/secret leaks into what is logged by the front end.
       t.eq(nil, configured.templates.worker.token)
     end)
@@ -390,6 +443,7 @@ return function(t)
             queued = 2,
             turns = { task = 0, total = 1 },
             paused = true,
+            worktree = { path = "/tmp/wt/w1", branch = "ade/t1-20260101-000000/w1" },
           },
         },
         inbox = {},
@@ -418,6 +472,7 @@ return function(t)
       t.match("leader", text)
       t.match("w1", text)
       t.match("paused", text)
+      t.match("wt ade/t1%-20260101%-000000/w1", text)
       t.match("which one%?", text)
       -- Answered items disappear without another team.changed.
       service:team_inbox({
@@ -671,6 +726,88 @@ return function(t)
         end
       end
       t.eq(1, skipped)
+    end)
+
+    local function defined_teams(over)
+      return teams_config(vim.tbl_deep_extend("force", {
+        enabled = true,
+        default = "dev",
+        definitions = {
+          dev = {
+            workers = {
+              { name = "w1", template = "worker", task = "T1" },
+              { name = "w2", template = "worker" },
+            },
+          },
+        },
+      }, over or {}))
+    end
+
+    t.it("starts configured workers once when the leader creates the team", function()
+      local service, dir = start_service(t, "defined", { team_spawn_warning = "dirty_tree" })
+      setup(t, "defined", service, dir, { teams = defined_teams() })
+      local notices = capture(t)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #service.team_spawns == 2
+      end, 10000, "the configured workers")
+      t.eq("t1", service.team_spawns[1].team)
+      t.eq("w1", service.team_spawns[1].name)
+      t.eq("worker", service.team_spawns[1].template)
+      t.eq("T1", service.team_spawns[1].task)
+      t.eq("w2", service.team_spawns[2].name)
+      t.eq(nil, service.team_spawns[2].task)
+      wait(function()
+        local found = false
+        for _, note in ipairs(notices) do
+          if note.message:find("last commit", 1, true) then
+            found = true
+          end
+        end
+        return found
+      end, 5000, "the dirty-tree warning")
+      -- A second bind/reconnect for the same team must not start them again.
+      team():start_defined_workers("t1", team():team("t1"))
+      vim.wait(100)
+      t.eq(2, #service.team_spawns, "workers start only once per team")
+    end)
+
+    t.it("does not start a defined worker that is already in the team", function()
+      local service, dir = start_service(t, "defined-existing", {
+        team_participants = {
+          { name = "leader", state = "idle", task = "_", queued = 0, turns = {} },
+          { name = "w1", state = "exited", task = "_", queued = 0, turns = {} },
+        },
+      })
+      setup(t, "defined-existing", service, dir, { teams = defined_teams() })
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #service.team_spawns >= 1
+      end, 10000, "the missing worker")
+      vim.wait(100)
+      t.eq(1, #service.team_spawns)
+      t.eq("w2", service.team_spawns[1].name)
+    end)
+
+    t.it("reports each defined worker that could not start", function()
+      local service, dir = start_service(t, "defined-failed", {
+        team_spawn_error = { code = -32061, message = "worker limit reached" },
+      })
+      setup(t, "defined-failed", service, dir, { teams = defined_teams() })
+      local notices = capture(t)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        local n = 0
+        for _, note in ipairs(notices) do
+          if note.message:find("could not start worker", 1, true) then
+            n = n + 1
+          end
+        end
+        return n == 2
+      end, 10000, "one warning per failed worker")
     end)
 
     t.it("does not inject a leader when another instance already leads the cwd", function()
@@ -946,6 +1083,207 @@ return function(t)
         return #service.team_answers == 2
       end, 5000, "the cancelled answer")
       t.eq(nil, service.team_answers[2].option)
+      ui:close()
+    end)
+
+    t.it("the panel's s starts a worker from a template", function()
+      local service, dir = start_service(t, "panel-spawn")
+      setup(t, "panel-spawn", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed({
+        id = "t1",
+        cwd = dir,
+        state = "active",
+        participants = { { name = "leader", state = "idle", task = "_", queued = 0, turns = {} } },
+        inbox = {},
+        limits = {},
+      })
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local ui = state().view.team_ui
+      local lnum
+      for index, id in pairs(ui.ids) do
+        if id == "team:t1" then
+          lnum = index
+        end
+      end
+      t.truthy(lnum, "the team line")
+      vim.api.nvim_win_set_cursor(ui.win, { lnum, 0 })
+      local original_select, original_input = vim.ui.select, vim.ui.input
+      local answers = { "w9", "task nine" }
+      t.cleanup(function()
+        vim.ui.select, vim.ui.input = original_select, original_input
+      end)
+      vim.ui.select = function(_, _, cb)
+        cb("worker")
+      end
+      vim.ui.input = function(_, cb)
+        cb(table.remove(answers, 1))
+      end
+      vim.api.nvim_feedkeys("s", "x", false)
+      wait(function()
+        return #service.team_spawns == 1
+      end, 5000, "the person-started worker")
+      t.eq("t1", service.team_spawns[1].team)
+      t.eq("worker", service.team_spawns[1].template)
+      t.eq("w9", service.team_spawns[1].name)
+      t.eq("task nine", service.team_spawns[1].task)
+      ui:close()
+    end)
+
+    t.it("the panel's D removes an exited worker's worktree only", function()
+      local service, dir = start_service(t, "panel-worktree", {
+        team_remove_result = { removed = true, branch_kept = true, branch = "ade/t1-20260101-000000/w1" },
+      })
+      setup(t, "panel-worktree", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed({
+        id = "t1",
+        cwd = dir,
+        state = "active",
+        participants = {
+          { name = "leader", state = "idle", task = "_", queued = 0, turns = {} },
+          {
+            name = "w1",
+            state = "exited",
+            task = "_",
+            queued = 0,
+            turns = {},
+            worktree = { path = "/tmp/wt/w1", branch = "ade/t1-20260101-000000/w1" },
+          },
+          {
+            name = "w2",
+            state = "idle",
+            task = "_",
+            queued = 0,
+            turns = {},
+            worktree = { path = "/tmp/wt/w2", branch = "ade/t1-20260101-000000/w2" },
+          },
+        },
+        inbox = {},
+        limits = {},
+      })
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      local notices = capture(t)
+      t.eq(true, controller.open_team())
+      local ui = state().view.team_ui
+      local function line_of(name)
+        for index, id in pairs(ui.ids) do
+          if id == "t1|" .. name then
+            return index
+          end
+        end
+      end
+      local original_select = vim.ui.select
+      t.cleanup(function()
+        vim.ui.select = original_select
+      end)
+
+      vim.api.nvim_win_set_cursor(ui.win, { line_of("w1"), 0 })
+      vim.ui.select = function(_, _, cb)
+        cb({ label = "Force remove worktree", value = true })
+      end
+      vim.api.nvim_feedkeys("D", "x", false)
+      wait(function()
+        return #service.team_removals == 1
+      end, 5000, "the worktree removal")
+      t.eq("t1", service.team_removals[1].team)
+      t.eq("w1", service.team_removals[1].participant)
+      t.eq(true, service.team_removals[1].force)
+      wait(function()
+        local found = false
+        for _, note in ipairs(notices) do
+          if note.message:find("was kept", 1, true) then
+            found = true
+          end
+        end
+        return found
+      end, 5000, "the kept-branch notice")
+
+      -- A running worker has no removable worktree yet.
+      vim.ui.select = function(_, _, cb)
+        cb({ label = "Remove worktree", value = false })
+      end
+      vim.api.nvim_win_set_cursor(ui.win, { line_of("w2"), 0 })
+      vim.api.nvim_feedkeys("D", "x", false)
+      vim.wait(150)
+      t.eq(1, #service.team_removals)
+      local hint = false
+      for _, note in ipairs(notices) do
+        if note.message:find("must have exited", 1, true) then
+          hint = true
+        end
+      end
+      t.truthy(hint, "a running worker must be told to exit first")
+      ui:close()
+    end)
+
+    t.it("shows git's stderr when removing a worktree fails", function()
+      local service, dir = start_service(t, "panel-worktree-error", {
+        team_remove_error = {
+          code = -32066,
+          message = "git worktree remove failed",
+          data = { stderr = "fatal: not a git repository" },
+        },
+      })
+      setup(t, "panel-worktree-error", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed({
+        id = "t1",
+        cwd = dir,
+        state = "active",
+        participants = {
+          { name = "leader", state = "idle", task = "_", queued = 0, turns = {} },
+          {
+            name = "w1",
+            state = "exited",
+            task = "_",
+            queued = 0,
+            turns = {},
+            worktree = { path = "/tmp/wt/w1", branch = "ade/t1-20260101-000000/w1" },
+          },
+        },
+        inbox = {},
+        limits = {},
+      })
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      local notices = capture(t)
+      t.eq(true, controller.open_team())
+      local ui = state().view.team_ui
+      local lnum
+      for index, id in pairs(ui.ids) do
+        if id == "t1|w1" then
+          lnum = index
+        end
+      end
+      t.truthy(lnum)
+      vim.api.nvim_win_set_cursor(ui.win, { lnum, 0 })
+      local original_select = vim.ui.select
+      t.cleanup(function()
+        vim.ui.select = original_select
+      end)
+      vim.ui.select = function(_, _, cb)
+        cb({ label = "Remove worktree", value = false })
+      end
+      vim.api.nvim_feedkeys("D", "x", false)
+      wait(function()
+        local found = false
+        for _, note in ipairs(notices) do
+          if note.message:find("fatal: not a git repository", 1, true) then
+            found = true
+          end
+        end
+        return found
+      end, 5000, "git's stderr in the notice")
       ui:close()
     end)
 

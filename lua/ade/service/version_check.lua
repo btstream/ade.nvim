@@ -67,6 +67,18 @@ function M.is_idle(instances)
   return true
 end
 
+---Whether the handshake advertised service-owned teams.
+---@param info table
+---@return boolean
+local function advertises_teams(info)
+  for _, feature in ipairs(type(info.features) == "table" and info.features or {}) do
+    if feature == "teams" then
+      return true
+    end
+  end
+  return false
+end
+
 ---@class AdeVersionCheck
 ---@field deps table
 local Check = {}
@@ -99,6 +111,40 @@ function Check:check(info, done)
   info = type(info) == "table" and info or {}
   if M.matches(info.server_version) then
     return true
+  end
+  -- PROTOCOL.md 18.14/18.16: a service with any team (except a suspended one)
+  -- is busy whatever the instances say, so ask before agent.list and treat a
+  -- failed/timeout probe as busy. -32601 means the service has no teams.
+  if advertises_teams(info) then
+    local teams_ok, teams_value = self.deps.request_sync("team.list", {}, 5000)
+    local busy = false
+    if not teams_ok then
+      local code = type(teams_value) == "table" and teams_value.code or nil
+      busy = code ~= -32601
+    elseif type(teams_value) ~= "table" or type(teams_value.teams) ~= "table" then
+      busy = true
+    else
+      for _, team in ipairs(teams_value.teams) do
+        if type(team) ~= "table" or team.state ~= "suspended" then
+          busy = true
+          break
+        end
+      end
+    end
+    if busy then
+      if not self.warned then
+        self.warned = true
+        self.deps.notify(
+          string.format(
+            "the service has an update (%s -> %s); it restarts automatically once the running team finishes",
+            tostring(info.server_version),
+            Version.VERSION
+          ),
+          vim.log.levels.WARN
+        )
+      end
+      return true
+    end
   end
   local ok, value = self.deps.request_sync("agent.list", {}, 2000)
   local instances = ok and type(value) == "table" and value.instances or nil

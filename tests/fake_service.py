@@ -131,6 +131,8 @@ class Server:
         self.team_binds = []
         self.team_sends = []
         self.team_answers = []
+        self.team_spawns = []
+        self.team_removals = []
         self.team_watch_replay = []
         self.team_counter = 0
         self.install_version = args.install_version
@@ -352,6 +354,22 @@ class Server:
             threading.Thread(
                 target=self.later_result, args=(conn, ident, {"id": self.team_counter}), daemon=True
             ).start()
+            return None
+        if method == "team.spawn":
+            self.team_spawns.append(copy.deepcopy(params))
+            name = params.get("name") or "w1"
+            threading.Thread(
+                target=self.later_result, args=(conn, ident, {"name": name}), daemon=True
+            ).start()
+            return None
+        if method == "team.remove_worktree":
+            self.team_removals.append(copy.deepcopy(params))
+            result = {
+                "removed": True,
+                "branch_kept": False,
+                "branch": "ade/t1-20260101-000000/" + str(params.get("participant")),
+            }
+            threading.Thread(target=self.later_result, args=(conn, ident, result), daemon=True).start()
             return None
         if method == "team.read":
             threading.Thread(

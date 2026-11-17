@@ -36,7 +36,8 @@ Server.__index = Server
 ---  install_busy?: boolean, uninstall_busy?: boolean, resolve_delay_ms?: integer,
 ---  policy_delay_ms?: integer, policy_error?: table,
 ---  teams?: table, team_watch?: table, team_leader_error?: table,
----  team_bind_error?: table,
+---  team_bind_error?: table, team_participants?: table, team_spawn_warning?: string,
+---  team_spawn_error?: table, team_remove_result?: table, team_remove_error?: table,
 ---  run_error?: table, uninstall_error?: table, canned_agent?: boolean}|nil
 ---@return FakeService
 function M.new(opts)
@@ -107,6 +108,13 @@ function M.new(opts)
     team_watch = opts.team_watch,
     team_leader_error = opts.team_leader_error,
     team_bind_error = opts.team_bind_error,
+    team_participants = opts.team_participants,
+    team_spawn_warning = opts.team_spawn_warning,
+    team_spawn_error = opts.team_spawn_error,
+    team_remove_result = opts.team_remove_result,
+    team_remove_error = opts.team_remove_error,
+    team_spawns = {},
+    team_removals = {},
     team_counter = 0,
     policy_responses = 0,
     policy_before_prompt = nil,
@@ -362,7 +370,7 @@ function Server:dispatch(message, client)
       cwd = params.cwd or "/",
       state = "active",
       leader = { instance = params.instance, sessionId = params.sessionId },
-      participants = {},
+      participants = vim.deepcopy(self.team_participants or {}),
       inbox = {},
       limits = { max_turns_per_task = 30, max_turns_total = 200, turns_total = 0 },
     }
@@ -406,6 +414,55 @@ function Server:dispatch(message, client)
     self.team_counter = self.team_counter + 1
     vim.defer_fn(function()
       self:send(client, { jsonrpc = "2.0", id = ident, result = { id = self.team_counter } })
+    end, 5)
+    return nil
+  end
+  if method == "team.spawn" then
+    if self.team_spawn_error then
+      return error_reply(ident, self.team_spawn_error.code, self.team_spawn_error.message, self.team_spawn_error.data)
+    end
+    self.team_spawns[#self.team_spawns + 1] = vim.deepcopy(params)
+    local team = self.teams[params.team]
+    local name = params.name
+    if name == nil then
+      local taken = {}
+      for _, entry in ipairs(team and team.participants or {}) do
+        taken[entry.name] = true
+      end
+      local n = 1
+      while taken["w" .. n] do
+        n = n + 1
+      end
+      name = "w" .. n
+    end
+    if team then
+      team.participants[#team.participants + 1] =
+        { name = name, state = "idle", task = params.task or "_", queued = 0, turns = { task = 0, total = 0 } }
+      self:emit(client, "team.changed", { team = vim.deepcopy(team) })
+    end
+    local result = { name = name }
+    if self.team_spawn_warning then
+      result.warning = self.team_spawn_warning
+    end
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = result })
+    end, 5)
+    return nil
+  end
+  if method == "team.remove_worktree" then
+    if self.team_remove_error then
+      return error_reply(
+        ident,
+        self.team_remove_error.code,
+        self.team_remove_error.message,
+        self.team_remove_error.data
+      )
+    end
+    self.team_removals[#self.team_removals + 1] = vim.deepcopy(params)
+    local result = vim.deepcopy(self.team_remove_result)
+      or { removed = true, branch_kept = false, branch = "ade/t1-20260101-000000/" .. tostring(params.participant) }
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = result })
     end, 5)
     return nil
   end

@@ -379,11 +379,6 @@ function M.build(ctx, opts, action)
       end
     end,
   })
-  if merged.teams and merged.teams.enabled then
-    vim.schedule(function()
-      notify("teams.enabled (pre-built teams) is not supported yet; start a team from chat", vim.log.levels.WARN)
-    end)
-  end
   S.sess.service = Sessions.new({
     config = cfg,
     runtime = function()
