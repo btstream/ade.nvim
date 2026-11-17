@@ -6,6 +6,7 @@
 //! `hub::teams`, which owns the hub and calls these methods.
 
 pub mod mcp;
+pub mod worktree;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -22,6 +23,8 @@ pub const WATCHER_REQUEST: i64 = -32062;
 pub const UNKNOWN_INBOX: i64 = -32063;
 pub const UNKNOWN_PARTICIPANT: i64 = -32064;
 pub const PARTICIPANT_METHOD: i64 = -32065;
+/// A git command for a worktree failed (18.16).
+pub const GIT_FAILED: i64 = -32066;
 
 /// Message body limit (18.1).
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -41,6 +44,8 @@ pub const MAX_TURN_TEXT: usize = 64 * 1024;
 pub struct TeamError {
     pub code: i64,
     pub message: String,
+    /// Extra `error.data` (18.16: git's stderr).
+    pub data: Option<Value>,
 }
 
 impl TeamError {
@@ -48,7 +53,16 @@ impl TeamError {
         Self {
             code,
             message: message.into(),
+            data: None,
         }
+    }
+
+    pub fn git(message: impl Into<String>, stderr: &str) -> Self {
+        let mut error = Self::new(GIT_FAILED, message);
+        if !stderr.trim().is_empty() {
+            error.data = Some(json!({ "stderr": stderr }));
+        }
+        error
     }
 
     pub fn invalid(message: impl Into<String>) -> Self {
@@ -302,6 +316,8 @@ pub struct Template {
     pub launch: Option<crate::install::Launch>,
     pub model: Option<String>,
     pub role: String,
+    /// Start this worker in a git worktree (18.12).
+    pub worktree: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -311,6 +327,9 @@ pub struct TeamConfig {
     pub max_turns_per_task: u64,
     pub max_turns_total: u64,
     pub templates: HashMap<String, Template>,
+    /// Parent directory for worker worktrees; required when a template asks
+    /// for one (18.12).
+    pub worktree_root: Option<String>,
 }
 
 impl Default for TeamConfig {
@@ -321,6 +340,7 @@ impl Default for TeamConfig {
             max_turns_per_task: 30,
             max_turns_total: 200,
             templates: HashMap::new(),
+            worktree_root: None,
         }
     }
 }
@@ -360,6 +380,8 @@ pub struct Participant {
     pub turn_sender: Option<String>,
     pub reported: bool,
     pub turns: VecDeque<TurnText>,
+    /// The worktree this worker runs in (18.12); kept after the worker exits.
+    pub worktree: Option<worktree::WorktreeInfo>,
 }
 
 impl Participant {
@@ -387,6 +409,7 @@ impl Participant {
             turn_sender: None,
             reported: false,
             turns: VecDeque::new(),
+            worktree: None,
         }
     }
 
@@ -418,6 +441,8 @@ pub struct Team {
     pub watchers: HashMap<String, Vec<u64>>,
     /// (instance, serialized agent request id) -> inbox item id.
     pub pending_items: HashMap<(String, String), String>,
+    /// Creation time in ms; worktree names embed its UTC stamp (18.12).
+    pub created_at: u64,
 }
 
 impl Team {
@@ -539,7 +564,15 @@ pub struct TurnEffects {
     pub delivery_team: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub struct SpawnPlan {
+    pub template: Template,
+    pub cwd: String,
+    pub stamp: String,
+    pub worktree_root: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct SpawnRequest {
     pub team: String,
     pub name: String,
@@ -866,6 +899,7 @@ impl Teams {
             task_limit_hit: HashSet::new(),
             watchers: HashMap::new(),
             pending_items: HashMap::new(),
+            created_at: now_ms(),
         };
         let mut leader = Participant::new("leader", Role::Leader);
         leader.instance = Some(instance.to_string());
@@ -1344,7 +1378,15 @@ impl Teams {
             }
         }
         turns.reverse();
-        Ok(json!({ "messages": messages, "turns": turns }))
+        let mut out = json!({ "messages": messages, "turns": turns });
+        if let Some(worktree) = &participant_entry.worktree {
+            out["worktree"] = json!({
+                "path": worktree.path,
+                "branch": worktree.branch,
+                "base": worktree.base,
+            });
+        }
+        Ok(out)
     }
 
     // -- spawning ----------------------------------------------------------
@@ -1364,28 +1406,7 @@ impl Teams {
         if team.closed {
             return Err(TeamError::unknown("team closed"));
         }
-        if !team.config.templates.contains_key(template) {
-            return Err(TeamError::not_allowed("unknown template"));
-        }
-        if team.live_workers() as u64 >= team.config.max_workers {
-            return Err(TeamError::not_allowed("worker limit reached"));
-        }
-        if let Some(task) = task {
-            validate_body(task)?;
-        }
-        let name = match name {
-            Some(name) => {
-                validate_name(name)?;
-                if name == "leader" || name == "human" {
-                    return Err(TeamError::invalid("that name is reserved"));
-                }
-                if team.participants.contains_key(name) || team.reserved_names.contains(name) {
-                    return Err(TeamError::invalid("name is already in use"));
-                }
-                name.to_string()
-            }
-            None => lowest_free_name(team),
-        };
+        let name = spawn_name(team, template, name, task)?;
         let auto = team.config.spawn_auto.contains(template);
         if auto {
             spawn_participant(team, &name, template, task)?;
@@ -1434,6 +1455,34 @@ impl Teams {
         })
     }
 
+    /// `team.spawn` (18.13): the person starts a worker without the inbox.
+    pub fn request_spawn_human(
+        &mut self,
+        team_id: &str,
+        template: &str,
+        name: Option<&str>,
+        task: Option<&str>,
+    ) -> Result<SpawnRequest, TeamError> {
+        let team = self
+            .teams
+            .get_mut(team_id)
+            .ok_or_else(|| TeamError::unknown("unknown team"))?;
+        if team.closed {
+            return Err(TeamError::unknown("team closed"));
+        }
+        let name = spawn_name(team, template, name, task)?;
+        spawn_participant(team, &name, template, task)?;
+        team.order.push(name.clone());
+        let team_id = team.id.clone();
+        self.events.push(TeamEvent::Changed(team_id.clone()));
+        Ok(SpawnRequest {
+            team: team_id,
+            name,
+            template: template.to_string(),
+            task: task.map(str::to_string),
+        })
+    }
+
     /// The driver starts an approved/auto worker. The participant already
     /// exists in `starting` state; this returns the template details.
     pub fn spawn_details(&self, team_id: &str, name: &str) -> Option<(String, Template, String)> {
@@ -1442,6 +1491,67 @@ impl Teams {
         let template_name = participant.template.clone()?;
         let template = team.config.templates.get(&template_name)?.clone();
         Some((template_name, template, team.cwd.clone()))
+    }
+
+    /// Everything the driver needs to place a worker (18.12).
+    pub fn spawn_plan(&self, team_id: &str, name: &str) -> Option<SpawnPlan> {
+        let team = self.teams.get(team_id)?;
+        let participant = team.participants.get(name)?;
+        let template_name = participant.template.clone()?;
+        let template = team.config.templates.get(&template_name)?.clone();
+        Some(SpawnPlan {
+            template,
+            cwd: team.cwd.clone(),
+            stamp: worktree::stamp(team.created_at),
+            worktree_root: team.config.worktree_root.clone(),
+        })
+    }
+
+    pub fn worktree_prepared(&mut self, team_id: &str, name: &str, info: worktree::WorktreeInfo) {
+        let Some(team) = self.teams.get_mut(team_id) else {
+            return;
+        };
+        let Some(participant) = team.participants.get_mut(name) else {
+            return;
+        };
+        if info.warning.as_deref() == Some("dirty_tree") {
+            if let Some(card) = &mut participant.role_card {
+                card.push('\n');
+                card.push_str(worktree::dirty_note());
+            }
+        }
+        if let Some(relative) = &info.missing_subdir {
+            if let Some(card) = &mut participant.role_card {
+                card.push('\n');
+                card.push_str(&format!(
+                    "The team's subdirectory {relative} is missing here; you are at the worktree root."
+                ));
+            }
+        }
+        participant.worktree = Some(info);
+        self.events.push(TeamEvent::Changed(team_id.to_string()));
+    }
+
+    pub fn worktree_removed(&mut self, team_id: &str, name: &str) {
+        if let Some(team) = self.teams.get_mut(team_id) {
+            if let Some(participant) = team.participants.get_mut(name) {
+                participant.worktree = None;
+            }
+        }
+        self.events.push(TeamEvent::Changed(team_id.to_string()));
+    }
+
+    pub fn worktree_info(&self, team_id: &str, name: &str) -> Option<worktree::WorktreeInfo> {
+        self.teams
+            .get(team_id)?
+            .participants
+            .get(name)?
+            .worktree
+            .clone()
+    }
+
+    pub fn created_at(&self, team_id: &str) -> Option<u64> {
+        self.teams.get(team_id).map(|team| team.created_at)
     }
 
     pub fn worker_instance_set(&mut self, team_id: &str, name: &str, instance: &str) {
@@ -2309,6 +2419,36 @@ impl Teams {
     }
 }
 
+fn spawn_name(
+    team: &Team,
+    template: &str,
+    name: Option<&str>,
+    task: Option<&str>,
+) -> Result<String, TeamError> {
+    if !team.config.templates.contains_key(template) {
+        return Err(TeamError::not_allowed("unknown template"));
+    }
+    if team.live_workers() as u64 >= team.config.max_workers {
+        return Err(TeamError::not_allowed("worker limit reached"));
+    }
+    if let Some(task) = task {
+        validate_body(task)?;
+    }
+    match name {
+        Some(name) => {
+            validate_name(name)?;
+            if name == "leader" || name == "human" {
+                return Err(TeamError::invalid("that name is reserved"));
+            }
+            if team.participants.contains_key(name) || team.reserved_names.contains(name) {
+                return Err(TeamError::invalid("name is already in use"));
+            }
+            Ok(name.to_string())
+        }
+        None => Ok(lowest_free_name(team)),
+    }
+}
+
 fn spawn_participant(
     team: &mut Team,
     name: &str,
@@ -2428,6 +2568,12 @@ fn team_entry(team: &Team) -> Value {
             });
             if let Some(reason) = &participant.reason {
                 out["reason"] = json!(reason);
+            }
+            if let Some(worktree) = &participant.worktree {
+                out["worktree"] = json!({
+                    "path": worktree.path,
+                    "branch": worktree.branch,
+                });
             }
             out
         })
@@ -2576,12 +2722,25 @@ fn parse_config(value: &Value) -> Result<TeamConfig, TeamError> {
                 .ok_or_else(|| TeamError::invalid("limits.max_turns_total must be an integer"))?;
         }
     }
+    let worktree_root = match object.get("worktree_root") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let root = value
+                .as_str()
+                .ok_or_else(|| TeamError::invalid("worktree_root must be a string"))?;
+            if root.is_empty() || !std::path::Path::new(root).is_absolute() {
+                return Err(TeamError::invalid("worktree_root must be an absolute path"));
+            }
+            Some(root.to_string())
+        }
+    };
     Ok(TeamConfig {
         max_workers,
         spawn_auto,
         max_turns_per_task,
         max_turns_total,
         templates,
+        worktree_root,
     })
 }
 
@@ -2661,6 +2820,12 @@ fn parse_template(name: &str, value: &Value) -> Result<Template, TeamError> {
                 .to_string(),
         ),
     };
+    let worktree = match object.get("worktree") {
+        None | Some(Value::Null) => false,
+        Some(value) => value.as_bool().ok_or_else(|| {
+            TeamError::invalid(format!("template {name}.worktree must be a boolean"))
+        })?,
+    };
     let role = object
         .get("role")
         .and_then(Value::as_str)
@@ -2687,6 +2852,7 @@ fn parse_template(name: &str, value: &Value) -> Result<Template, TeamError> {
         launch,
         model,
         role: role.to_string(),
+        worktree,
     })
 }
 
@@ -3278,6 +3444,114 @@ mod tests {
             ItemState::Orphaned
         );
         assert!(teams.token_role("k1").is_none());
+    }
+
+    #[test]
+    fn worktree_configuration_is_validated() {
+        let mut teams = Teams::new(new_shared_tokens());
+        let error = teams
+            .configure("/p", config(json!({"worktree_root": "relative/path"})))
+            .expect_err("a relative root must fail");
+        assert_eq!(error.code, INVALID_TEAM_PARAM, "{error:?}");
+        assert!(error.message.contains("worktree_root"), "{error:?}");
+
+        let mut templates = json!({
+            "dev": {
+                "key": { "agent": "a", "command": "c", "args": [] },
+                "role": "role",
+                "worktree": "yes"
+            }
+        });
+        let error = teams
+            .configure("/p", config(json!({"templates": templates.take()})))
+            .expect_err("a non-boolean worktree must fail");
+        assert_eq!(error.code, INVALID_TEAM_PARAM, "{error:?}");
+        assert!(error.message.contains("worktree"), "{error:?}");
+
+        teams
+            .configure("/p", config(json!({"worktree_root": "/tmp/worktrees"})))
+            .expect("an absolute root is accepted");
+        assert_eq!(
+            teams.config_for("/p").worktree_root.as_deref(),
+            Some("/tmp/worktrees")
+        );
+    }
+
+    #[test]
+    fn a_human_spawn_has_no_inbox_item() {
+        let (mut teams, team) = fixture(json!({}));
+        let spawn = teams
+            .request_spawn_human(&team, "dev", Some("w1"), Some("do it"))
+            .expect("human spawn");
+        assert_eq!(spawn.name, "w1");
+        assert_eq!(spawn.template, "dev");
+        let entry = teams.entry(&team).expect("entry");
+        assert!(entry["inbox"]
+            .as_array()
+            .is_some_and(|items| items.iter().all(|item| item["kind"] != "spawn")));
+        assert!(entry["participants"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["name"] == "w1")));
+        // The same name and the worker limit still apply.
+        let used = teams
+            .request_spawn_human(&team, "dev", Some("w1"), None)
+            .expect_err("a used name fails");
+        assert_eq!(used.code, INVALID_TEAM_PARAM, "{used:?}");
+        let (mut limited, limited_team) = fixture(json!({"max_workers": 1}));
+        limited
+            .request_spawn_human(&limited_team, "dev", Some("w1"), None)
+            .expect("first worker");
+        let error = limited
+            .request_spawn_human(&limited_team, "dev", Some("w2"), None)
+            .expect_err("the limit applies");
+        assert_eq!(error.code, NOT_ALLOWED, "{error:?}");
+    }
+
+    #[test]
+    fn the_team_and_read_carry_the_worktree() {
+        let (mut teams, team) = fixture(json!({"worktree_root": "/tmp/worktrees"}));
+        let spawn = teams
+            .request_spawn_human(&team, "dev", Some("w1"), None)
+            .unwrap();
+        let info = worktree::WorktreeInfo {
+            path: "/tmp/worktrees/repo-12345678/t1-w1".to_string(),
+            cwd: "/tmp/worktrees/repo-12345678/t1-w1/sub".to_string(),
+            branch: "ade/t1-stamp/w1".to_string(),
+            base: "abc".to_string(),
+            toplevel: "/tmp/repo".to_string(),
+            warning: Some("dirty_tree".to_string()),
+            missing_subdir: None,
+        };
+        teams.worktree_prepared(&team, &spawn.name, info);
+        let entry = teams.entry(&team).unwrap();
+        let worker = entry["participants"]
+            .as_array()
+            .and_then(|items| items.iter().find(|item| item["name"] == "w1"))
+            .expect("worker");
+        assert_eq!(worker["worktree"]["branch"], "ade/t1-stamp/w1", "{worker}");
+        assert_eq!(
+            worker["worktree"]["path"],
+            "/tmp/worktrees/repo-12345678/t1-w1"
+        );
+        let read = teams.read(&team, "w1", None).unwrap();
+        assert_eq!(read["worktree"]["base"], "abc", "{read}");
+        teams.worktree_removed(&team, "w1");
+        let entry = teams.entry(&team).unwrap();
+        let worker = entry["participants"]
+            .as_array()
+            .and_then(|items| items.iter().find(|item| item["name"] == "w1"))
+            .expect("worker");
+        assert!(worker.get("worktree").is_none(), "{worker}");
+    }
+
+    #[test]
+    fn a_leaderless_team_allows_a_human_spawn() {
+        let (mut teams, team) = fixture(json!({}));
+        teams.leader_session_closed("i1", "s1");
+        let spawn = teams
+            .request_spawn_human(&team, "dev", Some("w1"), None)
+            .expect("leaderless spawn");
+        assert_eq!(spawn.name, "w1");
     }
 
     #[test]

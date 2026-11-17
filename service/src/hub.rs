@@ -31,7 +31,7 @@ use crate::store::EventKind;
 
 mod teams;
 
-use teams::{ServiceCall, TeamResult};
+use teams::{PendingWorktree, ServiceCall, TeamResult};
 
 /// Maximum bytes queued for one connection (PROTOCOL.md section 7).
 pub const MAX_OUTBOX_BYTES: usize = 64 * 1024 * 1024;
@@ -136,6 +136,12 @@ impl OutboxReceiver {
     }
 }
 
+#[derive(Debug)]
+pub enum WorktreeOutcome {
+    Spawn(Result<crate::team::worktree::WorktreeInfo, crate::team::TeamError>),
+    Remove(Result<crate::team::worktree::Removed, crate::team::TeamError>),
+}
+
 /// Instructions from connection tasks to the hub.
 #[derive(Debug)]
 pub enum Command {
@@ -154,6 +160,12 @@ pub enum Command {
     Authenticated {
         conn: u64,
         participant: Option<String>,
+    },
+    /// A background git worktree command finished (18.12/18.16).
+    TeamWorktree {
+        team: String,
+        participant: String,
+        outcome: WorktreeOutcome,
     },
     /// The 30 s grace period after cancelling a bus prompt ended (18.11).
     TeamDeadline {
@@ -438,6 +450,10 @@ pub struct Hub {
     held_generation: HashMap<(String, String), u64>,
     held_timed_out: HashSet<(String, String)>,
     next_held_generation: u64,
+    /// Spawns waiting for their git worktree, by (team, participant).
+    pending_worktrees: HashMap<(String, String), PendingWorktree>,
+    /// `team.remove_worktree` requests waiting for git, by (team, participant).
+    pending_removals: HashMap<(String, String), (u64, Value)>,
     team_sender: mpsc::UnboundedSender<TeamResult>,
     team_results: mpsc::UnboundedReceiver<TeamResult>,
 }
@@ -495,6 +511,8 @@ impl Hub {
             held_generation: HashMap::new(),
             held_timed_out: HashSet::new(),
             next_held_generation: 0,
+            pending_worktrees: HashMap::new(),
+            pending_removals: HashMap::new(),
             team_sender,
             team_results,
         }
@@ -574,6 +592,14 @@ impl Hub {
         match command {
             Command::Register { conn, outbox } => {
                 self.conns.insert(conn, outbox);
+            }
+            Command::TeamWorktree {
+                team,
+                participant,
+                outcome,
+            } => {
+                self.team_worktree(&team, &participant, outcome);
+                self.update_busy();
             }
             Command::TeamDeadline {
                 instance,

@@ -7,9 +7,40 @@
 
 use super::*;
 use crate::team::{
-    AnswerEffect, ItemKind, Kind, Role, SpawnOutcome, TeamError, TeamEvent, INVALID_TEAM_PARAM,
-    MAX_BODY_BYTES,
+    worktree, AnswerEffect, ItemKind, Kind, Role, SpawnOutcome, SpawnPlan, SpawnRequest, TeamError,
+    TeamEvent, INVALID_TEAM_PARAM, MAX_BODY_BYTES,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpawnReplyKind {
+    /// `bus.spawn` from the leader's MCP tool.
+    Bus,
+    /// `team.spawn` from the person's front end.
+    Team,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StartOptions {
+    pub reply: Option<(u64, Value, SpawnReplyKind)>,
+    /// The approved-spawn request id, for the notice (18.3/18.16).
+    pub approved_request: Option<String>,
+    /// `team.spawn` announces itself to the leader (18.13).
+    pub human_notice: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingWorktree {
+    pub spawn: SpawnRequest,
+    pub plan: SpawnPlan,
+    pub opts: StartOptions,
+}
+
+pub(crate) enum StartResult {
+    Started,
+    Deferred,
+    /// The failure was reported and the spawn must not reply again.
+    Replied,
+}
 
 #[derive(Debug)]
 pub enum ServiceCall {
@@ -95,6 +126,18 @@ impl Hub {
             // reply and no meaning here.
             return;
         }
+        if method == "bus.spawn" {
+            if role != Role::Leader {
+                self.send_error(
+                    conn,
+                    id,
+                    &TeamError::not_allowed("team_spawn is leader only"),
+                );
+            } else {
+                self.bus_spawn(conn, id, &team, params);
+            }
+            return;
+        }
         let result = match method {
             "bus.send" => self.bus_send(conn, &team, &name, params),
             "bus.ask_human" => self.bus_ask_human(&team, &name, params),
@@ -104,13 +147,6 @@ impl Hub {
                     Err(TeamError::not_allowed("bus_read is leader only"))
                 } else {
                     self.bus_read(&team, params)
-                }
-            }
-            "bus.spawn" => {
-                if role != Role::Leader {
-                    Err(TeamError::not_allowed("team_spawn is leader only"))
-                } else {
-                    self.bus_spawn(&team, params)
                 }
             }
             _ => Err(TeamError::new(METHOD_NOT_FOUND, "method not found")),
@@ -123,7 +159,7 @@ impl Hub {
                 }
                 self.send_to(conn, &success(id, value));
             }
-            Err(error) => self.send_to(conn, &failure(id, error.code, &error.message)),
+            Err(error) => self.send_error(conn, id, &error),
         }
     }
 
@@ -134,6 +170,14 @@ impl Hub {
         params: &Value,
         id: &Value,
     ) {
+        if method == "team.spawn" {
+            self.team_spawn(conn, id, params);
+            return;
+        }
+        if method == "team.remove_worktree" {
+            self.team_remove_worktree(conn, id, params);
+            return;
+        }
         let result = match method {
             "team.configure" => self.team_configure(params).map(|value| (value, false)),
             "team.leader_server" => self.team_leader_server(params).map(|value| (value, false)),
@@ -159,7 +203,7 @@ impl Hub {
                 }
                 self.send_to(conn, &success(id, value));
             }
-            Err(error) => self.send_to(conn, &failure(id, error.code, &error.message)),
+            Err(error) => self.send_error(conn, id, &error),
         }
     }
 
@@ -237,8 +281,15 @@ impl Hub {
         let spawned = matches!(&effect, AnswerEffect::Spawn(_));
         match effect {
             AnswerEffect::Spawn(spawn) => {
-                self.team_spawn_notice(&team, &request, allow == Some(true), &spawn.name);
-                self.start_worker(&spawn);
+                // The approval notice waits for the worktree result so a
+                // dirty tree can be named (18.16).
+                self.start_worker(
+                    &spawn,
+                    StartOptions {
+                        approved_request: Some(request.clone()),
+                        ..StartOptions::default()
+                    },
+                );
             }
             AnswerEffect::Permission {
                 instance,
@@ -468,25 +519,139 @@ impl Hub {
         Ok((self.teams.read(team, &participant, since)?, false))
     }
 
-    fn bus_spawn(&mut self, team: &str, params: &Value) -> Result<(Value, bool), TeamError> {
-        let template = required_team_string(params, "template")?;
-        let name = optional_string(params, "name")?;
-        let task = optional_string(params, "task")?;
-        match self
-            .teams
-            .request_spawn(team, &template, name.as_deref(), task.as_deref())?
-        {
-            SpawnOutcome::Started(spawn) => {
-                self.start_worker(&spawn);
-                Ok((json!({ "status": "started", "name": spawn.name }), true))
+    /// `bus.spawn`: a worktree spawn answers after git finished, so the reply
+    /// is sent here instead of returning a value.
+    fn bus_spawn(&mut self, conn: u64, id: &Value, team: &str, params: &Value) {
+        let result = (|| -> Result<Option<(Value, bool)>, TeamError> {
+            let template = required_team_string(params, "template")?;
+            let name = optional_string(params, "name")?;
+            let task = optional_string(params, "task")?;
+            match self
+                .teams
+                .request_spawn(team, &template, name.as_deref(), task.as_deref())?
+            {
+                SpawnOutcome::Started(spawn) => {
+                    let opts = StartOptions {
+                        reply: Some((conn, id.clone(), SpawnReplyKind::Bus)),
+                        ..StartOptions::default()
+                    };
+                    match self.start_worker(&spawn, opts) {
+                        StartResult::Started => Ok(Some((
+                            Self::spawn_value(&spawn.name, SpawnReplyKind::Bus, None),
+                            true,
+                        ))),
+                        StartResult::Deferred | StartResult::Replied => Ok(None),
+                    }
+                }
+                SpawnOutcome::Awaiting { request, name: _ } => Ok(Some((
+                    json!({
+                        "status": "awaiting_approval",
+                        "request": request,
+                    }),
+                    false,
+                ))),
             }
-            SpawnOutcome::Awaiting { request, name: _ } => Ok((
-                json!({
-                    "status": "awaiting_approval",
-                    "request": request,
-                }),
-                false,
-            )),
+        })();
+        match result {
+            Ok(Some((value, delivery))) => {
+                self.drain_team_events();
+                if delivery {
+                    self.team_deliveries();
+                }
+                self.send_to(conn, &success(id, value));
+            }
+            Ok(None) => {}
+            Err(error) => self.send_error(conn, id, &error),
+        }
+    }
+
+    /// `team.spawn` (18.13): the person starts a worker, no inbox item.
+    fn team_spawn(&mut self, conn: u64, id: &Value, params: &Value) {
+        let result = (|| -> Result<SpawnRequest, TeamError> {
+            let team = required_team_string(params, "team")?;
+            let template = required_team_string(params, "template")?;
+            let name = optional_string(params, "name")?;
+            let task = optional_string(params, "task")?;
+            self.teams
+                .request_spawn_human(&team, &template, name.as_deref(), task.as_deref())
+        })();
+        match result {
+            Ok(spawn) => {
+                self.drain_team_events();
+                let opts = StartOptions {
+                    reply: Some((conn, id.clone(), SpawnReplyKind::Team)),
+                    human_notice: true,
+                    ..StartOptions::default()
+                };
+                if matches!(self.start_worker(&spawn, opts), StartResult::Started) {
+                    self.send_to(
+                        conn,
+                        &success(
+                            id,
+                            Self::spawn_value(&spawn.name, SpawnReplyKind::Team, None),
+                        ),
+                    );
+                }
+                self.drain_team_events();
+                self.team_deliveries();
+            }
+            Err(error) => self.send_error(conn, id, &error),
+        }
+    }
+
+    /// `team.remove_worktree` (18.16): allowed for an exited worker only.
+    fn team_remove_worktree(&mut self, conn: u64, id: &Value, params: &Value) {
+        let result = (|| -> Result<worktree::WorktreeInfo, TeamError> {
+            let team = required_team_string(params, "team")?;
+            let participant = required_team_string(params, "participant")?;
+            let force = optional_bool(params, "force")?.unwrap_or(false);
+            let entry = self
+                .teams
+                .team(&team)
+                .ok_or_else(|| TeamError::unknown("unknown team"))?;
+            let worker = entry
+                .participants
+                .get(&participant)
+                .ok_or_else(|| TeamError::unknown("unknown participant"))?;
+            if worker.role != Role::Worker {
+                return Err(TeamError::not_allowed("only a worker has a worktree"));
+            }
+            if worker.state != crate::team::ParticipantState::Exited {
+                return Err(TeamError::not_allowed("the worker is still running"));
+            }
+            let info = worker
+                .worktree
+                .clone()
+                .ok_or_else(|| TeamError::invalid("the worker has no worktree"))?;
+            if self
+                .pending_removals
+                .contains_key(&(team.clone(), participant.clone()))
+            {
+                return Err(TeamError::invalid("a removal is already in progress"));
+            }
+            self.pending_removals
+                .insert((team.clone(), participant.clone()), (conn, id.clone()));
+            let sender = self.command_sender.clone();
+            let team_for_git = team.clone();
+            let participant_for_git = participant.clone();
+            let toplevel = info.toplevel.clone();
+            let path = info.path.clone();
+            let branch = info.branch.clone();
+            tokio::spawn(async move {
+                let result = worktree::remove(&toplevel, &path, &branch, force).await;
+                let _ = sender
+                    .send(Command::TeamWorktree {
+                        team: team_for_git,
+                        participant: participant_for_git,
+                        outcome: WorktreeOutcome::Remove(result),
+                    })
+                    .await;
+            });
+            // The actual reply is sent when git finishes.
+            Ok(info)
+        })();
+        if let Err(error) = result {
+            self.send_error(conn, id, &error);
         }
     }
 
@@ -520,25 +685,81 @@ impl Hub {
         });
     }
 
-    fn start_worker(&mut self, spawn: &crate::team::SpawnRequest) {
-        let Some((_template_name, template, cwd)) =
-            self.teams.spawn_details(&spawn.team, &spawn.name)
-        else {
-            return;
+    fn start_worker(&mut self, spawn: &SpawnRequest, opts: StartOptions) -> StartResult {
+        let Some(plan) = self.teams.spawn_plan(&spawn.team, &spawn.name) else {
+            self.fail_spawn(spawn, &opts, TeamError::unknown("unknown participant"));
+            return StartResult::Replied;
         };
-        let mut key = template.key.clone();
-        key.cwd = cwd;
+        if plan.template.worktree {
+            let Some(root) = plan.worktree_root.clone() else {
+                self.fail_spawn(
+                    spawn,
+                    &opts,
+                    TeamError::not_allowed("worktree_root is not configured"),
+                );
+                return StartResult::Replied;
+            };
+            let team = spawn.team.clone();
+            let participant = spawn.name.clone();
+            self.pending_worktrees.insert(
+                (team.clone(), participant.clone()),
+                PendingWorktree {
+                    spawn: spawn.clone(),
+                    plan: plan.clone(),
+                    opts,
+                },
+            );
+            let cwd = plan.cwd.clone();
+            let stamp = plan.stamp.clone();
+            let sender = self.command_sender.clone();
+            let team_for_git = team.clone();
+            let name_for_git = participant.clone();
+            tokio::spawn(async move {
+                let result =
+                    worktree::create(&cwd, &root, &team_for_git, &stamp, &name_for_git).await;
+                let _ = sender
+                    .send(Command::TeamWorktree {
+                        team,
+                        participant,
+                        outcome: WorktreeOutcome::Spawn(result),
+                    })
+                    .await;
+            });
+            return StartResult::Deferred;
+        }
+        if self.start_worker_now(spawn, &plan, None, &opts) {
+            self.announce_start(spawn, &opts, None);
+            StartResult::Started
+        } else {
+            StartResult::Replied
+        }
+    }
+
+    /// Spawn the process and send `initialize`. Failures are reported through
+    /// `fail_spawn` and return false.
+    fn start_worker_now(
+        &mut self,
+        spawn: &SpawnRequest,
+        plan: &SpawnPlan,
+        cwd: Option<String>,
+        opts: &StartOptions,
+    ) -> bool {
+        let mut key = plan.template.key.clone();
+        key.cwd = cwd.unwrap_or_else(|| plan.cwd.clone());
         key.capabilities = crate::team::worker_capabilities();
         #[cfg(unix)]
-        let spawned = self.spawn_worker(key.clone(), template.env.clone(), template.launch.clone());
+        let spawned = self.spawn_worker(
+            key.clone(),
+            plan.template.env.clone(),
+            plan.template.launch.clone(),
+        );
         #[cfg(not(unix))]
-        let spawned = self.spawn_worker(key.clone(), template.env.clone());
+        let spawned = self.spawn_worker(key.clone(), plan.template.env.clone());
         let instance = match spawned {
             Ok(instance) => instance,
             Err(error) => {
-                self.teams
-                    .worker_start_failed(&spawn.team, &spawn.name, &error);
-                return;
+                self.fail_spawn(spawn, opts, TeamError::not_allowed(error));
+                return false;
             }
         };
         self.teams
@@ -547,9 +768,13 @@ impl Hub {
             self.teams
                 .create_worker_token(&spawn.team, &spawn.name, &instance)
         else {
-            self.teams
-                .worker_start_failed(&spawn.team, &spawn.name, "cannot create worker token");
-            return;
+            self.stop_worker_instance(&instance);
+            self.fail_spawn(
+                spawn,
+                opts,
+                TeamError::not_allowed("cannot create worker token"),
+            );
+            return false;
         };
         let command = std::env::current_exe()
             .ok()
@@ -569,17 +794,178 @@ impl Hub {
             team: spawn.team.clone(),
             participant: spawn.name.clone(),
             server,
-            model: template.model.clone(),
+            model: plan.template.model.clone(),
         };
         if !self.send_service_request(&instance, "initialize", params, call) {
             self.teams.revoke_instance_tokens(&instance);
             self.stop_worker_instance(&instance);
-            self.teams.worker_start_failed(
+            self.fail_spawn(
+                spawn,
+                opts,
+                TeamError::not_allowed("agent is not accepting messages"),
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Report a failed spawn once: the participant becomes exited with the
+    /// documented notices and the waiting request gets the error.
+    fn fail_spawn(&mut self, spawn: &SpawnRequest, opts: &StartOptions, error: TeamError) {
+        self.teams
+            .worker_start_failed(&spawn.team, &spawn.name, &error.message);
+        if let Some((conn, id, _)) = &opts.reply {
+            self.send_error(*conn, id, &error);
+        }
+        self.drain_team_events();
+    }
+
+    fn spawn_value(
+        name: &str,
+        kind: SpawnReplyKind,
+        info: Option<&worktree::WorktreeInfo>,
+    ) -> Value {
+        let mut value = match kind {
+            SpawnReplyKind::Bus => json!({ "status": "started", "name": name }),
+            SpawnReplyKind::Team => json!({ "name": name }),
+        };
+        if let Some(info) = info {
+            if let Some(warning) = &info.warning {
+                value["warning"] = json!(warning);
+            }
+        }
+        value
+    }
+
+    fn announce_start(
+        &mut self,
+        spawn: &SpawnRequest,
+        opts: &StartOptions,
+        info: Option<&worktree::WorktreeInfo>,
+    ) {
+        let warning = info.and_then(|info| info.warning.as_deref());
+        if let Some(request) = &opts.approved_request {
+            let mut body = format!("spawn request {request} approved: {}", spawn.name);
+            if warning.is_some() {
+                body.push_str(" (warning: dirty_tree)");
+            }
+            let _ = self.teams.send_message(
                 &spawn.team,
-                &spawn.name,
-                "agent is not accepting messages",
+                "human",
+                "leader",
+                Kind::Notice,
+                &body,
+                None,
+                vec![request.clone()],
             );
         }
+        if opts.human_notice {
+            let body = format!(
+                "worker {} started from template {}",
+                spawn.name, spawn.template
+            );
+            let _ = self.teams.send_message(
+                &spawn.team,
+                "human",
+                "leader",
+                Kind::Notice,
+                &body,
+                None,
+                vec![],
+            );
+        }
+    }
+
+    pub(crate) fn team_worktree(
+        &mut self,
+        team: &str,
+        participant: &str,
+        outcome: WorktreeOutcome,
+    ) {
+        match outcome {
+            WorktreeOutcome::Spawn(result) => {
+                let Some(pending) = self
+                    .pending_worktrees
+                    .remove(&(team.to_string(), participant.to_string()))
+                else {
+                    return;
+                };
+                match result {
+                    Ok(info) => {
+                        self.teams
+                            .worktree_prepared(team, participant, info.clone());
+                        if self.teams.team(team).is_none() {
+                            if let Some((conn, id, _)) = &pending.opts.reply {
+                                self.send_error(*conn, id, &TeamError::unknown("team closed"));
+                            }
+                            return;
+                        }
+                        if let Some(relative) = &info.missing_subdir {
+                            let body =
+                                worktree::missing_subdir_notice(participant, relative, &info.path);
+                            let _ = self.teams.send_message(
+                                team,
+                                "human",
+                                "leader",
+                                Kind::Notice,
+                                &body,
+                                None,
+                                vec![],
+                            );
+                        }
+                        let cwd = info.cwd.clone();
+                        if self.start_worker_now(
+                            &pending.spawn,
+                            &pending.plan,
+                            Some(cwd),
+                            &pending.opts,
+                        ) {
+                            self.announce_start(&pending.spawn, &pending.opts, Some(&info));
+                            if let Some((conn, id, kind)) = &pending.opts.reply {
+                                let value =
+                                    Self::spawn_value(&pending.spawn.name, *kind, Some(&info));
+                                self.send_to(*conn, &success(id, value));
+                            }
+                        }
+                    }
+                    Err(error) => self.fail_spawn(&pending.spawn, &pending.opts, error),
+                }
+            }
+            WorktreeOutcome::Remove(result) => {
+                let Some((conn, id)) = self
+                    .pending_removals
+                    .remove(&(team.to_string(), participant.to_string()))
+                else {
+                    return;
+                };
+                match result {
+                    Ok(removed) => {
+                        self.teams.worktree_removed(team, participant);
+                        self.drain_team_events();
+                        self.send_to(
+                            conn,
+                            &success(
+                                &id,
+                                json!({
+                                    "removed": true,
+                                    "branch_kept": removed.branch_kept,
+                                    "branch": removed.branch,
+                                }),
+                            ),
+                        );
+                    }
+                    Err(error) => self.send_error(conn, &id, &error),
+                }
+            }
+        }
+    }
+
+    fn send_error(&self, conn: u64, id: &Value, error: &TeamError) {
+        let mut body = json!({ "code": error.code, "message": error.message });
+        if let Some(data) = &error.data {
+            body["data"] = data.clone();
+        }
+        self.send_to(conn, &json!({ "jsonrpc": "2.0", "id": id, "error": body }));
     }
 
     fn send_service_request(
@@ -625,7 +1011,13 @@ impl Hub {
                     self.drain_team_events();
                     return;
                 }
-                let Some(cwd) = self.teams.team(&team).map(|team| team.cwd.clone()) else {
+                // A worktree worker starts in its instance's cwd, not in the
+                // team's tree (18.12).
+                let Some(cwd) = self
+                    .instances
+                    .get(instance)
+                    .map(|handle| handle.key.cwd.clone())
+                else {
                     return;
                 };
                 let params = json!({ "cwd": cwd, "mcpServers": [server] });
