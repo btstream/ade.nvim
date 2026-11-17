@@ -35,7 +35,8 @@ Server.__index = Server
 ---  install_fail?: boolean, install_log?: string, install_delay_ms?: integer,
 ---  install_busy?: boolean, uninstall_busy?: boolean, resolve_delay_ms?: integer,
 ---  policy_delay_ms?: integer, policy_error?: table,
----  teams?: table, team_watch?: table,
+---  teams?: table, team_watch?: table, team_leader_error?: table,
+---  team_bind_error?: table,
 ---  run_error?: table, uninstall_error?: table, canned_agent?: boolean}|nil
 ---@return FakeService
 function M.new(opts)
@@ -104,6 +105,8 @@ function M.new(opts)
     team_sends = {},
     team_answers = {},
     team_watch = opts.team_watch,
+    team_leader_error = opts.team_leader_error,
+    team_bind_error = opts.team_bind_error,
     team_counter = 0,
     policy_responses = 0,
     policy_before_prompt = nil,
@@ -322,6 +325,19 @@ function Server:dispatch(message, client)
     return nil
   end
   if method == "team.leader_server" then
+    if self.team_leader_error then
+      return error_reply(ident, self.team_leader_error.code, self.team_leader_error.message)
+    end
+    for _, team in pairs(self.teams) do
+      if
+        team.cwd == params.cwd
+        and team.state ~= "closed"
+        and team.leader
+        and team.leader.instance ~= params.instance
+      then
+        return error_reply(ident, -32061, "a team already exists for this cwd")
+      end
+    end
     local result = {
       server = {
         name = "ade-team",
@@ -337,6 +353,9 @@ function Server:dispatch(message, client)
     return nil
   end
   if method == "team.bind_leader" then
+    if self.team_bind_error then
+      return error_reply(ident, self.team_bind_error.code, self.team_bind_error.message)
+    end
     self.team_binds[#self.team_binds + 1] = vim.deepcopy(params)
     local team = {
       id = "t1",
@@ -345,7 +364,7 @@ function Server:dispatch(message, client)
       leader = { instance = params.instance, sessionId = params.sessionId },
       participants = {},
       inbox = {},
-      limits = { max_workers = 3, max_turns_per_task = 30, max_turns_total = 200, turns_total = 0 },
+      limits = { max_turns_per_task = 30, max_turns_total = 200, turns_total = 0 },
     }
     if not self.teams.t1 then
       self.teams.t1 = team
@@ -358,7 +377,9 @@ function Server:dispatch(message, client)
   if method == "team.list" then
     local teams = {}
     for _, team in pairs(self.teams) do
-      teams[#teams + 1] = vim.deepcopy(team)
+      if team.state ~= "closed" then
+        teams[#teams + 1] = vim.deepcopy(team)
+      end
     end
     table.sort(teams, function(a, b)
       return a.id < b.id
@@ -366,6 +387,21 @@ function Server:dispatch(message, client)
     return { jsonrpc = "2.0", id = ident, result = { teams = teams } }
   end
   if method == "team.send" then
+    local kinds = {
+      task = true,
+      report = true,
+      question = true,
+      answer = true,
+      review = true,
+      notice = true,
+      control = true,
+    }
+    if not kinds[params.kind] then
+      return error_reply(ident, -32060, "kind is invalid: " .. tostring(params.kind))
+    end
+    if params.to == "human" and params.kind == "control" then
+      return error_reply(ident, -32060, "control to human is refused")
+    end
     self.team_sends[#self.team_sends + 1] = vim.deepcopy(params)
     self.team_counter = self.team_counter + 1
     vim.defer_fn(function()
@@ -390,6 +426,21 @@ function Server:dispatch(message, client)
     local watch = self.team_watch or {}
     local instance = watch.instance or "inst-1"
     local session_id = watch.sessionId or "watch-session"
+    for _, foreign in ipairs(watch.foreign or {}) do
+      self:send(client, {
+        jsonrpc = "2.0",
+        method = "tunnel.recv",
+        params = {
+          instance = foreign.instance or "inst-1",
+          seq = 1,
+          message = {
+            jsonrpc = "2.0",
+            method = "session/update",
+            params = { sessionId = foreign.sessionId or "sess_mock", update = foreign.update },
+          },
+        },
+      })
+    end
     for _, update in ipairs(watch.replay or {}) do
       self:send(client, {
         jsonrpc = "2.0",
@@ -414,7 +465,15 @@ function Server:dispatch(message, client)
     end, 5)
     return nil
   end
-  if method == "team.unwatch" or method == "team.reset_limits" then
+  if method == "team.unwatch" then
+    self.team_unwatch = self.team_unwatch or {}
+    self.team_unwatch[#self.team_unwatch + 1] = vim.deepcopy(params)
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
+    end, 5)
+    return nil
+  end
+  if method == "team.reset_limits" then
     vim.defer_fn(function()
       self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
     end, 5)
@@ -424,6 +483,8 @@ function Server:dispatch(message, client)
     local team = self.teams[params.team]
     if team then
       team.state = "closed"
+      self:emit(client, "team.changed", { team = vim.deepcopy(team) })
+      self.teams[params.team] = nil
     end
     vim.defer_fn(function()
       self:send(client, { jsonrpc = "2.0", id = ident, result = {} })

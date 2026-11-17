@@ -44,6 +44,8 @@ function M.new(opts)
     bound = {},
     -- cwd -> true when another session already leads that team (-32061).
     blocked = {},
+    warned_blocked = {},
+    notified = {},
     watching = nil,
     raw = nil,
   }, Team)
@@ -69,6 +71,11 @@ function Team:available()
   local cfg = self.config() or {}
   local teams = type(cfg.teams) == "table" and cfg.teams or {}
   if cfg.backend == "direct" or teams.spawn_from_chat == false then
+    return false
+  end
+  -- A team needs at least one template; without one nothing is injected and
+  -- the single-agent experience is untouched.
+  if next(teams.templates or {}) == nil then
     return false
   end
   local raw = self:_raw()
@@ -111,18 +118,15 @@ function Team:reset()
   self.leader_pending = nil
   self.bound = {}
   self.blocked = {}
+  -- `warned_blocked` / `notified` survive a reconnect: an item or conflict
+  -- that was already announced must not be announced again.
   self:unwatch(true)
   self:changed()
 end
 
 ---Reset what a reconnect invalidates: teams do not survive a service restart.
 function Team:on_hello()
-  self.teams = {}
-  self.inbox = {}
-  self.leader_pending = nil
-  self.bound = {}
-  self.blocked = {}
-  self:unwatch(true)
+  self:reset()
   local cwd = self.resolve_cwd and self.resolve_cwd() or nil
   if cwd then
     self:configure(cwd, true)
@@ -170,7 +174,7 @@ function Team:service_config(cwd)
       max_turns_per_task = limits.max_turns_per_task or 30,
       max_turns_total = limits.max_turns_total or 200,
     },
-    templates = templates,
+    templates = next(templates) and templates or vim.empty_dict(),
   },
     skipped
 end
@@ -210,6 +214,8 @@ end
 ---@param cwd string
 ---@return table|nil server
 function Team:leader_server(instance, cwd)
+  -- Never bind with a token from an earlier session request.
+  self.leader_pending = nil
   if not self:available() or not instance then
     return nil
   end
@@ -221,6 +227,34 @@ function Team:leader_server(instance, cwd)
   end
   if self.blocked[cwd] then
     return nil
+  end
+  -- A reconnect empties `bound`; ask the service who leads this cwd before
+  -- injecting a second leader server for the same instance.
+  local listed_ok, listed = async.await(function(done)
+    local raw = self:_raw()
+    if not raw then
+      done(false, nil)
+      return
+    end
+    raw:request_tracked("team.list", {}, function(ok, value)
+      done(ok, value)
+    end)
+  end)
+  if listed_ok and type(listed) == "table" and type(listed.teams) == "table" then
+    for _, entry in ipairs(listed.teams) do
+      if entry.cwd == cwd and type(entry.leader) == "table" then
+        if entry.leader.instance == instance then
+          self.bound[cwd] = { instance = instance, session_id = entry.leader.sessionId }
+          return nil
+        end
+        self.blocked[cwd] = true
+        if not self.warned_blocked[cwd] then
+          self.warned_blocked[cwd] = true
+          self.notify("a team already exists for this cwd; close it before starting another", vim.log.levels.WARN)
+        end
+        return nil
+      end
+    end
   end
   local ok, result = async.await(function(done)
     self:configure(cwd, false, function(ok)
@@ -272,9 +306,17 @@ function Team:bind_leader(instance, session_id, cwd)
     if not ok then
       local message = type(value) == "table" and (value.message or value.code) or tostring(value)
       log.warn("team.bind_leader failed: %s", tostring(message))
+      if type(value) == "table" and value.code == -32061 then
+        self.blocked[cwd] = true
+        if not self.warned_blocked[cwd] then
+          self.warned_blocked[cwd] = true
+          self.notify("another session already leads this team: " .. tostring(value.message or ""), vim.log.levels.WARN)
+        end
+      end
       return
     end
-    self.bound[cwd] = { instance = instance, session_id = session_id }
+    local team_id = type(value) == "table" and type(value.team) == "table" and value.team.id or nil
+    self.bound[cwd] = { instance = instance, session_id = session_id, team = team_id }
     self:refresh()
   end)
 end
@@ -331,6 +373,22 @@ function Team:on_changed_payload(payload)
         self.inbox[id] = nil
       end
     end
+    -- The team is gone: this instance may lead a new one for the same cwd.
+    for cwd, entry in pairs(self.bound) do
+      if entry.team == team.id or team.cwd == cwd then
+        self.bound[cwd] = nil
+      end
+    end
+    for cwd in pairs(self.blocked) do
+      if team.cwd == cwd then
+        self.blocked[cwd] = nil
+        self.warned_blocked[cwd] = nil
+      end
+    end
+    if self.watching and self.watching.team_id == team.id then
+      -- The team is gone; there is nothing left to unwatch on the service.
+      self:unwatch(true)
+    end
   else
     self.teams[team.id] = team
   end
@@ -345,7 +403,8 @@ function Team:on_inbox_payload(payload)
   end
   local fresh = self.inbox[item.id] == nil and item.state == "open"
   self.inbox[item.id] = item
-  if fresh then
+  if fresh and not self.notified[item.id] then
+    self.notified[item.id] = true
     local message = string.format("team inbox: %s from %s", tostring(item.kind), tostring(item.from))
     self.notify(message, vim.log.levels.INFO)
   end
@@ -494,12 +553,12 @@ end
 
 ---@param session table|nil
 ---@return boolean changed
-function M.apply_turn_finished(session)
+function M.apply_turn_finished(session, payload)
   if not session or not session.bus_turn then
     return false
   end
   session.bus_turn = nil
-  session.status = "idle"
+  session:finish_turn(type(payload) == "table" and payload.stopReason or "end_turn")
   return true
 end
 
@@ -541,7 +600,7 @@ end
 function Team:turn_finished(payload)
   payload = type(payload) == "table" and payload or {}
   local session = self:session_of(payload.sessionId or payload.session_id)
-  if session and session.bus_turn and M.apply_turn_finished(session) then
+  if session and session.bus_turn and M.apply_turn_finished(session, payload) then
     self:changed()
     self:_watch_rendered()
     if self.on_turn then
@@ -567,7 +626,8 @@ function Team:watch(team, participant, replay, cb)
     cb(false, "teams are not available")
     return
   end
-  self:unwatch(true)
+  -- A real unwatch for the previous worker while the connection is still up.
+  self:unwatch(false)
   local raw = self:_raw()
   local session = State.new("watch:" .. tostring(participant), self.resolve_cwd())
   session.historical = true
@@ -576,36 +636,53 @@ function Team:watch(team, participant, replay, cb)
     channel = channel,
     session = session,
     title = team .. "/" .. participant,
+    team_id = team,
+    participant = participant,
+    buffer = {},
+    ready = false,
   }
   self.watching = entry
-  raw:subscribe(channel, "tunnel.recv", function(payload)
-    if not self.watching or self.watching ~= entry then
+  local function apply(payload)
+    if type(payload) ~= "table" or not entry.ready then
       return
     end
-    if type(payload) ~= "table" or (entry.instance and payload.instance ~= entry.instance) then
+    if entry.instance and payload.instance ~= entry.instance then
       return
     end
     local message = payload.message
-    if type(message) == "table" and message.method == "_ade/turn_started" then
+    if type(message) ~= "table" then
+      return
+    end
+    if message.method == "_ade/turn_started" then
       M.apply_turn_started(session, message.params or {})
       self:_watch_rendered()
       return
     end
-    if type(message) == "table" and message.method == "_ade/turn_finished" then
-      M.apply_turn_finished(session)
+    if message.method == "_ade/turn_finished" then
+      M.apply_turn_finished(session, message.params or {})
       self:_watch_rendered()
       return
     end
-    if type(message) == "table" and message.method == "session/update" and type(message.params) == "table" then
-      -- Replay arrives before the watch response: adopt the session id from
-      -- the first update instead of comparing with the placeholder.
-      if session.id:sub(1, 6) == "watch:" and type(message.params.sessionId) == "string" then
-        session.id = message.params.sessionId
+    if message.method == "session/update" and type(message.params) == "table" then
+      if message.params.sessionId ~= session.id then
+        return
       end
-      if message.params.sessionId == session.id and reducer.apply(session, message.params.update or {}) then
+      if reducer.apply(session, message.params.update or {}) then
         self:_watch_rendered()
       end
     end
+  end
+  raw:subscribe(channel, "tunnel.recv", function(payload)
+    if self.watching ~= entry then
+      return
+    end
+    -- Replay frames arrive before the response names the instance/session;
+    -- buffer them so a leader's update cannot leak into the watch.
+    if not entry.ready then
+      entry.buffer[#entry.buffer + 1] = payload
+      return
+    end
+    apply(payload)
   end)
   raw:request_tracked(
     "team.watch",
@@ -621,8 +698,12 @@ function Team:watch(team, participant, replay, cb)
         if type(value.sessionId) == "string" then
           session.id = value.sessionId
         end
-        entry.replayed = value.replayed
       end
+      entry.ready = true
+      for _, payload in ipairs(entry.buffer) do
+        apply(payload)
+      end
+      entry.buffer = {}
       if self.on_watch then
         pcall(self.on_watch, session, entry.title)
       end
@@ -642,11 +723,8 @@ function Team:unwatch(quiet)
   if raw and type(raw.unsubscribe) == "function" then
     pcall(raw.unsubscribe, raw, entry.channel, "tunnel.recv")
   end
-  if not quiet and raw then
-    local team_id, participant = entry.title:match("^([^/]+)/(.+)$")
-    if team_id then
-      raw:request_tracked("team.unwatch", { team = team_id, participant = participant }, function() end)
-    end
+  if not quiet and raw and entry.team_id and entry.participant then
+    raw:request_tracked("team.unwatch", { team = entry.team_id, participant = entry.participant }, function() end)
   end
   if self.on_watch then
     pcall(self.on_watch, nil, nil)

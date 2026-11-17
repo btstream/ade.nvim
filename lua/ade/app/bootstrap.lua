@@ -362,9 +362,13 @@ function M.build(ctx, opts, action)
       ctx.refresh_chrome()
     end,
     on_watch = function(session, title)
-      if S.view.team_ui then
-        S.view.team_ui:watch(session, title)
-      end
+      -- Called from the socket dispatch (fast event context); window APIs are
+      -- only legal on the main loop.
+      vim.schedule(function()
+        if S.view.team_ui then
+          S.view.team_ui:watch(session, title)
+        end
+      end)
     end,
     runtime = function()
       return S.sess.runtime
@@ -688,8 +692,13 @@ function M.build(ctx, opts, action)
     if S.conn.policy then
       pcall(S.conn.policy.reconcile, S.conn.policy, true)
     end
-    if S.view.team then
-      pcall(S.view.team.on_hello, S.view.team)
+    if S.view.team and S.view.team:available() then
+      local cwd = S.view.team.resolve_cwd and S.view.team.resolve_cwd() or nil
+      if cwd then
+        -- Re-send only when the resolved config actually changed; on_hello
+        -- owns the forced re-send for a (re)started service.
+        pcall(S.view.team.configure, S.view.team, cwd, false)
+      end
     end
   end)
   S.view.agent_manager = AgentManagerUI.new({

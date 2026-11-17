@@ -328,7 +328,7 @@ class Server:
                 "leader": {"instance": params.get("instance"), "sessionId": params.get("sessionId")},
                 "participants": [],
                 "inbox": [],
-                "limits": {"max_workers": 3, "max_turns_per_task": 30, "max_turns_total": 200, "turns_total": 0},
+                "limits": {"max_turns_per_task": 30, "max_turns_total": 200, "turns_total": 0},
             }
             self.teams.setdefault("t1", team)
             threading.Thread(
@@ -336,7 +336,16 @@ class Server:
             ).start()
             return None
         if method == "team.list":
-            return self.result(ident, {"teams": [copy.deepcopy(team) for team in self.teams.values()]})
+            return self.result(
+                ident,
+                {
+                    "teams": [
+                        copy.deepcopy(team)
+                        for team in self.teams.values()
+                        if team.get("state") != "closed"
+                    ]
+                },
+            )
         if method == "team.send":
             self.team_sends.append(copy.deepcopy(params))
             self.team_counter += 1
