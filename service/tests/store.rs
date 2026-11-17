@@ -1207,3 +1207,56 @@ fn a_version_one_log_migrates_without_losing_events() {
         .expect("tables");
     assert_eq!(tables, 4);
 }
+
+#[test]
+fn a_version_two_log_with_data_keeps_events_and_teams_when_upgraded() {
+    let dir = TempDir::new("migrate-v2");
+    let path = dir.db();
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    {
+        let store = Store::open(&path).expect("open");
+        store
+            .append(event("old-instance", Some("old-session"), "kept"))
+            .expect("append");
+        store
+            .save_team("t7", r#"{"id":"t7","cwd":"/p"}"#, 7, 3)
+            .expect("save team");
+        store
+            .save_board(
+                "t7",
+                4,
+                r#"{"rev":4,"columns":[],"cards":[]}"#,
+                &[("T1".to_string(), r#"{"id":"T1"}"#.to_string(), 3, 1)],
+                &[],
+            )
+            .expect("save board");
+    }
+    // Turn the file into the W0b-less v2 schema: team tables, no boards.
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw");
+        conn.execute_batch("DROP TABLE boards; DROP TABLE card_history; PRAGMA user_version = 2;")
+            .expect("downgrade");
+    }
+    let store = Store::open(&path).expect("migrate");
+    let events = store.read(&Query::new("old-instance")).expect("read");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].message, "kept");
+    let teams = store.load_teams().expect("teams");
+    assert_eq!(teams.len(), 1);
+    assert_eq!(teams[0].0, "t7");
+    assert!(store.load_board("t7").expect("board").is_none());
+    let conn = rusqlite::Connection::open(&path).expect("open raw");
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("version");
+    assert_eq!(version, 3);
+    let tables: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table'
+             AND name IN ('boards', 'card_history')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("tables");
+    assert_eq!(tables, 2);
+}

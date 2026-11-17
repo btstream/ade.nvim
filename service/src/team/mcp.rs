@@ -105,7 +105,11 @@ impl Socket {
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| error.to_string());
-                return Err(message);
+                let code = error.get("code").and_then(Value::as_i64);
+                return Err(match code {
+                    Some(code) => format!("{message} ({code})"),
+                    None => message,
+                });
             }
             return Ok(value.get("result").cloned().unwrap_or(Value::Null));
         }
@@ -480,12 +484,14 @@ impl Mcp {
                     "since": arguments.get("since"),
                 }),
             ),
-            "board_update" if leader => ("bus.board_update", arguments),
-            "card_update" if !leader => ("bus.card_update", arguments),
-            "team_spawn" | "bus_read" | "board_update" => {
+            // Both board tools reach the service, which owns the role check and
+            // returns the documented -32061. `tools/list` still hides the other
+            // role's tool.
+            "board_update" => ("bus.board_update", arguments),
+            "card_update" => ("bus.card_update", arguments),
+            "team_spawn" | "bus_read" => {
                 return Ok(error_result("this tool is only available to the leader"))
             }
-            "card_update" => return Ok(error_result("this tool is only available to a worker")),
             _ => return Err((-32602, format!("unknown tool {name}"))),
         };
         let Some(socket) = self.socket.as_mut() else {

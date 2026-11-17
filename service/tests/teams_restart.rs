@@ -513,12 +513,33 @@ fn board_restart_scenario(label: &str, sigkill: bool) {
         .as_str()
         .unwrap_or_else(|| panic!("bind: {bound}"))
         .to_string();
-    let rev = board_update(&server, &token, "default");
+    board_update(&server, &token, "default");
+    // One more write leaves a history version for T1 before the restart.
+    let changed = mcp_call(
+        &server,
+        &token,
+        "board_update",
+        json!({"upsert": [{"id": "T1", "title": "renamed"}]}),
+    );
+    assert_eq!(changed["isError"], false, "{changed}");
+    let rev = serde_json::from_str::<Value>(&mcp_text(&changed)).expect("board_update JSON")["rev"]
+        .as_u64()
+        .expect("board rev");
     let board = client.request(50, "team.board", json!({"team": team}));
     assert_eq!(board["result"]["board"]["rev"], rev, "{board}");
     assert_eq!(
         board["result"]["board"]["workflow_name"], "default",
         "{board}"
+    );
+    let history = client.request(53, "team.card_history", json!({"team": team, "card": "T1"}));
+    assert_eq!(
+        history["result"]["versions"].as_array().map(Vec::len),
+        Some(1),
+        "{history}"
+    );
+    assert_eq!(
+        history["result"]["versions"][0]["title"], "one",
+        "{history}"
     );
 
     if sigkill {
@@ -542,12 +563,32 @@ fn board_restart_scenario(label: &str, sigkill: bool) {
         json!([{"stage": "S1", "open": 2, "archived": 0}]),
         "{suspended}"
     );
+    for participant in suspended["participants"].as_array().expect("participants") {
+        assert!(
+            participant["state_since"].as_u64().is_some_and(|at| at > 0),
+            "a recovered participant sets state_since: {participant}"
+        );
+        assert!(
+            participant["activity"].is_null(),
+            "activity is not persisted: {participant}"
+        );
+    }
     let board = second.request(51, "team.board", json!({"team": team}));
     assert_eq!(board["result"]["board"]["rev"], rev, "{board}");
     assert_eq!(
         board["result"]["board"]["cards"].as_array().map(Vec::len),
         Some(2),
         "{board}"
+    );
+    let history = second.request(54, "team.card_history", json!({"team": team, "card": "T1"}));
+    assert_eq!(
+        history["result"]["versions"].as_array().map(Vec::len),
+        Some(1),
+        "history survives the restart: {history}"
+    );
+    assert_eq!(
+        history["result"]["versions"][0]["title"], "one",
+        "{history}"
     );
 
     fixture.configure(&mut second, &fixture.work, &restarted, true);

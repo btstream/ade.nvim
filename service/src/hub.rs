@@ -41,6 +41,16 @@ fn team_ttl_ms() -> u64 {
         .unwrap_or(7 * 24 * 60 * 60 * 1000)
 }
 
+/// How often expired teams and pending boards are checked (18.15); tests
+/// shorten it so the expiry tick can be exercised.
+fn team_expiry_tick_ms() -> u64 {
+    std::env::var("NVIM_ADE_SERVER_TEAM_EXPIRY_TICK_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(60 * 60 * 1000)
+}
+
 /// Maximum bytes queued for one connection (PROTOCOL.md section 7).
 pub const MAX_OUTBOX_BYTES: usize = 64 * 1024 * 1024;
 /// Frames that may sit in the writer queue before the connection counts as
@@ -586,8 +596,15 @@ impl Hub {
             for id in &stored {
                 match self.recorder.load_board(id) {
                     Ok(Some(board)) => {
-                        self.teams
-                            .restore_board(id, board.rev, &board.json, board.history);
+                        if let Err(error) =
+                            self.teams
+                                .restore_board(id, board.rev, &board.json, board.history)
+                        {
+                            eprintln!(
+                                "nvim_ade_server: cannot read the board of {id}: {error}; \
+                                 keeping its database row and refusing board writes"
+                            );
+                        }
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -612,7 +629,7 @@ impl Hub {
         #[cfg(unix)]
         let mut install_events =
             std::mem::replace(&mut self.install_events, mpsc::unbounded_channel().1);
-        let mut expiry = tokio::time::interval(Duration::from_secs(3600));
+        let mut expiry = tokio::time::interval(Duration::from_millis(team_expiry_tick_ms()));
         expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Worker board writes coalesce (19.2); this tick persists the ones whose
         // timer fired and sends one `team.board_changed` each.
@@ -651,6 +668,7 @@ impl Hub {
                 }
                 _ = board_tick.tick() => {
                     self.flush_due_boards();
+                    self.flush_due_activities();
                 }
                 event = install_event => {
                     #[cfg(unix)]

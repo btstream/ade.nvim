@@ -98,6 +98,10 @@ pub struct Board {
     persisted: HashMap<String, Card>,
     #[serde(skip)]
     persisted_rev: u64,
+    /// The stored JSON could not be read. The board is shown empty and every
+    /// write is refused so the database row is never overwritten.
+    #[serde(skip)]
+    pub unavailable: bool,
 }
 
 /// One board write ready for the store thread.
@@ -215,10 +219,13 @@ impl Board {
         workers: &HashSet<String>,
         now: u64,
     ) -> Result<u64, TeamError> {
+        if self.unavailable {
+            return Err(TeamError::not_allowed("board unavailable"));
+        }
         let object = params
             .as_object()
             .ok_or_else(|| TeamError::invalid("board_update params must be an object"))?;
-        let mut next = self.clone();
+        let mut next = self.writable_clone();
 
         // 1. workflow_name / workflow.
         if let Some(value) = object.get("workflow_name") {
@@ -284,7 +291,7 @@ impl Board {
 
         next.enforce_limits()?;
         next.rev += 1;
-        *self = next;
+        self.adopt(next);
         Ok(self.rev)
     }
 
@@ -296,6 +303,9 @@ impl Board {
         params: &Value,
         now: u64,
     ) -> Result<u64, TeamError> {
+        if self.unavailable {
+            return Err(TeamError::not_allowed("board unavailable"));
+        }
         let object = params
             .as_object()
             .ok_or_else(|| TeamError::invalid("card_update params must be an object"))?;
@@ -316,7 +326,7 @@ impl Board {
             return Err(TeamError::not_allowed("not your card"));
         }
 
-        let mut next = self.clone();
+        let mut next = self.writable_clone();
         if let Some(value) = object.get("body") {
             let body = parse_optional_string(value, "body")?;
             if let Some(text) = &body {
@@ -343,8 +353,31 @@ impl Board {
         next.cards[index].updated_at = now;
         next.enforce_limits()?;
         next.rev += 1;
-        *self = next;
+        self.adopt(next);
         Ok(self.rev)
+    }
+
+    /// A clone of only what a write may change. History and the persisted
+    /// bookkeeping are not copied (they can hold every card version).
+    fn writable_clone(&self) -> Board {
+        Board {
+            rev: self.rev,
+            workflow_name: self.workflow_name.clone(),
+            workflow: self.workflow.clone(),
+            columns: self.columns.clone(),
+            cards: self.cards.clone(),
+            unavailable: self.unavailable,
+            ..Board::default()
+        }
+    }
+
+    /// Copy back the writable half after a successful write.
+    fn adopt(&mut self, next: Board) {
+        self.rev = next.rev;
+        self.workflow_name = next.workflow_name;
+        self.workflow = next.workflow;
+        self.columns = next.columns;
+        self.cards = next.cards;
     }
 
     fn upsert(
@@ -481,7 +514,7 @@ impl Board {
     /// Build the store job for the current state and remember it as persisted.
     /// `None` means there is nothing new to write.
     pub fn take_persist(&mut self, now: u64) -> Option<BoardPersist> {
-        if self.rev == self.persisted_rev {
+        if self.unavailable || self.rev == self.persisted_rev {
             return None;
         }
         let mut history = Vec::new();
@@ -523,6 +556,9 @@ impl Board {
         for card in self.cards.iter().filter(|card| !card.archived) {
             self.persisted.insert(card.id.clone(), card.clone());
         }
+        // The in-memory persisted state advances before the store thread has
+        // confirmed the write. A failed database write therefore loses this
+        // delta; journaling failures was judged not worth the complexity.
         self.persisted_rev = self.rev;
         let json = serde_json::to_string(self).unwrap_or_default();
         Some(BoardPersist {
@@ -533,9 +569,23 @@ impl Board {
         })
     }
 
-    /// Restore a board and its history from the database.
-    pub fn from_stored(rev: u64, json: &str, rows: Vec<(String, String, i64)>) -> Board {
-        let mut board: Board = serde_json::from_str(json).unwrap_or_default();
+    /// A board whose stored JSON could not be read. Writes are refused so an
+    /// empty board never replaces the row.
+    pub fn unavailable() -> Board {
+        Board {
+            unavailable: true,
+            ..Board::default()
+        }
+    }
+
+    /// Restore a board and its history from the database. An unreadable board
+    /// is reported to the caller, which keeps the row untouched.
+    pub fn from_stored(
+        rev: u64,
+        json: &str,
+        rows: Vec<(String, String, i64)>,
+    ) -> Result<Board, String> {
+        let mut board: Board = serde_json::from_str(json).map_err(|error| format!("{error}"))?;
         board.rev = rev;
         board.persisted_rev = rev;
         board.persisted = board
@@ -563,7 +613,7 @@ impl Board {
             versions.truncate(HISTORY_VERSIONS);
         }
         board.history = history;
-        board
+        Ok(board)
     }
 
     /// Newest first. Empty for an archived card.
@@ -579,7 +629,7 @@ impl Board {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.rev != self.persisted_rev
+        !self.unavailable && self.rev != self.persisted_rev
     }
 }
 
@@ -905,11 +955,22 @@ impl Teams {
         rev: u64,
         json: &str,
         rows: Vec<(String, String, i64)>,
-    ) {
+    ) -> Result<(), String> {
+        let board = match Board::from_stored(rev, json, rows) {
+            Ok(board) => board,
+            Err(error) => {
+                if let Some(team) = self.teams.get_mut(team_id) {
+                    team.board = Board::unavailable();
+                    team.board_flush_at = None;
+                }
+                return Err(error);
+            }
+        };
         if let Some(team) = self.teams.get_mut(team_id) {
-            team.board = Board::from_stored(rev, json, rows);
+            team.board = board;
             team.board_flush_at = None;
         }
+        Ok(())
     }
 }
 
@@ -1357,12 +1418,25 @@ mod tests {
             .iter()
             .map(|(id, json, rev, _)| (id.clone(), json.clone(), *rev))
             .collect();
-        let restored = Board::from_stored(later.rev, &later.json, rows);
+        let restored = Board::from_stored(later.rev, &later.json, rows).expect("stored board");
         assert_eq!(restored.rev, later.rev);
         assert!(!restored.is_dirty());
         assert_eq!(restored.history_of("T1").len(), 1);
         assert_eq!(restored.history_of("T1")[0].title, "one");
         assert_eq!(persist.rev + 1, later.rev);
+    }
+
+    #[test]
+    fn an_unreadable_stored_board_is_read_only() {
+        assert!(Board::from_stored(1, "not json", Vec::new()).is_err());
+        let mut board = Board::unavailable();
+        let error = leader(&mut board, json!({})).expect_err("read-only board");
+        assert_eq!(error.code, super::super::NOT_ALLOWED);
+        assert!(error.message.contains("unavailable"));
+        let error = worker(&mut board, "w1", json!({"card": "T1"})).expect_err("read-only");
+        assert_eq!(error.code, super::super::NOT_ALLOWED);
+        assert!(board.take_persist(0).is_none());
+        assert!(!board.is_dirty());
     }
 
     #[test]

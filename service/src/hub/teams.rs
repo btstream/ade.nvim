@@ -178,6 +178,14 @@ impl Hub {
         };
         match result {
             Ok((value, delivery)) => {
+                self.teams.note_bus_call(
+                    &team,
+                    &name,
+                    method,
+                    params,
+                    &value,
+                    crate::team::now_ms(),
+                );
                 self.drain_team_events();
                 if delivery {
                     self.team_deliveries();
@@ -362,11 +370,11 @@ impl Hub {
                 .and_then(|team| team.participants.get_mut(&name))
             {
                 participant.starting = true;
-                participant.state = if waiting {
+                participant.set_state(if waiting {
                     crate::team::ParticipantState::WaitingHuman
                 } else {
                     crate::team::ParticipantState::Idle
-                };
+                });
                 participant.instance = None;
             }
             let spawn = SpawnRequest {
@@ -810,13 +818,33 @@ impl Hub {
         })();
         match result {
             Ok(Some((value, delivery))) => {
+                self.teams.note_bus_call(
+                    team,
+                    "leader",
+                    "bus.spawn",
+                    params,
+                    &value,
+                    crate::team::now_ms(),
+                );
                 self.drain_team_events();
                 if delivery {
                     self.team_deliveries();
                 }
                 self.send_to(conn, &success(id, value));
             }
-            Ok(None) => {}
+            Ok(None) => {
+                // The worktree spawn answers later; the call itself is still
+                // the leader's latest activity.
+                self.teams.note_bus_call(
+                    team,
+                    "leader",
+                    "bus.spawn",
+                    params,
+                    &Value::Null,
+                    crate::team::now_ms(),
+                );
+                self.drain_team_events();
+            }
             Err(error) => self.send_error(conn, id, &error),
         }
     }
@@ -1856,6 +1884,13 @@ impl Hub {
         let Some(update) = params.get("update") else {
             return;
         };
+        let session = params.get("sessionId").and_then(Value::as_str);
+        if self
+            .teams
+            .observe_activity_update(instance, session, update, crate::team::now_ms())
+        {
+            self.drain_team_events();
+        }
         if update.get("sessionUpdate").and_then(Value::as_str) != Some("agent_message_chunk") {
             return;
         }
@@ -1866,8 +1901,12 @@ impl Hub {
         else {
             return;
         };
-        let session = params.get("sessionId").and_then(Value::as_str);
         self.teams.observe_chunk(instance, session, text);
+    }
+
+    pub(crate) fn flush_due_activities(&mut self) {
+        self.teams.flush_due_activities(crate::team::now_ms());
+        self.drain_team_events();
     }
 
     pub(crate) fn instance_left_team(&mut self, instance: &str, reason: &str) {
@@ -1991,9 +2030,10 @@ impl Hub {
     }
 
     pub(crate) fn expire_teams(&mut self) {
-        // A pending worker write must reach the store before the team (and its
-        // board row) can be deleted.
-        self.flush_all_boards(false);
+        // A pending worker write is persisted here even when its 10 s timer has
+        // not fired yet. It must be announced too: clearing the timer without
+        // `team.board_changed` would hide that rev from the front end.
+        self.flush_all_boards(true);
         let ttl = team_ttl_ms();
         let expired = self.teams.expire_suspended(crate::team::now_ms(), ttl);
         for id in expired {
