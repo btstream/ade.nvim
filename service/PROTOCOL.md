@@ -1,4 +1,4 @@
-# nvim_ade_server protocol (api_version 4, service 0.5.0)
+# nvim_ade_server protocol (api_version 5, service 0.6.0)
 
 This is the contract between the Neovim front end (`lua/ade/service/`) and the
 service (`service/src/`). Both sides implement it as written; a deviation is a
@@ -39,7 +39,8 @@ they do not change what is written here.
 `-> {token, client, client_version, api_version}`
 `<- {server_version, api_version, features}`
 
-`api_version` is `4`. `features` contains `"tunnel"`, `"policy"` (section 17),
+`api_version` is `5`. `features` contains `"tunnel"`, `"policy"` (section 17),
+`"teams"` (section 18),
 `"install"` on unix (section 16), and `"log"` when the event log is enabled (section 10). Errors are unchanged:
 `-32001` bad token (connection closed), `-32002` incompatible api_version with
 `data = {server_api_version}`, `-32003` hello required.
@@ -187,6 +188,7 @@ unsupported shape, agent line too long).
 | -32040 to -32045 | managed installs, section 16.5 |
 | -32800 | request cancelled (section 16.3) |
 | -32050 | invalid policy rule set (section 17) |
+| -32060 to -32064 | teams, section 18.10 |
 | -32601, -32700, -32600, -32602 | standard JSON-RPC errors |
 
 ## 5. Relay rules (per instance)
@@ -876,3 +878,195 @@ ACP lets clients ignore unknown session updates.
   always-allowed kinds and the configured extra kinds (`kinds = {...}`, same
   `choose`); finally everything else (`choose = {"reject_once"}`). An offered
   `allow_always` is never a substitute for `allow_once`.
+
+## 18. Teams (feature `"teams"`, api_version 5)
+
+A **team** is one leader agent and up to `max_workers` worker agents that talk
+through a **bus** the service owns, with the person (`human`) as a participant.
+Neovim shows the team and answers for the human; the team keeps running when
+Neovim exits. Without a team nothing in this section happens: a single agent
+behaves exactly as before.
+
+Stages: S4a implements 18.1–18.8 and 18.10 in the service; S4b the front end
+(18.9); S4c worktrees for workers (18.3 `worktree`), predefined teams and
+recovery after a service restart (until then teams live in memory and end with
+the service).
+
+### 18.1 Participants, messages, tokens
+
+- A team has an id (`t1`, `t2`, ...), a `cwd` (absolute), a leader, workers and
+  the implicit participant `human`. Participant names are
+  `[a-z0-9][a-z0-9_-]{0,31}`; `leader` and `human` are reserved.
+- A participant is an agent instance (section 3.2) plus one ACP session in it.
+  Its state is `idle`, `working` (a prompt of its session is running),
+  `waiting_human` (it asked the human, 18.5), `paused` (18.7) or `exited`.
+- A **message** is `{id, team, from, to, kind, task?, body, refs?, at}`:
+  `kind` is `task`, `report`, `question`, `answer`, `review` or `control`;
+  `task` is a free label (`T3`) that ties reports to assignments; `body` is
+  text (at most 64 KiB); `refs` an optional list of strings (paths, commits).
+  Every participant has a FIFO **mailbox**.
+- A **participant token** (32 random bytes, hex) identifies one participant to
+  the service. It is only ever handed to the MCP server of that participant
+  (18.6) and is never logged.
+
+### 18.2 Team configuration and the leader
+
+`team.configure {cwd, config}` `<- {}` stores the configuration that teams
+created for `cwd` will use (the latest call wins; existing teams keep theirs):
+
+```
+config = {
+  "max_workers":  integer,          // 1..8, default 3
+  "spawn_confirm": { "auto": string[] },   // templates that start without asking
+  "limits": { "max_turns_per_task": integer?, "max_duration_min": integer? },
+  "templates": {
+    "<name>": {
+      "launch": { "agent", "command", "args", "env", "launch"? },  // resolved by the front end,
+                                                     // same shape as agent.attach key/env/launch
+      "model":    string?,        // set through session/set_config_option when offered
+      "role":     string,         // role card text (18.4)
+      "worktree": boolean?        // S4c
+    }
+  }
+}
+```
+
+The front end resolves each template's command, args, environment and managed
+release exactly as for its own agent, so the service starts nothing the person
+could not have started from Neovim. A team may only start workers from
+`templates`.
+
+**Leader.** `team.leader_server {instance, cwd}` `<- {server}` returns an MCP
+server description for ACP's `mcpServers`:
+`{"name": "ade-team", "command": <service binary>, "args": ["mcp", "--token",
+<token>], "env": []}`. The front end adds it to the `session/new` (or
+`session/load`) it sends to that instance. When the service relays a successful
+`session/new`/`session/load` whose `params.mcpServers` contains that token, the
+session becomes the leader of a team for `cwd` (created now, `team.changed`
+sent). A token that is never used expires with its instance.
+
+### 18.3 Workers
+
+`team_spawn` (18.6) asks for a worker: `{template, name?, task?}`. The service
+checks the template exists and the team has fewer than `max_workers` live
+workers (`-32061` otherwise), then:
+
+- if the template is in `spawn_confirm.auto`, it starts the worker at once;
+- otherwise it puts a **spawn request** in the human inbox (18.5) and the tool
+  call returns `{"status": "awaiting_approval", "request": <id>}` immediately.
+  `team.answer {request, allow}` starts the worker or refuses it; the leader
+  gets a `control` message from `human` saying which.
+
+Starting a worker: spawn the template's `launch` as an instance with
+`cwd` = the team's cwd (S4c: a worktree), the service itself sends
+`initialize` (protocol version 1, `clientCapabilities` with `fs` and
+`terminal` false), then `session/new {cwd, mcpServers: [<the worker's own
+ade-team server>]}`, then `session/set_config_option` for `model` when the
+session offers a model option with that value. The role card (18.4) and, if
+given, the first task are delivered as its first prompt. The worker is now a
+normal instance: `agent.list` shows it with `team` and `participant`, front
+ends may attach to watch it, and its permission requests go through section 17
+and, undecided, to attached front ends and the human inbox.
+
+Sessions the service drives (workers) do not accept prompts from front ends:
+a front end's `session/prompt` for such a session is answered with `-32062`;
+the person talks to a worker through `team.send` (18.9).
+
+### 18.4 Delivery
+
+- A participant's queued messages are delivered when its session is idle (no
+  prompt running, whoever sent it), not `waiting_human` and not `paused`: the
+  service combines **all** queued messages into one `session/prompt` it sends
+  itself, with one text content block per message:
+  `<bus from="leader" kind="task" task="T3">...body...</bus>`.
+- The first prompt of a worker starts with its **role card**: who it is, its
+  team, its leader, the tools it has (18.6), that it must report with
+  `bus_send(kind="report")` when done or stuck, and that only messages with
+  `from="human"` speak for the person.
+- The service records each delivered prompt as a synthetic `user_prompt`
+  (section 10) and tells attached front ends `tunnel.recv` with
+  `_ade/turn_started {sessionId, origin: "bus"}`; when the prompt is answered
+  they get `_ade/turn_finished` (section 13). Front ends render it like an
+  adopted turn.
+- The leader's session is driven by the front end too: bus messages to the
+  leader wait until no prompt of that session runs. A front end prompt that
+  arrives while a bus prompt runs is relayed as usual (the agent decides).
+- **Report fallback**: when a bus-delivered turn of a worker ends and the
+  worker did not send a `report` during it, the service sends the text of the
+  turn's `agent_message_chunk` updates (at most 64 KiB, the end kept) as a
+  `report` to the sender of its current task.
+- `control` messages are not delivered as prompts: body `cancel` sends
+  `session/cancel` for the target, `pause` and `resume` set and clear
+  `paused`.
+- Messages to `human` go to the human inbox.
+
+### 18.5 Human in the loop
+
+- `bus_ask_human(question, options?)` returns at once; the asker becomes
+  `waiting_human` (its mailbox is held, other participants' reports keep
+  queueing) and an inbox item is created.
+- **Inbox items** are `{id, team, kind: "question" | "spawn" | "message" |
+  "limit", from, body, options?, at}`; they are sent to every connection as
+  `team.inbox {item}` and listed by `team.list`. Items wait for as long as it
+  takes; nobody needs to be attached.
+- `team.answer {request, text?, option?, allow?}` answers an item once
+  (`-32063` for an unknown or answered item): a question's answer is delivered
+  to the asker as `kind = "answer"` from `human` before its queued messages,
+  and the asker returns to `idle`; a spawn request takes `allow`. A message
+  item is acknowledged by any answer.
+
+### 18.6 MCP tools (`nvim_ade_server mcp --token <token>`)
+
+The subcommand is a stdio MCP server (MCP 2025-06-18: `initialize`,
+`tools/list`, `tools/call`). It connects to the service socket, says `hello`
+with `participant_token` instead of `token`, and maps each tool to a `bus.*`
+request on behalf of its participant. Tools (JSON schemas in `tools/list`):
+
+| Tool | Who | Effect |
+|---|---|---|
+| `team_spawn(template, name?, task?)` | leader | 18.3 |
+| `bus_send(to, kind, body, task?, refs?)` | everyone | queue a message (`to` = participant name or `human`) |
+| `bus_ask_human(question, options?)` | everyone | 18.5 |
+| `bus_status()` | everyone | team members, states, current tasks, queued counts; the templates the leader may start |
+| `bus_read(participant, since?)` | leader | the participant's recent messages and the text of its last turns |
+
+Tool errors are MCP tool results with `isError: true` and a message the agent
+can act on (unknown participant, limit reached, not allowed for a worker).
+
+### 18.7 Limits
+
+- `max_workers` (default 3) counts live workers; `team_spawn` beyond it fails.
+- `max_turns_per_task`: bus-delivered turns of a worker with the same `task`
+  label; when reached the worker becomes `paused` and a `limit` inbox item is
+  created. `max_duration_min`: same, measured from the first delivery of the
+  task.
+- `team.send {team, to, kind: "control", body: "resume"}` from the person
+  clears `paused`.
+
+### 18.8 Notifications to front ends
+
+- `team.changed {team}`: the team's summary changed (`team.list` shape for one
+  team), sent to every connection.
+- `team.inbox {item}`: 18.5.
+- `tunnel.recv` `_ade/turn_started`: 18.4.
+
+### 18.9 Front-end methods
+
+| Method | Result |
+|---|---|
+| `team.configure {cwd, config}` | `{}` (18.2) |
+| `team.leader_server {instance, cwd}` | `{server}` (18.2) |
+| `team.list {}` | `{teams: [{id, cwd, leader, workers, participants: [{name, role, state, instance, sessionId, task, queued}], inbox: [item]}]}` |
+| `team.send {team, to, kind, body, task?}` | `{id}`: a message from `human` |
+| `team.answer {request, ...}` | `{}` (18.5) |
+| `team.close {team, stop_workers}` | `{}`: ends the team; workers are stopped when `stop_workers`, otherwise they become ordinary instances |
+
+### 18.10 Error codes
+
+| Code | Meaning |
+|---|---|
+| -32060 | invalid team parameter (`message` names the field) |
+| -32061 | not allowed: template unknown, worker limit, tool reserved for the leader |
+| -32062 | the session is driven by the team bus; use `team.send` |
+| -32063 | unknown or already answered inbox item |
+| -32064 | unknown team or participant |
