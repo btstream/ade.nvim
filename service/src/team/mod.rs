@@ -5,6 +5,8 @@
 //! layer. I/O (spawning agents, sending frames, broadcasts) is done by
 //! `hub::teams`, which owns the hub and calls these methods.
 
+pub mod activity;
+pub mod board;
 pub mod brief;
 pub mod mcp;
 pub mod workflow;
@@ -444,6 +446,18 @@ pub struct Participant {
     pub turns: VecDeque<TurnText>,
     /// The worktree this worker runs in (18.12); kept after the worker exits.
     pub worktree: Option<worktree::WorktreeInfo>,
+    /// Latest extracted one-line activity (19.9); not persisted.
+    #[serde(skip)]
+    pub activity: Option<activity::Activity>,
+    /// The activity-only notification gate (19.9).
+    #[serde(skip)]
+    pub activity_throttle: activity::ActivityThrottle,
+    /// A non-fallback activity source was seen during this bus turn.
+    #[serde(skip)]
+    pub turn_activity: bool,
+    /// When `state` last changed, in ms since the epoch (19.9).
+    #[serde(skip)]
+    pub state_since: u64,
     /// The model a spawn asked for (19.6); re-applied when the worker resumes.
     #[serde(default)]
     pub model: Option<String>,
@@ -478,6 +492,10 @@ impl Participant {
             reported: false,
             turns: VecDeque::new(),
             worktree: None,
+            activity: None,
+            activity_throttle: activity::ActivityThrottle::default(),
+            turn_activity: false,
+            state_since: now_ms(),
             model: None,
             spawn_role: None,
         }
@@ -518,6 +536,10 @@ pub struct Team {
     pub pending_items: HashMap<(String, String), String>,
     /// Creation time in ms; worktree names embed its UTC stamp (18.12).
     pub created_at: u64,
+    /// The team's board (19.2).
+    pub board: board::Board,
+    /// When the pending worker board write is persisted and announced (19.2).
+    pub board_flush_at: Option<u64>,
     /// The spawn group of a prompt the leader is running (19.6).
     pub current_group: Option<String>,
 }
@@ -683,6 +705,11 @@ pub enum AnswerEffect {
     },
     Ack,
 }
+
+/// The items a group answer answered, with their effects (19.6).
+pub type GroupAnswers = Vec<(String, AnswerEffect)>;
+/// The items a group answer failed to answer, with their errors (19.6).
+pub type GroupFailures = Vec<(String, TeamError)>;
 
 #[derive(Debug)]
 pub enum BindOutcome {
@@ -1144,7 +1171,7 @@ impl Teams {
             if let Some(leader) = team.participants.get_mut("leader") {
                 leader.instance = Some(instance.to_string());
                 leader.session = Some(session.to_string());
-                leader.state = ParticipantState::Idle;
+                leader.set_state(ParticipantState::Idle);
                 leader.starting = false;
             }
         }
@@ -1288,6 +1315,8 @@ impl Teams {
             watchers: HashMap::new(),
             pending_items: HashMap::new(),
             created_at: now_ms(),
+            board: board::Board::default(),
+            board_flush_at: None,
             current_group: None,
         };
         let mut leader = Participant::new("leader", Role::Leader);
@@ -1653,7 +1682,7 @@ impl Teams {
                 }
             }
         }
-        participant.state = ParticipantState::WaitingHuman;
+        participant.set_state(ParticipantState::WaitingHuman);
         let item = InboxItem {
             id: id.clone(),
             team: team.id.clone(),
@@ -1745,6 +1774,7 @@ impl Teams {
                 .config
                 .max_workers
                 .saturating_sub(team.live_workers() as u64));
+            out["board"] = team.board.status();
         }
         Ok(out)
     }
@@ -2038,7 +2068,7 @@ impl Teams {
         if let Some(team) = self.teams.get_mut(&team_id) {
             if let Some(participant) = team.participants.get_mut(&name) {
                 if participant.state != ParticipantState::Exited {
-                    participant.state = ParticipantState::Working;
+                    participant.set_state(ParticipantState::Working);
                 }
                 leader = participant.role == Role::Leader;
             }
@@ -2062,11 +2092,11 @@ impl Teams {
         });
         if let Some(participant) = team.participants.get_mut(&name) {
             if participant.state != ParticipantState::Exited {
-                participant.state = if waiting {
+                participant.set_state(if waiting {
                     ParticipantState::WaitingHuman
                 } else {
                     ParticipantState::Idle
-                };
+                });
             }
         }
         let leader = team
@@ -2097,7 +2127,7 @@ impl Teams {
         let Some(participant) = team.participants.get_mut(name) else {
             return;
         };
-        participant.state = ParticipantState::Exited;
+        participant.set_state(ParticipantState::Exited);
         participant.reason = Some(reason.to_string());
         participant.starting = false;
         participant.bus_turn = false;
@@ -2209,12 +2239,13 @@ impl Teams {
         }
         let first_prompt = participant.first_prompt;
         participant.first_prompt = false;
-        participant.state = ParticipantState::Working;
+        participant.set_state(ParticipantState::Working);
         participant.bus_turn = true;
         participant.turn_text.clear();
         participant.turn_task = participant.task.clone();
         participant.turn_sender = participant.task_sender.clone();
         participant.reported = false;
+        participant.turn_activity = false;
         let instance = participant.instance.clone()?;
         let session = participant.session.clone()?;
         self.events.push(TeamEvent::Changed(team_id.to_string()));
@@ -2248,7 +2279,7 @@ impl Teams {
             participant.mailbox.push_front(message);
         }
         participant.first_prompt |= first_prompt;
-        participant.state = ParticipantState::Idle;
+        participant.set_state(ParticipantState::Idle);
         participant.bus_turn = false;
         participant.reported = false;
         self.events.push(TeamEvent::Changed(team_id.to_string()));
@@ -2307,17 +2338,19 @@ impl Teams {
         let sender = participant.turn_sender.clone();
         let reported = participant.reported;
         let was_waiting = participant.state == ParticipantState::WaitingHuman;
+        let bus_turn = participant.bus_turn;
         participant.bus_turn = false;
         let turn_text = if text.is_empty() {
             participant.turn_text.clone()
         } else {
             text
         };
-        participant.state = if was_waiting {
+        participant.finish_turn_activity(&turn_text, bus_turn, now_ms());
+        participant.set_state(if was_waiting {
             ParticipantState::WaitingHuman
         } else {
             ParticipantState::Idle
-        };
+        });
         participant.turns_total += 1;
         participant.turn_text.clear();
         participant.turns.push_back(TurnText {
@@ -2550,13 +2583,13 @@ impl Teams {
                 let answer = text.or(option).unwrap_or_default();
                 validate_body(&answer)?;
                 if let Some(participant) = team.participants.get_mut(&from) {
-                    participant.state = if still_waiting {
+                    participant.set_state(if still_waiting {
                         ParticipantState::WaitingHuman
                     } else if participant.bus_turn {
                         ParticipantState::Working
                     } else {
                         ParticipantState::Idle
-                    };
+                    });
                     let message = Message {
                         id: answer_message_id,
                         from: "human".to_string(),
@@ -2642,12 +2675,13 @@ impl Teams {
     }
 
     /// `team.answer_group {group, allow}` (19.6): answer every open item of
-    /// the group as `team.answer` would, in creation order.
+    /// the group as `team.answer` would, in creation order. An item that fails
+    /// stays open and is returned in the failed list; the others take effect.
     pub fn answer_group(
         &mut self,
         group: &str,
         allow: Option<bool>,
-    ) -> Result<Vec<(String, AnswerEffect)>, TeamError> {
+    ) -> Result<(GroupAnswers, GroupFailures), TeamError> {
         let ids: Vec<String> = self
             .teams
             .values()
@@ -2663,25 +2697,22 @@ impl Teams {
         }
         // Not atomic on purpose: an item that cannot be answered is skipped so
         // the effects of the items already answered are never lost (their
-        // workers would stay in `starting` forever).
+        // workers would stay in `starting` forever). The skipped items stay
+        // open and are reported in `failed`.
         let mut answered = Vec::new();
-        let mut first_error: Option<TeamError> = None;
+        let mut failed = Vec::new();
         for id in ids {
             match self.answer(&id, None, None, allow) {
                 Ok((effect, _)) => answered.push((id, effect)),
-                Err(error) => {
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
-                }
+                Err(error) => failed.push((id, error)),
             }
         }
         if answered.is_empty() {
-            if let Some(error) = first_error {
-                return Err(error);
+            if let Some((_, error)) = failed.first() {
+                return Err(error.clone());
             }
         }
-        Ok(answered)
+        Ok((answered, failed))
     }
 
     pub fn mark_item_answered_by_instance(
@@ -2825,7 +2856,7 @@ impl Teams {
         if participant.state == ParticipantState::Exited {
             return;
         }
-        participant.state = ParticipantState::Exited;
+        participant.set_state(ParticipantState::Exited);
         participant.reason = Some(reason.to_string());
         participant.bus_turn = false;
         participant.mailbox.clear();
@@ -2889,7 +2920,7 @@ impl Teams {
         };
         team.leaderless = true;
         if let Some(leader) = team.participants.get_mut("leader") {
-            leader.state = ParticipantState::Exited;
+            leader.set_state(ParticipantState::Exited);
             leader.reason = Some(reason.to_string());
         }
         team.current_group = None;
@@ -2924,7 +2955,7 @@ impl Teams {
         };
         team.leaderless = true;
         if let Some(leader) = team.participants.get_mut("leader") {
-            leader.state = ParticipantState::Exited;
+            leader.set_state(ParticipantState::Exited);
             leader.reason = Some("session closed".to_string());
         }
         team.current_group = None;
@@ -3138,6 +3169,8 @@ fn team_entry(team: &Team) -> Value {
                 "queued": participant.queued(),
                 "paused": participant.paused,
                 "turns": { "task": task_count, "total": participant.turns_total },
+                "activity": participant.activity,
+                "state_since": participant.state_since,
             });
             if let Some(reason) = &participant.reason {
                 out["reason"] = json!(reason);
@@ -3178,6 +3211,9 @@ fn team_entry(team: &Team) -> Value {
             "max_turns_total": team.config.max_turns_total,
             "turns_total": team.total_turns,
         },
+        "board_rev": team.board.rev,
+        "workflow_name": team.board.workflow_name,
+        "stages": team.board.stages(),
     });
     if let Some(at) = team.suspended_at {
         entry["suspended_at"] = json!(at);
@@ -3487,6 +3523,12 @@ impl Teams {
                     ParticipantState::Working => ParticipantState::Idle,
                     other => other,
                 };
+                // Recovered participants start their state clock at restore
+                // time (19.9).
+                participant.state_since = now;
+                participant.activity = None;
+                participant.activity_throttle = activity::ActivityThrottle::default();
+                participant.turn_activity = false;
                 participants.insert(participant.name.clone(), participant);
             }
             let inbox: Vec<InboxItem> = snapshot
@@ -3531,6 +3573,8 @@ impl Teams {
                 watchers: HashMap::new(),
                 pending_items: HashMap::new(),
                 created_at: snapshot.created_at,
+                board: board::Board::default(),
+                board_flush_at: None,
                 current_group: None,
             };
             self.by_cwd.insert(team.cwd.clone(), team.id.clone());
@@ -4950,6 +4994,32 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_leader_session_ends_the_current_spawn_group() {
+        let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}, "max_workers": 8}));
+        teams
+            .send_message(&team, "human", "leader", Kind::Task, "do", None, vec![])
+            .unwrap();
+        teams.take_deliveries(&HashSet::new());
+        let group = teams
+            .team(&team)
+            .unwrap()
+            .current_group
+            .clone()
+            .expect("group");
+        teams.leader_session_closed("i1", "s1");
+        // The team stays, the group does not: the next item gets its own.
+        assert!(teams.team(&team).unwrap().current_group.is_none());
+        let SpawnOutcome::Awaiting { request, .. } = teams
+            .request_spawn(&team, "dev", Some("w1"), None, None, None)
+            .unwrap()
+        else {
+            panic!("expected approval");
+        };
+        let item = teams.item(&team, &request).unwrap();
+        assert_ne!(item.group.as_deref(), Some(group.as_str()));
+    }
+
+    #[test]
     fn a_frontend_prompt_opens_and_closes_a_group_too() {
         let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}, "max_workers": 8}));
         teams
@@ -4987,7 +5057,8 @@ mod tests {
         let group = spawn_item_group(&teams, &team, "w1").expect("group");
         let unknown = teams.answer_group("g999", Some(true)).unwrap_err();
         assert_eq!(unknown.code, UNKNOWN_INBOX);
-        let answers = teams.answer_group(&group, Some(true)).unwrap();
+        let (answers, failed) = teams.answer_group(&group, Some(true)).unwrap();
+        assert!(failed.is_empty(), "{failed:?}");
         let answered: Vec<String> = answers.iter().map(|(id, _)| id.clone()).collect();
         assert_eq!(answered, ids, "creation order");
         assert!(answers
@@ -5025,6 +5096,76 @@ mod tests {
         teams
             .workflow_save(&team, "/other", &extra, workflow::Scope::Project, false)
             .expect("another project's own cap");
+    }
+
+    #[test]
+    fn answer_group_reports_failed_items_and_answers_the_rest() {
+        let (mut teams, team) = fixture(json!({
+            "spawn_confirm": {"auto": []},
+            "max_workers": 8,
+            "templates": {
+                "dev": {
+                    "key": { "agent": "a", "command": "c", "args": [] },
+                    "role": "dev",
+                },
+                "alt": {
+                    "key": { "agent": "a", "command": "c", "args": [] },
+                    "role": "alt",
+                },
+            }
+        }));
+        teams
+            .send_message(&team, "human", "leader", Kind::Task, "do", None, vec![])
+            .unwrap();
+        teams.take_deliveries(&HashSet::new());
+        let mut ids = Vec::new();
+        for (name, template) in [("w1", "dev"), ("w2", "alt")] {
+            let SpawnOutcome::Awaiting { request, .. } = teams
+                .request_spawn(&team, template, Some(name), None, None, None)
+                .unwrap()
+            else {
+                panic!("expected approval");
+            };
+            ids.push(request);
+        }
+        let group = teams.item(&team, &ids[0]).unwrap().group.expect("group");
+
+        // The second item's template disappears between the request and the
+        // answer: that item fails, the first still starts.
+        teams
+            .teams
+            .get_mut(&team)
+            .unwrap()
+            .config
+            .templates
+            .remove("alt");
+        let (answers, failed) = teams.answer_group(&group, Some(true)).unwrap();
+        assert_eq!(answers.len(), 1, "{failed:?}");
+        assert_eq!(answers[0].0, ids[0]);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, ids[1]);
+        assert_eq!(failed[0].1.code, NOT_ALLOWED);
+        assert!(failed[0].1.message.contains("unknown template"));
+        assert!(teams.team(&team).unwrap().participants.contains_key("w1"));
+        assert!(!teams.team(&team).unwrap().participants.contains_key("w2"));
+        assert_eq!(
+            teams.item(&team, &ids[1]).unwrap().state,
+            ItemState::Open,
+            "a failed item stays open"
+        );
+
+        // When every remaining item fails, the first error comes back as the
+        // call's error and nothing is answered.
+        teams
+            .teams
+            .get_mut(&team)
+            .unwrap()
+            .config
+            .templates
+            .remove("dev");
+        let error = teams.answer_group(&group, Some(true)).unwrap_err();
+        assert_eq!(error.code, NOT_ALLOWED);
+        assert_eq!(teams.item(&team, &ids[1]).unwrap().state, ItemState::Open);
     }
 
     #[test]

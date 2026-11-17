@@ -252,6 +252,13 @@ function Panel:refresh()
     self.watcher:update_header()
   end
   local rows = self.team:list_rows()
+  if #rows == 0 and self.had_teams then
+    self:close()
+    return
+  end
+  if #rows > 0 then
+    self.had_teams = true
+  end
   local lines, ids = self:lines()
   self.ids = ids
   vim.bo[self.buf].modifiable = true

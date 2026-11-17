@@ -42,7 +42,9 @@ Server.__index = Server
 ---  team_answer_group_error?: table, team_workflows?: table, team_workflows_error?: table,
 ---  team_workflow_delete_error?: table, team_board?: table, team_boards?: table,
 ---  team_board_error?: table, team_board_delay?: integer,
+---  team_answer_group_failed?: table,
 ---  team_card_history?: table, team_card_history_error?: table,
+---  team_workflow_delete_delay?: integer,
 ---  run_error?: table, uninstall_error?: table, canned_agent?: boolean}|nil
 ---@return FakeService
 function M.new(opts)
@@ -135,9 +137,11 @@ function M.new(opts)
     team_start_error = opts.team_start_error,
     team_start_result = opts.team_start_result,
     team_answer_group_error = opts.team_answer_group_error,
+    team_answer_group_failed = opts.team_answer_group_failed,
     team_workflows = opts.team_workflows,
     team_workflows_error = opts.team_workflows_error,
     team_workflow_delete_error = opts.team_workflow_delete_error,
+    team_workflow_delete_delay = opts.team_workflow_delete_delay or 5,
     team_board = opts.team_board,
     team_boards = opts.team_boards,
     team_board_error = opts.team_board_error,
@@ -601,8 +605,9 @@ function Server:dispatch(message, client)
         self.team_answer_group_error.data
       )
     end
+    local failed = vim.deepcopy(self.team_answer_group_failed or {})
     vim.defer_fn(function()
-      self:send(client, { jsonrpc = "2.0", id = ident, result = { answered = {} } })
+      self:send(client, { jsonrpc = "2.0", id = ident, result = { answered = {}, failed = failed } })
     end, 5)
     return nil
   end
@@ -660,6 +665,15 @@ function Server:dispatch(message, client)
   end
   if method == "team.workflow_delete" then
     self.team_workflow_deletes[#self.team_workflow_deletes + 1] = vim.deepcopy(params)
+    if type(self.team_workflows) == "table" then
+      local left = {}
+      for _, workflow in ipairs(self.team_workflows) do
+        if workflow.name ~= params.name or workflow.scope ~= params.scope then
+          left[#left + 1] = workflow
+        end
+      end
+      self.team_workflows = left
+    end
     if self.team_workflow_delete_error then
       return error_reply(
         ident,
@@ -764,7 +778,7 @@ function Server:dispatch(message, client)
     end
     vim.defer_fn(function()
       self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
-    end, 5)
+    end, self.team_workflow_delete_delay or 5)
     return nil
   end
   if method == "policy.set" then

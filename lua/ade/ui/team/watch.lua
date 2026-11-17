@@ -150,6 +150,14 @@ local function build_session(source, opts)
     return block
   end
 
+  if opts.title then
+    add({
+      kind = "system",
+      text = " watching " .. tostring(opts.title) .. " (read-only)",
+      id = "watch-title",
+    })
+  end
+
   local supplement = opts.supplement
   if supplement then
     add({
@@ -616,6 +624,7 @@ function Watch:refresh(first)
     expanded = self.expanded,
     turn_times = self.turn_times,
     supplement = self.supplement,
+    title = self.title or (self.participant and (tostring(self.team_id) .. "/" .. tostring(self.participant))),
     version = self.display and self.display.version or 0,
     cache = self.turn_cache,
     use_cache = self.turn_cache ~= nil,

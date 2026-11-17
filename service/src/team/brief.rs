@@ -36,50 +36,74 @@ pub fn start_notice(
     members: &[(WorkflowMember, String)],
     task: Option<&str>,
 ) -> String {
-    let mut body = String::from(LEADER_INSTRUCTIONS);
-    body.push_str("\n\n组队开始，本次流程如下。\n");
-    // The task comes before the flow and the members: when the notice exceeds
-    // one message and is trimmed from the end, the person's task must survive.
-    if let Some(task) = task {
-        if !task.trim().is_empty() {
-            body.push_str(&format!("本次任务：{task}\n"));
-        }
-    }
-    body.push_str(&format!("流程：{}\n", workflow.name));
+    let intro = format!("{LEADER_INSTRUCTIONS}\n\n组队开始，本次流程如下。\n");
+    let mut head = String::new();
+    head.push_str(&format!("流程：{}\n", workflow.name));
     if !workflow.summary.is_empty() {
-        body.push_str(&format!("说明：{}\n", workflow.summary));
+        head.push_str(&format!("说明：{}\n", workflow.summary));
     }
-    body.push_str("<workflow>\n");
-    body.push_str(&workflow.text);
-    body.push_str("\n</workflow>\n");
+    if let Some(columns) = &workflow.columns {
+        head.push_str(&format!("看板列：{}\n", columns.join(" / ")));
+    }
+    // Member identities are fixed parts; their roles are what gets cut first.
+    let mut identities = String::new();
+    let mut roles = String::new();
     if !members.is_empty() {
-        body.push_str("成员：\n");
+        identities.push_str("成员：\n");
         for (member, agent) in members {
-            body.push_str(&format!(
+            identities.push_str(&format!(
                 "- {} · 模板 {} · agent {}",
                 member.name, member.template, agent
             ));
             if let Some(model) = &member.model {
-                body.push_str(&format!(" · 模型 {model}"));
+                identities.push_str(&format!(" · 模型 {model}"));
             }
+            identities.push('\n');
             if let Some(role) = &member.role {
                 if !role.trim().is_empty() {
-                    body.push_str(&format!(" · 角色 {role}"));
+                    roles.push_str(&format!("  角色 {role}\n"));
                 }
             }
-            body.push('\n');
         }
     }
-    if let Some(columns) = &workflow.columns {
-        body.push_str(&format!("看板列：{}\n", columns.join(" / ")));
+    let flow = format!("<workflow>\n{}\n</workflow>\n", workflow.text);
+
+    // The task, instructions, member identities and columns are preserved; the
+    // task is only shortened when even those fixed parts would exceed one
+    // message (it may be 64 KiB on its own). Roles are cut first, then the flow
+    // text, exactly as 19.7 requires.
+    let task_prefix = "本次任务：";
+    let fixed = intro.len() + head.len() + identities.len() + task_prefix.len() + 1;
+    let mut body = intro;
+    if let Some(task) = task {
+        if !task.trim().is_empty() {
+            let budget = MAX_BODY_BYTES.saturating_sub(fixed);
+            if budget > 0 {
+                body.push_str(task_prefix);
+                body.push_str(&trim_to(task, budget));
+                body.push('\n');
+            }
+        }
     }
-    trim_to(body, MAX_BODY_BYTES)
+    body.push_str(&head);
+    body.push_str(&identities);
+    let remaining = MAX_BODY_BYTES.saturating_sub(body.len());
+    if remaining >= flow.len() + roles.len() {
+        body.push_str(&flow);
+        body.push_str(&roles);
+    } else if remaining >= flow.len() {
+        body.push_str(&flow);
+        body.push_str(&trim_to(&roles, remaining - flow.len()));
+    } else {
+        body.push_str(&trim_to(&flow, remaining));
+    }
+    body
 }
 
 /// Cut `text` to at most `limit` bytes on a character boundary.
-fn trim_to(text: String, limit: usize) -> String {
+fn trim_to(text: &str, limit: usize) -> String {
     if text.len() <= limit {
-        return text;
+        return text.to_string();
     }
     let mut end = limit;
     while end > 0 && !text.is_char_boundary(end) {
@@ -125,7 +149,7 @@ pub fn role_card(
         );
     }
     card.push_str("Work in the team's cwd and report to the leader when done.");
-    trim_to(card, MAX_BODY_BYTES)
+    trim_to(&card, MAX_BODY_BYTES)
 }
 
 #[cfg(test)]
@@ -200,7 +224,7 @@ mod tests {
                     WorkflowMember {
                         name: format!("w{index}"),
                         template: "dev".to_string(),
-                        model: None,
+                        model: Some("m2".to_string()),
                         role: Some(long_role.clone()),
                         task: None,
                     },
@@ -208,12 +232,46 @@ mod tests {
                 )
             })
             .collect();
-        let notice = start_notice(&workflow, &members, None);
+        let notice = start_notice(&workflow, &members, Some("the task that must survive"));
         assert!(notice.len() <= MAX_BODY_BYTES, "{}", notice.len());
         assert!(
             notice.starts_with(leader_instructions()),
             "base instructions survive"
         );
+        assert!(notice.contains("the task that must survive"));
+        // Roles are the first thing trimmed: every member identity and the
+        // column line are still there.
+        for index in 0..8 {
+            assert!(
+                notice.contains(&format!("- w{index} · 模板 dev · agent opencode · 模型 m2")),
+                "member {index} identity lost: {notice}"
+            );
+        }
+        assert!(notice.contains("看板列：待开发 / 进行中"), "{notice}");
+        assert!(
+            notice.contains("<workflow>"),
+            "the flow text fits when only roles overflow: {notice}"
+        );
+    }
+
+    #[test]
+    fn a_huge_task_is_shortened_last() {
+        let workflow = workflow();
+        let members = vec![(workflow.team[0].clone(), "opencode".to_string())];
+        let task = "t".repeat(MAX_BODY_BYTES);
+        let notice = start_notice(&workflow, &members, Some(&task));
+        assert_eq!(notice.len(), MAX_BODY_BYTES, "fills one message exactly");
+        assert!(notice.starts_with(leader_instructions()));
+        assert!(notice.contains("本次任务：tttt"));
+        assert!(
+            notice.contains("- w1 · 模板 dev · agent opencode · 模型 m2"),
+            "member identities survive: {notice}"
+        );
+        assert!(
+            notice.contains("看板列：待开发 / 进行中"),
+            "columns survive: {notice}"
+        );
+        assert!(!notice.contains("step 1, step 2"), "the flow text is cut");
     }
 
     #[test]

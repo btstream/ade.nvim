@@ -105,7 +105,11 @@ impl Socket {
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| error.to_string());
-                return Err(message);
+                let code = error.get("code").and_then(Value::as_i64);
+                return Err(match code {
+                    Some(code) => format!("{message} ({code})"),
+                    None => message,
+                });
             }
             return Ok(value.get("result").cloned().unwrap_or(Value::Null));
         }
@@ -355,6 +359,80 @@ impl Mcp {
                 },
             }));
             tools.push(json!({
+                "name": "board_update",
+                "description": "Update the team board: workflow, columns, cards, archive or remove.",
+                "inputSchema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "workflow_name": {
+                            "type": ["string", "null"],
+                            "description": "Name of the workflow shown on the board; null clears it."
+                        },
+                        "workflow": {
+                            "type": ["string", "null"],
+                            "description": "Workflow text, at most 4 KiB; null clears it."
+                        },
+                        "columns": {
+                            "type": "array",
+                            "description": "The complete column list, in display order (up to 16 unique titles, 1..40 characters each).",
+                            "items": { "type": "string" },
+                            "maxItems": 16
+                        },
+                        "upsert": {
+                            "type": "array",
+                            "description": "Create cards (id, title and column required) or merge fields into existing cards.",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "id": {
+                                        "type": "string",
+                                        "description": "[A-Za-z0-9][A-Za-z0-9_.-]{0,31}"
+                                    },
+                                    "title": {
+                                        "type": "string",
+                                        "description": "1..200 characters; required for a new card."
+                                    },
+                                    "column": {
+                                        "type": "string",
+                                        "description": "One of the board columns; required for a new card."
+                                    },
+                                    "owner": {
+                                        "type": ["string", "null"],
+                                        "description": "A worker name of the team; null clears it."
+                                    },
+                                    "stage": {
+                                        "type": ["string", "null"],
+                                        "description": "1..40 characters; null clears it."
+                                    },
+                                    "body": {
+                                        "type": ["string", "null"],
+                                        "description": "Card body, at most 8 KiB; null clears it."
+                                    },
+                                    "fields": {
+                                        "type": ["object", "null"],
+                                        "description": "Short key/value pairs; merges by key, a null value deletes the key, null clears all.",
+                                        "additionalProperties": { "type": ["string", "null"] }
+                                    }
+                                },
+                                "required": ["id"]
+                            }
+                        },
+                        "archive": {
+                            "type": "array",
+                            "description": "Archive these cards and delete their history.",
+                            "items": { "type": "string" }
+                        },
+                        "remove": {
+                            "type": "array",
+                            "description": "Delete these cards and their history.",
+                            "items": { "type": "string" }
+                        }
+                    }
+                },
+            }));
+            tools.push(json!({
                 "name": "workflow_save",
                 "description": "Save a named workflow for this project (or every project with scope \"user\").",
                 "inputSchema": {
@@ -422,6 +500,35 @@ impl Mcp {
                         "scope": { "type": "string", "enum": ["project", "user"] },
                     },
                     "required": ["name"],
+                },
+            }));
+        } else {
+            tools.push(json!({
+                "name": "card_update",
+                "description": "Update your own card's body and fields, or archive it.",
+                "inputSchema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "card": {
+                            "type": "string",
+                            "description": "The card id you own."
+                        },
+                        "body": {
+                            "type": ["string", "null"],
+                            "description": "Card body, at most 8 KiB; null clears it."
+                        },
+                        "fields": {
+                            "type": ["object", "null"],
+                            "description": "Short key/value pairs; merges by key, a null value deletes the key, null clears all.",
+                            "additionalProperties": { "type": ["string", "null"] }
+                        },
+                        "archive": {
+                            "type": "boolean",
+                            "description": "true archives the card and deletes its history."
+                        }
+                    },
+                    "required": ["card"]
                 },
             }));
         }
@@ -493,6 +600,31 @@ impl Mcp {
                     "since": arguments.get("since"),
                 }),
             ),
+            // Both board tools reach the service, which owns the role check and
+            // returns the documented -32061. `tools/list` still hides the other
+            // role's tool.
+            "board_update" => ("bus.board_update", arguments),
+            "card_update" => ("bus.card_update", arguments),
+            "workflow_save" if leader => {
+                let mut call = json!({
+                    "workflow": arguments.get("workflow"),
+                    "replace": arguments.get("replace"),
+                });
+                if let Some(scope) = arguments.get("scope") {
+                    call["scope"] = scope.clone();
+                }
+                ("bus.workflow_save", call)
+            }
+            "workflow_get" if leader => {
+                ("bus.workflow_get", json!({ "name": arguments.get("name") }))
+            }
+            "workflow_delete" if leader => {
+                let mut call = json!({ "name": arguments.get("name") });
+                if let Some(scope) = arguments.get("scope") {
+                    call["scope"] = scope.clone();
+                }
+                ("bus.workflow_delete", call)
+            }
             "team_spawn" | "bus_read" | "workflow_save" | "workflow_get" | "workflow_delete" => {
                 return Ok(error_result("this tool is only available to the leader"))
             }

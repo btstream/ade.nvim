@@ -1878,6 +1878,9 @@ return function(t)
       vim.api.nvim_win_set_cursor(ui.watch_win, { 1, 0 })
       vim.api.nvim_feedkeys("]]", "x", false)
       local cursor = vim.api.nvim_win_get_cursor(ui.watch_win)[1]
+      t.match("── turn 1", vim.api.nvim_buf_get_lines(ui.watch_buf, cursor - 1, cursor, false)[1] or "")
+      vim.api.nvim_feedkeys("]]", "x", false)
+      cursor = vim.api.nvim_win_get_cursor(ui.watch_win)[1]
       t.match("── turn 2", vim.api.nvim_buf_get_lines(ui.watch_buf, cursor - 1, cursor, false)[1] or "")
       vim.api.nvim_feedkeys("[[", "x", false)
       cursor = vim.api.nvim_win_get_cursor(ui.watch_win)[1]

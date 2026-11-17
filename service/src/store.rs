@@ -70,7 +70,7 @@ use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBeha
 ///
 /// - 1: the S4a event log.
 /// - 2: the team tables (18.15).
-/// - 3: the `workflows` table (19.11).
+/// - 3: boards, card history and named workflows (19.11).
 pub const SCHEMA_VERSION: i64 = 3;
 
 /// How long a writer waits for another process holding the database lock.
@@ -207,6 +207,15 @@ pub struct InstanceInfo {
     pub bytes: u64,
     /// Highest `seq` ever issued to the instance (0 when nothing is stored).
     pub last_seq: u64,
+}
+
+/// A stored board and its card history (PROTOCOL.md 19.11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredBoard {
+    pub rev: u64,
+    pub json: String,
+    /// `(card_id, old card JSON, rev)`, newest first.
+    pub history: Vec<(String, String, i64)>,
 }
 
 /// SQLite-backed event log.
@@ -703,8 +712,101 @@ impl Store {
             .context("starting a team delete")?;
         tx.execute("DELETE FROM teams WHERE id = ?1", params![id])
             .context("deleting a team")?;
+        // The board and its history live with the team (19.11).
+        tx.execute("DELETE FROM boards WHERE team_id = ?1", params![id])
+            .context("deleting a board")?;
+        tx.execute("DELETE FROM card_history WHERE team_id = ?1", params![id])
+            .context("deleting card history")?;
         tx.commit().context("committing a team delete")?;
         Ok(())
+    }
+
+    /// Persist one board and the history changes caused by this write, in one
+    /// transaction. `history` entries are `(card_id, old card JSON, old board
+    /// rev, ts_ms)`; `cleared` cards lose all their history (archived or
+    /// removed).
+    pub fn save_board(
+        &self,
+        team_id: &str,
+        rev: u64,
+        json: &str,
+        history: &[(String, String, i64, i64)],
+        cleared: &[String],
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("starting a board transaction")?;
+        tx.prepare_cached(
+            "INSERT INTO boards (team_id, rev, json) VALUES (?1, ?2, ?3)
+             ON CONFLICT(team_id) DO UPDATE SET rev = excluded.rev, json = excluded.json",
+        )
+        .context("preparing the board upsert")?
+        .execute(params![team_id, to_i64(rev, "board rev")?, json])
+        .context("writing a board")?;
+        for card in cleared {
+            tx.prepare_cached("DELETE FROM card_history WHERE team_id = ?1 AND card_id = ?2")
+                .context("preparing a card history delete")?
+                .execute(params![team_id, card])
+                .context("clearing card history")?;
+        }
+        for (card, card_json, board_rev, ts_ms) in history {
+            tx.prepare_cached(
+                "INSERT OR REPLACE INTO card_history (team_id, card_id, rev, json, ts_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .context("preparing a card history insert")?
+            .execute(params![team_id, card, board_rev, card_json, ts_ms])
+            .context("writing card history")?;
+            // Keep the 20 newest versions of each card in the same transaction.
+            tx.prepare_cached(
+                "DELETE FROM card_history
+                 WHERE team_id = ?1 AND card_id = ?2 AND rev NOT IN (
+                     SELECT rev FROM card_history
+                     WHERE team_id = ?1 AND card_id = ?2
+                     ORDER BY rev DESC LIMIT 20
+                 )",
+            )
+            .context("preparing a card history prune")?
+            .execute(params![team_id, card])
+            .context("pruning card history")?;
+        }
+        tx.commit().context("committing a board")?;
+        Ok(())
+    }
+
+    /// Read a stored board and its history rows, newest first.
+    pub fn load_board(&self, id: &str) -> Result<Option<StoredBoard>> {
+        let conn = self.lock()?;
+        let board: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT rev, json FROM boards WHERE team_id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .context("reading a board")?;
+        let Some((rev, json)) = board else {
+            return Ok(None);
+        };
+        let mut statement = conn
+            .prepare(
+                "SELECT card_id, json, rev FROM card_history
+                 WHERE team_id = ?1 ORDER BY rev DESC",
+            )
+            .context("preparing a card history load")?;
+        let rows = statement
+            .query_map(params![id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .context("reading card history")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("collecting card history")?;
+        Ok(Some(StoredBoard {
+            rev: from_i64(rev, "board rev")?,
+            json,
+            history: rows,
+        }))
     }
 
     pub fn load_teams(&self) -> Result<Vec<(String, String)>> {
@@ -1069,6 +1171,19 @@ fn create_schema(conn: &Connection) -> Result<()> {
              key   TEXT PRIMARY KEY,
              value TEXT NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS boards (
+             team_id TEXT PRIMARY KEY,
+             rev     INTEGER NOT NULL,
+             json    TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS card_history (
+             team_id TEXT NOT NULL,
+             card_id TEXT NOT NULL,
+             rev     INTEGER NOT NULL,
+             json    TEXT NOT NULL,
+             ts_ms   INTEGER NOT NULL,
+             PRIMARY KEY (team_id, card_id, rev)
+         );
          CREATE TABLE IF NOT EXISTS workflows (
              scope      TEXT    NOT NULL,
              project    TEXT    NOT NULL,
@@ -1428,5 +1543,30 @@ mod tests {
         let report = store.prune("a", 10).expect("prune");
         assert_eq!(report, PruneReport::default());
         assert!(store.session_complete("a", "s").expect("complete"));
+    }
+
+    #[test]
+    fn boards_keep_twenty_versions_and_are_deleted_with_their_team() {
+        let store = Store::open_in_memory().expect("open");
+        let history: Vec<(String, String, i64, i64)> = (1..=25)
+            .map(|rev| ("T1".to_string(), format!("{{\"rev\":{rev}}}"), rev, rev))
+            .collect();
+        store
+            .save_board("t1", 25, r#"{"rev":25}"#, &history, &[])
+            .expect("save board");
+        let board = store.load_board("t1").expect("load").expect("board");
+        assert_eq!(board.rev, 25);
+        assert_eq!(board.history.len(), 20, "older versions are pruned");
+        assert_eq!(board.history[0].2, 25, "newest first");
+        assert_eq!(board.history[19].2, 6);
+
+        store
+            .save_board("t1", 26, r#"{"rev":26}"#, &[], &["T1".to_string()])
+            .expect("clear history");
+        let board = store.load_board("t1").expect("load").expect("board");
+        assert!(board.history.is_empty(), "archiving clears history");
+
+        store.delete_team("t1").expect("delete team");
+        assert!(store.load_board("t1").expect("load").is_none());
     }
 }

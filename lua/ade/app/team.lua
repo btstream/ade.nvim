@@ -162,10 +162,12 @@ function Team:forget_connection()
   self.bound = {}
   self.blocked = {}
   self.suspended_cwd = {}
-  -- A board request that was in flight when the connection died never answers;
-  -- clear the latch so the next `team.changed` can fetch it again.
+  -- A board request that was in flight when the connection died may still
+  -- call back; bumping its token makes that late reply a no-op while the next
+  -- `team.changed` can start a fresh request.
   for _, entry in pairs(self.boards) do
     if type(entry) == "table" then
+      entry.seq = (entry.seq or 0) + 1
       entry.inflight = false
       entry.again = false
     end
@@ -271,6 +273,10 @@ function Team:service_config(cwd)
   local workflows = {}
   for name, workflow in pairs(teams.workflows or {}) do
     local copy = vim.deepcopy(workflow)
+    if type(copy.leader) == "table" and next(copy.leader) == nil then
+      -- An empty Lua table encodes as `[]`; `leader` must be an object.
+      copy.leader = nil
+    end
     if type(copy.summary) ~= "string" or copy.summary == "" then
       -- 19.1 requires a summary on the wire; a config entry may rely on its
       -- text's first line instead (the draft's `default = { text = ... }`).
@@ -557,6 +563,13 @@ function Team:start_enabled_workers(team_id, entry)
   if teams.enabled ~= true then
     return
   end
+  local team = self.teams[team_id]
+  local cwd = team and team.cwd or (type(entry) == "table" and entry.cwd or nil)
+  if cwd and require("ade.app.team_start").active(cwd) then
+    -- `:Ade team start` is picking a workflow for this cwd: its own team.start
+    -- must not be pre-empted by the configured default.
+    return
+  end
   if type(entry) == "table" and entry.state == "suspended" then
     -- A resume still waiting for its configuration cannot take team.start; do
     -- not mark the team so the active `team.changed` can try later.
@@ -676,7 +689,7 @@ function Team:request_board(team_id, cb)
   end
   local entry = self.boards[team_id]
   if type(entry) ~= "table" then
-    entry = { board = nil, inflight = false, again = false }
+    entry = { board = nil, inflight = false, again = false, seq = 0 }
     self.boards[team_id] = entry
   end
   if entry.inflight then
@@ -688,7 +701,15 @@ function Team:request_board(team_id, cb)
     return
   end
   entry.inflight = true
+  -- A per-request token: a reply that arrives after the team was closed, the
+  -- cache reset or the connection dropped must not touch a newer request.
+  entry.seq = (entry.seq or 0) + 1
+  local seq = entry.seq
   self:_call("team.board", { team = team_id }, function(ok, value)
+    if self.boards[team_id] ~= entry or entry.seq ~= seq then
+      cb(ok, nil)
+      return
+    end
     entry.inflight = false
     if ok and type(value) == "table" and type(value.board) == "table" then
       entry.board = value.board
@@ -713,27 +734,13 @@ function Team:on_changed_payload(payload)
     return
   end
   if team.state == "closed" then
-    self.teams[team.id] = nil
-    for id, item in pairs(self.inbox) do
-      if item.team == team.id then
-        self.inbox[id] = nil
-        self.notified[id] = nil
-      end
-    end
-    for id, team_id in pairs(self.notified) do
-      if team_id == team.id then
-        self.notified[id] = nil
-      end
-    end
-    self.enabled_teams[team.id] = nil
-    self.boards[team.id] = nil
+    self:forget_team(team.id)
     for cwd, id in pairs(self.suspended_cwd) do
       if id == team.id then
         self.suspended_cwd[cwd] = nil
         self.warned_suspended[cwd] = nil
       end
     end
-    -- The team is gone: this instance may lead a new one for the same cwd.
     for cwd, entry in pairs(self.bound) do
       if entry.team == team.id or team.cwd == cwd then
         self.bound[cwd] = nil
@@ -758,6 +765,20 @@ function Team:on_changed_payload(payload)
           self.warned_suspended[cwd] = nil
         end
       end
+    end
+    -- A team created after the cache was cleared (or a reconnect) gets its
+    -- board when its revision differs from the cache.
+    local rev = tonumber(team.board_rev)
+    if rev ~= nil then
+      local cached = self.boards[team.id]
+      if not cached or type(cached.board) ~= "table" or tonumber(cached.board.rev) ~= rev then
+        self:request_board(team.id)
+      end
+    end
+    -- A suspended team may become active later; then the enabled workflow can
+    -- start (still at most once per team).
+    if team.state ~= "suspended" then
+      self:start_enabled_workers(team.id, team)
     end
   end
   self:changed()
@@ -786,6 +807,11 @@ end
 function Team:on_board_changed_payload(payload)
   local team_id = type(payload) == "table" and (payload.team or (payload.board and payload.board.id)) or nil
   if type(team_id) ~= "string" then
+    return
+  end
+  if not self.teams[team_id] then
+    -- A late notification for a closed (or not yet listed) team: do not
+    -- recreate its cache entry or fetch a board that no longer exists.
     return
   end
   local entry = self.boards[team_id]
@@ -936,10 +962,49 @@ function Team:read(team, participant, since, cb)
   self:_call("team.read", { team = team, participant = participant, since = since }, cb)
 end
 
+---Remove a team from the local caches (a close reply, or `team.changed`
+---closed). A board request still in flight must not recreate its entry.
+---@param team_id string
+function Team:forget_team(team_id)
+  if type(team_id) ~= "string" then
+    return
+  end
+  local entry = self.boards[team_id]
+  if type(entry) == "table" then
+    entry.seq = (entry.seq or 0) + 1
+    entry.inflight = false
+    entry.again = false
+  end
+  self.boards[team_id] = nil
+  self.teams[team_id] = nil
+  self.enabled_teams[team_id] = nil
+  for id, item in pairs(self.inbox) do
+    if item.team == team_id then
+      self.inbox[id] = nil
+      self.notified[id] = nil
+    end
+  end
+  for cwd, bound in pairs(self.bound) do
+    if bound.team == team_id then
+      self.bound[cwd] = nil
+    end
+  end
+end
+
 ---@param team string
 ---@param cb fun(ok: boolean, value: any)|nil
 function Team:close(team, cb)
-  self:_call("team.close", { team = team }, cb)
+  self:_call("team.close", { team = team }, function(ok, value)
+    if ok then
+      -- The reply may arrive before `team.changed(closed)`; the local state
+      -- must not keep a team that is already gone (19.7 "start over").
+      self:forget_team(team)
+      self:changed()
+    end
+    if cb then
+      cb(ok, value)
+    end
+  end)
 end
 
 ---@param team string
@@ -958,11 +1023,23 @@ function Team:start(team, workflow, task, cb)
 end
 
 ---Answer every open inbox item of a spawn group (19.6).
+---
+---A partially failed group is still a success: `value.failed` lists the items
+---that stayed open, for the caller (the panel) to show.
 ---@param group string
 ---@param allow boolean|nil
 ---@param cb fun(ok: boolean, value: any)|nil
 function Team:answer_group(group, allow, cb)
-  self:_call("team.answer_group", { group = group, allow = allow }, cb)
+  self:_call("team.answer_group", { group = group, allow = allow }, function(ok, value)
+    if ok and type(value) == "table" then
+      if type(value.failed) ~= "table" then
+        value.failed = {}
+      end
+    end
+    if cb then
+      cb(ok, value)
+    end
+  end)
 end
 
 ---Read a card's stored versions, newest first (19.4).

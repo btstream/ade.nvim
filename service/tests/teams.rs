@@ -292,6 +292,22 @@ impl Harness {
         self.client.request(98, "team.spawn", params)
     }
 
+    /// Wait for one `team.board_changed` notification and return its params.
+    fn wait_board_changed(&mut self) -> Value {
+        let deadline = Instant::now() + WAIT;
+        while Instant::now() < deadline {
+            if let Some(frame) = self
+                .client
+                .try_next_notification(Duration::from_millis(200))
+            {
+                if frame["method"] == "team.board_changed" {
+                    return frame["params"].clone();
+                }
+            }
+        }
+        panic!("timed out waiting for team.board_changed");
+    }
+
     fn worker_names(&mut self) -> Vec<String> {
         self.team()["participants"]
             .as_array()
@@ -307,6 +323,95 @@ impl Harness {
 
     fn events(&self) -> Vec<Value> {
         read_log(&self.log)
+    }
+
+    fn board(&mut self) -> Value {
+        self.client
+            .request(96, "team.board", json!({ "team": self.team }))
+            .get("result")
+            .and_then(|result| result.get("board"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    fn card_history(&mut self, card: &str) -> Value {
+        self.client
+            .request(
+                97,
+                "team.card_history",
+                json!({ "team": self.team, "card": card }),
+            )
+            .get("result")
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// The next `team.board_changed` rev for this team, skipping other
+    /// notifications.
+    fn next_board_changed(&mut self, timeout: Duration) -> Option<u64> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let frame = self.client.try_next_notification(remaining)?;
+            if frame["method"] == "team.board_changed" && frame["params"]["team"] == self.team {
+                return frame["params"]["rev"].as_u64();
+            }
+        }
+    }
+
+    fn spawn_worker(&mut self, name: &str, task: &str) {
+        let spawn = mcp_call(
+            &self.server,
+            &self.token,
+            "team_spawn",
+            json!({"template": "dev", "name": name, "task": task}),
+        );
+        assert_eq!(spawn["isError"], false, "{spawn}");
+        self.wait_participant(name, |entry| entry["state"] == "idle");
+    }
+
+    fn wait_board_card(&mut self, card: &str, check: impl Fn(&Value) -> bool) -> Value {
+        wait_for(
+            || {
+                let board = self.board();
+                board["cards"]
+                    .as_array()?
+                    .iter()
+                    .find(|entry| entry["id"] == card && check(entry))
+                    .cloned()
+            },
+            &format!("board card {card}"),
+        )
+    }
+
+    fn wait_board_rev(&mut self, rev: u64) -> Value {
+        wait_for(
+            || {
+                let board = self.board();
+                (board["rev"].as_u64() == Some(rev)).then_some(board)
+            },
+            &format!("board rev {rev}"),
+        )
+    }
+
+    fn wait_activity(&mut self, name: &str, text: &str) -> Value {
+        wait_for(
+            || {
+                self.participant(name)
+                    .filter(|entry| entry["activity"]["text"] == text)
+            },
+            &format!("activity {text:?} of {name}"),
+        )
+    }
+
+    fn connect_watcher(&self) -> Client {
+        let mut client = self.server.connect();
+        let hello = client.hello(&self.server.token(), nvim_ade_server::API_VERSION);
+        assert!(hello["result"].is_object(), "hello: {hello}");
+        client
     }
 }
 
@@ -441,6 +546,10 @@ fn mcp_text(result: &Value) -> String {
         .as_str()
         .unwrap_or_default()
         .to_string()
+}
+
+fn mcp_json(result: &Value) -> Value {
+    serde_json::from_str(&mcp_text(result)).unwrap_or(Value::Null)
 }
 
 fn team_instance(harness: &mut Harness, participant: &str) -> (String, String) {
@@ -641,6 +750,494 @@ fn leader_binds_and_spawns_through_mcp() {
             .iter()
             .all(|message| message["id"].as_u64().is_some_and(|id| id > 1))),
         "{since}"
+    );
+}
+
+#[test]
+fn boards_are_written_by_the_leader_and_the_owning_worker() {
+    let mut harness = Harness::new(
+        "team-board",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    harness.spawn_worker("w1", "do work");
+    harness.spawn_worker("w2", "do work");
+    let created = mcp_call(
+        &harness.server,
+        &harness.token,
+        "board_update",
+        json!({
+            "workflow_name": "default",
+            "workflow": "do things",
+            "columns": ["todo", "doing"],
+            "upsert": [
+                {"id": "T1", "title": "one", "column": "todo", "owner": "w1",
+                 "stage": "S1", "fields": {"branch": "ade/w1"}},
+                {"id": "T2", "title": "two", "column": "todo", "owner": "w2",
+                 "stage": "S1"}
+            ]
+        }),
+    );
+    assert_eq!(created["isError"], false, "{created}");
+    assert_eq!(mcp_json(&created)["rev"], 1, "{created}");
+    assert_eq!(
+        harness.next_board_changed(Duration::from_secs(10)),
+        Some(1),
+        "the leader write is announced at once"
+    );
+    let board = harness.board();
+    assert_eq!(board["rev"], 1, "{board}");
+    assert_eq!(board["workflow_name"], "default");
+    assert_eq!(board["columns"], json!(["todo", "doing"]));
+    assert_eq!(board["cards"].as_array().map(Vec::len), Some(2), "{board}");
+    assert_eq!(board["cards"][0]["owner"], "w1");
+    let entry = harness.team();
+    assert_eq!(entry["board_rev"], 1, "{entry}");
+    assert_eq!(entry["workflow_name"], "default", "{entry}");
+    assert_eq!(
+        entry["stages"],
+        json!([{"stage": "S1", "open": 2, "archived": 0}]),
+        "{entry}"
+    );
+
+    let worker_task = r#"do [card-update {"card":"T1","body":"from w1","fields":{"tests":"ok"}}]"#;
+    harness.send("w1", "task", worker_task);
+    let card = harness.wait_board_card("T1", |card| card["body"] == "from w1");
+    assert_eq!(card["fields"]["tests"], "ok", "{card}");
+    assert_eq!(card["updated_by"], "w1", "{card}");
+
+    let rejected_task = r#"do [card-update {"card":"T2","body":"nope"}]"#;
+    harness.send("w1", "task", rejected_task);
+    let rejected = wait_for(
+        || {
+            harness.events().into_iter().find(|event| {
+                event["event"] == "card-update-response" && event["arguments"]["card"] == "T2"
+            })
+        },
+        "the worker's rejected card write",
+    );
+    assert_eq!(rejected["response"]["isError"], true, "{rejected}");
+    assert!(
+        mcp_text(&rejected["response"]).contains("not your card"),
+        "{rejected}"
+    );
+    let board = harness.board();
+    let other = board["cards"]
+        .as_array()
+        .and_then(|cards| cards.iter().find(|card| card["id"] == "T2"))
+        .expect("T2");
+    assert!(other.get("body").is_none(), "{other}");
+
+    // Settle the reports caused by the worker turns, then prove a board write
+    // starts no bus turn for anyone.
+    std::thread::sleep(Duration::from_millis(500));
+    harness.wait_participant("leader", |entry| entry["state"] == "idle");
+    let prompts = harness
+        .events()
+        .iter()
+        .filter(|event| event["event"] == "prompt")
+        .count();
+    let renamed = mcp_call(
+        &harness.server,
+        &harness.token,
+        "board_update",
+        json!({"workflow_name": "renamed"}),
+    );
+    assert_eq!(renamed["isError"], false, "{renamed}");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        harness
+            .events()
+            .iter()
+            .filter(|event| event["event"] == "prompt")
+            .count(),
+        prompts,
+        "board changes must not be delivered to a participant"
+    );
+}
+
+#[test]
+fn worker_board_writes_coalesce_into_one_notification() {
+    let mut harness = Harness::new_with_env(
+        "team-board-coalesce",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+        &[("NVIM_ADE_SERVER_BOARD_FLUSH_MS", "2000")],
+    );
+    harness.spawn_worker("w1", "do work");
+    let created = mcp_call(
+        &harness.server,
+        &harness.token,
+        "board_update",
+        json!({
+            "columns": ["todo"],
+            "upsert": [{"id": "T1", "title": "one", "column": "todo", "owner": "w1"}]
+        }),
+    );
+    assert_eq!(created["isError"], false, "{created}");
+    assert_eq!(harness.next_board_changed(Duration::from_secs(10)), Some(1));
+    harness.send(
+        "w1",
+        "task",
+        r#"do [card-update [{"card":"T1","body":"a"},{"card":"T1","body":"b"}]]"#,
+    );
+    let board = harness.wait_board_rev(3);
+    assert_eq!(board["cards"][0]["body"], "b", "{board}");
+    assert_eq!(
+        harness.next_board_changed(Duration::from_secs(10)),
+        Some(3),
+        "one notification with the current rev"
+    );
+    assert!(
+        harness
+            .next_board_changed(Duration::from_millis(800))
+            .is_none(),
+        "coalesced writes must not notify again"
+    );
+}
+
+#[test]
+fn the_expiry_tick_flushes_and_announces_pending_worker_writes() {
+    let mut harness = Harness::new_with_env(
+        "team-board-expiry-flush",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+        &[
+            ("NVIM_ADE_SERVER_BOARD_FLUSH_MS", "10000"),
+            ("NVIM_ADE_SERVER_TEAM_EXPIRY_TICK_MS", "100"),
+        ],
+    );
+    harness.spawn_worker("w1", "do work");
+    let created = mcp_call(
+        &harness.server,
+        &harness.token,
+        "board_update",
+        json!({
+            "columns": ["todo"],
+            "upsert": [{"id": "T1", "title": "one", "column": "todo", "owner": "w1"}]
+        }),
+    );
+    assert_eq!(created["isError"], false, "{created}");
+    assert_eq!(harness.next_board_changed(Duration::from_secs(10)), Some(1));
+    harness.send(
+        "w1",
+        "task",
+        r#"do [card-update {"card":"T1","body":"pending"}]"#,
+    );
+    harness.wait_board_rev(2);
+    assert_eq!(
+        harness.next_board_changed(Duration::from_secs(5)),
+        Some(2),
+        "the expiry tick must announce the write it flushed"
+    );
+}
+
+#[test]
+fn a_leader_write_flushes_a_pending_worker_write() {
+    let mut harness = Harness::new_with_env(
+        "team-board-flush",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+        &[("NVIM_ADE_SERVER_BOARD_FLUSH_MS", "10000")],
+    );
+    harness.spawn_worker("w1", "do work");
+    let created = mcp_call(
+        &harness.server,
+        &harness.token,
+        "board_update",
+        json!({
+            "columns": ["todo"],
+            "upsert": [{"id": "T1", "title": "one", "column": "todo", "owner": "w1"}]
+        }),
+    );
+    assert_eq!(created["isError"], false, "{created}");
+    assert_eq!(harness.next_board_changed(Duration::from_secs(10)), Some(1));
+    harness.send(
+        "w1",
+        "task",
+        r#"do [card-update {"card":"T1","body":"pending"}]"#,
+    );
+    harness.wait_board_rev(2);
+    assert!(
+        harness
+            .next_board_changed(Duration::from_millis(400))
+            .is_none(),
+        "the worker write waits for its 10 s timer"
+    );
+
+    let leader = mcp_call(
+        &harness.server,
+        &harness.token,
+        "board_update",
+        json!({"upsert": [{"id": "T2", "title": "two", "column": "todo"}]}),
+    );
+    assert_eq!(leader["isError"], false, "{leader}");
+    assert_eq!(mcp_json(&leader)["rev"], 3, "{leader}");
+    assert_eq!(
+        harness.next_board_changed(Duration::from_secs(5)),
+        Some(2),
+        "the pending worker write is flushed first"
+    );
+    assert_eq!(
+        harness.next_board_changed(Duration::from_secs(5)),
+        Some(3),
+        "the leader write is announced at once"
+    );
+}
+
+#[test]
+fn board_tools_are_role_scoped() {
+    let mut harness = Harness::new(
+        "team-board-roles",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let leader_tools = mcp_tools(&harness.server, &harness.token);
+    assert!(
+        leader_tools.iter().any(|tool| tool == "board_update"),
+        "{leader_tools:?}"
+    );
+    assert!(
+        !leader_tools.iter().any(|tool| tool == "card_update"),
+        "{leader_tools:?}"
+    );
+    let wrong = mcp_call(
+        &harness.server,
+        &harness.token,
+        "card_update",
+        json!({"card": "T1", "body": "x"}),
+    );
+    assert_eq!(wrong["isError"], true, "{wrong}");
+    assert!(mcp_text(&wrong).contains("-32061"), "{wrong}");
+
+    harness.spawn_worker("w1", "do work");
+    let worker_tools = wait_for(
+        || {
+            harness
+                .events()
+                .into_iter()
+                .find(|event| {
+                    event["event"] == "tools"
+                        && event["names"]
+                            .as_array()
+                            .is_some_and(|names| names.iter().any(|name| name == "card_update"))
+                })
+                .and_then(|event| event["names"].as_array().cloned())
+        },
+        "the worker tools list",
+    );
+    let worker_tools: Vec<&str> = worker_tools.iter().filter_map(Value::as_str).collect();
+    assert!(worker_tools.contains(&"card_update"), "{worker_tools:?}");
+    assert!(!worker_tools.contains(&"board_update"), "{worker_tools:?}");
+
+    harness.send("w1", "task", "do [board-update]");
+    let rejected = wait_for(
+        || {
+            harness
+                .events()
+                .into_iter()
+                .find(|event| event["event"] == "board-update-response")
+        },
+        "the worker's rejected board_update",
+    );
+    assert_eq!(rejected["response"]["isError"], true, "{rejected}");
+    assert!(
+        mcp_text(&rejected["response"]).contains("-32061"),
+        "{rejected}"
+    );
+}
+
+#[test]
+fn activity_tracks_tools_plans_reports_and_leader_bus_calls() {
+    let mut harness = Harness::new(
+        "team-activity",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let updated = mcp_call(
+        &harness.server,
+        &harness.token,
+        "board_update",
+        json!({"workflow_name": "default"}),
+    );
+    assert_eq!(updated["isError"], false, "{updated}");
+    harness.wait_activity("leader", "board updated");
+
+    harness.spawn_worker("w1", "do work");
+    harness.wait_activity("leader", "spawn w1");
+
+    harness.send("w1", "task", "do [activity-tool]");
+    harness.wait_activity("w1", "Run cargo test");
+    harness.wait_participant("w1", |entry| entry["state"] == "idle");
+
+    harness.send("w1", "task", "do [activity-plan]");
+    harness.wait_activity("w1", "补 reconnect 的回归测试");
+    harness.wait_participant("w1", |entry| entry["state"] == "idle");
+
+    harness.send("w1", "task", "do [activity-failed]");
+    harness.wait_activity("w1", "failed: Edit hub.rs");
+    harness.wait_participant("w1", |entry| entry["state"] == "idle");
+
+    harness.send("w1", "task", "do [report-task]");
+    harness.wait_activity("w1", "→ leader report T4: first line");
+}
+
+#[test]
+fn an_awaiting_spawn_activity_names_the_assigned_worker() {
+    let mut harness = Harness::new("team-activity-spawn", json!({}), None);
+    // No template name: the service assigns `w1`, and the activity line must
+    // show it instead of the template (`dev`).
+    let spawned = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template": "dev"}),
+    );
+    let text = mcp_text(&spawned);
+    assert!(text.contains("awaiting_approval"), "{text}");
+    harness.wait_activity("leader", "spawn w1");
+}
+
+#[test]
+fn activity_notifications_are_throttled_and_state_since_moves() {
+    let mut harness = Harness::new_with_env(
+        "team-activity-throttle",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+        &[("NVIM_ADE_SERVER_ACTIVITY_NOTIFY_MS", "1500")],
+    );
+    harness.spawn_worker("w1", "idle");
+    // Wait for the spawn turn to finish: an idle participant right after spawn
+    // still has its creation time as `state_since`.
+    let idle = harness.wait_participant("w1", |entry| {
+        entry["state"] == "idle" && entry["turns"]["total"].as_u64().unwrap_or(0) >= 1
+    });
+    let idle_before = idle["state_since"].as_u64().expect("idle since");
+    std::thread::sleep(Duration::from_millis(50));
+
+    harness.send("w1", "task", "do [activity-gated]");
+    let working = harness.wait_participant("w1", |entry| entry["state"] == "working");
+    let working_since = working["state_since"].as_u64().expect("working since");
+    assert!(
+        working_since > idle_before,
+        "state_since advances at the delivery: {working_since} <= {idle_before}"
+    );
+
+    let mut watcher = harness.connect_watcher();
+    std::fs::write(harness.server.dir().join("team-agent.gate"), b"go").expect("gate");
+
+    // The state change to Working already carried the current activity, so the
+    // two rapid updates stay inside the 1500 ms window; the tick announces the
+    // last value once. The agent stays busy for 4 s, so the window has a wide
+    // margin on both sides.
+    let mut changes = 0;
+    let deadline = Instant::now() + Duration::from_millis(2600);
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Some(frame) = watcher.try_next_notification(remaining) else {
+            break;
+        };
+        if frame["method"] == "team.changed" {
+            changes += 1;
+        }
+    }
+    assert_eq!(changes, 1, "the tick announces the coalesced last value");
+    harness.wait_activity("w1", "gated step 2");
+
+    let idle = harness.wait_participant("w1", |entry| entry["state"] == "idle");
+    let idle_since = idle["state_since"].as_u64().expect("idle since");
+    assert!(
+        idle_since > working_since,
+        "state_since moves on a state change: {idle_since} <= {working_since}"
+    );
+}
+
+#[test]
+fn card_messages_and_history_follow_the_board() {
+    let mut harness = Harness::new("team-board-history", json!({}), None);
+    let created = mcp_call(
+        &harness.server,
+        &harness.token,
+        "board_update",
+        json!({
+            "columns": ["doing"],
+            "upsert": [{
+                "id": "T3", "title": "fix reconnect", "column": "doing",
+                "fields": {"tests": "ok"}
+            }]
+        }),
+    );
+    assert_eq!(created["isError"], false, "{created}");
+
+    let sent = harness.client.request(
+        98,
+        "team.send",
+        json!({
+            "team": harness.team, "to": "leader", "kind": "notice",
+            "body": "what now?", "card": "T3"
+        }),
+    );
+    assert!(sent["result"].is_object(), "{sent}");
+    let prompt = wait_for(
+        || {
+            harness.events().into_iter().find(|event| {
+                event["event"] == "prompt"
+                    && event["text"].as_str().is_some_and(|text| {
+                        text.contains("[card T3 · fix reconnect · doing · - · tests=ok]")
+                    })
+            })
+        },
+        "the card summary line",
+    );
+    let text = prompt["text"].as_str().expect("prompt text");
+    assert!(text.contains("what now?"), "{text}");
+    assert!(text.contains("task=\"T3\""), "{text}");
+
+    let unknown = harness.client.request(
+        99,
+        "team.send",
+        json!({
+            "team": harness.team, "to": "leader", "kind": "notice",
+            "body": "x", "card": "missing"
+        }),
+    );
+    assert_eq!(unknown["error"]["code"], -32060, "{unknown}");
+
+    for title in ["second", "third"] {
+        let updated = mcp_call(
+            &harness.server,
+            &harness.token,
+            "board_update",
+            json!({"upsert": [{"id": "T3", "title": title}]}),
+        );
+        assert_eq!(updated["isError"], false, "{updated}");
+    }
+    let history = harness.card_history("T3");
+    let titles: Vec<&str> = history["versions"]
+        .as_array()
+        .expect("versions")
+        .iter()
+        .filter_map(|version| version["title"].as_str())
+        .collect();
+    assert_eq!(titles, ["second", "fix reconnect"], "{history}");
+
+    let archived = mcp_call(
+        &harness.server,
+        &harness.token,
+        "board_update",
+        json!({"archive": ["T3"]}),
+    );
+    assert_eq!(archived["isError"], false, "{archived}");
+    let history = harness.card_history("T3");
+    assert_eq!(history["versions"], json!([]), "{history}");
+    let unknown_history = harness.client.request(
+        100,
+        "team.card_history",
+        json!({ "team": harness.team, "card": "missing" }),
+    );
+    assert_eq!(
+        unknown_history["error"]["code"], -32060,
+        "{unknown_history}"
     );
 }
 
@@ -3054,6 +3651,7 @@ fn spawns_from_one_leader_prompt_share_a_group_and_are_approved_together() {
         Some(2),
         "{answered}"
     );
+    assert_eq!(answered["result"]["failed"], json!([]), "{answered}");
     harness.wait_participant("w1", |entry| entry["state"] == "idle");
     harness.wait_participant("w2", |entry| entry["state"] == "idle");
     // Every worker started through the group gets the same approval notice as
@@ -3147,13 +3745,34 @@ fn leader_instructions_and_tools_follow_the_role() {
     );
     assert_eq!(
         tools["names"],
-        json!(["bus_send", "bus_ask_human", "bus_status"]),
+        json!(["bus_send", "bus_ask_human", "bus_status", "card_update"]),
         "{tools}"
     );
     assert!(
         tools["instructions"].is_null(),
         "workers get no instructions: {tools}"
     );
+}
+
+#[test]
+fn team_start_refuses_a_task_longer_than_64_kib() {
+    let mut harness = Harness::new(
+        "team-start-task",
+        json!({
+            "spawn_confirm": {"auto": []},
+            "workflows": {
+                "one": {"summary": "one worker", "team": [{"name": "w1", "template": "dev"}]}
+            }
+        }),
+        None,
+    );
+    let long = "x".repeat(64 * 1024 + 1);
+    let started = harness.start("one", Some(&long));
+    assert_eq!(started["error"]["code"], -32060, "{started}");
+    assert!(started["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("task")));
+    assert!(harness.worker_names().is_empty(), "nothing may start");
 }
 
 #[test]
@@ -3232,4 +3851,68 @@ fn team_start_boundary_and_a_leaderless_team() {
         },
         "the queued team.start notice",
     );
+}
+
+#[test]
+fn team_start_writes_the_workflow_onto_an_empty_board() {
+    let mut harness = Harness::new(
+        "team-start-board",
+        json!({
+            "spawn_confirm": {"auto": []},
+            "workflows": {
+                "flow": {
+                    "summary": "a flow with a board",
+                    "text": "1. write 2. review",
+                    "columns": ["待开发", "审查中"],
+                    "team": []
+                }
+            }
+        }),
+        None,
+    );
+    let started = harness.start("flow", None);
+    assert_eq!(started["result"]["started"], json!([]), "{started}");
+    let changed = harness.wait_board_changed();
+    assert_eq!(changed["team"], harness.team);
+    let board = harness.board();
+    assert_eq!(board["workflow_name"], "flow", "{board}");
+    assert_eq!(board["workflow"], "1. write 2. review", "{board}");
+    assert_eq!(board["columns"], json!(["待开发", "审查中"]), "{board}");
+    assert_eq!(board["rev"], 1, "{board}");
+    assert_eq!(changed["rev"], 1, "{changed}");
+
+    // A board that already names a workflow is not overwritten.
+    let again = harness.start("flow", None);
+    assert_eq!(again["result"]["started"], json!([]), "{again}");
+    let board = harness.board();
+    assert_eq!(board["rev"], 1, "no second service write: {board}");
+
+    // What the leader already put on the board wins over the workflow's columns.
+    let mut leader = Harness::new(
+        "team-start-board-columns",
+        json!({
+            "spawn_confirm": {"auto": []},
+            "workflows": {
+                "flow": {
+                    "summary": "a flow",
+                    "text": "the text",
+                    "columns": ["workflow column"],
+                    "team": []
+                }
+            }
+        }),
+        None,
+    );
+    let updated = mcp_call(
+        &leader.server,
+        &leader.token,
+        "board_update",
+        json!({"columns": ["mine"]}),
+    );
+    assert_eq!(updated["isError"], false, "{updated}");
+    let started = leader.start("flow", None);
+    assert!(started["result"].is_object(), "{started}");
+    let board = leader.board();
+    assert_eq!(board["workflow_name"], "flow", "{board}");
+    assert_eq!(board["columns"], json!(["mine"]), "{board}");
 }
