@@ -1266,10 +1266,12 @@ A template may set `"worktree": true`, and `config` may carry
   --show-toplevel`), and `worktree_root` must be set; otherwise the spawn fails
   (`-32061`, and a `notice` to the leader for an approved request);
 - the service runs, without a shell and with the template's environment,
-  `git -C <toplevel> worktree add -b ade/<team>/<name> <worktree_root>/<repo>-<hash8>/<team>-<name> HEAD`,
+  `git -C <toplevel> worktree add -b ade/<team>-<stamp>/<name> <worktree_root>/<repo>-<hash8>/<team>-<stamp>-<name> HEAD`,
   where `<repo>` is the toplevel's last path component (characters outside
   `[A-Za-z0-9._-]` replaced by `_`) and `<hash8>` the first 8 hex digits of
-  SHA-256 of the toplevel's absolute path. An existing branch or directory of
+  SHA-256 of the toplevel's absolute path, and `<stamp>` the team's creation
+  time in UTC as `YYYYMMDD-HHMMSS` (team ids restart after a service restart;
+  the stamp keeps names unique). An existing branch or directory of
   that name is an error (`-32061`), never reused;
 - the worker's `cwd` is the worktree directory, plus the same relative
   subdirectory the team's `cwd` has inside the toplevel.
