@@ -1663,7 +1663,8 @@ skipped (it stays open and is listed in `failed`); the others take effect.
    `model`, `role` and `task` from the member), in order.
 4. When the board has no `workflow_name`, the service writes `workflow_name`,
    `workflow` (the text), and `columns` (when the workflow has them and the
-   board has none) as one write with `updated_by: "service"`.
+   board has none) as one write with `updated_by: "service"`. An unavailable
+   board (19.2) is left alone and the start goes on.
 5. The leader receives one `notice` from `human` whose body is, in this
    order: the base instructions (19.8), `task` if given, the workflow's name,
    summary and text, the members (name, template, agent, model, role), and the
