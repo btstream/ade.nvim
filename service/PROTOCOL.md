@@ -1237,3 +1237,16 @@ section 10) or to the service's stderr; neither are template environments.
 `team.list` never contains templates or environments. A worker's token stops
 working when its session or instance ends. Participant connections receive
 no notifications at all (`team.changed`, `team.inbox`, `tunnel.recv`).
+
+**Shapes settled during implementation.** `team.bind_leader` returns
+`{team: <the team's team.list entry>}`. In a delivered prompt each ref follows
+the body as a child element: `<bus from="leader" kind="task" task="T3">body<ref>src/x.rs</ref></bus>`
+(refs escaped like bodies). A message whose task is `_` has no `task`
+attribute; `team_spawn`'s `task` is sent with task `_`. `bus.status.members`
+lists every participant including the caller, never `human`. A `team.list`
+entry's `limits` is `{max_turns_per_task, max_turns_total, turns_total}`.
+`team.watch` always returns `{instance, sessionId, replayed}` (`replayed` is
+false when no replay was asked for or it was too large). A closed team is
+gone from `team.list` once its last `team.changed` was sent. Worker names are
+unique for the team's lifetime: a default name never reuses an exited
+worker's name.
