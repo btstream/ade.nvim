@@ -694,9 +694,14 @@ return function(t)
       local ui = state().view.team_ui
       ui:watch(m.watching.session, "t1/w1")
       t.truthy(ui.watch_buf, "the watch view is open")
-      local text = table.concat(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false), "\n")
-      t.match("replay line", text)
-      t.match("live line", text, text)
+      local function text()
+        return table.concat(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false), "\n")
+      end
+      wait(function()
+        return text():find("replay line", 1, true) and text():find("live line", 1, true)
+      end, 5000, "the first watch paint")
+      t.match("replay line", text())
+      t.match("live line", text())
       m:unwatch()
     end)
 
@@ -1640,6 +1645,29 @@ return function(t)
       t.match("role card", text(), text())
       t.falsy(text():find("ROLE TEXT", 1, true), "the role card starts collapsed")
       t.match("src/a.rs", text())
+      local turn1
+      for _, line in ipairs(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false)) do
+        if line:find("── turn 1", 1, true) then
+          turn1 = line
+        end
+      end
+      t.truthy(turn1)
+      t.falsy(turn1:match("%d+%.%ds"), "a replayed turn has no reliable duration")
+
+      -- Synthetic blocks keep their expansion across live refreshes.
+      local role_line
+      for index, line in ipairs(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false)) do
+        if line:find("role card", 1, true) then
+          role_line = index
+        end
+      end
+      t.truthy(role_line)
+      vim.api.nvim_set_current_win(ui.watch_win)
+      vim.api.nvim_win_set_cursor(ui.watch_win, { role_line, 0 })
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Tab>", true, false, true), "x", false)
+      wait(function()
+        return text():find("ROLE TEXT", 1, true)
+      end, 5000, "the role card expansion")
 
       -- A second live turn with a plan, a diff and a bus tool call.
       service:turn_started("inst-w", {
@@ -1681,7 +1709,8 @@ return function(t)
       t.truthy(edit_line)
       vim.api.nvim_set_current_win(ui.watch_win)
       vim.api.nvim_win_set_cursor(ui.watch_win, { edit_line, 0 })
-      vim.api.nvim_feedkeys("za", "x", false)
+      -- The chat's own tool-expansion key works here too.
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Tab>", true, false, true), "x", false)
       wait(function()
         local body = text()
         return body:find("old line", 1, true) or body:find("new line", 1, true)
@@ -1732,7 +1761,137 @@ return function(t)
       vim.api.nvim_feedkeys("[[", "x", false)
       cursor = vim.api.nvim_win_get_cursor(ui.watch_win)[1]
       t.match("── turn 1", vim.api.nvim_buf_get_lines(ui.watch_buf, cursor - 1, cursor, false)[1] or "")
+
+      -- Live updates reuse the same display session: no repeated full
+      -- `set_session` and the user's scroll position is preserved.
+      local chat = ui.watcher.chat
+      local original_set_session = chat.set_session
+      local set_sessions = 0
+      chat.set_session = function(self, session)
+        set_sessions = set_sessions + 1
+        return original_set_session(self, session)
+      end
+      chat.follow = false
+      vim.api.nvim_set_current_win(ui.watch_win)
+      vim.api.nvim_win_set_cursor(ui.watch_win, { 1, 0 })
+      service:watch_update("inst-w", "sess-w", {
+        sessionUpdate = "agent_message_chunk",
+        content = { type = "text", text = "follow up" },
+      })
+      wait(function()
+        return text():find("follow up", 1, true)
+      end, 5000, "the live update")
+      t.eq(0, set_sessions, "live updates do not call set_session again")
+      t.eq(1, vim.api.nvim_win_get_cursor(ui.watch_win)[1], "the scroll position is preserved")
+      t.eq(false, chat.follow, "the follow state is preserved")
+      t.match("ROLE TEXT", text(), "synthetic expansion survives a refresh")
       m:unwatch()
+    end)
+
+    t.it("only bus tools become messages and only the first prompt has a role card", function()
+      local watch = require("ade.ui.team.watch")
+      t.eq(
+        nil,
+        watch.bus_tool({ kind = "tool", tool_name = "create_issue", raw_input = { body = "x" } }),
+        "a tool with a body argument is not a bus message"
+      )
+      local direct = watch.bus_tool({
+        kind = "tool",
+        tool_name = "mcp__ade-team__bus_send",
+        raw_input = { to = "leader", kind = "report", task = "T4", body = "done" },
+      })
+      t.truthy(direct)
+      t.match("→ leader report T4：done", direct.text)
+      local proxy = watch.bus_tool({
+        kind = "tool",
+        tool_name = "mcp",
+        raw_input = {
+          tool = "bus_ask_human",
+          args = { question = "keep it?" },
+        },
+      })
+      t.truthy(proxy)
+      t.match("asks: keep it?", proxy.text)
+      local role, message = watch.split_role("You are w1, a worker.")
+      t.eq(nil, role)
+      t.match("You are w1", message)
+      role, message = watch.split_role('You are w1<bus from="leader" kind="task">do</bus>')
+      t.truthy(role)
+      t.match("do", message)
+    end)
+
+    t.it("rapid A-B-A switching keeps the last watch and does not unwatch it again", function()
+      local service, dir = start_service(t, "watch-rapid", {
+        team_watch = { instance = "inst-w", sessionId = "sess-w", delays = { 200, 10, 10 } },
+      })
+      setup(t, "watch-rapid", service, dir)
+      controller.connect()
+      wait_ready()
+      local ui = state().view.team_ui
+      ui.watcher:open("t1", "w1")
+      vim.wait(30)
+      ui.watcher:open("t1", "w2")
+      vim.wait(30)
+      ui.watcher:open("t1", "w1")
+      wait(function()
+        return team().watching
+          and team().watching.participant == "w1"
+          and ui.watch_buf ~= nil
+          and vim.api.nvim_buf_is_valid(ui.watch_buf)
+      end, 5000, "the final A watch")
+      vim.wait(400)
+      t.eq("w1", team().watching.participant, "a stale A response must not replace the new A")
+      local unwatches = 0
+      for _, call in ipairs(service.team_unwatch or {}) do
+        if call.participant == "w1" then
+          unwatches = unwatches + 1
+        end
+      end
+      t.eq(1, unwatches, "the late A response must not unwind the new A watch")
+      ui.watcher:close()
+    end)
+
+    t.it("a superseded watch failure does not clear the current watch", function()
+      local service, dir = start_service(t, "watch-superseded-fail", {
+        team_watch = {
+          instance = "inst-w",
+          sessionId = "sess-w",
+          delays = { 120, 10 },
+          errors = { "superseded failure" },
+        },
+      })
+      setup(t, "watch-superseded-fail", service, dir)
+      controller.connect()
+      wait_ready()
+      local ui = state().view.team_ui
+      ui.watcher:open("t1", "w1")
+      vim.wait(20)
+      ui.watcher:open("t1", "w2")
+      wait(function()
+        return team().watching
+          and team().watching.participant == "w2"
+          and ui.watch_buf ~= nil
+      end, 5000, "the current w2 watch")
+      vim.wait(200)
+      t.eq("w2", team().watching.participant)
+      t.truthy(ui.watch_buf and vim.api.nvim_buf_is_valid(ui.watch_buf))
+      ui.watcher:close()
+    end)
+
+    t.it("closing during an in-flight watch request releases it", function()
+      local service, dir = start_service(t, "watch-inflight-close", {
+        team_watch = { instance = "inst-w", sessionId = "sess-w", delays = { 120 } },
+      })
+      setup(t, "watch-inflight-close", service, dir)
+      controller.connect()
+      wait_ready()
+      local ui = state().view.team_ui
+      ui.watcher:open("t1", "w1")
+      ui.watcher:close()
+      vim.wait(250)
+      t.eq(nil, team().watching, "the late response must not leave a watch")
+      t.eq(nil, ui.watch_buf, "the late response must not open a window")
+      t.truthy(#(service.team_unwatch or {}) >= 1, "the in-flight watch is released")
     end)
 
     t.it("shows the replay fallback notice and supplements it from team.read", function()

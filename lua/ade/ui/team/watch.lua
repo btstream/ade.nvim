@@ -5,6 +5,7 @@
 -- into turns, renders bus traffic as messages, and keeps the role card
 -- collapsed. The leader uses the existing chat window (no second Chat/input).
 local Chat = require("ade.ui.chat")
+local keymaps = require("ade.ui.keymaps")
 
 local M = {}
 
@@ -40,9 +41,8 @@ end
 local function split_role(text)
   local bus_at = text:find("<bus", 1, true)
   if not bus_at then
-    if text:find("You are ", 1, true) or text:find("<team_role>", 1, true) then
-      return text, ""
-    end
+    -- Only a bus prompt can carry a role-card prefix; an ordinary prompt that
+    -- happens to start with "You are" is a normal message.
     return nil, text
   end
   local before = text:sub(1, bus_at - 1)
@@ -72,29 +72,36 @@ local function bus_tool(block)
   end
   local input = type(block.raw_input) == "table" and block.raw_input or {}
   local title = typesafe_title(block)
-  local body = nil
-  if input.body ~= nil or title:find("bus_send", 1, true) or title:find("bus send", 1, true) then
-    local to = input.to or "?"
-    local kind = input.kind or "message"
-    local task = input.task
-    local suffix = task and task ~= "" and task ~= "_" and (" " .. task) or ""
-    body = string.format("→ %s %s%s：%s", to, kind, suffix, tostring(input.body or ""))
-  elseif
-    input.question ~= nil
-    or title:find("bus_ask_human", 1, true)
-    or title:find("bus ask human", 1, true)
-  then
-    body = "asks: " .. tostring(input.question or "")
-  end
-  if not body then
+  -- The pi adapter calls a generic `mcp` tool with `{tool="bus_send", args=...}`;
+  -- direct agents expose `bus_send` or `mcp__ade-team__bus_send`.
+  local proxy = type(input.tool) == "string" and input.tool:lower() or nil
+  local name = proxy or title
+  local args = proxy and type(input.args) == "table" and input.args or input
+  local is_send = name:find("bus_send", 1, true) ~= nil or name:find("bus send", 1, true) ~= nil
+  local is_ask = name:find("bus_ask_human", 1, true) ~= nil or name:find("bus ask human", 1, true) ~= nil
+  if not is_send and not is_ask then
+    -- A tool that happens to have a `body`/`question` argument is not a bus
+    -- message (create-issue and ask-user tools are common false positives).
     return nil
+  end
+  local body
+  if is_send then
+    local to = args.to or "?"
+    local kind = args.kind or "message"
+    local task = args.task
+    local suffix = task and task ~= "" and task ~= "_" and (" " .. task) or ""
+    body = string.format("→ %s %s%s：%s", to, kind, suffix, tostring(args.body or ""))
+  else
+    body = "asks: " .. tostring(args.question or "")
   end
   return { title = title, text = body }
 end
 
 ---A display-only session for Chat: the source blocks grouped into turns.
 ---@param source table
----@param opts {collapsed: table<integer, boolean>, supplement: table|nil}
+---@param opts {collapsed: table<integer, boolean>, expanded: table<string, boolean>,
+---  turn_times: table<string, {started_at: integer|nil, ended_at: integer|nil}>|nil,
+---  supplement: table|nil, version: integer|nil, on_toggle: (fun(block: table)|nil)}
 ---@return table session
 local function build_session(source, opts)
   local display = {
@@ -107,7 +114,11 @@ local function build_session(source, opts)
     trimmed = source.trimmed,
   }
   function display:toggle(block)
+    block.toggled = true
     block.expanded = not block.expanded
+    if opts.on_toggle then
+      opts.on_toggle(block)
+    end
   end
   function display:finish_turn() end
 
@@ -177,8 +188,9 @@ local function build_session(source, opts)
     local prompt = group.prompt
     local bus = parse_bus(prompt.text or "")
     local origin = (type(prompt.bus) == "table" and prompt.bus.origin) or (bus and "bus") or "prompt"
-    local started = type(prompt.bus) == "table" and prompt.bus.started_at or nil
-    local ended = type(prompt.bus) == "table" and prompt.bus.ended_at or nil
+    local timing = opts.turn_times and opts.turn_times[prompt.id] or nil
+    local started = timing and timing.started_at or nil
+    local ended = timing and timing.ended_at or nil
     local label
     if bus then
       label = string.format(
@@ -214,17 +226,22 @@ local function build_session(source, opts)
     })
 
     local text = prompt.text or ""
-    local role, message = split_role(text)
+    -- The role card belongs to the first bus prompt only.
+    local role, message = nil, text
+    if turn_index == 1 and bus then
+      role, message = split_role(text)
+    end
     if role then
+      local role_id = "watch-role-" .. turn_index
       add({
         kind = "message",
         title = "role card",
         text = role,
         collapsible = true,
-        expanded = false,
+        expanded = opts.expanded[role_id] == true,
         display_text = "",
-        id = "watch-role-" .. turn_index,
-      }, "watch-role-" .. turn_index)
+        id = role_id,
+      }, role_id)
     end
     local bus_message = parse_bus(message)
     add({
@@ -276,6 +293,8 @@ function M.new(opts)
     supplement = nil,
     supplement_for = nil,
     collapsed = {},
+    expanded = {},
+    turn_times = {},
     generation = 0,
     closing = false,
     leader_active = false,
@@ -324,9 +343,6 @@ function Watch:update_header()
   local header = string.format(" %s · %s · %s ", self.participant, tostring(task), tostring(state))
   pcall(function()
     vim.wo[self.win].winbar = header
-  end)
-  pcall(function()
-    vim.bo[self.buf].filetype = "ade_team_watch"
   end)
 end
 
@@ -389,13 +405,40 @@ function Watch:map_keys()
       self.chat:resume_follow()
     end
   end)
-  map("g?", function()
-    if self.notify then
-      self.notify(
-        "watch: za collapse turn · [[ / ]] previous/next turn · G follow · q close"
-      )
-    end
+  map("<CR>", function()
+    self:toggle_at_cursor()
   end)
+  -- Use the same configurable block keys as the chat view (`<Tab>`, `[b`,
+  -- `]b`, `G`, `gg`, `g?`). Only actions that make sense read-only are bound.
+  local config = self:watch_config()
+  keymaps.attach("chat", self.buf, (config.keymaps or {}).chat or {}, {
+    on_toggle_block = function()
+      self:toggle_at_cursor()
+    end,
+    on_prev_block = function()
+      self:jump_turn(-1)
+    end,
+    on_next_block = function()
+      self:jump_turn(1)
+    end,
+    on_scroll_bottom = function()
+      if self.chat then
+        self.chat:resume_follow()
+      end
+    end,
+    on_scroll_top = function()
+      if self.chat then
+        self.chat:scroll_to_top()
+      end
+    end,
+    on_help = function()
+      if self.notify then
+        self.notify(
+          "watch: za/<Tab>/<CR> toggle · [[ / ]] previous/next turn · G follow · q close"
+        )
+      end
+    end,
+  })
   map("q", function()
     self:close()
   end)
@@ -426,9 +469,8 @@ function Watch:window_gone()
     return
   end
   self:destroy_view()
-  if self.participant then
-    self.team:unwatch()
-  end
+  -- Idempotent: a superseded request may already have cleared `participant`.
+  self.team:unwatch()
   self.participant, self.team_id, self.title = nil, nil, nil
   self.leader_active = false
   self:changed()
@@ -455,18 +497,23 @@ function Watch:on_watch(session, title)
   end
   self.leader_active = false
   self.title = title
-  if self.source ~= session then
+  local first = self.source ~= session
+  if first then
     self:destroy_view()
     self.source = session
     self.supplement = nil
     self.supplement_for = nil
     self.collapsed = {}
+    self.expanded = {}
+    self.turn_times = (watching and watching.turn_times) or {}
     self:ensure_window()
+  elseif watching and watching.turn_times then
+    self.turn_times = watching.turn_times
   end
   if not self:is_open() then
     return
   end
-  self:refresh(true)
+  self:refresh(first)
   self:update_header()
   if not self.replayed and self.supplement_for ~= session and self.team_id and self.participant then
     self.supplement_for = session
@@ -488,8 +535,13 @@ function Watch:refresh(first)
   end
   local display = build_session(self.source, {
     collapsed = self.collapsed,
+    expanded = self.expanded,
+    turn_times = self.turn_times,
     supplement = self.supplement,
     version = self.display and self.display.version or 0,
+    on_toggle = function(block)
+      self.expanded[block.id] = block.expanded
+    end,
   })
   self.display = display
   if first or not self.chat.session then
@@ -579,9 +631,7 @@ end
 ---@return boolean
 function Watch:focus_leader()
   self:destroy_view()
-  if self.participant then
-    self.team:unwatch()
-  end
+  self.team:unwatch()
   self.participant, self.team_id, self.title = "leader", nil, nil
   self.leader_active = true
   self:changed()
@@ -622,13 +672,24 @@ end
 ---@param participant string
 function Watch:switch(team, participant)
   self:destroy_view()
+  -- Release any current watch first: unwatch is idempotent and may clear the
+  -- participant through `on_watch(nil)`, so the new target is set afterwards.
+  self.team:unwatch()
   self.participant, self.team_id, self.title = participant, team, nil
   self.replayed = true
   self.supplement, self.supplement_for = nil, nil
   self.collapsed = {}
+  self.expanded = {}
+  self.turn_times = {}
   self.leader_active = false
-  self.team:unwatch()
+  self.generation = self.generation + 1
+  local generation = self.generation
   self.team:watch(team, participant, true, function(ok, value)
+    if generation ~= self.generation then
+      -- The request was superseded or the view was closed while it was in
+      -- flight; its late failure must not clear the current watch.
+      return
+    end
     if not ok then
       if self.notify then
         local message = type(value) == "table" and (value.message or value.code) or tostring(value)
@@ -642,13 +703,12 @@ function Watch:switch(team, participant)
 end
 
 function Watch:close()
-  local participant = self.participant
   self:destroy_view()
+  -- Idempotent and unconditional: a switch may have cleared `participant`
+  -- through `on_watch(nil)` while its new request is still in flight.
+  self.team:unwatch()
   self.participant, self.team_id, self.title = nil, nil, nil
   self.leader_active = false
-  if participant and participant ~= "leader" then
-    self.team:unwatch()
-  end
   self:changed()
 end
 

@@ -555,6 +555,19 @@ function Server:dispatch(message, client)
       return error_reply(ident, -32064, "suspended")
     end
     local watch = self.team_watch or {}
+    local delay = 5
+    if type(watch.delays) == "table" then
+      delay = table.remove(watch.delays, 1) or delay
+    end
+    if type(watch.errors) == "table" then
+      local message = table.remove(watch.errors, 1)
+      if message then
+        vim.defer_fn(function()
+          self:send(client, { jsonrpc = "2.0", id = ident, error = { code = -32060, message = message } })
+        end, delay)
+        return nil
+      end
+    end
     local instance = watch.instance or "inst-1"
     local session_id = watch.sessionId or "watch-session"
     for _, foreign in ipairs(watch.foreign or {}) do
@@ -582,10 +595,6 @@ function Server:dispatch(message, client)
           message = { jsonrpc = "2.0", method = "session/update", params = { sessionId = session_id, update = update } },
         },
       })
-    end
-    local delay = 5
-    if type(watch.delays) == "table" then
-      delay = table.remove(watch.delays, 1) or delay
     end
     vim.defer_fn(function()
       self:send(client, {

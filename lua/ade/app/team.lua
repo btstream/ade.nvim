@@ -826,6 +826,14 @@ end
 
 ---@param payload table
 ---@return string
+local function epoch_ms()
+  if vim.uv and vim.uv.gettimeofday then
+    local seconds, micros = vim.uv.gettimeofday()
+    return seconds * 1000 + math.floor(micros / 1000)
+  end
+  return os.time() * 1000
+end
+
 local function prompt_text(payload)
   local parts = {}
   for _, block in ipairs(type(payload) == "table" and payload.prompt or {}) do
@@ -836,53 +844,39 @@ local function prompt_text(payload)
   return table.concat(parts, "\n")
 end
 
----Milliseconds for display-only turn durations.
----@return integer
-local function now_ms()
-  if vim.uv and vim.uv.gettimeofday then
-    local seconds, micros = vim.uv.gettimeofday()
-    return seconds * 1000 + math.floor(micros / 1000)
-  end
-  return os.time() * 1000
-end
-
 ---Mark a bus turn on a session and render it as user-side content.
 ---@param session table|nil
 ---@param payload table
----@return boolean changed
+---@return table|nil block the bus prompt block
 function M.apply_turn_started(session, payload)
   if not session then
-    return false
+    return nil
   end
   local text = prompt_text(payload)
   local origin = type(payload) == "table" and payload.origin or "bus"
   session.status = "running"
   session.turn = (session.turn or 0) + 1
   session.bus_turn = session.turn
-  session:append({
+  return session:append({
     id = require("ade.session.state").next_id("bus"),
     kind = "user",
     text = "[" .. tostring(origin) .. "] " .. text,
-    -- Display-only metadata for the watch view (not understood by the reducer).
-    bus = { origin = origin, started_at = now_ms() },
+    bus = { origin = origin },
   })
-  return true
 end
 
 ---@param session table|nil
----@return boolean changed
+---@return table|nil block the bus prompt block the turn ended on
 function M.apply_turn_finished(session, payload)
   if not session or not session.bus_turn then
-    return false
+    return nil
   end
   local bus_turn = session.bus_turn
   session.bus_turn = nil
-  local ended = now_ms()
+  local block
   for i = #session.blocks, 1, -1 do
-    local block = session.blocks[i]
-    if block.bus and block.bus.ended_at == nil then
-      block.bus.ended_at = ended
-      block.bus.stop_reason = type(payload) == "table" and payload.stopReason or nil
+    if session.blocks[i].bus then
+      block = session.blocks[i]
       break
     end
   end
@@ -891,7 +885,7 @@ function M.apply_turn_finished(session, payload)
   if session.turn == bus_turn then
     session:finish_turn(type(payload) == "table" and payload.stopReason or "end_turn")
   end
-  return true
+  return block
 end
 
 ---The main (attached) session a notification is about.
@@ -972,6 +966,8 @@ function Team:watch(team, participant, replay, cb)
     participant = participant,
     buffer = {},
     ready = false,
+    -- Display-only turn timings, keyed by the bus prompt block id.
+    turn_times = {},
   }
   self.watching = entry
   local function apply(payload)
@@ -986,12 +982,20 @@ function Team:watch(team, participant, replay, cb)
       return
     end
     if message.method == "_ade/turn_started" then
-      M.apply_turn_started(session, message.params or {})
+      local block = M.apply_turn_started(session, message.params or {})
+      if block then
+        entry.turn_times[block.id] = { started_at = epoch_ms() }
+      end
       self:_watch_rendered()
       return
     end
     if message.method == "_ade/turn_finished" then
-      M.apply_turn_finished(session, message.params or {})
+      local block = M.apply_turn_finished(session, message.params or {})
+      if block then
+        local timing = entry.turn_times[block.id] or {}
+        timing.ended_at = epoch_ms()
+        entry.turn_times[block.id] = timing
+      end
       self:_watch_rendered()
       return
     end
@@ -1022,10 +1026,9 @@ function Team:watch(team, participant, replay, cb)
     function(ok, value)
       if self.watching ~= entry then
         -- This watch was superseded/abandoned while its request was in flight.
-        -- Do not touch the newer watch, but release the service-side watch.
-        if ok then
-          raw:request_tracked("team.unwatch", { team = team, participant = participant }, function() end)
-        end
+        -- The switch/close that superseded it already released that watch; a
+        -- late success must not send another unwatch that could cancel a newer
+        -- watch of the same participant.
         cb(ok, value)
         return
       end
