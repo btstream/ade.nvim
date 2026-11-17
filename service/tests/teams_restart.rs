@@ -1732,3 +1732,81 @@ fn a_database_error_loading_the_board_marks_it_unavailable() {
         .expect("board rows");
     assert_eq!(rows, 0, "a refused write must not touch the database");
 }
+
+#[test]
+fn team_start_reports_a_board_that_cannot_be_written() {
+    let fixture = Fixture::new("restart-start-board-error");
+    let mut server = fixture.start("a", &[]);
+    let mut client = fixture.connect(&server);
+    fixture.configure(&mut client, &fixture.work, &server, true);
+    let (_instance, leader_session, token, bound) =
+        fixture.attach_leader(&server, &mut client, &fixture.work, None);
+    let team = bound["result"]["team"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("bind: {bound}"))
+        .to_string();
+    board_update(&server, &token, "default");
+    Fixture::shutdown(&mut server);
+    drop(server);
+
+    {
+        let conn = rusqlite::Connection::open(database_path(&fixture)).expect("database");
+        conn.execute(
+            "UPDATE boards SET json = '{broken' WHERE team_id = ?1",
+            rusqlite::params![team],
+        )
+        .expect("corrupt the board");
+    }
+
+    let mut restarted = fixture.start("b", &[]);
+    let mut second = fixture.connect(&restarted);
+    wait_suspended(&mut second, &team);
+    let mut config = fixture.config(&restarted, true);
+    config["workflows"] = json!({
+        "flow": {
+            "summary": "one worker",
+            "text": "the text",
+            "team": [{"name": "w1", "template": "dev"}]
+        }
+    });
+    let configured = second.request(
+        2,
+        "team.configure",
+        json!({"cwd": fixture.work.to_string_lossy(), "config": config}),
+    );
+    assert!(configured["result"].is_object(), "{configured}");
+    let (_instance, _session, _token, bound) = fixture.attach_leader(
+        &restarted,
+        &mut second,
+        &fixture.work,
+        Some(&leader_session),
+    );
+    assert_eq!(bound["result"]["team"]["id"], team, "{bound}");
+    wait_active(&mut second, &team);
+
+    // Step 4 cannot write the board: the call fails instead of pretending the
+    // workflow was recorded, and the error is the board's.
+    let started = second.request(3, "team.start", json!({"team": team, "workflow": "flow"}));
+    assert_eq!(started["error"]["code"], -32061, "{started}");
+    assert!(
+        started["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("board unavailable")),
+        "{started}"
+    );
+    // The member was started before step 4; it must still be visible.
+    wait_active(&mut second, &team);
+    let listed = second.request(4, "team.list", json!({}));
+    let participants = listed["result"]["teams"]
+        .as_array()
+        .and_then(|teams| teams.iter().find(|entry| entry["id"] == team.as_str()))
+        .and_then(|entry| entry["participants"].as_array())
+        .cloned()
+        .expect("participants");
+    assert!(
+        participants.iter().any(|entry| entry["name"] == "w1"),
+        "{participants:?}"
+    );
+
+    Fixture::shutdown(&mut restarted);
+}

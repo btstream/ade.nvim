@@ -3651,6 +3651,7 @@ fn spawns_from_one_leader_prompt_share_a_group_and_are_approved_together() {
         Some(2),
         "{answered}"
     );
+    assert_eq!(answered["result"]["failed"], json!([]), "{answered}");
     harness.wait_participant("w1", |entry| entry["state"] == "idle");
     harness.wait_participant("w2", |entry| entry["state"] == "idle");
     // Every worker started through the group gets the same approval notice as
@@ -3751,6 +3752,27 @@ fn leader_instructions_and_tools_follow_the_role() {
         tools["instructions"].is_null(),
         "workers get no instructions: {tools}"
     );
+}
+
+#[test]
+fn team_start_refuses_a_task_longer_than_64_kib() {
+    let mut harness = Harness::new(
+        "team-start-task",
+        json!({
+            "spawn_confirm": {"auto": []},
+            "workflows": {
+                "one": {"summary": "one worker", "team": [{"name": "w1", "template": "dev"}]}
+            }
+        }),
+        None,
+    );
+    let long = "x".repeat(64 * 1024 + 1);
+    let started = harness.start("one", Some(&long));
+    assert_eq!(started["error"]["code"], -32060, "{started}");
+    assert!(started["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("task")));
+    assert!(harness.worker_names().is_empty(), "nothing may start");
 }
 
 #[test]

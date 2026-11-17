@@ -706,6 +706,11 @@ pub enum AnswerEffect {
     Ack,
 }
 
+/// The items a group answer answered, with their effects (19.6).
+pub type GroupAnswers = Vec<(String, AnswerEffect)>;
+/// The items a group answer failed to answer, with their errors (19.6).
+pub type GroupFailures = Vec<(String, TeamError)>;
+
 #[derive(Debug)]
 pub enum BindOutcome {
     /// A live team, or a new one.
@@ -2670,12 +2675,13 @@ impl Teams {
     }
 
     /// `team.answer_group {group, allow}` (19.6): answer every open item of
-    /// the group as `team.answer` would, in creation order.
+    /// the group as `team.answer` would, in creation order. An item that fails
+    /// stays open and is returned in the failed list; the others take effect.
     pub fn answer_group(
         &mut self,
         group: &str,
         allow: Option<bool>,
-    ) -> Result<Vec<(String, AnswerEffect)>, TeamError> {
+    ) -> Result<(GroupAnswers, GroupFailures), TeamError> {
         let ids: Vec<String> = self
             .teams
             .values()
@@ -2691,25 +2697,22 @@ impl Teams {
         }
         // Not atomic on purpose: an item that cannot be answered is skipped so
         // the effects of the items already answered are never lost (their
-        // workers would stay in `starting` forever).
+        // workers would stay in `starting` forever). The skipped items stay
+        // open and are reported in `failed`.
         let mut answered = Vec::new();
-        let mut first_error: Option<TeamError> = None;
+        let mut failed = Vec::new();
         for id in ids {
             match self.answer(&id, None, None, allow) {
                 Ok((effect, _)) => answered.push((id, effect)),
-                Err(error) => {
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
-                }
+                Err(error) => failed.push((id, error)),
             }
         }
         if answered.is_empty() {
-            if let Some(error) = first_error {
-                return Err(error);
+            if let Some((_, error)) = failed.first() {
+                return Err(error.clone());
             }
         }
-        Ok(answered)
+        Ok((answered, failed))
     }
 
     pub fn mark_item_answered_by_instance(
@@ -4991,6 +4994,32 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_leader_session_ends_the_current_spawn_group() {
+        let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}, "max_workers": 8}));
+        teams
+            .send_message(&team, "human", "leader", Kind::Task, "do", None, vec![])
+            .unwrap();
+        teams.take_deliveries(&HashSet::new());
+        let group = teams
+            .team(&team)
+            .unwrap()
+            .current_group
+            .clone()
+            .expect("group");
+        teams.leader_session_closed("i1", "s1");
+        // The team stays, the group does not: the next item gets its own.
+        assert!(teams.team(&team).unwrap().current_group.is_none());
+        let SpawnOutcome::Awaiting { request, .. } = teams
+            .request_spawn(&team, "dev", Some("w1"), None, None, None)
+            .unwrap()
+        else {
+            panic!("expected approval");
+        };
+        let item = teams.item(&team, &request).unwrap();
+        assert_ne!(item.group.as_deref(), Some(group.as_str()));
+    }
+
+    #[test]
     fn a_frontend_prompt_opens_and_closes_a_group_too() {
         let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}, "max_workers": 8}));
         teams
@@ -5028,7 +5057,8 @@ mod tests {
         let group = spawn_item_group(&teams, &team, "w1").expect("group");
         let unknown = teams.answer_group("g999", Some(true)).unwrap_err();
         assert_eq!(unknown.code, UNKNOWN_INBOX);
-        let answers = teams.answer_group(&group, Some(true)).unwrap();
+        let (answers, failed) = teams.answer_group(&group, Some(true)).unwrap();
+        assert!(failed.is_empty(), "{failed:?}");
         let answered: Vec<String> = answers.iter().map(|(id, _)| id.clone()).collect();
         assert_eq!(answered, ids, "creation order");
         assert!(answers
@@ -5066,6 +5096,76 @@ mod tests {
         teams
             .workflow_save(&team, "/other", &extra, workflow::Scope::Project, false)
             .expect("another project's own cap");
+    }
+
+    #[test]
+    fn answer_group_reports_failed_items_and_answers_the_rest() {
+        let (mut teams, team) = fixture(json!({
+            "spawn_confirm": {"auto": []},
+            "max_workers": 8,
+            "templates": {
+                "dev": {
+                    "key": { "agent": "a", "command": "c", "args": [] },
+                    "role": "dev",
+                },
+                "alt": {
+                    "key": { "agent": "a", "command": "c", "args": [] },
+                    "role": "alt",
+                },
+            }
+        }));
+        teams
+            .send_message(&team, "human", "leader", Kind::Task, "do", None, vec![])
+            .unwrap();
+        teams.take_deliveries(&HashSet::new());
+        let mut ids = Vec::new();
+        for (name, template) in [("w1", "dev"), ("w2", "alt")] {
+            let SpawnOutcome::Awaiting { request, .. } = teams
+                .request_spawn(&team, template, Some(name), None, None, None)
+                .unwrap()
+            else {
+                panic!("expected approval");
+            };
+            ids.push(request);
+        }
+        let group = teams.item(&team, &ids[0]).unwrap().group.expect("group");
+
+        // The second item's template disappears between the request and the
+        // answer: that item fails, the first still starts.
+        teams
+            .teams
+            .get_mut(&team)
+            .unwrap()
+            .config
+            .templates
+            .remove("alt");
+        let (answers, failed) = teams.answer_group(&group, Some(true)).unwrap();
+        assert_eq!(answers.len(), 1, "{failed:?}");
+        assert_eq!(answers[0].0, ids[0]);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, ids[1]);
+        assert_eq!(failed[0].1.code, NOT_ALLOWED);
+        assert!(failed[0].1.message.contains("unknown template"));
+        assert!(teams.team(&team).unwrap().participants.contains_key("w1"));
+        assert!(!teams.team(&team).unwrap().participants.contains_key("w2"));
+        assert_eq!(
+            teams.item(&team, &ids[1]).unwrap().state,
+            ItemState::Open,
+            "a failed item stays open"
+        );
+
+        // When every remaining item fails, the first error comes back as the
+        // call's error and nothing is answered.
+        teams
+            .teams
+            .get_mut(&team)
+            .unwrap()
+            .config
+            .templates
+            .remove("dev");
+        let error = teams.answer_group(&group, Some(true)).unwrap_err();
+        assert_eq!(error.code, NOT_ALLOWED);
+        assert_eq!(teams.item(&team, &ids[1]).unwrap().state, ItemState::Open);
     }
 
     #[test]

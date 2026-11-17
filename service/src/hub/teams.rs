@@ -1294,6 +1294,11 @@ impl Hub {
         project: &str,
     ) {
         let result = (|| -> Result<Value, TeamError> {
+            if let Some(task) = &task {
+                if task.len() > MAX_BODY_BYTES {
+                    return Err(TeamError::invalid("task is longer than 64 KiB"));
+                }
+            }
             if self.teams.team(team_id).is_none() {
                 return Err(TeamError::unknown("unknown team"));
             }
@@ -1418,7 +1423,13 @@ impl Hub {
                 self.team_deliveries();
                 self.send_to(conn, &success(id, value));
             }
-            Err(error) => self.send_error(conn, id, &error),
+            Err(error) => {
+                // Members started before the failure must reach the front end
+                // and their first prompts at once.
+                self.drain_team_events();
+                self.team_deliveries();
+                self.send_error(conn, id, &error);
+            }
         }
     }
 
@@ -1446,7 +1457,7 @@ impl Hub {
     fn team_answer_group(&mut self, params: &Value) -> Result<(Value, bool), TeamError> {
         let group = required_team_string(params, "group")?;
         let allow = optional_bool(params, "allow")?;
-        let answers = self.teams.answer_group(&group, allow)?;
+        let (answers, failed) = self.teams.answer_group(&group, allow)?;
         let mut answered = Vec::new();
         for (id, effect) in answers {
             // Exactly what team.answer does, including the approval notice
@@ -1466,7 +1477,11 @@ impl Hub {
             }
             answered.push(id);
         }
-        Ok((json!({ "answered": answered }), true))
+        let failed: Vec<Value> = failed
+            .iter()
+            .map(|(id, error)| json!({ "id": id, "code": error.code, "message": error.message }))
+            .collect();
+        Ok((json!({ "answered": answered, "failed": failed }), true))
     }
 
     /// Apply one answered inbox item. `team.answer` and `team.answer_group`

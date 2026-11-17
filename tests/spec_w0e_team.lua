@@ -419,6 +419,45 @@ return function(t)
     end)
   end)
 
+  t.describe("W0e group answers", function()
+    t.it("ignore partial failures and hand them to the caller", function()
+      local service, dir = start_service(t, "group-partial", {
+        team_answer_group_failed = {
+          { id = "i2", code = -32061, message = "unknown template" },
+        },
+      })
+      setup(t, "group-partial", service, dir)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the bound team")
+      local done, ok, value = false, nil, nil
+      team():answer_group("g1", true, function(result, result_value)
+        done, ok, value = true, result, result_value
+      end)
+      wait(function()
+        return done
+      end, 5000, "team.answer_group")
+      t.eq(true, ok)
+      t.eq(1, #value.failed, vim.inspect(value))
+      t.eq("i2", value.failed[1].id)
+      t.eq(-32061, value.failed[1].code)
+      -- A service that omits `failed` still gives the caller an empty list.
+      service.team_answer_group_failed = nil
+      local plain_done, plain_ok, plain = false, nil, nil
+      team():answer_group("g2", false, function(result, result_value)
+        plain_done, plain_ok, plain = true, result, result_value
+      end)
+      wait(function()
+        return plain_done
+      end, 5000, "the second group answer")
+      t.eq(true, plain_ok)
+      t.truthy(type(plain.failed) == "table")
+      t.eq(0, #plain.failed)
+    end)
+  end)
+
   t.describe("W0e start flow", function()
     t.it("picks a workflow and starts it with the task", function()
       local cwd = "/tmp/w0e-flow"

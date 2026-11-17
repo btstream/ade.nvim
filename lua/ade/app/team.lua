@@ -945,11 +945,23 @@ function Team:start(team, workflow, task, cb)
 end
 
 ---Answer every open inbox item of a spawn group (19.6).
+---
+---A partially failed group is still a success: `value.failed` lists the items
+---that stayed open, for the caller (the panel) to show.
 ---@param group string
 ---@param allow boolean|nil
 ---@param cb fun(ok: boolean, value: any)|nil
 function Team:answer_group(group, allow, cb)
-  self:_call("team.answer_group", { group = group, allow = allow }, cb)
+  self:_call("team.answer_group", { group = group, allow = allow }, function(ok, value)
+    if ok and type(value) == "table" then
+      if type(value.failed) ~= "table" then
+        value.failed = {}
+      end
+    end
+    if cb then
+      cb(ok, value)
+    end
+  end)
 end
 
 ---Read a card's stored versions, newest first (19.4).
