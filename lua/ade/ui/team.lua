@@ -442,6 +442,42 @@ function Panel:spawn_current()
     self:notify("no team templates are configured")
     return
   end
+  local function ask_task(template, name)
+    self.interacting = true
+    vim.ui.input({ prompt = "task label (optional): " }, function(task)
+      self:interaction_done()
+      if task == nil then
+        return
+      end
+      if task == "" then
+        task = nil
+      end
+      self.team:spawn(team, template, name, task, function(ok, value)
+        self:report(ok, value)
+        self.team:refresh()
+      end)
+    end)
+  end
+  local function ask_name(template)
+    self.interacting = true
+    vim.ui.input({ prompt = "worker name (blank: next free wN): " }, function(name)
+      if name == nil then
+        self:interaction_done()
+        return
+      end
+      if name == "" then
+        ask_task(template, nil)
+        return
+      end
+      local valid = #name <= 32 and name:match("^[a-z0-9][a-z0-9_%-]*$") ~= nil and name ~= "leader" and name ~= "human"
+      if not valid then
+        self:notify("worker names must match [a-z0-9][a-z0-9_-]{0,31} and not be leader or human")
+        ask_name(template)
+        return
+      end
+      ask_task(template, name)
+    end)
+  end
   self.interacting = true
   vim.ui.select(names, {
     prompt = "template for the new worker",
@@ -453,30 +489,7 @@ function Panel:spawn_current()
       self:interaction_done()
       return
     end
-    self.interacting = true
-    vim.ui.input({ prompt = "worker name (blank: next free wN): " }, function(name)
-      if name == nil then
-        self:interaction_done()
-        return
-      end
-      if name == "" then
-        name = nil
-      end
-      self.interacting = true
-      vim.ui.input({ prompt = "task label (optional): " }, function(task)
-        self:interaction_done()
-        if task == nil then
-          return
-        end
-        if task == "" then
-          task = nil
-        end
-        self.team:spawn(team, template, name, task, function(ok, value)
-          self:report(ok, value)
-          self.team:refresh()
-        end)
-      end)
-    end)
+    ask_name(template)
   end)
 end
 

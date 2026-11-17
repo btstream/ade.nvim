@@ -464,11 +464,17 @@ function Team:start_defined_workers(team_id, entry)
       started[worker.name] = true
       self:spawn(team_id, worker.template, worker.name, worker.task, function(ok, value)
         if not ok then
-          local message = type(value) == "table" and (value.message or value.code) or tostring(value)
-          self.notify(
-            "could not start worker " .. tostring(worker.name) .. ": " .. tostring(message),
-            vim.log.levels.WARN
-          )
+          local code = type(value) == "table" and value.code or nil
+          if code == -32060 then
+            -- The service refuses a name an in-flight spawn already took:
+            -- not a failure the person needs to see, just a duplicate start.
+            log.debug("worker %s was already started: %s", tostring(worker.name), M.error_text(value))
+          else
+            self.notify(
+              "could not start worker " .. tostring(worker.name) .. ": " .. M.error_text(value),
+              vim.log.levels.WARN
+            )
+          end
         end
         self:refresh()
       end)

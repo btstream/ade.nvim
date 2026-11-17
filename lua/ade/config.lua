@@ -1164,6 +1164,11 @@ function M.validate(cfg)
     if type(definition) ~= "table" then
       fail("teams.definitions.%s must be a table", name)
     end
+    for key in pairs(definition) do
+      if key ~= "workers" then
+        fail("teams.definitions.%s has unknown field %s", name, vim.inspect(key))
+      end
+    end
     local workers = definition.workers
     if workers ~= nil then
       if type(workers) ~= "table" or not vim.islist(workers) then
@@ -1178,8 +1183,16 @@ function M.validate(cfg)
         if type(worker) ~= "table" then
           fail("%s must be a table", where)
         end
+        for key in pairs(worker) do
+          if key ~= "name" and key ~= "template" and key ~= "task" then
+            fail("%s has unknown field %s", where, vim.inspect(key))
+          end
+        end
         if type(worker.name) ~= "string" or not worker.name:match(worker_pattern) or #worker.name > 32 then
           fail("%s.name must match [a-z0-9][a-z0-9_-]{0,31}", where)
+        end
+        if worker.name == "leader" or worker.name == "human" then
+          fail("%s.name %q is reserved", where, worker.name)
         end
         if seen[worker.name] then
           fail("%s.name %q is duplicated in this definition", where, worker.name)

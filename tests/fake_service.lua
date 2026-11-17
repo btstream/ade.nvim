@@ -418,10 +418,10 @@ function Server:dispatch(message, client)
     return nil
   end
   if method == "team.spawn" then
+    self.team_spawns[#self.team_spawns + 1] = vim.deepcopy(params)
     if self.team_spawn_error then
       return error_reply(ident, self.team_spawn_error.code, self.team_spawn_error.message, self.team_spawn_error.data)
     end
-    self.team_spawns[#self.team_spawns + 1] = vim.deepcopy(params)
     local team = self.teams[params.team]
     local name = params.name
     if name == nil then
@@ -450,6 +450,7 @@ function Server:dispatch(message, client)
     return nil
   end
   if method == "team.remove_worktree" then
+    self.team_removals[#self.team_removals + 1] = vim.deepcopy(params)
     if self.team_remove_error then
       return error_reply(
         ident,
@@ -458,7 +459,6 @@ function Server:dispatch(message, client)
         self.team_remove_error.data
       )
     end
-    self.team_removals[#self.team_removals + 1] = vim.deepcopy(params)
     local result = vim.deepcopy(self.team_remove_result)
       or { removed = true, branch_kept = false, branch = "ade/t1-20260101-000000/" .. tostring(params.participant) }
     vim.defer_fn(function()

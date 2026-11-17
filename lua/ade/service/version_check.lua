@@ -136,7 +136,7 @@ function Check:check(info, done)
         self.warned = true
         self.deps.notify(
           string.format(
-            "the service has an update (%s -> %s); it restarts automatically once the running team finishes",
+            "the service has an update (%s -> %s); it restarts after the team ends, on the next connection or with :Ade service stop",
             tostring(info.server_version),
             Version.VERSION
           ),
@@ -175,7 +175,7 @@ function Check:check(info, done)
       self.warned = true
       self.deps.notify(
         string.format(
-          "the service has an update (%s -> %s); it restarts automatically once the current task finishes",
+          "the service has an update (%s -> %s); it restarts after the current task ends, on the next connection or with :Ade service stop",
           tostring(info.server_version),
           Version.VERSION
         ),
