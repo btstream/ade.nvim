@@ -1,6 +1,10 @@
 -- Board layout for the unified team dashboard (W0f, PROTOCOL.md 19.2).
 local M = {}
 
+local function one_line(text)
+  return (tostring(text or ""):gsub("[\r\n]+", " "))
+end
+
 local function display_width(text)
   local ok, width = pcall(vim.fn.strdisplaywidth, tostring(text or ""))
   return ok and width or #tostring(text or "")
@@ -30,21 +34,21 @@ end
 ---@param states table<string, table>
 ---@return string
 function M.card_text(card, states)
-  local owner = card.owner and tostring(card.owner) or "-"
+  local owner = card.owner and one_line(card.owner) or "-"
   local state = ""
   if card.owner and states[card.owner] then
     state = " " .. (states[card.owner].icon or "")
   end
   local fields = {}
   for key, value in pairs(card.fields or {}) do
-    fields[#fields + 1] = key .. "=" .. tostring(value)
+    fields[#fields + 1] = one_line(key) .. "=" .. one_line(value)
   end
   table.sort(fields)
   local suffix = ""
   if #fields > 0 then
     suffix = "  " .. table.concat(fields, " ", 1, math.min(2, #fields))
   end
-  return string.format("%s %s · %s%s%s", tostring(card.id), tostring(card.title), owner, state, suffix)
+  return string.format("%s %s · %s%s%s", tostring(card.id), one_line(card.title), owner, state, suffix)
 end
 
 ---@param board table
@@ -121,7 +125,7 @@ function M.lines(board, states, opts)
     local header_cells = {}
     local start_col = 0
     for _, item in ipairs(visible) do
-      header[#header + 1] = pad(item.column, item.width)
+      header[#header + 1] = pad(one_line(item.column), item.width)
       header_cells[#header_cells + 1] = { column = item.column, start = start_col, stop = start_col + item.width }
       start_col = start_col + item.width
     end
@@ -193,6 +197,7 @@ function M.stage_progress(stages)
   return nil
 end
 
+M.one_line = one_line
 M.display_width = display_width
 M.truncate = truncate
 M.pad = pad

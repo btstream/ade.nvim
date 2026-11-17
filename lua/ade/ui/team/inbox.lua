@@ -1,4 +1,6 @@
 -- The dashboard inbox: open items, with spawn groups collapsed to one row.
+local Board = require("ade.ui.team.board")
+
 local M = {}
 
 local ICONS = {
@@ -31,7 +33,7 @@ function M.lines(team, items, width)
   local lines, ids, meta = {}, {}, {}
   local index = 1
   local function add(text, id, info)
-    lines[#lines + 1] = text:sub(1, width)
+    lines[#lines + 1] = Board.truncate(one_line(text), width)
     if id then
       ids[#lines] = id
     end

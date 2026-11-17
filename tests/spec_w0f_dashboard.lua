@@ -348,6 +348,70 @@ return function(t)
       end, 5000, "the expanded archived stage")
     end)
 
+    t.it("notifications and single-line text", function()
+      wide(t)
+      local service, dir = start_service(t, "text")
+      setup(t, "text", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      local notices = {}
+      local original = vim.notify
+      vim.notify = function(message)
+        notices[#notices + 1] = tostring(message)
+      end
+      UI._impl:notify("hello")
+      vim.notify = original
+      t.truthy(#notices == 1 and notices[1]:find("hello", 1, true), vim.inspect(notices))
+
+      local Members = require("ade.ui.team.members")
+      local Detail = require("ade.ui.team.detail")
+      local lines = Members.entry_lines({
+        name = "w1",
+        state = "working",
+        state_since = os.time() * 1000,
+        activity = { text = "line one\nline two" },
+        task = "中文任务",
+        turns = { task = 1, total = 2 },
+      }, {}, 40)
+      for _, line in ipairs(lines) do
+        t.falsy(line:find("\n", 1, true), line)
+        t.truthy(Board.display_width(line) <= 40, line)
+      end
+      local board_lines = Board.lines({
+        rev = 1,
+        columns = { "中文列" },
+        cards = {
+          {
+            id = "T1",
+            title = "中文\n标题",
+            column = "中文列",
+            fields = { tests = "值\n第二行" },
+            archived = false,
+            updated_by = "leader",
+            updated_at = 1,
+          },
+        },
+      }, {}, { width = 40 })
+      for _, line in ipairs(board_lines) do
+        t.falsy(line:find("\n", 1, true), line)
+      end
+      local detail = Detail.card({ participants = {} }, {
+        id = "T1",
+        title = "标题\n第二行",
+        column = "中文列",
+        body = "first\nsecond",
+        updated_by = "leader",
+        updated_at = 1,
+      })
+      t.falsy(detail[1]:find("\n", 1, true), detail[1])
+    end)
+
     t.it("board lines align mixed widths and support scroll, unavailable and empty", function()
       local lines = Board.lines({
         rev = 1,
@@ -501,11 +565,84 @@ return function(t)
           and vim.api.nvim_win_get_buf(input.win) == input.buf
       end, 5000, "the leader chat in the right column")
       t.eq(vim.api.nvim_get_current_tabpage(), UI.tab.tab)
+      local original_tab = UI._impl.leader_mounted and UI._impl.leader_mounted.original_tab or nil
       vim.api.nvim_set_current_win(UI.tab.panels.members)
       vim.api.nvim_feedkeys("q", "x", false)
       wait(function()
-        return chat.win == old_chat and input.win == old_input
+        return chat.win ~= nil
+          and vim.api.nvim_win_is_valid(chat.win)
+          and vim.api.nvim_win_get_buf(chat.win) == chat.buf
+          and input.win ~= nil
+          and vim.api.nvim_win_is_valid(input.win)
+          and vim.api.nvim_win_get_buf(input.win) == input.buf
+          and not UI._impl.leader_mounted
       end, 5000, "the chat restored to the panel")
+    end)
+
+    t.it("the narrow float keeps the group A key", function()
+      local service, dir = start_service(t, "narrow-actions")
+      setup(t, "narrow-actions", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed(base_team(dir))
+      service:team_inbox({
+        id = "i41",
+        team = "t1",
+        kind = "spawn",
+        from = "leader",
+        name = "w2",
+        template = "opencode",
+        group = "g4",
+        state = "open",
+        body = "spawn",
+      })
+      service:team_inbox({
+        id = "i42",
+        team = "t1",
+        kind = "spawn",
+        from = "leader",
+        name = "w3",
+        template = "opencode",
+        group = "g4",
+        state = "open",
+        body = "spawn",
+      })
+      wait(function()
+        return team():item("i42") ~= nil
+      end, 5000, "the narrow spawn group")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      local line
+      for index, id in pairs(UI.ids or {}) do
+        if id == "item:i41" or id == "item:i42" then
+          line = index
+        end
+      end
+      t.truthy(line)
+      vim.api.nvim_set_current_win(UI.win)
+      vim.api.nvim_win_set_cursor(UI.win, { line, 0 })
+      vim.api.nvim_feedkeys("A", "x", false)
+      wait(function()
+        return #(service.team_answer_groups or {}) == 1
+      end, 5000, "the narrow group answer")
+    end)
+
+    t.it("setup can run again while the dashboard is open", function()
+      wide(t)
+      local service, dir = start_service(t, "setup-again")
+      setup(t, "setup-again", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local ok, err = pcall(function()
+        require("ade").setup(controller.state().config)
+      end)
+      t.truthy(ok, tostring(err))
+      t.truthy(controller.state().view.team_ui, "the dashboard view exists after setup")
     end)
 
     t.it("coalesces frequent dashboard refreshes", function()
@@ -545,6 +682,10 @@ return function(t)
       end, 5000, "the merged refresh")
       vim.wait(120)
       t.truthy(count <= 2, "a burst of three changes coalesces into at most two paints")
+      wait(function()
+        local text = table.concat(vim.api.nvim_buf_get_lines(UI.tab.buffers.inbox, 0, -1, false), "\n")
+        return text:find("i43", 1, true) ~= nil
+      end, 5000, "the final state after the merged refresh")
     end)
   end)
 end

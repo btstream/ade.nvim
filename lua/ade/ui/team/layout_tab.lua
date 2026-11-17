@@ -73,7 +73,11 @@ function Tab:open()
   self.original_tab = vim.api.nvim_get_current_tabpage()
   vim.cmd("tabnew")
   self.tab = vim.api.nvim_get_current_tabpage()
+  local scratch = vim.api.nvim_get_current_buf()
   local members = self:make_window("members")
+  if scratch ~= self.buffers.members and vim.api.nvim_buf_is_valid(scratch) then
+    pcall(vim.api.nvim_buf_delete, scratch, { force = true })
+  end
   vim.cmd("vsplit")
   local board = self:make_window("board")
   vim.api.nvim_set_current_win(members)
@@ -118,7 +122,7 @@ function Tab:open()
       end
     end,
   })
-  vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, {
+  vim.api.nvim_create_autocmd("VimResized", {
     group = self.group,
     callback = function()
       vim.schedule(function()
@@ -186,12 +190,21 @@ function Tab:refresh()
   self.meta = rendered.meta
   self.ids = rendered.ids
   self.last_lines = self.last_lines or {}
+  local detail_win = self.panels.detail
+  local detail_cursor
+  if detail_win and vim.api.nvim_win_is_valid(detail_win) then
+    detail_cursor = vim.api.nvim_win_get_cursor(detail_win)
+  end
   for _, name in ipairs(PANELS) do
     local lines = rendered[name] or {}
     if not vim.deep_equal(self.last_lines[name], lines) then
       self:set_lines(name, lines)
       self.last_lines[name] = vim.deepcopy(lines)
     end
+  end
+  if detail_cursor and detail_win and vim.api.nvim_win_is_valid(detail_win) then
+    local count = vim.api.nvim_buf_line_count(self.buffers.detail)
+    pcall(vim.api.nvim_win_set_cursor, detail_win, { math.min(detail_cursor[1], count), detail_cursor[2] })
   end
   self:resize()
 end

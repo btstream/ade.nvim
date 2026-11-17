@@ -862,6 +862,10 @@ function M.build(ctx, opts, action)
   S.view.team_ui = TeamUI.new({
     team = S.view.team,
     config = cfg,
+    notify = notify,
+    panel = function()
+      return S.view.panel
+    end,
     -- The watch view reuses the leader's existing chat; it never creates a
     -- second Chat or a second input area.
     leader_chat = function()

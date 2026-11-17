@@ -29,22 +29,22 @@ function M.card(team, card)
   end
   local state = entry and string.format("%s %s", members.state_icon(entry), members.state_label(entry)) or "-"
   local lines = {
-    "卡片 " .. tostring(card.id) .. " · " .. tostring(card.title),
+    "卡片 " .. one_line(card.id) .. " · " .. one_line(card.title),
     string.format(
       "%s · 负责 %s %s · %s 更新于 %s",
-      tostring(card.column),
-      owner,
+      one_line(card.column),
+      one_line(owner),
       state,
-      tostring(card.updated_by or "?"),
+      one_line(card.updated_by or "?"),
       time_text(card.updated_at)
     ),
   }
   if card.stage and card.stage ~= "" then
-    lines[2] = lines[2] .. " · 阶段 " .. tostring(card.stage)
+    lines[2] = lines[2] .. " · 阶段 " .. one_line(card.stage)
   end
   local fields = {}
   for key, value in pairs(card.fields or {}) do
-    fields[#fields + 1] = key .. "=" .. tostring(value)
+    fields[#fields + 1] = one_line(key) .. "=" .. one_line(value)
   end
   table.sort(fields)
   if #fields > 0 then
@@ -74,10 +74,10 @@ function M.participant(team, name, board)
   local lines = {
     string.format(
       "%s %s %s · task %s · 回合 %s",
-      tostring(entry.name),
+      one_line(entry.name),
       members.state_icon(entry),
       members.state_label(entry),
-      tostring(entry.task or "-"),
+      one_line(entry.task or "-"),
       tostring((entry.turns or {}).task or 0)
     ),
   }
@@ -86,7 +86,7 @@ function M.participant(team, name, board)
   end
   local worktree = entry.worktree
   if type(worktree) == "table" and worktree.branch then
-    lines[#lines + 1] = "worktree " .. tostring(worktree.branch)
+    lines[#lines + 1] = "worktree " .. one_line(worktree.branch)
   end
   lines[#lines + 1] = ""
   lines[#lines + 1] = "负责的卡片"
@@ -99,12 +99,6 @@ function M.participant(team, name, board)
   end
   if found == 0 then
     lines[#lines + 1] = "  （无）"
-  end
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = "最近回合"
-  for index = math.max(1, #(entry.turns or {}) - 2), #(entry.turns or {}) do
-    local turn = entry.turns[index]
-    lines[#lines + 1] = "  " .. one_line(turn.text or "")
   end
   return lines
 end
@@ -133,9 +127,9 @@ function M.inbox(item)
     lines[#lines + 1] = ""
     lines[#lines + 1] = string.format(
       "模板 %s · 名字 %s · 模型 %s",
-      tostring(item.template),
-      tostring(item.name or "-"),
-      tostring(item.model or "-")
+      one_line(item.template),
+      one_line(item.name or "-"),
+      one_line(item.model or "-")
     )
   end
   return lines

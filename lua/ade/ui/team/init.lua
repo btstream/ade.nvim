@@ -31,15 +31,17 @@ function M.dashboard(opts)
   local self = setmetatable({
     team = opts.team,
     config = opts.config,
-    notify = opts.notify,
+    notify_fn = opts.notify,
     leader_chat = opts.leader_chat,
     leader_input = opts.leader_input,
+    panel = opts.panel,
     start_team = opts.start_team,
     layout = nil,
     float = nil,
     tab = nil,
     watcher = nil,
     index = 1,
+    selected_id = nil,
     help = false,
     replies = {},
     cwd = nil,
@@ -63,8 +65,8 @@ function M.dashboard(opts)
 end
 
 function Dashboard:notify(message, level)
-  if self.notify then
-    self.notify(tostring(message), level)
+  if self.notify_fn then
+    self.notify_fn(tostring(message), level)
   else
     vim.notify("ade.nvim: " .. tostring(message), level or vim.log.levels.WARN)
   end
@@ -98,7 +100,16 @@ function Dashboard:current_team()
   if #rows == 0 then
     return nil
   end
+  if self.selected_id then
+    for index, row in ipairs(rows) do
+      if row.id == self.selected_id then
+        self.index = index
+        return row
+      end
+    end
+  end
   self.index = math.max(1, math.min(self.index, #rows))
+  self.selected_id = rows[self.index].id
   return rows[self.index]
 end
 
@@ -151,7 +162,13 @@ function Dashboard:title(team)
   local limits = team.limits or {}
   local selected = ""
   if #rows > 1 then
-    selected = string.format(" [%d/%d] ", self.index, #rows)
+    local index = 1
+    for position, row in ipairs(rows) do
+      if row.id == team.id then
+        index = position
+      end
+    end
+    selected = string.format(" [%d/%d] ", index, #rows)
   end
   return string.format(
     " ade.nvim · team %s · %s%s  %s · workers %d/%d · turns %s/%s · board rev %s",
@@ -176,126 +193,6 @@ function Dashboard:workflow_line(team)
     line = line .. " · " .. progress
   end
   return line
-end
-
----Build the narrow float. The board is appended under the inbox as a grouped
----list so the single column still shows it.
-function Dashboard:render_float(layout)
-  local lines, ids, meta = {}, {}, {}
-  local function add(text, id, info)
-    lines[#lines + 1] = text
-    if id then
-      ids[#lines] = id
-    end
-    meta[#lines] = info
-  end
-  local rows = self.team:list_rows()
-  if #rows == 0 then
-    add(" ade.nvim · team", nil, { kind = "title" })
-    add("", nil, { kind = "blank" })
-    add(" 还没有团队", nil, { kind = "empty" })
-    local workflows = self.team.workflows_list or {}
-    if #workflows == 0 then
-      add(" 正在读取可用流程…", nil, { kind = "empty" })
-      self:load_workflows()
-    else
-      add(" 可用流程（S 启动，<CR> 看全文）", nil, { kind = "empty" })
-      for _, workflow in ipairs(workflows) do
-        add(
-          string.format("   %-20s %s", tostring(workflow.name), one_line(workflow.summary or "")),
-          "workflow:" .. tostring(workflow.name),
-          { kind = "workflow", workflow = workflow }
-        )
-      end
-    end
-    return lines, meta, ids
-  end
-  local team = self:current_team()
-  if not team then
-    return lines, meta, ids
-  end
-  add(self:title(team), "team:" .. team.id, { kind = "team", team = team.id })
-  add(self:workflow_line(team), nil, { kind = "workflow_line", team = team.id })
-  if self.team:is_stale(team.id) then
-    add(" connection lost; waiting for the service to reconnect", nil, { kind = "notice", team = team.id })
-  end
-  if team.state == "suspended" then
-    local at = tonumber(team.suspended_at)
-    local when = at and os.date("%Y-%m-%d %H:%M:%S", math.floor(at / 1000)) or "unknown"
-    add(
-      " suspended since " .. when .. "; waiting for the leader session to resume",
-      nil,
-      { kind = "notice", team = team.id }
-    )
-  end
-  if layout.help then
-    for _, entry in ipairs({
-      { "<CR> / w", "watch / detail" },
-      { "m", "message the member or card" },
-      { "a / A", "answer one / a spawn group" },
-      { "p / r / c", "pause / resume / cancel" },
-      { "H", "card history" },
-      { "s / R / D", "spawn / reset limits / remove worktree" },
-      { "L", "leader chat" },
-      { "S", "start the selected workflow (empty state)" },
-      { "]t / [t", "next / previous team" },
-      { "x", "close the team" },
-      { "q", "close the panel" },
-    }) do
-      add(string.format("   %-10s %s", entry[1], entry[2]), nil, { kind = "help" })
-    end
-    add("", nil, { kind = "blank" })
-  end
-  add(
-    string.format(
-      "   workers %s/%s · turns %s/%s",
-      tostring(#team.participants),
-      "?",
-      tostring((team.limits or {}).turns_total or 0),
-      tostring((team.limits or {}).max_turns_total or "?")
-    ),
-    nil,
-    { kind = "summary", team = team.id }
-  )
-  local width = math.max(50, vim.o.columns - 8)
-  local member_lines, member_ids, member_meta = Members.lines(team, width)
-  for index, text in ipairs(member_lines) do
-    add(text, member_ids[index], member_meta[index])
-  end
-  local items = {}
-  for _, item in pairs(self.team.inbox) do
-    if item.team == team.id and item.state == "open" then
-      items[#items + 1] = item
-    end
-  end
-  local inbox_lines, inbox_ids, inbox_meta = Inbox.lines(team, items, width)
-  if #inbox_lines > 0 then
-    add("", nil, { kind = "blank" })
-    add(string.format(" 收件箱 %d", #items), nil, { kind = "inbox_title", team = team.id })
-    for index, text in ipairs(inbox_lines) do
-      add("  " .. text, inbox_ids[index], inbox_meta[index])
-    end
-  end
-  local board = self:board(team)
-  if board then
-    add("", nil, { kind = "blank" })
-    add(string.format(" 看板 · rev %s", tostring(board.rev or "?")), nil, { kind = "board_title", team = team.id })
-    local board_lines, board_meta, board_ids = Board.lines(board, self:states(team), {
-      scroll = self:scroll(team.id),
-      expanded = self:expanded(team.id),
-      width = width,
-      team = team,
-    })
-    for index, text in ipairs(board_lines) do
-      add(" " .. text, board_ids[index], board_meta[index])
-    end
-  elseif team.board_rev == nil then
-    add("", nil, { kind = "blank" })
-    add(" leader 还没有创建看板", nil, { kind = "board_empty", team = team.id })
-    add(" 按 L 去和 leader 聊", nil, { kind = "board_empty", team = team.id })
-  end
-  add("", nil, { kind = "blank" })
-  return lines, meta, ids
 end
 
 function Dashboard:render_tab(tab)
@@ -368,7 +265,7 @@ function Dashboard:render_tab(tab)
         .. " · 看板 rev "
         .. tostring((self:board(team) or {}).rev or "?")
       vim.wo[tab.panels.inbox].winbar = string.format(" 收件箱 %d", #rendered.inbox)
-      vim.wo[tab.panels.detail].winbar = " 详情"
+      vim.wo[tab.panels.detail].winbar = self:title(team) .. " · " .. self:workflow_line(team)
     end)
   end
   return rendered
@@ -509,7 +406,6 @@ function Dashboard:attach_keys(buf)
     ["S"] = "S",
     ["g?"] = "help",
     ["q"] = "q",
-    ["<Esc>"] = "q",
     ["zh"] = "zh",
     ["zl"] = "zl",
     ["]t"] = "]t",
@@ -559,6 +455,7 @@ function Dashboard:handle_key(key)
       return
     end
     self.index = ((self.index - 1 + (key == "[t" and -1 or 1)) % #rows) + 1
+    self.selected_id = rows[self.index].id
     self:refresh()
     return
   end
@@ -578,8 +475,9 @@ function Dashboard:handle_key(key)
   if key == "zh" or key == "zl" then
     if team then
       self.scrolls = self.scrolls or {}
+      local max_columns = math.max(0, #((self:board(self:team_by_id(team)) or {}).columns or {}) - 1)
       local value = (self.scrolls[team] or 0) + (key == "zl" and 1 or -1)
-      self.scrolls[team] = math.max(0, value)
+      self.scrolls[team] = math.max(0, math.min(max_columns, value))
       self:refresh()
     end
     return
@@ -993,6 +891,9 @@ function Dashboard:open_watch(team, participant)
     self:open_leader(team)
     return
   end
+  if self.leader_mounted then
+    self:unmount_leader()
+  end
   if self.tab and self.tab:is_open() then
     local host = self.tab:open_watch_host()
     self.watcher.host_win = host
@@ -1007,6 +908,9 @@ end
 
 function Dashboard:open_leader(team)
   if self.tab and self.tab:is_open() then
+    if self.watcher:is_open() or self.watcher.participant then
+      self.watcher:close()
+    end
     pcall(self.mount_leader, self)
   else
     local chat = self.leader_chat and self.leader_chat() or nil
@@ -1019,6 +923,10 @@ function Dashboard:open_leader(team)
 end
 
 ---Move the existing chat/input into the right column of the wide tab.
+---
+---Uses the normal panel window path (`layout.create_chat_win` /
+---`create_input_win`) so wrap, conceal, winfixbuf, width and keys match the
+---regular panel. The original panel windows are closed first, never duplicated.
 function Dashboard:mount_leader()
   if not (self.tab and self.tab:is_open()) then
     return
@@ -1032,57 +940,115 @@ function Dashboard:mount_leader()
   if self.leader_mounted then
     return
   end
-  local host = self.tab:open_watch_host()
-  if not host then
+  local panel = self.panel and self.panel() or nil
+  local original_tab = vim.api.nvim_get_current_tabpage()
+  if chat.win and vim.api.nvim_win_is_valid(chat.win) then
+    original_tab = vim.api.nvim_win_get_tabpage(chat.win)
+  end
+  if panel then
+    -- Closes the original chat/input windows without losing drafts.
+    panel:hide()
+    -- While mounted these buffers are on screen, so `:Ade hide` is the only
+    -- thing that may clear this flag and keep them hidden on unmount.
+    panel.requested = true
+  end
+  -- `panel:hide()` may focus the tab that held the old windows.
+  if self.tab and self.tab:is_open() then
+    pcall(vim.api.nvim_set_current_tabpage, self.tab.tab)
+  end
+  local layout = require("ade.layout")
+  local chat_win = layout.create_chat_win(chat.buf, nil)
+  local input_win = chat_win and layout.create_input_win(input.buf, chat_win) or nil
+  if not (chat_win and input_win) then
+    self:notify("unable to move the leader chat to the watch column")
+    if panel then
+      panel:show()
+    end
     return
   end
-  self.leader_mounted = {
-    chat_win = chat.win,
-    input_win = input.win,
-    host = host,
-  }
-  vim.api.nvim_set_current_win(host)
-  vim.api.nvim_win_set_buf(host, chat.buf)
-  vim.cmd("belowright split")
-  local input_win = vim.api.nvim_get_current_win()
-  vim.api.nvim_win_set_buf(input_win, input.buf)
-  vim.wo[input_win].winfixheight = true
-  pcall(vim.api.nvim_win_set_height, input_win, math.max(5, math.floor((vim.o.lines - vim.o.cmdheight) * 0.2)))
-  chat.win = host
+  chat.win = chat_win
   input.win = input_win
-  self.leader_input_win = input_win
-  self.leader_mounted.input_new = input_win
+  self.leader_mounted = {
+    chat_win = chat_win,
+    input_win = input_win,
+    original_tab = original_tab,
+    panel = panel,
+  }
+  self.leader_unmounting = false
+  local group = vim.api.nvim_create_augroup("AdeTeamLeaderMount" .. tostring(chat_win), { clear = true })
+  self.leader_mounted.group = group
+  vim.api.nvim_create_autocmd("WinClosed", {
+    group = group,
+    callback = function(args)
+      local win = tonumber(args.match)
+      local mounted = self.leader_mounted
+      if not mounted or self.leader_unmounting then
+        return
+      end
+      if win == mounted.chat_win or win == mounted.input_win then
+        vim.schedule(function()
+          self:unmount_leader()
+        end)
+      end
+    end,
+  })
   pcall(function()
-    vim.wo[host].winbar = " leader · 对话"
+    vim.wo[chat_win].winbar = " leader · 对话"
   end)
   vim.api.nvim_set_current_win(input_win)
 end
 
 function Dashboard:unmount_leader()
   local mounted = self.leader_mounted
-  if not mounted then
+  if not mounted or self.leader_unmounting then
     return
   end
   self.leader_mounted = nil
+  self.leader_unmounting = true
+  if mounted.group then
+    pcall(vim.api.nvim_del_augroup_by_id, mounted.group)
+  end
   local chat = self.leader_chat and self.leader_chat() or nil
   local input = self.leader_input and self.leader_input() or nil
-  if chat and mounted.chat_win and vim.api.nvim_win_is_valid(mounted.chat_win) then
-    chat.win = mounted.chat_win
+  if chat then
+    chat.win = nil
   end
-  if input and mounted.input_win and vim.api.nvim_win_is_valid(mounted.input_win) then
-    input.win = mounted.input_win
+  if input then
+    input.win = nil
   end
-  if mounted.input_new and vim.api.nvim_win_is_valid(mounted.input_new) then
-    pcall(vim.api.nvim_win_close, mounted.input_new, true)
+  for _, win in ipairs({ mounted.input_win, mounted.chat_win }) do
+    if win and vim.api.nvim_win_is_valid(win) then
+      pcall(vim.api.nvim_win_close, win, true)
+    end
   end
-  if mounted.host and vim.api.nvim_win_is_valid(mounted.host) then
-    pcall(vim.api.nvim_win_close, mounted.host, true)
+  local panel = mounted.panel or (self.panel and self.panel() or nil)
+  local show = panel ~= nil and panel.requested ~= false
+  local target = mounted.original_tab
+  if not (target and vim.api.nvim_tabpage_is_valid(target)) then
+    target = vim.api.nvim_get_current_tabpage()
+    if not (target and vim.api.nvim_tabpage_is_valid(target)) then
+      vim.cmd("tabnew")
+      target = vim.api.nvim_get_current_tabpage()
+    end
   end
-  self.tab.watch_win = nil
+  pcall(vim.api.nvim_set_current_tabpage, target)
+  if show and panel then
+    panel:set_views(chat, input)
+    if not panel:show() then
+      self:notify("unable to restore the leader chat window")
+    end
+  end
+  self.leader_unmounting = false
 end
 
 function Dashboard:open()
   self.interacting = false
+  if not self.selected_id then
+    local rows = self.team:list_rows()
+    if #rows > 0 then
+      self.selected_id = rows[1].id
+    end
+  end
   self.cwd = self.team.resolve_cwd and self.team.resolve_cwd() or nil
   local cfg = self.config() or {}
   local wide = tonumber((cfg.teams or {}).dashboard and (cfg.teams or {}).dashboard.wide) or 160
@@ -1091,6 +1057,9 @@ function Dashboard:open()
     if use_tab ~= (self.tab ~= nil) then
       self:close(true)
     else
+      if self.tab and self.tab:is_open() then
+        pcall(vim.api.nvim_set_current_tabpage, self.tab.tab)
+      end
       self:refresh()
       return true
     end
@@ -1185,13 +1154,31 @@ function Dashboard:load_workflows()
   self.workflows_requested = true
   local cwd = self.cwd or (self.team.resolve_cwd and self.team.resolve_cwd())
   if not cwd then
+    self.workflows_requested = false
+    self.team.workflows_list = {}
     return
   end
+  local token = {}
+  self.workflow_token = token
+  vim.defer_fn(function()
+    if self.workflow_token == token and self.workflows_requested then
+      self.workflows_requested = false
+      self.workflow_token = nil
+      self.team.workflows_list = {}
+      self:notify("cannot load workflows (timed out)")
+      self:schedule_refresh()
+    end
+  end, 5000)
   self.team:workflows(cwd, function(ok, value)
+    if self.workflow_token ~= token and self.workflow_token ~= nil then
+      return
+    end
+    self.workflow_token = nil
     if ok and type(value) == "table" then
       self.team.workflows_list = value.workflows or {}
     else
       self.team.workflows_list = {}
+      self:notify("cannot load workflows")
     end
     self.workflows_requested = false
     self:schedule_refresh()
@@ -1200,7 +1187,10 @@ end
 
 function Dashboard:close(quiet)
   if self.refresh_timer then
-    pcall(vim.defer_fn, function() end, 0)
+    pcall(function()
+      self.refresh_timer:stop()
+      self.refresh_timer:close()
+    end)
     self.refresh_timer = nil
   end
   if self.unmount_leader then

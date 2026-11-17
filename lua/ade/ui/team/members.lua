@@ -1,5 +1,11 @@
 -- Member rows for the unified team dashboard (W0f).
+local Board = require("ade.ui.team.board")
+
 local M = {}
+
+local function one_line(text)
+  return Board.one_line(text)
+end
 
 local ICONS = {
   working = "●",
@@ -82,17 +88,17 @@ function M.entry_lines(entry, limits, width)
     parts[#parts + 1] = "队列 " .. tostring(queued)
   end
   local first = table.concat(parts, "  ")
-  local lines = { first:sub(1, width) }
+  local lines = { Board.truncate(first, width) }
   local activity = entry.activity and entry.activity.text
   if type(activity) == "string" and activity ~= "" then
-    lines[#lines + 1] = ("  ↳ " .. activity):sub(1, width)
+    lines[#lines + 1] = Board.truncate("  ↳ " .. one_line(activity), width)
   end
   local worktree = entry.worktree
   if type(worktree) == "table" and worktree.branch then
-    lines[#lines + 1] = ("  wt " .. tostring(worktree.branch)):sub(1, width)
+    lines[#lines + 1] = Board.truncate("  wt " .. one_line(worktree.branch), width)
   end
   if type(worktree) == "table" and worktree.path and not worktree.branch then
-    lines[#lines + 1] = ("  wt " .. tostring(worktree.path)):sub(1, width)
+    lines[#lines + 1] = Board.truncate("  wt " .. one_line(worktree.path), width)
   end
   return lines
 end

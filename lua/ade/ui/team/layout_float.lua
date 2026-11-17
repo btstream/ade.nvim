@@ -19,6 +19,7 @@ function M.new(opts)
     team = opts.team,
     config = opts.config,
     start_team = opts.start_team,
+    leader_chat = opts.leader_chat,
     win = nil,
     buf = nil,
     watch_win = nil,
@@ -312,6 +313,26 @@ function Panel:open()
   self:map("a", function()
     self:answer_current()
   end)
+  self:map("A", function()
+    self:answer_group_current()
+  end)
+  self:map("H", function()
+    self:history_current()
+  end)
+  self:map("L", function()
+    local chat = self.leader_chat and self.leader_chat() or nil
+    if chat and chat.win and vim.api.nvim_win_is_valid(chat.win) then
+      pcall(vim.api.nvim_set_current_win, chat.win)
+    else
+      self:notify("the leader chat window is not open")
+    end
+  end)
+  self:map("]t", function()
+    self.team:refresh()
+  end)
+  self:map("[t", function()
+    self.team:refresh()
+  end)
   self:map("p", function()
     self:control_current("pause")
   end)
@@ -392,9 +413,6 @@ function Panel:open()
     self:send_current()
   end)
   self:map("q", function()
-    self:close()
-  end)
-  self:map("<Esc>", function()
     self:close()
   end)
   self.augroup = vim.api.nvim_create_augroup("AdeTeam", { clear = true })
@@ -917,6 +935,37 @@ function Panel:popup(title, lines)
   vim.keymap.set("n", "<Esc>", function()
     pcall(vim.api.nvim_win_close, win, true)
   end, { buffer = buf, nowait = true, silent = true })
+end
+
+function Panel:answer_group_current()
+  local kind, item_id = self:current()
+  if kind ~= "item" or not item_id then
+    return
+  end
+  local item = self.team:item(item_id)
+  if not item then
+    return
+  end
+  if not item.group then
+    self:answer_current()
+    return
+  end
+  self.team:answer_group(item.group, true, function(ok, value)
+    self:report(ok, value)
+    self.team:refresh()
+  end)
+end
+
+function Panel:history_current()
+  local kind, team_id, card_id = self:current()
+  if kind ~= "card" or not card_id then
+    return
+  end
+  self.team:card_history(team_id, card_id, function(ok, value)
+    if self:report(ok, value) and type(value) == "table" then
+      require("ade.ui.team.history").open(team_id, card_id, value.versions or {})
+    end
+  end)
 end
 
 M.Panel = Panel
