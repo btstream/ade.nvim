@@ -611,7 +611,8 @@ fn a_second_open_replaces_the_file_but_a_live_one_keeps_its_handle() {
     });
     runtime.block_on(async {
         let second = Recorder::open(&path, 1024 * 1024).expect("reopen");
-        // The spec says the whole log file is deleted when the service starts.
+        // A service start clears the event tables; teams (18.15) stay in the
+        // same file, but no old session may be replayed.
         assert!(second
             .read_session("a", "s", u64::MAX)
             .await

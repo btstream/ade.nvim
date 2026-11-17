@@ -31,7 +31,7 @@ const STRIPPED_ENV: [&str; 5] = [
     "GIT_COMMON_DIR",
 ];
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WorktreeInfo {
     /// The worktree root (what `git worktree remove` takes).
     pub path: String,

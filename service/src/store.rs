@@ -67,7 +67,7 @@ use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBeha
 ///
 /// A file with any other non-zero value is treated as incompatible and moved
 /// aside; a zero-length file (version 0) is initialised in place.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// How long a writer waits for another process holding the database lock.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -663,6 +663,83 @@ impl Store {
         Ok(())
     }
 
+    // -- teams (PROTOCOL.md 18.15) ----------------------------------------
+
+    /// Save one team snapshot. The row and the id counters are one
+    /// transaction, so a crash cannot leave a team row without its id history.
+    pub fn save_team(
+        &self,
+        id: &str,
+        state_json: &str,
+        max_team: u64,
+        max_inbox: u64,
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("starting a team transaction")?;
+        tx.prepare_cached("INSERT INTO teams (id, state_json) VALUES (?1, ?2) ON CONFLICT(id) DO UPDATE SET state_json = excluded.state_json")
+            .context("preparing the team upsert")?
+            .execute(params![id, state_json])
+            .context("writing a team")?;
+        for (key, value) in [("max_team", max_team), ("max_inbox", max_inbox)] {
+            tx.prepare_cached("INSERT INTO team_meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+                .context("preparing the team meta upsert")?
+                .execute(params![key, value.to_string()])
+                .context("writing team meta")?;
+        }
+        tx.commit().context("committing a team")?;
+        Ok(())
+    }
+
+    pub fn delete_team(&self, id: &str) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("starting a team delete")?;
+        tx.execute("DELETE FROM teams WHERE id = ?1", params![id])
+            .context("deleting a team")?;
+        tx.commit().context("committing a team delete")?;
+        Ok(())
+    }
+
+    pub fn load_teams(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare("SELECT id, state_json FROM teams ORDER BY id")
+            .context("preparing the team load")?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .context("reading teams")?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .context("collecting teams")
+    }
+
+    pub fn load_team_meta(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.lock()?;
+        conn.query_row(
+            "SELECT value FROM team_meta WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("reading team meta")
+    }
+
+    /// Forget every instance and event from the previous service run while
+    /// keeping the team rows (section 10/18.15): a new service has no agents,
+    /// so old sessions can never be replayed, but teams must survive.
+    pub fn clear_events_for_restart(&self) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("starting the event log reset")?;
+        tx.execute_batch("DELETE FROM events; DELETE FROM sessions; DELETE FROM instances;")
+            .context("clearing the previous event log")?;
+        tx.commit().context("committing the event log reset")?;
+        Ok(())
+    }
+
     /// Path of the database file; `None` for an in-memory store.
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
@@ -685,7 +762,9 @@ impl Store {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .context("reading the event store schema version")
             .map_err(Failure::classify)?;
-        if version != 0 && version != SCHEMA_VERSION {
+        // Version 1 is the S4a event log; version 2 adds the team tables. Both
+        // migrate in place, and existing events are kept.
+        if version != 0 && !(1..=SCHEMA_VERSION).contains(&version) {
             return Err(Failure::corrupt(format!(
                 "event store schema version {version} is not supported (expected {SCHEMA_VERSION})"
             )));
@@ -695,7 +774,7 @@ impl Store {
         // pages, so it is classified too: only SQLite's corruption codes are
         // treated as corruption, never a permission or I/O error.
         create_schema(&conn).map_err(Failure::classify)?;
-        if version == 0 {
+        if version < SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .context("recording the event store schema version")
                 .map_err(Failure::other)?;
@@ -924,6 +1003,14 @@ fn create_schema(conn: &Connection) -> Result<()> {
              session_id  TEXT    NOT NULL,
              incomplete  INTEGER NOT NULL DEFAULT 0,
              PRIMARY KEY (instance_id, session_id)
+         );
+         CREATE TABLE IF NOT EXISTS teams (
+             id          TEXT PRIMARY KEY,
+             state_json  TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS team_meta (
+             key   TEXT PRIMARY KEY,
+             value TEXT NOT NULL
          );",
     )
     .context("creating tables")

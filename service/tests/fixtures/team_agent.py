@@ -373,7 +373,15 @@ def main():
             continue
         if method == "initialize":
             log({"event": "initialize", "params": params})
-            result(ident, {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}, "authMethods": []})
+            load_session = os.environ.get("TEAM_AGENT_LOAD_SESSION", "1") != "0"
+            result(
+                ident,
+                {
+                    "protocolVersion": 1,
+                    "agentCapabilities": {"loadSession": load_session},
+                    "authMethods": [],
+                },
+            )
         elif method in ("session/new", "session/load", "session/resume"):
             if method == "session/new":
                 COUNT[0] += 1
@@ -395,6 +403,7 @@ def main():
                 }
             log({
                 "event": "session",
+                "method": method,
                 "session": session,
                 "mcp": bool(entry),
                 "cwd": params.get("cwd"),

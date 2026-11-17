@@ -730,7 +730,8 @@ require("ade").setup({
 
 服务声明 `teams` 能力（0.6.0+）时，可以在聊天里让主 agent 组建一个小团队：主 agent 用
 `team_spawn` 拉 worker，worker 之间通过服务总线（bus）传消息，人来审批/回答。团队运行在
-服务里，Neovim 退出后继续；服务重启后所有团队结束（本阶段不做恢复）。
+服务里，Neovim 退出后继续。团队存进服务的 SQLite 事件日志：服务重启后未关闭的
+团队变成 **suspended**，前端重新配置并恢复 leader 会话后可以继续。
 
 ```lua
 teams = {
@@ -765,6 +766,11 @@ teams = {
 
 每次 `team_spawn` 默认都要人确认；把模板加进 `spawn_confirm.auto` 才会自动放行。
 worker 的权限请求、提问、spawn 请求等进入 **收件箱**，`team.inbox` 到来时通知一次。
+
+**持久化**：团队、参与者、排队消息和每个团队最近 200 条消息正文写入
+`nvim_ade_server` 的事件日志数据库（权限 0600）；模板的 `key`、`env`、`launch`
+不落盘，恢复时要由前端重新提供配置。重启后 suspended 团队可用 panel 关闭；
+7 天未恢复会被删除（worktree/分支保留）。suspended 团队不阻止服务空闲退出。
 
 `worktree = true` 的模板由服务在
 `stdpath("data")/ade/worktrees/<repo>-<hash8>/<team>-<stamp>-<name>` 创建独立

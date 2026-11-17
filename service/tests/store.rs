@@ -1167,3 +1167,42 @@ fn a_new_session_starts_complete_and_only_pruning_makes_it_incomplete() {
         .expect("append");
     assert!(store.session_complete("a", "fresh").expect("fresh"));
 }
+
+#[test]
+fn a_version_one_log_migrates_without_losing_events() {
+    let dir = TempDir::new("migrate-v1");
+    let path = dir.db();
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    {
+        let store = Store::open(&path).expect("open");
+        store
+            .append(event("old-instance", Some("old-session"), "kept"))
+            .expect("append");
+        store
+            .save_team("t7", r#"{"id":"t7","cwd":"/p"}"#, 7, 3)
+            .expect("save team");
+    }
+    // Turn the file back into the S4a schema: event tables only, version 1.
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw");
+        conn.execute_batch("DROP TABLE teams; DROP TABLE team_meta; PRAGMA user_version = 1;")
+            .expect("downgrade");
+    }
+    let store = Store::open(&path).expect("migrate");
+    let events = store.read(&Query::new("old-instance")).expect("read");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].message, "kept");
+    let conn = rusqlite::Connection::open(&path).expect("open raw");
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("version");
+    assert_eq!(version, 2);
+    let tables: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('teams', 'team_meta')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("tables");
+    assert_eq!(tables, 2);
+}

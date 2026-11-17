@@ -198,9 +198,9 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
         Arc::clone(&stopped),
         stop_timeouts,
     )
-    .with_event_log(options.event_log, options.event_log_max_mb, recorder)
     .with_limits(crate::hub::Limits::from_env())
-    .with_teams(Arc::clone(&tokens));
+    .with_teams(Arc::clone(&tokens))
+    .with_event_log(options.event_log, options.event_log_max_mb, recorder);
     let hub_task = tokio::spawn(hub.run());
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<ConnectionEvent>();

@@ -8,9 +8,10 @@
 pub mod mcp;
 pub mod worktree;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -78,7 +79,8 @@ impl TeamError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     Leader,
     Worker,
@@ -93,7 +95,8 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ParticipantState {
     Idle,
     Working,
@@ -112,7 +115,8 @@ impl ParticipantState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Kind {
     Task,
     Report,
@@ -152,7 +156,7 @@ impl Kind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub id: u64,
     pub from: String,
@@ -185,7 +189,8 @@ impl Message {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ItemState {
     Open,
     Answered,
@@ -202,7 +207,8 @@ impl ItemState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ItemKind {
     Question,
     Spawn,
@@ -225,7 +231,7 @@ impl ItemKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboxItem {
     pub id: String,
     pub team: String,
@@ -345,13 +351,13 @@ impl Default for TeamConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnText {
     pub at: u64,
     pub text: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Participant {
     pub name: String,
     pub role: Role,
@@ -424,6 +430,11 @@ pub struct Team {
     pub cwd: String,
     pub leaderless: bool,
     pub closed: bool,
+    /// Loaded from disk after a service restart and not resumed yet (18.15).
+    pub suspended: bool,
+    pub suspended_at: Option<u64>,
+    /// The one resume triggered by `team.bind_leader` is in flight.
+    pub resuming: bool,
     pub leader_instance: Option<String>,
     pub leader_session: Option<String>,
     pub participants: HashMap<String, Participant>,
@@ -601,6 +612,14 @@ pub enum AnswerEffect {
         result: Value,
     },
     Ack,
+}
+
+#[derive(Debug)]
+pub enum BindOutcome {
+    /// A live team, or a new one.
+    Active(Value),
+    /// A suspended team whose first matching bind starts the resume.
+    Resume { team: String, entry: Value },
 }
 
 pub struct Teams {
@@ -815,7 +834,10 @@ impl Teams {
         }
         if let Some(team_id) = self.by_cwd.get(cwd) {
             let team = self.teams.get(team_id).expect("cwd index");
-            if team.leader_instance.as_deref() != Some(instance) {
+            if team.suspended {
+                // A suspended team accepts a leader server for any instance in
+                // its cwd; the bind decides whether the session matches.
+            } else if team.leader_instance.as_deref() != Some(instance) {
                 return Err(TeamError::not_allowed("a team already exists for this cwd"));
             }
         }
@@ -842,7 +864,7 @@ impl Teams {
         instance: &str,
         session: &str,
         token_id: &str,
-    ) -> Result<Value, TeamError> {
+    ) -> Result<BindOutcome, TeamError> {
         let Some(record) = self.token_records.get(token_id) else {
             return Err(TeamError::not_allowed("unknown leader token"));
         };
@@ -857,7 +879,56 @@ impl Teams {
             .ok_or_else(|| TeamError::not_allowed("leader token has no cwd"))?;
 
         if let Some(team_id) = self.by_cwd.get(&cwd).cloned() {
-            {
+            let suspended = self.teams[&team_id].suspended;
+            if suspended {
+                if self.teams[&team_id].leader_session.as_deref() != Some(session) {
+                    return Err(TeamError::not_allowed(
+                        "the resumed session is not the team's leader session",
+                    ));
+                }
+                if !self.configs.contains_key(&cwd) {
+                    return Err(TeamError::not_allowed(
+                        "no configuration for this cwd: the team stays suspended",
+                    ));
+                }
+                let config = self.config_for(&cwd);
+                let resumed = {
+                    let team = self.teams.get_mut(&team_id).expect("cwd index");
+                    if team.resuming {
+                        false
+                    } else {
+                        // Once, atomically: state first, participants follow.
+                        team.suspended = false;
+                        team.suspended_at = None;
+                        team.resuming = true;
+                        team.leader_instance = Some(instance.to_string());
+                        team.leader_session = Some(session.to_string());
+                        team.leaderless = false;
+                        team.config = config;
+                        if let Some(leader) = team.participants.get_mut("leader") {
+                            leader.instance = Some(instance.to_string());
+                            leader.session = Some(session.to_string());
+                            leader.state = ParticipantState::Idle;
+                            leader.starting = false;
+                        }
+                        true
+                    }
+                };
+                if resumed {
+                    self.events.push(TeamEvent::Changed(team_id.clone()));
+                    let entry = json!({ "team": team_entry(&self.teams[&team_id]) });
+                    if let Some(record) = self.token_records.get_mut(token_id) {
+                        record.bound = true;
+                        record.team = Some(team_id.clone());
+                        record.name = Some("leader".to_string());
+                    }
+                    self.token_entry(token_id);
+                    return Ok(BindOutcome::Resume {
+                        team: team_id,
+                        entry,
+                    });
+                }
+            } else {
                 let team = self.teams.get(&team_id).expect("cwd index");
                 if team.leader_instance.as_deref() != Some(instance)
                     || team.leader_session.as_deref() != Some(session)
@@ -873,7 +944,9 @@ impl Teams {
                 record.name = Some("leader".to_string());
             }
             self.token_entry(token_id);
-            return Ok(json!({ "team": team_entry(&self.teams[&team_id]) }));
+            return Ok(BindOutcome::Active(
+                json!({ "team": team_entry(&self.teams[&team_id]) }),
+            ));
         }
 
         self.next_team += 1;
@@ -884,6 +957,9 @@ impl Teams {
             cwd: cwd.clone(),
             leaderless: false,
             closed: false,
+            suspended: false,
+            suspended_at: None,
+            resuming: false,
             leader_instance: Some(instance.to_string()),
             leader_session: Some(session.to_string()),
             participants: HashMap::new(),
@@ -917,7 +993,7 @@ impl Teams {
         }
         self.token_entry(token_id);
         self.events.push(TeamEvent::Changed(id));
-        Ok(json!({ "team": entry }))
+        Ok(BindOutcome::Active(json!({ "team": entry })))
     }
 
     // -- front-end methods -------------------------------------------------
@@ -965,7 +1041,7 @@ impl Teams {
             }
         }
         self.teams.remove(&id);
-        self.by_cwd.retain(|_, value| *value != id);
+        self.by_cwd.retain(|_, value| *value != *id);
         // Keep the token records so a participant connection gets the
         // documented "team closed" answer instead of "unknown token"; the
         // worker instances are stopped and revoke their own tokens on exit.
@@ -1406,6 +1482,9 @@ impl Teams {
         if team.closed {
             return Err(TeamError::unknown("team closed"));
         }
+        if team.suspended {
+            return Err(TeamError::unknown("suspended"));
+        }
         let name = spawn_name(team, template, name, task)?;
         let auto = team.config.spawn_auto.contains(template);
         if auto {
@@ -1469,6 +1548,9 @@ impl Teams {
             .ok_or_else(|| TeamError::unknown("unknown team"))?;
         if team.closed {
             return Err(TeamError::unknown("team closed"));
+        }
+        if team.suspended {
+            return Err(TeamError::unknown("suspended"));
         }
         let name = spawn_name(team, template, name, task)?;
         spawn_participant(team, &name, template, task)?;
@@ -1699,6 +1781,9 @@ impl Teams {
 
     fn deliver(&mut self, team_id: &str, name: &str) -> Option<DeliveryRequest> {
         let team = self.teams.get_mut(team_id)?;
+        if team.suspended {
+            return None;
+        }
         let participant = team.participants.get_mut(name)?;
         if participant.state != ParticipantState::Idle
             || participant.paused
@@ -2041,6 +2126,14 @@ impl Teams {
         }
         let team = self.teams.get_mut(&team_id).expect("found above");
         let kind = item.kind.clone();
+        if team.suspended
+            && !matches!(
+                kind,
+                ItemKind::Question | ItemKind::Message | ItemKind::Limit
+            )
+        {
+            return Err(TeamError::not_allowed("team suspended"));
+        }
         let from = item.from.clone();
         let item_id = item.id.clone();
         let still_waiting = team.inbox.iter().any(|other| {
@@ -2587,10 +2680,16 @@ fn team_entry(team: &Team) -> Value {
             "sessionId": team.leader_session,
         })
     };
-    json!({
+    let mut entry = json!({
         "id": team.id,
         "cwd": team.cwd,
-        "state": if team.leaderless { "leaderless" } else { "active" },
+        "state": if team.suspended {
+            "suspended"
+        } else if team.leaderless {
+            "leaderless"
+        } else {
+            "active"
+        },
         "leader": leader,
         "participants": participants,
         "inbox": inbox,
@@ -2599,7 +2698,328 @@ fn team_entry(team: &Team) -> Value {
             "max_turns_total": team.config.max_turns_total,
             "turns_total": team.total_turns,
         },
-    })
+    });
+    if let Some(at) = team.suspended_at {
+        entry["suspended_at"] = json!(at);
+    }
+    entry
+}
+
+// -- persistence (PROTOCOL.md 18.15) ---------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TemplateSnapshot {
+    model: Option<String>,
+    role: String,
+    worktree: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConfigSnapshot {
+    max_workers: u64,
+    spawn_auto: Vec<String>,
+    max_turns_per_task: u64,
+    max_turns_total: u64,
+    worktree_root: Option<String>,
+    templates: BTreeMap<String, TemplateSnapshot>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TeamSnapshot {
+    id: String,
+    cwd: String,
+    created_at: u64,
+    suspended_at: Option<u64>,
+    config: ConfigSnapshot,
+    leader_instance: Option<String>,
+    leader_session: Option<String>,
+    participants: Vec<Participant>,
+    messages: Vec<Message>,
+    inbox: Vec<InboxItem>,
+    next_message: u64,
+    task_turns: Vec<(String, String, u64)>,
+    total_turns: u64,
+    order: Vec<String>,
+    reserved_names: Vec<String>,
+}
+
+impl Team {
+    fn snapshot(&self) -> String {
+        let templates: BTreeMap<String, TemplateSnapshot> = self
+            .config
+            .templates
+            .iter()
+            .map(|(name, template)| {
+                (
+                    name.clone(),
+                    TemplateSnapshot {
+                        model: template.model.clone(),
+                        role: template.role.clone(),
+                        worktree: template.worktree,
+                    },
+                )
+            })
+            .collect();
+        let messages: Vec<Message> = self
+            .messages
+            .iter()
+            .rev()
+            .take(200)
+            .rev()
+            .cloned()
+            .collect();
+        let inbox: Vec<InboxItem> = self
+            .inbox
+            .iter()
+            .filter(|item| item.state == ItemState::Open)
+            .cloned()
+            .collect();
+        let snapshot = TeamSnapshot {
+            id: self.id.clone(),
+            cwd: self.cwd.clone(),
+            created_at: self.created_at,
+            suspended_at: self.suspended_at,
+            config: ConfigSnapshot {
+                max_workers: self.config.max_workers,
+                spawn_auto: self.config.spawn_auto.iter().cloned().collect(),
+                max_turns_per_task: self.config.max_turns_per_task,
+                max_turns_total: self.config.max_turns_total,
+                worktree_root: self.config.worktree_root.clone(),
+                templates,
+            },
+            leader_instance: self.leader_instance.clone(),
+            leader_session: self.leader_session.clone(),
+            participants: self
+                .order
+                .iter()
+                .filter_map(|name| self.participants.get(name))
+                .cloned()
+                .collect(),
+            messages,
+            inbox,
+            next_message: self.next_message,
+            task_turns: self
+                .task_turns
+                .iter()
+                .map(|((name, task), count)| (name.clone(), task.clone(), *count))
+                .collect(),
+            total_turns: self.total_turns,
+            order: self.order.clone(),
+            reserved_names: self.reserved_names.iter().cloned().collect(),
+        };
+        serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string())
+    }
+}
+
+impl Teams {
+    pub fn team_ids(&self) -> Vec<String> {
+        self.teams.keys().cloned().collect()
+    }
+
+    pub fn snapshot_team(&self, id: &str) -> Option<String> {
+        self.teams.get(id).map(Team::snapshot)
+    }
+
+    pub fn counters(&self) -> (u64, u64) {
+        (self.next_team, self.next_inbox)
+    }
+
+    /// Load stored teams after a service restart. Returns the ids that are
+    /// stored again as suspended (their `suspended_at` may have been set now)
+    /// and the ids that expired and must be deleted.
+    pub fn restore(
+        &mut self,
+        rows: Vec<(String, String)>,
+        max_team: u64,
+        max_inbox: u64,
+        now: u64,
+        expiry_ms: Option<u64>,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut stored = Vec::new();
+        let mut expired = Vec::new();
+        let mut highest_team = max_team;
+        let mut highest_inbox = max_inbox;
+        for (id, json) in rows {
+            let snapshot: TeamSnapshot = match serde_json::from_str(&json) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    eprintln!("nvim_ade_server: ignoring an unreadable team {id}: {error}");
+                    continue;
+                }
+            };
+            if let Some(number) = id
+                .strip_prefix('t')
+                .and_then(|rest| rest.parse::<u64>().ok())
+            {
+                highest_team = highest_team.max(number);
+            }
+            for item in &snapshot.inbox {
+                if let Some(number) = item
+                    .id
+                    .strip_prefix('i')
+                    .and_then(|rest| rest.parse::<u64>().ok())
+                {
+                    highest_inbox = highest_inbox.max(number);
+                }
+            }
+            let suspended_at = snapshot.suspended_at.unwrap_or(now);
+            if snapshot.suspended_at.is_some()
+                && expiry_ms.is_some_and(|ttl| now.saturating_sub(suspended_at) > ttl)
+            {
+                expired.push(id);
+                continue;
+            }
+            let templates: HashMap<String, Template> = snapshot
+                .config
+                .templates
+                .iter()
+                .map(|(name, template)| {
+                    (
+                        name.clone(),
+                        Template {
+                            key: InstanceKey {
+                                agent: String::new(),
+                                command: String::new(),
+                                args: Vec::new(),
+                                cwd: snapshot.cwd.clone(),
+                                capabilities: Value::Null,
+                            },
+                            env: None,
+                            #[cfg(unix)]
+                            launch: None,
+                            model: template.model.clone(),
+                            role: template.role.clone(),
+                            worktree: template.worktree,
+                        },
+                    )
+                })
+                .collect();
+            let config = TeamConfig {
+                max_workers: snapshot.config.max_workers,
+                spawn_auto: snapshot.config.spawn_auto.iter().cloned().collect(),
+                max_turns_per_task: snapshot.config.max_turns_per_task,
+                max_turns_total: snapshot.config.max_turns_total,
+                templates,
+                worktree_root: snapshot.config.worktree_root.clone(),
+            };
+            let mut participants = HashMap::new();
+            let mut crashed = Vec::new();
+            for mut participant in snapshot.participants {
+                participant.instance = None;
+                participant.starting = false;
+                if participant.bus_turn {
+                    crashed.push((
+                        participant.name.clone(),
+                        participant.turn_task.clone(),
+                        participant.turn_sender.clone(),
+                    ));
+                }
+                participant.bus_turn = false;
+                participant.reported = false;
+                participant.state = match participant.state {
+                    ParticipantState::WaitingHuman => ParticipantState::WaitingHuman,
+                    _ => ParticipantState::Idle,
+                };
+                participants.insert(participant.name.clone(), participant);
+            }
+            let inbox: Vec<InboxItem> = snapshot
+                .inbox
+                .into_iter()
+                .map(|mut item| {
+                    if matches!(item.kind, ItemKind::Permission | ItemKind::Request) {
+                        item.state = ItemState::Orphaned;
+                    }
+                    item
+                })
+                .collect();
+            let task_turns: HashMap<(String, String), u64> = snapshot
+                .task_turns
+                .into_iter()
+                .map(|(name, task, count)| ((name, task), count))
+                .collect();
+            let leaderless = participants
+                .get("leader")
+                .is_none_or(|leader| leader.state == ParticipantState::Exited);
+            let team = Team {
+                id: snapshot.id.clone(),
+                cwd: snapshot.cwd.clone(),
+                leaderless,
+                closed: false,
+                suspended: true,
+                suspended_at: Some(suspended_at),
+                resuming: false,
+                leader_instance: None,
+                leader_session: snapshot.leader_session.clone(),
+                participants,
+                order: snapshot.order,
+                reserved_names: snapshot.reserved_names.into_iter().collect(),
+                config,
+                inbox,
+                messages: snapshot.messages,
+                next_message: snapshot.next_message,
+                task_turns,
+                total_turns: snapshot.total_turns,
+                total_limit_hit: false,
+                task_limit_hit: HashSet::new(),
+                watchers: HashMap::new(),
+                pending_items: HashMap::new(),
+                created_at: snapshot.created_at,
+            };
+            self.by_cwd.insert(team.cwd.clone(), team.id.clone());
+            self.teams.insert(team.id.clone(), team);
+            for (name, task, sender) in crashed {
+                let _ = self.send_message(
+                    &snapshot.id,
+                    &name,
+                    "leader",
+                    Kind::Notice,
+                    "turn ended: error: the service restarted",
+                    Some(&task),
+                    sender.into_iter().collect(),
+                );
+            }
+            stored.push(snapshot.id);
+        }
+        self.next_team = self.next_team.max(highest_team);
+        self.next_inbox = self.next_inbox.max(highest_inbox);
+        (stored, expired)
+    }
+
+    pub fn is_suspended(&self, team: &str) -> bool {
+        self.teams.get(team).is_some_and(|team| team.suspended)
+    }
+
+    pub fn has_active(&self) -> bool {
+        self.teams.values().any(|team| !team.suspended)
+    }
+
+    /// Remove teams suspended longer than the TTL; worktrees are kept.
+    pub fn expire_suspended(&mut self, now: u64, ttl: u64) -> Vec<String> {
+        let expired: Vec<String> = self
+            .teams
+            .values()
+            .filter(|team| {
+                team.suspended
+                    && team
+                        .suspended_at
+                        .is_some_and(|at| now.saturating_sub(at) > ttl)
+            })
+            .map(|team| team.id.clone())
+            .collect();
+        for id in &expired {
+            if let Some(team) = self.teams.get(id) {
+                let mut entry = team_entry(team);
+                entry["state"] = json!("closed");
+                self.events.push(TeamEvent::Closed(entry));
+            }
+            if let Some(team) = self.teams.remove(id) {
+                self.by_cwd.retain(|_, value| *value != *id);
+                self.closed_teams.insert(id.clone());
+                let _ = team;
+            }
+        }
+        expired
+    }
 }
 
 // -- validation ------------------------------------------------------------
@@ -3444,6 +3864,128 @@ mod tests {
             ItemState::Orphaned
         );
         assert!(teams.token_role("k1").is_none());
+    }
+
+    #[test]
+    fn a_snapshot_round_trips_and_restores_suspended() {
+        let (mut teams, team) = fixture(json!({}));
+        add_worker(&mut teams, &team, "w1");
+        teams
+            .send_message(
+                &team,
+                "leader",
+                "w1",
+                Kind::Task,
+                "queued work",
+                Some("T1"),
+                vec![],
+            )
+            .unwrap();
+        let request = teams.ask_human(&team, "w1", "question?", None).unwrap();
+        let json = teams.snapshot_team(&team).expect("snapshot");
+        let (max_team, max_inbox) = teams.counters();
+
+        let mut restored = Teams::new(new_shared_tokens());
+        let (stored, expired) = restored.restore(
+            vec![(team.clone(), json)],
+            max_team,
+            max_inbox,
+            now_ms(),
+            None,
+        );
+        assert_eq!(stored, vec![team.clone()]);
+        assert!(expired.is_empty());
+        let entry = restored.entry(&team).expect("entry");
+        assert_eq!(entry["state"], "suspended", "{entry}");
+        assert!(entry["suspended_at"].as_u64().is_some(), "{entry}");
+        assert!(entry["leader"]["instance"].is_null(), "{entry}");
+        assert_eq!(entry["leader"]["sessionId"], "s1");
+        let worker = entry["participants"]
+            .as_array()
+            .and_then(|items| items.iter().find(|item| item["name"] == "w1"))
+            .expect("worker");
+        assert!(worker["instance"].is_null(), "{worker}");
+        assert_eq!(worker["sessionId"], "w1-s");
+        assert_eq!(worker["queued"], 1, "{worker}");
+        assert_eq!(
+            restored.item(&team, &request).unwrap().state,
+            ItemState::Open
+        );
+        // Ids continue after the highest ever stored.
+        let (_server, token) = restored
+            .leader_server("i9", "/new", "/new")
+            .expect("leader");
+        let outcome = restored.bind_leader("i9", "s9", &token).expect("bind");
+        let BindOutcome::Active(value) = outcome else {
+            panic!("a new cwd team is not a resume");
+        };
+        assert_ne!(value["team"]["id"], team, "{value}");
+    }
+
+    #[test]
+    fn a_resume_starts_once_and_a_second_bind_only_adds_the_token() {
+        let (teams, team) = fixture(json!({}));
+        let json = teams.snapshot_team(&team).unwrap();
+        let (max_team, max_inbox) = teams.counters();
+        let mut restored = Teams::new(new_shared_tokens());
+        restored.configure("/p", config(json!({}))).unwrap();
+        restored.restore(
+            vec![(team.clone(), json)],
+            max_team,
+            max_inbox,
+            now_ms(),
+            None,
+        );
+        let (_server, token) = restored.leader_server("i1", "/p", "/p").unwrap();
+        let first = restored.bind_leader("i1", "s1", &token).unwrap();
+        assert!(matches!(first, BindOutcome::Resume { .. }), "{first:?}");
+        let second = restored.bind_leader("i1", "s1", &token).unwrap();
+        assert!(
+            matches!(second, BindOutcome::Active(_)),
+            "a second bind while resuming must not resume again: {second:?}"
+        );
+        assert!(!restored.team(&team).unwrap().suspended);
+    }
+
+    #[test]
+    fn a_suspended_team_expires_after_the_ttl() {
+        let (teams, team) = fixture(json!({}));
+        let now = now_ms();
+        let mut json: Value =
+            serde_json::from_str(&teams.snapshot_team(&team).unwrap()).expect("snapshot");
+        json["suspended_at"] = json!(now.saturating_sub(1000));
+        let mut restored = Teams::new(new_shared_tokens());
+        let (stored, expired) =
+            restored.restore(vec![(team.clone(), json.to_string())], 0, 0, now, Some(500));
+        assert!(stored.is_empty());
+        assert_eq!(expired, vec![team.clone()]);
+        assert!(restored.team(&team).is_none());
+    }
+
+    #[test]
+    fn permission_and_request_items_are_orphaned_on_restore() {
+        let (mut teams, team) = fixture(json!({}));
+        let _ = &mut teams;
+        let mut json: Value =
+            serde_json::from_str(&teams.snapshot_team(&team).expect("snapshot")).expect("json");
+        let mut item = json!({
+            "id": "i9",
+            "team": team,
+            "kind": "permission",
+            "from": "w1",
+            "body": "permission",
+            "at": 1,
+            "state": "open",
+            "agent_id": 7,
+        });
+        item["kind"] = json!("permission");
+        json["inbox"] = json!([item]);
+        let mut restored = Teams::new(new_shared_tokens());
+        restored.restore(vec![(team.clone(), json.to_string())], 1, 9, now_ms(), None);
+        assert_eq!(
+            restored.item(&team, "i9").unwrap().state,
+            ItemState::Orphaned
+        );
     }
 
     #[test]

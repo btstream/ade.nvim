@@ -94,6 +94,14 @@ enum Job {
     Forget(String),
     /// Mark every session of the instance incomplete (a dropped event).
     MarkIncomplete(String),
+    /// Persist one team snapshot and the id counters (18.15).
+    TeamSave {
+        id: String,
+        state_json: String,
+        max_team: u64,
+        max_inbox: u64,
+    },
+    TeamDelete(String),
     /// Complete the receiver once every earlier job is written.
     Barrier(oneshot::Sender<()>),
 }
@@ -159,15 +167,19 @@ pub struct Recorder {
 impl Recorder {
     /// Open the log at `path` and start the writer thread.
     ///
-    /// The file is deleted first, together with its `-wal`/`-shm` sidecars
-    /// (PROTOCOL.md section 10: a log never survives a service restart, because
-    /// no instance does). The store creates the new file with permission 0600.
+    /// The file is kept (teams live in it, PROTOCOL.md 18.15) but every
+    /// instance, event and session row from the previous service run is
+    /// cleared: a new service has no agents, so old sessions can never be
+    /// replayed. The store creates the file with permission 0600 and migrates
+    /// an older schema in place.
     ///
     /// `max_bytes_per_instance` is the retention cap for one instance.
     pub fn open(path: &Path, max_bytes_per_instance: u64) -> Result<Recorder> {
-        remove_log_files(path)?;
         let store = Store::open(path)
             .with_context(|| format!("opening the event log at {}", path.display()))?;
+        store
+            .clear_events_for_restart()
+            .with_context(|| format!("resetting the event log at {}", path.display()))?;
         Ok(Self::start(
             store,
             max_bytes_per_instance,
@@ -397,6 +409,43 @@ impl Recorder {
         }
     }
 
+    // -- teams (PROTOCOL.md 18.15) ----------------------------------------
+
+    /// Queue a team snapshot. Never blocks; the writer thread owns the store.
+    pub fn save_team(&self, id: &str, state_json: String, max_team: u64, max_inbox: u64) {
+        if !self.enabled {
+            return;
+        }
+        self.send(Job::TeamSave {
+            id: id.to_string(),
+            state_json,
+            max_team,
+            max_inbox,
+        });
+    }
+
+    pub fn delete_team(&self, id: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.send(Job::TeamDelete(id.to_string()));
+    }
+
+    /// Read the stored teams. Startup only: blocks on the database.
+    pub fn load_teams(&self) -> Result<Vec<(String, String)>> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        self.inner.store.load_teams()
+    }
+
+    pub fn load_team_meta(&self, key: &str) -> Result<Option<String>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        self.inner.store.load_team_meta(key)
+    }
+
     // -- internals ----------------------------------------------------------
 
     fn start(store: Store, max_bytes_per_instance: u64, limits: Limits) -> Recorder {
@@ -576,6 +625,19 @@ impl Writer {
                         self.write(&mut batch);
                         self.mark_incomplete(&instance);
                     }
+                    Job::TeamSave {
+                        id,
+                        state_json,
+                        max_team,
+                        max_inbox,
+                    } => {
+                        self.write(&mut batch);
+                        self.save_team(&id, &state_json, max_team, max_inbox);
+                    }
+                    Job::TeamDelete(id) => {
+                        self.write(&mut batch);
+                        self.delete_team(&id);
+                    }
                     Job::Barrier(sender) => {
                         self.write(&mut batch);
                         self.prune_oversized();
@@ -607,6 +669,19 @@ impl Writer {
                 Job::MarkIncomplete(instance) => {
                     self.write(&mut batch);
                     self.mark_incomplete(&instance);
+                }
+                Job::TeamSave {
+                    id,
+                    state_json,
+                    max_team,
+                    max_inbox,
+                } => {
+                    self.write(&mut batch);
+                    self.save_team(&id, &state_json, max_team, max_inbox);
+                }
+                Job::TeamDelete(id) => {
+                    self.write(&mut batch);
+                    self.delete_team(&id);
                 }
                 Job::Barrier(sender) => {
                     self.write(&mut batch);
@@ -749,10 +824,34 @@ impl Writer {
         // after the forget.
     }
 
+    fn save_team(&mut self, id: &str, state_json: &str, max_team: u64, max_inbox: u64) {
+        if let Err(error) = self.store.save_team(id, state_json, max_team, max_inbox) {
+            self.report_team_failure(&error);
+        }
+    }
+
+    fn delete_team(&mut self, id: &str) {
+        if let Err(error) = self.store.delete_team(id) {
+            self.report_team_failure(&error);
+        }
+    }
+
     fn mark_incomplete(&mut self, instance: &str) {
         if let Err(error) = self.store.mark_instance_incomplete(instance) {
             self.report_failure(instance, &error);
         }
+    }
+
+    fn report_team_failure(&mut self, error: &anyhow::Error) {
+        let now = Instant::now();
+        let recent = self
+            .last_warning
+            .is_some_and(|last| now.duration_since(last) < self.limits.warning_interval);
+        if recent {
+            return;
+        }
+        self.last_warning = Some(now);
+        eprintln!("nvim_ade_server: warning: team persistence failed: {error:#}");
     }
 
     /// Re-read one instance's stored size from the database (after a prune).
@@ -809,31 +908,4 @@ impl Writer {
         // warning above reported, and the next batch retries.
         let _ = self.store.mark_instance_incomplete(instance);
     }
-}
-
-/// Delete the log and its WAL sidecars, if any, so a new service starts clean.
-fn remove_log_files(path: &Path) -> Result<()> {
-    use std::io::ErrorKind;
-    for candidate in [
-        path.to_path_buf(),
-        sidecar(path, "-wal"),
-        sidecar(path, "-shm"),
-    ] {
-        match std::fs::remove_file(&candidate) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("removing a stale event log at {}", candidate.display())
-                })
-            }
-        }
-    }
-    Ok(())
-}
-
-fn sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(suffix);
-    std::path::PathBuf::from(name)
 }

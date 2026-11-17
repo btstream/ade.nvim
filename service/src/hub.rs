@@ -33,6 +33,14 @@ mod teams;
 
 use teams::{PendingWorktree, ServiceCall, TeamResult};
 
+/// How long a suspended team is kept (18.15); tests shorten it.
+fn team_ttl_ms() -> u64 {
+    std::env::var("NVIM_ADE_SERVER_TEAM_TTL_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(7 * 24 * 60 * 60 * 1000)
+}
+
 /// Maximum bytes queued for one connection (PROTOCOL.md section 7).
 pub const MAX_OUTBOX_BYTES: usize = 64 * 1024 * 1024;
 /// Frames that may sit in the writer queue before the connection counts as
@@ -424,6 +432,9 @@ pub struct Hub {
     /// Shared with background worktree tasks: they discard what they created
     /// once shutdown starts.
     closing_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Set when the shutdown starts: the last state was persisted before the
+    /// instances stop, and later exit-driven clears must not overwrite it.
+    persist_paused: bool,
     /// Set when the shutdown sequence completed; the run loop then ends.
     finished: bool,
     load_results: mpsc::UnboundedReceiver<LoadResult>,
@@ -497,6 +508,7 @@ impl Hub {
             pending_stop_replies: HashMap::new(),
             command_sender,
             closing_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            persist_paused: false,
             finished: false,
             #[cfg(unix)]
             install_jobs: HashMap::new(),
@@ -540,6 +552,42 @@ impl Hub {
         self.event_log = enabled;
         self.event_log_max_mb = max_mb;
         self.recorder = recorder;
+        if enabled {
+            let rows = self.recorder.load_teams().unwrap_or_else(|error| {
+                eprintln!("nvim_ade_server: cannot load stored teams: {error:#}");
+                Vec::new()
+            });
+            let max_team = self
+                .recorder
+                .load_team_meta("max_team")
+                .ok()
+                .flatten()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let max_inbox = self
+                .recorder
+                .load_team_meta("max_inbox")
+                .ok()
+                .flatten()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let (stored, expired) = self.teams.restore(
+                rows,
+                max_team,
+                max_inbox,
+                crate::team::now_ms(),
+                Some(team_ttl_ms()),
+            );
+            for id in expired {
+                self.recorder.delete_team(&id);
+            }
+            let (max_team, max_inbox) = self.teams.counters();
+            for id in stored {
+                if let Some(snapshot) = self.teams.snapshot_team(&id) {
+                    self.recorder.save_team(&id, snapshot, max_team, max_inbox);
+                }
+            }
+        }
         self
     }
 
@@ -550,6 +598,8 @@ impl Hub {
         #[cfg(unix)]
         let mut install_events =
             std::mem::replace(&mut self.install_events, mpsc::unbounded_channel().1);
+        let mut expiry = tokio::time::interval(Duration::from_secs(3600));
+        expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             #[cfg(unix)]
             let install_event = install_events.recv();
@@ -575,6 +625,10 @@ impl Hub {
                 result = self.team_results.recv() => {
                     let Some(result) = result else { return };
                     self.finish_team_result(result);
+                    self.update_busy();
+                }
+                _ = expiry.tick() => {
+                    self.expire_teams();
                     self.update_busy();
                 }
                 event = install_event => {
@@ -685,6 +739,10 @@ impl Hub {
                 self.closing = true;
                 self.closing_flag
                     .store(true, std::sync::atomic::Ordering::SeqCst);
+                // Teams must come back with their queues and in-flight marks,
+                // not with the participant exits caused by this shutdown.
+                self.persist_all_teams();
+                self.persist_paused = true;
                 let instances: Vec<(String, ProcControl, Arc<Exited>)> = self
                     .instances
                     .iter()
@@ -2386,7 +2444,7 @@ impl Hub {
     }
 
     fn update_busy(&mut self) {
-        let busy = !self.teams.is_empty()
+        let busy = self.teams.has_active()
             || self.instances.values().any(|instance| {
                 instance.relay.turns_running() > 0 || instance.relay.pending_requests() > 0
             })

@@ -26,6 +26,8 @@ pub(crate) struct StartOptions {
     pub approved_request: Option<String>,
     /// `team.spawn` announces itself to the leader (18.13).
     pub human_notice: bool,
+    /// A stored session to load instead of creating a new one.
+    pub resume: Option<String>,
 }
 
 #[derive(Debug)]
@@ -49,6 +51,15 @@ pub enum ServiceCall {
         participant: String,
         server: Value,
         model: Option<String>,
+        /// A stored worker session to `session/load` (18.15).
+        resume: Option<String>,
+    },
+    SessionLoad {
+        team: String,
+        participant: String,
+        model: Option<String>,
+        session: String,
+        server: Value,
     },
     SessionNew {
         team: String,
@@ -240,8 +251,106 @@ impl Hub {
         }
         let session = required_team_string(params, "sessionId")?;
         let token_id = required_team_string(params, "token_id")?;
-        let entry = self.teams.bind_leader(&instance, &session, &token_id)?;
-        Ok(entry)
+        match self.teams.bind_leader(&instance, &session, &token_id)? {
+            crate::team::BindOutcome::Active(entry) => Ok(entry),
+            crate::team::BindOutcome::Resume { team, entry } => {
+                self.resume_team(&team);
+                Ok(entry)
+            }
+        }
+    }
+
+    /// Start every stored participant of a resumed team (18.15).
+    fn resume_team(&mut self, team_id: &str) {
+        let Some(team) = self.teams.team(team_id) else {
+            return;
+        };
+        let names: Vec<String> = team
+            .order
+            .iter()
+            .filter(|name| *name != "leader")
+            .filter_map(|name| team.participants.get(name))
+            .filter(|participant| participant.state != crate::team::ParticipantState::Exited)
+            .map(|participant| participant.name.clone())
+            .collect();
+        let mut failures: Vec<String> = Vec::new();
+        for name in names {
+            let Some(team) = self.teams.team(team_id) else {
+                return;
+            };
+            let Some(participant) = team.participants.get(&name) else {
+                continue;
+            };
+            let template_name = participant.template.clone().unwrap_or_default();
+            if !team.config.templates.contains_key(&template_name) {
+                self.teams.worker_start_failed(
+                    team_id,
+                    &name,
+                    &format!("template {template_name} is no longer configured"),
+                );
+                failures.push(name.clone());
+                continue;
+            }
+            let resume_session = participant.session.clone();
+            let worktree = participant.worktree.clone();
+            let leader_cwd = team.cwd.clone();
+            let resume_cwd = if let Some(worktree) = &worktree {
+                if !std::path::Path::new(&worktree.cwd).is_dir() {
+                    self.teams.worker_start_failed(
+                        team_id,
+                        &name,
+                        &format!("the worktree {} is gone", worktree.cwd),
+                    );
+                    failures.push(name.clone());
+                    continue;
+                }
+                worktree.cwd.clone()
+            } else {
+                leader_cwd
+            };
+            let Some(plan) = self.teams.spawn_plan(team_id, &name) else {
+                failures.push(name.clone());
+                continue;
+            };
+            if let Some(participant) = self
+                .teams
+                .team_mut(team_id)
+                .and_then(|team| team.participants.get_mut(&name))
+            {
+                participant.starting = true;
+                participant.state = crate::team::ParticipantState::Idle;
+                participant.instance = None;
+            }
+            let spawn = SpawnRequest {
+                team: team_id.to_string(),
+                name: name.clone(),
+                template: template_name,
+                task: None,
+            };
+            let opts = StartOptions {
+                resume: resume_session,
+                ..StartOptions::default()
+            };
+            if !self.start_worker_now(&spawn, &plan, Some(resume_cwd), &opts) {
+                failures.push(name.clone());
+            }
+        }
+        let mut body = "team resumed after a service restart".to_string();
+        if !failures.is_empty() {
+            body.push_str("; not resumed: ");
+            body.push_str(&failures.join(", "));
+        }
+        let _ = self.teams.send_message(
+            team_id,
+            "human",
+            "leader",
+            Kind::Notice,
+            &body,
+            None,
+            vec![],
+        );
+        self.drain_team_events();
+        self.team_deliveries();
     }
 
     fn team_send(&mut self, params: &Value) -> Result<(Value, bool), TeamError> {
@@ -354,6 +463,9 @@ impl Hub {
     fn team_watch(&mut self, conn: u64, id: &Value, params: &Value) {
         let result = (|| -> Result<(), TeamError> {
             let team = required_team_string(params, "team")?;
+            if self.teams.is_suspended(&team) {
+                return Err(TeamError::unknown("suspended"));
+            }
             let participant = required_team_string(params, "participant")?;
             let replay = optional_bool(params, "replay")?.unwrap_or(false);
             if replay && self.gates.contains_key(&conn) {
@@ -616,7 +728,7 @@ impl Hub {
             if worker.role != Role::Worker {
                 return Err(TeamError::not_allowed("only a worker has a worktree"));
             }
-            if worker.state != crate::team::ParticipantState::Exited {
+            if worker.state != crate::team::ParticipantState::Exited && !entry.suspended {
                 return Err(TeamError::not_allowed("the worker is still running"));
             }
             let info = worker
@@ -802,6 +914,7 @@ impl Hub {
             participant: spawn.name.clone(),
             server,
             model: plan.template.model.clone(),
+            resume: opts.resume.clone(),
         };
         if !self.send_service_request(&instance, "initialize", params, call) {
             self.teams.revoke_instance_tokens(&instance);
@@ -1031,6 +1144,7 @@ impl Hub {
                 participant,
                 server,
                 model,
+                resume,
             } => {
                 if let Some(error) = message.get("error") {
                     let reason = error_message(error);
@@ -1049,6 +1163,47 @@ impl Hub {
                 else {
                     return;
                 };
+                let supports_load = message
+                    .get("result")
+                    .and_then(|result| result.get("agentCapabilities"))
+                    .and_then(|capabilities| capabilities.get("loadSession"))
+                    .and_then(Value::as_bool)
+                    == Some(true);
+                if let Some(session) = resume {
+                    if supports_load {
+                        let params = json!({
+                            "sessionId": session,
+                            "cwd": cwd,
+                            "mcpServers": [server],
+                        });
+                        let call = ServiceCall::SessionLoad {
+                            team: team.clone(),
+                            participant: participant.clone(),
+                            model,
+                            session,
+                            server: server.clone(),
+                        };
+                        if !self.send_service_request(instance, "session/load", params, call) {
+                            self.teams.worker_start_failed(
+                                &team,
+                                &participant,
+                                "agent is not accepting messages",
+                            );
+                        }
+                        self.drain_team_events();
+                        return;
+                    }
+                    // The agent cannot load: start a new session and say so.
+                    let _ = self.teams.send_message(
+                        &team,
+                        "human",
+                        "leader",
+                        Kind::Notice,
+                        &format!("worker {participant} restarted without its history"),
+                        None,
+                        vec![],
+                    );
+                }
                 let params = json!({ "cwd": cwd, "mcpServers": [server] });
                 if !self.send_service_request(
                     instance,
@@ -1067,6 +1222,56 @@ impl Hub {
                     );
                 }
                 self.drain_team_events();
+            }
+            ServiceCall::SessionLoad {
+                team,
+                participant,
+                model,
+                session,
+                server,
+            } => {
+                if let Some(error) = message.get("error") {
+                    let reason = error_message(error);
+                    let _ = self.teams.send_message(
+                        &team,
+                        "human",
+                        "leader",
+                        Kind::Notice,
+                        &format!("worker {participant} restarted without its history: {reason}"),
+                        None,
+                        vec![],
+                    );
+                    let Some(cwd) = self
+                        .instances
+                        .get(instance)
+                        .map(|handle| handle.key.cwd.clone())
+                    else {
+                        return;
+                    };
+                    let params = json!({ "cwd": cwd, "mcpServers": [server] });
+                    if !self.send_service_request(
+                        instance,
+                        "session/new",
+                        params,
+                        ServiceCall::SessionNew {
+                            team: team.clone(),
+                            participant: participant.clone(),
+                            model,
+                        },
+                    ) {
+                        self.teams.worker_start_failed(
+                            &team,
+                            &participant,
+                            "agent is not accepting messages",
+                        );
+                    }
+                    self.drain_team_events();
+                    return;
+                }
+                self.teams.worker_session_set(&team, &participant, &session);
+                self.teams.worker_started(&team, &participant);
+                self.drain_team_events();
+                self.team_deliveries();
             }
             ServiceCall::SessionNew {
                 team,
@@ -1172,6 +1377,11 @@ impl Hub {
             busy.insert(instance.clone());
         }
         let requests = self.teams.take_deliveries(&busy);
+        if !requests.is_empty() {
+            // The dequeue and the bus-turn mark must be durable before the
+            // prompt can run, or a restart would deliver it twice (18.15).
+            self.persist_all_teams();
+        }
         for request in requests {
             let crate::team::DeliveryRequest {
                 team,
@@ -1606,8 +1816,66 @@ impl Hub {
         }
     }
 
+    fn persist_team(&self, id: &str) {
+        if self.persist_paused {
+            return;
+        }
+        let Some(snapshot) = self.teams.snapshot_team(id) else {
+            return;
+        };
+        let (max_team, max_inbox) = self.teams.counters();
+        self.recorder.save_team(id, snapshot, max_team, max_inbox);
+    }
+
+    pub(crate) fn persist_all_teams(&self) {
+        if self.persist_paused {
+            return;
+        }
+        for id in self.teams.team_ids() {
+            self.persist_team(&id);
+        }
+    }
+
+    pub(crate) fn expire_teams(&mut self) {
+        let ttl = team_ttl_ms();
+        let expired = self.teams.expire_suspended(crate::team::now_ms(), ttl);
+        for id in expired {
+            self.recorder.delete_team(&id);
+        }
+        self.drain_team_events();
+        self.update_busy();
+    }
+
     pub(crate) fn drain_team_events(&mut self) {
-        for event in self.teams.drain_events() {
+        let events = self.teams.drain_events();
+        let mut saves: HashSet<String> = HashSet::new();
+        let mut deletes: HashSet<String> = HashSet::new();
+        for event in &events {
+            match event {
+                TeamEvent::Changed(id) | TeamEvent::Inbox(id, _) => {
+                    saves.insert(id.clone());
+                }
+                TeamEvent::InboxJson(item) => {
+                    if let Some(id) = item["team"].as_str() {
+                        saves.insert(id.to_string());
+                    }
+                }
+                TeamEvent::Closed(entry) => {
+                    if let Some(id) = entry["id"].as_str() {
+                        deletes.insert(id.to_string());
+                    }
+                }
+            }
+        }
+        if !self.persist_paused {
+            for id in saves {
+                self.persist_team(&id);
+            }
+            for id in deletes {
+                self.recorder.delete_team(&id);
+            }
+        }
+        for event in events {
             match event {
                 TeamEvent::Changed(id) => {
                     if let Some(entry) = self.teams.entry(&id) {
