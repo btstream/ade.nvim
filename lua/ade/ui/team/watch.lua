@@ -364,8 +364,19 @@ function Watch:watch_config()
   -- The watch is a replay of a potentially long session: page the old blocks
   -- so the first paint never lays out hundreds of turns. Scrolling to the top
   -- loads earlier blocks through the chat's existing pagination.
-  cfg.ui.render.pagination =
-    vim.tbl_extend("force", cfg.ui.render.pagination or {}, { enabled = true, page_blocks = 24 })
+  cfg.ui.render.pagination = vim.tbl_extend("force", cfg.ui.render.pagination or {}, {
+    enabled = true,
+    page_blocks = 24,
+    -- The display session marks each turn with a synthetic `watch-turn-N`
+    -- system block; without these hooks turn alignment is never active.
+    turn_start = function(block)
+      return type(block.id) == "string" and block.id:match("^watch%-turn%-%d+$") ~= nil
+    end,
+    turn_name = function(block)
+      local number = type(block.id) == "string" and block.id:match("^watch%-turn%-(%d+)$")
+      return number and ("回合 " .. number) or nil
+    end,
+  })
   return cfg
 end
 
@@ -667,6 +678,48 @@ function Watch:toggle_at_cursor()
   end
 end
 
+---Load older pages until `target_id` is inside the page, then let the chat's
+---page_target place the cursor. A very long turn can span several pages.
+---@param target_id string
+---@param attempts integer|nil
+function Watch:_load_turn_page(target_id, attempts)
+  local chat = self.chat
+  if not (chat and chat.page and chat.session) then
+    return
+  end
+  if chat.commit_job or chat.layout_job then
+    vim.defer_fn(function()
+      if self.chat then
+        self:_load_turn_page(target_id, attempts)
+      end
+    end, 50)
+    return
+  end
+  local index
+  for position, block in ipairs(chat.session.blocks) do
+    if block.id == target_id then
+      index = position
+      break
+    end
+  end
+  if not index then
+    return
+  end
+  if index >= chat.page.first then
+    return
+  end
+  if chat.page.first <= 1 or (attempts or 0) >= 100 then
+    return
+  end
+  if chat:load_page(-1, target_id) then
+    vim.defer_fn(function()
+      if self.chat then
+        self:_load_turn_page(target_id, (attempts or 0) + 1)
+      end
+    end, 50)
+  end
+end
+
 ---@param direction integer
 function Watch:jump_turn(direction)
   local win = self.win
@@ -702,21 +755,26 @@ function Watch:jump_turn(direction)
   -- the cursor lands on that turn after the asynchronous page render; a busy
   -- commit queue defers the request instead of silently ignoring the key.
   if direction < 0 and self.chat and self.chat.page then
-    if self.chat.commit_job then
-      vim.defer_fn(function()
-        if self.chat then
-          self:jump_turn(direction)
-        end
-      end, 50)
-      return
-    end
     local blocks = self.chat.session and self.chat.session.blocks or {}
+    local function is_turn(block)
+      return type(block.id) == "string" and block.id:match("^watch%-turn%-%d+$") ~= nil
+    end
     local index = (self.chat.page.first or 1) - 1
-    while index >= 1 and not (type(blocks[index].id) == "string" and blocks[index].id:match("^watch%-turn%-%d+$")) do
+    if self.chat.page.continuation then
+      -- The page starts inside the current turn: skip that turn's own heading
+      -- and target the previous turn.
+      local heading = self.chat.page.first or 1
+      while heading >= 1 and not is_turn(blocks[heading]) do
+        heading = heading - 1
+      end
+      index = heading - 1
+    end
+    while index >= 1 and not is_turn(blocks[index]) do
       index = index - 1
     end
-    if index >= 1 and self.chat:load_page(-1, blocks[index].id) then
+    if index >= 1 then
       self.chat.follow = false
+      self:_load_turn_page(blocks[index].id, 0)
     end
   end
 end

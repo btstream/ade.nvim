@@ -2939,6 +2939,7 @@ mod tests {
         assert_eq!(0, outbox.queued_bytes());
         // A second send must not log again (close_logged is sticky).
         assert!(!outbox.send(&json!({"a": 2})));
+        assert!(outbox.close_logged.load(Ordering::Acquire));
     }
 
     #[tokio::test]

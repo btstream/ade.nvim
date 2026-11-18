@@ -136,10 +136,24 @@ fn rotate(logger: &mut Logger) -> io::Result<()> {
     if path.exists() {
         std::fs::rename(&path, &rotating)?;
     }
-    let _ = std::fs::remove_file(&rotated);
-    if rotating.exists() && std::fs::rename(&rotating, &rotated).is_err() {
-        let _ = std::fs::rename(&rotating, &path);
-        return Err(io::Error::other("cannot rotate the service log"));
+    if rotating.exists() {
+        // Replace .1 only after the new generation is staged. Unix rename
+        // overwrites; on platforms where it does not, keep a temporary old
+        // name and restore it if the replacement fails.
+        if std::fs::rename(&rotating, &rotated).is_err() {
+            let backup = logger.dir.join("nvim_ade_server.log.old");
+            let _ = std::fs::remove_file(&backup);
+            if std::fs::rename(&rotated, &backup).is_err() {
+                let _ = std::fs::rename(&rotating, &path);
+                return Err(io::Error::other("cannot rotate the service log"));
+            }
+            if std::fs::rename(&rotating, &rotated).is_err() {
+                let _ = std::fs::rename(&backup, &rotated);
+                let _ = std::fs::rename(&rotating, &path);
+                return Err(io::Error::other("cannot rotate the service log"));
+            }
+            let _ = std::fs::remove_file(&backup);
+        }
     }
     match open(&logger.dir) {
         Ok((file, written)) => {
@@ -263,6 +277,40 @@ mod tests {
             "untouched",
             std::fs::read_to_string(&target).expect("target")
         );
+        reset_for_test();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_rotation_keeps_the_old_generation() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "ade-log-rotate-fail-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let rotated = dir.join(ROTATED_NAME);
+        std::fs::write(&rotated, "old generation").expect("old");
+        init(&dir, 1024).expect("init");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        for _ in 0..100 {
+            log(format_args!(
+                "nvim_ade_server: rotation failure marker padding padding"
+            ));
+        }
+        assert_eq!(
+            "old generation",
+            std::fs::read_to_string(&rotated).expect("old")
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
         reset_for_test();
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1000,6 +1000,17 @@ return function(t)
           content = { type = "text", text = "answer " .. turn },
         }
       end
+      -- One turn with more blocks than a page, plus an odd tail: the page
+      -- must start on a heading or a continuation line, not mid-turn.
+      for tool = 1, 60 do
+        replay[#replay + 1] = {
+          sessionUpdate = "tool_call",
+          toolCallId = "tail-" .. tool,
+          title = "tail tool " .. tool,
+          status = "completed",
+          rawInput = {},
+        }
+      end
       local service, dir = start_service(t, "watch-pages", {
         team_watch = { instance = "inst-w", sessionId = "sess-w", replay = replay },
       })
@@ -1021,11 +1032,24 @@ return function(t)
         return watch.chat and watch.chat.page and not watch.chat.commit_job
       end, 5000, "the paged watch")
       local page = watch.chat.page
+      t.truthy(watch.chat.config.ui.render.pagination.turn_start, "watch wires turn alignment")
       t.truthy(page.first > 1, "the watch pages old turns")
       local before_first = page.first
       local old_first = watch.chat.session.blocks[page.first]
-      t.match("^watch%-turn%-", old_first.id)
-      local previous = tonumber(old_first.id:match("(%d+)$"))
+      -- The page starts on a heading, or says it continues the turn.
+      local page_ok = old_first.id:match("^watch%-turn%-") ~= nil
+      if page.continuation then
+        local buffer_text = table.concat(vim.api.nvim_buf_get_lines(watch.buf, 0, -1, false), "\n")
+        page_ok = page_ok or buffer_text:find("（" .. page.continuation .. "）", 1, true) ~= nil
+      end
+      t.truthy(page_ok, "a watch page starts on a turn heading or a continuation line: " .. tostring(old_first.id))
+      local current_turn
+      if page.continuation then
+        current_turn = tonumber(page.continuation:match("(%d+)"))
+      else
+        current_turn = tonumber(old_first.id:match("(%d+)$"))
+      end
+      local previous = current_turn
       vim.api.nvim_set_current_win(watch.win)
       vim.api.nvim_win_set_cursor(watch.win, { 1, 0 })
       watch:jump_turn(-1)
