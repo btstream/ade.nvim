@@ -822,7 +822,9 @@ return function(t)
         end
         return false
       end, 5000, "the live watch update")
-      t.truthy(renders >= 2, "the watch view must be re-rendered for live updates")
+      wait(function()
+        return renders >= 2
+      end, 5000, "the watch view to render the live update")
       local ui = state().view.team_ui
       ui:watch(m.watching.session, "t1/w1")
       t.truthy(ui.watch_buf, "the watch view is open")
@@ -834,6 +836,108 @@ return function(t)
       end, 5000, "the first watch paint")
       t.match("replay line", text())
       t.match("live line", text())
+      m:unwatch()
+    end)
+
+    t.it("batches a 2000-frame replay into one render", function()
+      local replay = {}
+      for index = 1, 2000 do
+        replay[index] = {
+          sessionUpdate = "agent_message_chunk",
+          content = { type = "text", text = "frame " .. index .. "\n" },
+        }
+      end
+      local service, dir = start_service(t, "watch-batch", {
+        team_watch = { instance = "inst-w", sessionId = "sess-w", replay = replay },
+      })
+      setup(t, "watch-batch", service, dir)
+      controller.connect()
+      wait_ready()
+      local m = team()
+      local renders = 0
+      local original_watch = m.on_watch
+      m.on_watch = function(session, title)
+        renders = renders + 1
+        return original_watch and original_watch(session, title)
+      end
+      t.cleanup(function()
+        m.on_watch = original_watch
+      end)
+      local ok = nil
+      local started = vim.uv.hrtime()
+      m:watch("t1", "w1", true, function(result)
+        ok = result
+      end)
+      wait(function()
+        return ok == true and m.watching and m.watching.session
+      end, 10000, "the batched replay")
+      local elapsed = (vim.uv.hrtime() - started) / 1e6
+      t.eq(1, renders, "a replay batch renders once")
+      t.truthy(elapsed < 5000, string.format("the replay took %.0f ms", elapsed))
+      local session = m.watching.session
+      local text = {}
+      for _, block in ipairs(session.blocks or {}) do
+        text[#text + 1] = block.text or ""
+      end
+      t.match("frame 2000", table.concat(text, "\n"))
+      -- Live frames are coalesced: a burst may render more than once, but not
+      -- once per frame.
+      for index = 1, 100 do
+        service:watch_update("inst-w", "sess-w", {
+          sessionUpdate = "agent_message_chunk",
+          content = { type = "text", text = "live " .. index .. "\n" },
+        })
+      end
+      wait(function()
+        local joined = {}
+        for _, block in ipairs(session.blocks or {}) do
+          joined[#joined + 1] = block.text or ""
+        end
+        return table.concat(joined, "\n"):find("live 100", 1, true) ~= nil
+      end, 5000, "the live burst")
+      vim.wait(120)
+      t.truthy(renders <= 4, "live frames are coalesced, got " .. tostring(renders) .. " renders")
+      m:unwatch()
+    end)
+
+    t.it("drops frames from a watch superseded during its replay", function()
+      local service, dir = start_service(t, "watch-stale", {
+        team_watch = {
+          instance = "inst-w",
+          sessionId = "sess-w",
+          delays = { 200, 10 },
+          replay = { { sessionUpdate = "agent_message_chunk", content = { type = "text", text = "STALE A" } } },
+        },
+      })
+      setup(t, "watch-stale", service, dir)
+      controller.connect()
+      wait_ready()
+      local m = team()
+      local ui = state().view.team_ui
+      ui.watcher:open("t1", "w1")
+      vim.wait(20)
+      service.team_watch.replay = {
+        { sessionUpdate = "agent_message_chunk", content = { type = "text", text = "FRESH B" } },
+      }
+      ui.watcher:open("t1", "w2")
+      wait(function()
+        if not (m.watching and m.watching.participant == "w2" and m.watching.session) then
+          return false
+        end
+        for _, block in ipairs(m.watching.session.blocks or {}) do
+          if (block.text or ""):find("FRESH B", 1, true) then
+            return true
+          end
+        end
+        return false
+      end, 5000, "the new watch")
+      local text = {}
+      for _, block in ipairs(m.watching.session.blocks or {}) do
+        text[#text + 1] = block.text or ""
+      end
+      local joined = table.concat(text, "\n")
+      t.match("FRESH B", joined)
+      t.falsy(joined:find("STALE A", 1, true), "stale frames must be dropped")
       m:unwatch()
     end)
 

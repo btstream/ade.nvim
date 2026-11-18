@@ -16,6 +16,7 @@ local M = {}
 local SOCKET_NAME = "nvim_ade_server.sock"
 local TOKEN_NAME = "nvim_ade_server.token"
 local LOCK_NAME = "nvim_ade_server.lock"
+local LOG_NAME = "nvim_ade_server.log"
 
 ---@return boolean
 function M.is_windows()
@@ -65,7 +66,7 @@ function M.dir()
 end
 
 ---Everything the client needs to reach the service.
----@return {dir: string, socket: string, token: string, lock: string, pipe: boolean}
+---@return {dir: string, socket: string, token: string, lock: string, log: string, pipe: boolean}
 function M.paths()
   local dir = M.dir()
   local pipe = M.is_windows()
@@ -74,6 +75,7 @@ function M.paths()
     socket = pipe and M.pipe_name() or (dir .. "/" .. SOCKET_NAME),
     token = dir .. "/" .. TOKEN_NAME,
     lock = dir .. "/" .. LOCK_NAME,
+    log = dir .. "/" .. LOG_NAME,
     pipe = pipe,
   }
 end

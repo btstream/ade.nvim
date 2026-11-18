@@ -34,6 +34,20 @@ return function(t)
       s:append_text("agent", "only")
       t.eq("only", s.blocks[1].text)
     end)
+
+    t.it("tracks streamed bytes without rescanning every chunk", function()
+      local s = state.new("s", "/tmp")
+      local block = s:append_text("agent", string.rep("x", 100))
+      for _ = 1, 1000 do
+        s:append_text("agent", string.rep("y", 100))
+      end
+      t.eq(100 * 1001, block._text_bytes)
+      t.eq(100 * 1001, #block.text)
+      -- Reading materialises the buffer; later appends must keep counting.
+      t.eq(100, #block.text:sub(1, 100))
+      s:append_text("agent", "z")
+      t.eq(100 * 1001 + 1, block._text_bytes)
+    end)
   end)
 
   t.describe("streaming markdown rendering", function()
