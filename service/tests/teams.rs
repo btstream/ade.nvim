@@ -3753,6 +3753,59 @@ fn team_close_drops_a_prompt_held_for_the_leader() {
     assert!(dropped, "the held prompt is rejected by close");
 }
 
+#[test]
+fn team_close_after_the_leader_instance_is_gone() {
+    let mut harness = Harness::new("team-close-leaderless", json!({}), None);
+    let stopped = harness
+        .client
+        .request(120, "agent.stop", json!({"instance": harness.instance}));
+    assert!(stopped["result"].is_object(), "{stopped}");
+    wait_for(
+        || (harness.team()["state"] == "leaderless").then_some(()),
+        "the leaderless team",
+    );
+    let closed = harness
+        .client
+        .request(121, "team.close", json!({"team": harness.team}));
+    assert!(closed["result"].is_object(), "{closed}");
+    assert_eq!(harness.team(), Value::Null, "the team is gone");
+}
+
+#[test]
+fn team_close_after_a_bus_prompt_finished_does_not_cancel() {
+    let mut harness = Harness::new("team-close-finished", json!({}), None);
+    harness.send("leader", "task", "quick");
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .any(|event| {
+                    event["event"] == "prompt"
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("quick"))
+                })
+                .then_some(())
+        },
+        "the leader bus prompt",
+    );
+    harness.wait_participant("leader", |entry| {
+        entry["state"] == "idle" && entry["turns"]["total"].as_u64().unwrap_or(0) >= 1
+    });
+    harness
+        .client
+        .request(122, "team.close", json!({"team": harness.team}));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !harness
+            .events()
+            .iter()
+            .any(|event| event["event"] == "cancel"),
+        "a finished prompt must not be cancelled"
+    );
+}
+
 fn workflow_config(extra: Value) -> Value {
     let mut base = json!({
         "workflows": {

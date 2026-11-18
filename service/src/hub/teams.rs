@@ -742,6 +742,9 @@ impl Hub {
                 }
             }
             self.cancel_held_session(&instance, &session);
+            // A re-created team may bind the same leader session; its next bus
+            // turn must be able to hold and cancel afresh.
+            self.held_timed_out.remove(&(instance, session));
         }
         self.interrupt_queue.retain(|(id, _), _| id != &team);
         self.interrupt_generation.retain(|(id, _), _| id != &team);
@@ -2317,8 +2320,14 @@ impl Hub {
                 seq,
             } => {
                 if !self.teams.prompt_is_current(&team, &participant, seq) {
-                    // A forced interrupt deadline already ended this prompt;
-                    // its late completion must not end the next turn.
+                    // A forced interrupt deadline already ended this prompt,
+                    // or the team closed while it was running: its late
+                    // completion must not end the next turn. Prompts held
+                    // behind it must not wait forever, unless a newer bus
+                    // turn for this session is already running.
+                    if !self.bus_prompt_active(instance, &session) {
+                        self.release_held_prompts(instance, &session, false);
+                    }
                     return;
                 }
                 let (success, error) = turn_outcome(message);

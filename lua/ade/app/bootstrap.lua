@@ -472,7 +472,7 @@ function M.build(ctx, opts, action)
     on_closed = function(team_id)
       vim.schedule(function()
         if S.view.team_ui then
-          S.view.team_ui:team_closed(team_id)
+          pcall(S.view.team_ui.team_closed, S.view.team_ui, team_id)
         end
         if S.view.choices then
           S.view.choices:refresh()

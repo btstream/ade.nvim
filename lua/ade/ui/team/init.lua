@@ -949,6 +949,7 @@ function Dashboard:mount_leader()
     original_tab = original_tab,
     panel = panel,
   }
+  self.leader_team = self.selected_id
   self.leader_unmounting = false
   local group = vim.api.nvim_create_augroup("AdeTeamLeaderMount" .. tostring(chat_win), { clear = true })
   self.leader_mounted.group = group
@@ -976,6 +977,7 @@ function Dashboard:unmount_leader()
     return
   end
   self.leader_mounted = nil
+  self.leader_team = nil
   self.leader_unmounting = true
   if mounted.group then
     pcall(vim.api.nvim_del_augroup_by_id, mounted.group)
@@ -1179,21 +1181,24 @@ function Dashboard:team_closed(team_id)
   if not self:is_open() then
     return
   end
-  if self.selected_id and self.selected_id ~= team_id and self:team_by_id(self.selected_id) then
-    -- The panel is showing another team: repaint without the closed one.
-    self:refresh()
-    return
-  end
   local rows = self.team:list_rows()
   if #rows == 0 then
-    -- This was the only team: close the tab/float and put the leader chat
-    -- back where it was.
+    -- This was the only team: close the tab/float (closing puts the chat back).
     self:close()
+    return
+  end
+  -- The mounted chat belongs to the closed team's leader: put it back before
+  -- the panel shows another team (a refresh triggered by `changed` may already
+  -- have moved `selected_id`).
+  if self.leader_mounted and self.leader_team == team_id then
+    self:unmount_leader()
+  end
+  if self.selected_id and self.selected_id ~= team_id and self:team_by_id(self.selected_id) then
+    -- The panel is already showing another team; `team.changed` repaints it.
     return
   end
   self.index = math.max(1, math.min(self.index or 1, #rows))
   self.selected_id = rows[self.index].id
-  self:refresh()
 end
 
 function Dashboard:close(quiet)
@@ -1315,27 +1320,21 @@ function M.new(opts)
       return self._impl:close(quiet)
     end
   end
-  ---Close what belongs to a team that disappeared. The facade owns the shared
-  ---watch view, so this works even when the panel was never opened.
+  ---Close what belongs to a team that disappeared. The facade owns the watch
+  ---view even when the panel was never opened; an existing panel gets the
+  ---close first so it can return the watch column to the layout.
   ---@param team_id string
   function proxy:team_closed(team_id)
     if type(team_id) ~= "string" then
       return
     end
+    if self._impl and self._impl.team_closed then
+      return self._impl:team_closed(team_id)
+    end
     if watcher:current_team() == team_id then
       watcher:close()
       rawset(self, "watch_win", watcher.win)
       rawset(self, "watch_buf", watcher.buf)
-    end
-    if self._impl then
-      if self._impl.team_closed then
-        return self._impl:team_closed(team_id)
-      end
-      -- The narrow float lists every team in one window; it closes itself
-      -- when the last team is gone.
-      if self._impl.is_open and self._impl:is_open() then
-        return self._impl:refresh()
-      end
     end
   end
   function proxy:is_open()

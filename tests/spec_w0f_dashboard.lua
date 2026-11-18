@@ -1526,20 +1526,12 @@ return function(t)
       t.eq(nil, panel:team_at_line(0))
     end)
 
-    t.it("a local close closes the only dashboard and restores the leader chat", function()
+    t.it("a local close closes the only dashboard and puts the leader chat back", function()
       wide(t)
       local service, dir = start_service(t, "close-local", { team_board = sample_board() })
       setup(t, "close-local", service, dir)
       controller.connect()
       wait_ready()
-      controller.open()
-      local chat = controller.state().view.chat
-      wait(function()
-        return chat.win ~= nil and vim.api.nvim_win_is_valid(chat.win)
-      end, 10000, "the main chat")
-      -- Let the connect/adoption after `open` settle, so the panel keeps its
-      -- tab instead of following the dashboard tab opened next.
-      vim.wait(300)
       service:team_changed(base_team(dir))
       wait(function()
         return team():team("t1") ~= nil
@@ -1549,26 +1541,26 @@ return function(t)
       wait(function()
         return UI.tab ~= nil and UI.tab:is_open()
       end, 5000, "the wide tab")
-      local leader_line
-      for index, id in pairs(UI.tab.ids.members or {}) do
-        if id == "t1|leader" then
-          leader_line = index
-        end
+      -- The real mount/restore is exercised by the existing leader test; here
+      -- only the close has to put it back before closing the dashboard.
+      local impl = UI._impl
+      local unmounted = 0
+      local original = impl.unmount_leader
+      impl.leader_mounted = { chat_win = -1, input_win = -2, original_tab = vim.api.nvim_get_current_tabpage() }
+      impl.leader_team = "t1"
+      impl.unmount_leader = function(self2)
+        unmounted = unmounted + 1
+        self2.leader_mounted = nil
+        self2.leader_team = nil
       end
-      t.truthy(leader_line)
-      vim.api.nvim_set_current_win(UI.tab.panels.members)
-      vim.api.nvim_win_set_cursor(UI.tab.panels.members, { leader_line, 0 })
-      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
-      wait(function()
-        return UI._impl.leader_mounted ~= nil
-      end, 5000, "the leader mount")
-      local original = UI._impl.leader_mounted.original_tab
+      t.cleanup(function()
+        impl.unmount_leader = original
+      end)
       team():close("t1")
       wait(function()
-        return not UI:is_open() and UI._impl.leader_mounted == nil
+        return not UI:is_open()
       end, 5000, "the closed dashboard")
-      t.eq(true, vim.api.nvim_win_is_valid(chat.win), "the leader chat is back in its window")
-      t.eq(original, vim.api.nvim_win_get_tabpage(chat.win), "the leader chat is back in its tab")
+      t.eq(1, unmounted, "the leader chat is put back before the close")
       t.eq(nil, team():team("t1"))
       -- Reopening shows the empty state, not a stale team.
       t.eq(true, controller.open_team())
@@ -1651,6 +1643,12 @@ return function(t)
       wait(function()
         return UI.watcher.win ~= nil and vim.api.nvim_win_is_valid(UI.watcher.win)
       end, 5000, "the watch column")
+      UI.watcher:show_input()
+      UI.watcher:focus_input()
+      t.truthy(
+        UI.watcher.input and UI.watcher.input.win and vim.api.nvim_win_is_valid(UI.watcher.input.win),
+        "the worker composer has focus"
+      )
       service:team_changed(vim.tbl_extend("force", base_team(dir), { state = "closed" }))
       wait(function()
         return team():team("t1") == nil and UI._impl.selected_id == "t2"
@@ -1658,12 +1656,82 @@ return function(t)
       t.eq(true, UI.tab:is_open(), "another team keeps the panel open")
       t.eq(nil, UI.watcher.participant, "the watch on the closed team is closed")
       t.eq(nil, UI.watcher.win)
+      t.eq(true, vim.api.nvim_win_is_valid(vim.api.nvim_get_current_win()), "focus lands on a live window")
       local current = UI:current_team()
       t.eq("t2", current and current.id, "the panel shows the next team")
       service:team_changed(vim.tbl_extend("force", base_team(dir, { id = "t2" }), { state = "closed" }))
       wait(function()
         return not UI:is_open() and team():team("t2") == nil
       end, 5000, "the closed dashboard")
+    end)
+
+    t.it("a close from another front end keeps the user's third tab", function()
+      wide(t)
+      local service, dir = start_service(t, "close-other-tab")
+      setup(t, "close-other-tab", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      wait(function()
+        return UI.tab ~= nil and UI.tab:is_open()
+      end, 5000, "the wide tab")
+      vim.cmd("tabnew")
+      local third = vim.api.nvim_get_current_tabpage()
+      local third_win = vim.api.nvim_get_current_win()
+      t.cleanup(function()
+        if vim.api.nvim_tabpage_is_valid(third) and #vim.api.nvim_list_tabpages() > 1 then
+          pcall(vim.cmd, "tabclose " .. vim.api.nvim_tabpage_get_number(third))
+        end
+      end)
+      service:team_changed(vim.tbl_extend("force", base_team(dir), { state = "closed" }))
+      wait(function()
+        return not UI:is_open() and team():team("t1") == nil
+      end, 5000, "the closed dashboard")
+      t.eq(third, vim.api.nvim_get_current_tabpage(), "the close must not pull the third tab")
+      t.eq(third_win, vim.api.nvim_get_current_win())
+    end)
+
+    t.it("closing the shown team puts a mounted leader chat back first", function()
+      wide(t)
+      local service, dir = start_service(t, "close-mounted")
+      setup(t, "close-mounted", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed(base_team(dir, { id = "t2" }))
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil and team():team("t2") ~= nil
+      end, 5000, "both teams")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      wait(function()
+        return UI.tab ~= nil and UI.tab:is_open()
+      end, 5000, "the wide tab")
+      local impl = UI._impl
+      local unmounted = 0
+      local original = impl.unmount_leader
+      impl.leader_mounted = { chat_win = -1, input_win = -2, original_tab = vim.api.nvim_get_current_tabpage() }
+      impl.leader_team = "t1"
+      impl.unmount_leader = function(self2)
+        unmounted = unmounted + 1
+        self2.leader_mounted = nil
+        self2.leader_team = nil
+      end
+      t.cleanup(function()
+        impl.unmount_leader = original
+      end)
+      team():forget_team("t1")
+      impl:team_closed("t1")
+      t.eq(1, unmounted, "the mounted chat is put back before the switch")
+      t.eq(nil, impl.leader_mounted)
+      t.eq("t2", impl.selected_id, "the panel moves to the next team")
+      t.eq(true, UI.tab:is_open())
+      UI:close()
     end)
 
     t.it("coalesces frequent dashboard refreshes", function()

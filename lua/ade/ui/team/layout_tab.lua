@@ -484,6 +484,9 @@ function Tab:close()
   local original = self.original_tab
   local tab = self.tab
   local buffers = self.buffers
+  -- A close caused by another front end may arrive while the person works in
+  -- a third tab; only take the focus back when the dashboard was showing.
+  local was_current = tab ~= nil and vim.api.nvim_tabpage_is_valid(tab) and vim.api.nvim_get_current_tabpage() == tab
   self.closing = true
   self.tab, self.original_tab = nil, nil
   self.panels, self.buffers, self.meta, self.ids, self.marks = {}, {}, {}, {}, {}
@@ -531,7 +534,7 @@ function Tab:close()
       end
     end
   end
-  if original and vim.api.nvim_tabpage_is_valid(original) then
+  if was_current and original and vim.api.nvim_tabpage_is_valid(original) then
     pcall(vim.api.nvim_set_current_tabpage, original)
   end
   for _, buf in pairs(buffers) do

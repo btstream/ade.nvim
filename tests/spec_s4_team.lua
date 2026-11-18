@@ -988,6 +988,33 @@ return function(t)
       m:unwatch()
     end)
 
+    t.it("closes during an in-flight replay and ignores the late result", function()
+      local service, dir = start_service(t, "watch-close", {
+        team_watch = {
+          instance = "inst-w",
+          sessionId = "sess-w",
+          delays = { 200 },
+          replay = { { sessionUpdate = "agent_message_chunk", content = { type = "text", text = "LATE" } } },
+        },
+      })
+      setup(t, "watch-close", service, dir)
+      controller.connect()
+      wait_ready()
+      local m = team()
+      local ui = state().view.team_ui
+      ui.watcher:open("t1", "w1")
+      wait(function()
+        return ui.watcher.watch_inflight == true
+      end, 5000, "the watch replay")
+      ui.watcher:close()
+      t.eq(nil, ui.watcher.participant)
+      t.eq(nil, ui.watcher.win)
+      vim.wait(300)
+      t.eq(false, ui.watcher.watch_inflight, "the late result clears the request")
+      t.eq(nil, ui.watcher.participant, "the late result must not reopen the watch")
+      t.eq(nil, m.watching)
+    end)
+
     t.it("pages a long watch and jumps to the previous turn across pages", function()
       local replay = {}
       for turn = 1, 40 do
