@@ -378,6 +378,27 @@ function M.close_team()
   end
 end
 
+---Show the pending choices, or answer one participant's question
+---(`:Ade team answer [name]`, draft 8).
+---@param name string|nil
+function M.answer_team(name)
+  if not S.view.choices then
+    return
+  end
+  if name and name ~= "" then
+    local cwd = S.config and S.config.cwd or vim.fn.getcwd()
+    for _, row in ipairs(S.view.team and S.view.team:list_rows() or {}) do
+      if row.cwd == cwd and row.state ~= "closed" then
+        S.view.choices:answer_participant(row.id, name)
+        return
+      end
+    end
+    S.view.choices:notify("no team for this cwd", vim.log.levels.WARN)
+    return
+  end
+  S.view.choices:show_pending(nil)
+end
+
 ---Open the named workflows window (`:Ade workflows`, 19.5).
 ---@return boolean
 function M.workflows()

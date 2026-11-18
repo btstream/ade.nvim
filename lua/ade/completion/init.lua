@@ -53,6 +53,7 @@ end
 function M.available(buf)
   return vim.api.nvim_buf_is_valid(buf)
     and vim.bo[buf].filetype == "ade_input"
+    and not vim.b[buf].ade_choice
     and vim.bo[buf].modifiable
     and bindings[buf] ~= nil
 end

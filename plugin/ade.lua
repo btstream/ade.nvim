@@ -44,7 +44,7 @@ local SUBCOMMANDS = {
 local SERVICE_SUBCOMMANDS = { "install", "status", "start", "stop", "agents", "kill" }
 
 ---Subcommands of `:Ade team`.
-local TEAM_SUBCOMMANDS = { "start", "close" }
+local TEAM_SUBCOMMANDS = { "start", "close", "answer" }
 
 ---Workflow names known from the configuration and the last service listing.
 ---@return string[]
@@ -177,6 +177,8 @@ local function setup()
           ade.start_team(argument ~= "" and argument or nil)
         elseif action == "close" then
           ade.close_team()
+        elseif action == "answer" then
+          ade.answer_team(argument ~= "" and argument or nil)
         else
           vim.notify("ade.nvim: unknown team command " .. action, vim.log.levels.WARN)
         end

@@ -337,6 +337,16 @@ function Input:cursor_position()
     local p = vim.api.nvim_win_get_cursor(self.win)
     return { p[1] - 1, p[2] }
   end
+  -- The choice component borrows the window; an attachment must not land at
+  -- the top of the draft when the composer comes back. Append to its end.
+  if self.win and vim.api.nvim_win_is_valid(self.win) then
+    local shown = vim.api.nvim_win_get_buf(self.win)
+    if vim.b[shown].ade_choice and self.buf and vim.api.nvim_buf_is_valid(self.buf) then
+      local lines = vim.api.nvim_buf_get_lines(self.buf, 0, -1, false)
+      local last = math.max(0, #lines - 1)
+      return { last, #(lines[#lines] or "") }
+    end
+  end
   return { 0, 0 }
 end
 

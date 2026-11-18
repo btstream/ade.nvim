@@ -9,15 +9,18 @@ local Panel = {}
 Panel.__index = Panel
 
 ---@param opts {config: fun(): table, notify: fun(message: string, level: integer|nil),
----  on_windows_ready: fun(chat: table, input: table)|nil}
+---  on_windows_ready: fun(chat: table, input: table)|nil,
+---  on_visibility: fun(visible: boolean)|nil}
 function Panel.new(opts)
   return setmetatable({
     config = opts.config,
     notify = opts.notify,
     on_windows_ready = opts.on_windows_ready,
+    on_visibility = opts.on_visibility,
     chat = nil,
     input = nil,
     requested = false,
+    showing = false,
     augroup = nil,
   }, Panel)
 end
@@ -94,13 +97,27 @@ end
 ---@return boolean ok
 function Panel:show()
   self.requested = true
-  local ok = self:ensure()
-  local cfg = self.config()
-  if ok and cfg.layout.focus_input_on_open and self.input and self.input:is_visible() then
-    vim.api.nvim_set_current_win(self.input.win)
-    vim.cmd("startinsert")
+  self.showing = true
+  local ok, result = xpcall(function()
+    local ready = self:ensure()
+    local cfg = self.config()
+    if ready and cfg.layout.focus_input_on_open and self.input and self.input:is_visible() then
+      local buf = vim.api.nvim_win_get_buf(self.input.win)
+      if not vim.b[buf].ade_choice then
+        vim.api.nvim_set_current_win(self.input.win)
+        vim.cmd("startinsert")
+      end
+    end
+    if self.on_visibility then
+      pcall(self.on_visibility, true)
+    end
+    return ready
+  end, debug.traceback)
+  self.showing = false
+  if not ok then
+    error(result, 0)
   end
-  return ok
+  return result
 end
 
 ---Hide the panel without stopping the session.
@@ -134,6 +151,9 @@ function Panel:hide()
     pcall(vim.api.nvim_set_current_win, target)
   end
   layout.clear_saved_focus()
+  if self.on_visibility then
+    pcall(self.on_visibility, false)
+  end
 end
 
 ---@param which "input"|"chat"

@@ -149,6 +149,8 @@ require("tests.spec_s3_policy")(t)
 require("tests.spec_s4_team")(t)
 require("tests.spec_w0e_team")(t)
 require("tests.spec_w0f_dashboard")(t)
+require("tests.spec_choice")(t)
+require("tests.spec_choice_bootstrap")(t)
 require("tests.spec_s1b_tunnel")(t)
 
 t.run()

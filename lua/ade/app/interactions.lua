@@ -171,6 +171,16 @@ function Interactions:show(id)
   end
 end
 
+---Forget the shown marker without settling the request. The inline choice
+---component calls this when its window disappears, so `show_next` can present
+---the request again (in the component or the fallback picker).
+---@param id string|nil
+function Interactions:unshow(id)
+  if id == nil or self.shown == id then
+    self.shown = nil
+  end
+end
+
 ---Record a settled interaction, evicting the oldest beyond the cap.
 ---@param interaction AdeInteraction
 function Interactions:_retire(interaction)

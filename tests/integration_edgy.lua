@@ -185,6 +185,38 @@ check("idle transcript follows edgy width changes without a session update", fun
   end, 2000, "edgy width restore")
 end)
 
+-- The inline choice component borrows the composer without leaving the
+-- edgebar or changing the managed size.
+check("the choice component keeps the composer in the edgebar", function()
+  local Choice = require("ade.ui.choice")
+  local original = vim.api.nvim_win_get_buf(st.input.win)
+  local width = vim.api.nvim_win_get_width(st.input.win)
+  local view = Choice.new({ notify = function() end })
+  assert(
+    view:show({
+      title = "choice",
+      questions = { { header = "Q", question = "pick", options = { { label = "A" }, { label = "B" } } } },
+      on_cancel = function() end,
+    }, { win = st.input.win, external = true }),
+    "the component did not mount"
+  )
+  local buf = vim.api.nvim_win_get_buf(st.input.win)
+  assert(vim.bo[buf].filetype == "ade_input", "edgy needs the ade_input filetype")
+  assert(vim.b[buf].ade_choice == true, "the composer marker is missing")
+  assert(vim.api.nvim_win_get_width(st.input.win) == width, "edgy's size changed")
+  require("edgy.layout").update()
+  vim.wait(100)
+  assert(vim.api.nvim_win_is_valid(st.input.win), "the composer left the edgebar")
+  local shown_width = vim.api.nvim_win_get_width(st.input.win)
+  view:close()
+  assert(vim.api.nvim_win_get_buf(st.input.win) == original, "the draft buffer was not restored")
+  vim.wait(100)
+  assert(
+    vim.api.nvim_win_get_width(st.input.win) == shown_width,
+    "the width changed after close: " .. vim.api.nvim_win_get_width(st.input.win) .. " vs " .. shown_width
+  )
+end)
+
 -- Closing only the composer must not be re-created by ade.
 vim.api.nvim_win_close(st.input.win, true)
 vim.wait(200)

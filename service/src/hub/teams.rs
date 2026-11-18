@@ -339,8 +339,9 @@ impl Hub {
             .ok_or_else(|| TeamError::invalid("config is required"))?;
         self.teams.configure(&cwd, config)?;
         if let Some((team, instance, session)) = self.teams.config_resume(&cwd) {
-            if self.instances.contains_key(&instance) {
-                self.teams.start_resume(&team, &instance, &session);
+            if let Some(handle) = self.instances.get(&instance) {
+                let agent = handle.key.agent.clone();
+                self.teams.start_resume(&team, &instance, &session, &agent);
                 self.resume_team(&team);
             } else {
                 // The instance that bound before configure is gone; stay
@@ -364,12 +365,16 @@ impl Hub {
 
     fn team_bind_leader(&mut self, params: &Value) -> Result<Value, TeamError> {
         let instance = required_team_string(params, "instance")?;
-        if !self.instances.contains_key(&instance) {
+        let Some(handle) = self.instances.get(&instance) else {
             return Err(TeamError::new(UNKNOWN_INSTANCE, "unknown instance"));
-        }
+        };
+        let agent = handle.key.agent.clone();
         let session = required_team_string(params, "sessionId")?;
         let token_id = required_team_string(params, "token_id")?;
-        match self.teams.bind_leader(&instance, &session, &token_id)? {
+        match self
+            .teams
+            .bind_leader(&instance, &session, &token_id, &agent)?
+        {
             crate::team::BindOutcome::Active(entry) => Ok(entry),
             crate::team::BindOutcome::Resume { team, entry } => {
                 self.resume_team(&team);
@@ -547,8 +552,19 @@ impl Hub {
         let text = optional_string(params, "text")?;
         let option = optional_string(params, "option")?;
         let allow = optional_bool(params, "allow")?;
+        let answers = match params.get("answers") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(crate::team::parse_answers(value)?),
+        };
+        if answers.is_some() && (text.is_some() || option.is_some()) {
+            return Err(TeamError::invalid(
+                "use either answers or text/option, not both",
+            ));
+        }
         let before = self.teams.item_by_id(&request);
-        let (effect, team) = self.teams.answer(&request, text, option, allow)?;
+        let (effect, team) = self
+            .teams
+            .answer_with(&request, answers, text, option, allow)?;
         let spawned = self.apply_answer_effect(&request, effect);
         if let Some(item) = before {
             if item.kind == ItemKind::Spawn && !spawned {
@@ -753,6 +769,20 @@ impl Hub {
         name: &str,
         params: &Value,
     ) -> Result<(Value, bool), TeamError> {
+        if let Some(questions) = params.get("questions").filter(|value| !value.is_null()) {
+            if params.get("question").is_some_and(|value| !value.is_null())
+                || params.get("options").is_some_and(|value| !value.is_null())
+            {
+                return Err(TeamError::invalid(
+                    "use either question/options or questions, not both",
+                ));
+            }
+            let questions = crate::team::parse_questions(questions)?;
+            let request = self
+                .teams
+                .ask_human_questions(team, name, questions, None)?;
+            return Ok((json!({ "request": request }), true));
+        }
         let question = required_team_string(params, "question")?;
         if question.is_empty() || question.len() > MAX_BODY_BYTES {
             return Err(TeamError::invalid("question must be 1..64 KiB"));
@@ -866,13 +896,15 @@ impl Hub {
             let model = optional_string(params, "model")?;
             let role = optional_string(params, "role")?;
             let task = optional_string(params, "task")?;
-            match self.teams.request_spawn(
+            let label = optional_string(params, "label")?;
+            match self.teams.request_spawn_labeled(
                 team,
                 &template,
                 name.as_deref(),
                 model.as_deref(),
                 role.as_deref(),
                 task.as_deref(),
+                label.as_deref(),
             )? {
                 SpawnOutcome::Started(spawn) => {
                     assigned_name = Some(spawn.name.clone());
@@ -953,13 +985,15 @@ impl Hub {
             let model = optional_string(params, "model")?;
             let role = optional_string(params, "role")?;
             let task = optional_string(params, "task")?;
-            self.teams.request_spawn_human(
+            let label = optional_string(params, "label")?;
+            self.teams.request_spawn_human_labeled(
                 &team,
                 &template,
                 name.as_deref(),
                 model.as_deref(),
                 role.as_deref(),
                 task.as_deref(),
+                label.as_deref(),
             )
         })();
         match result {
@@ -1370,13 +1404,14 @@ impl Hub {
             }
             let mut started = Vec::new();
             for member in &pending {
-                let spawn = self.teams.request_spawn_human(
+                let spawn = self.teams.request_spawn_human_labeled(
                     team_id,
                     &member.template,
                     Some(&member.name),
                     member.model.as_deref(),
                     member.role.as_deref(),
                     member.task.as_deref(),
+                    member.label.as_deref(),
                 )?;
                 let name = spawn.name.clone();
                 if !matches!(
@@ -2663,7 +2698,7 @@ impl Hub {
         let mut deletes: HashSet<String> = HashSet::new();
         for event in &events {
             match event {
-                TeamEvent::Changed(id) | TeamEvent::Inbox(id, _) => {
+                TeamEvent::Changed(id) | TeamEvent::Inbox(id, _) | TeamEvent::Board(id, _) => {
                     saves.insert(id.clone());
                 }
                 TeamEvent::InboxJson(item) => {
@@ -2695,6 +2730,15 @@ impl Hub {
                             "method": "team.changed",
                             "params": { "team": entry },
                         }));
+                    }
+                }
+                TeamEvent::Board(team, rev) => {
+                    if self.persist_paused {
+                        self.announce_board(&team, rev);
+                    } else if let Some(persisted) = self.persist_board(&team) {
+                        self.announce_board(&team, persisted);
+                    } else {
+                        self.announce_board(&team, rev);
                     }
                 }
                 TeamEvent::Inbox(team, item) => {
