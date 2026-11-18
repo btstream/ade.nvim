@@ -206,7 +206,8 @@ function M.build(ctx, opts, action)
       return S.sess.current
     end,
     replacing = function()
-      return S.view.choices ~= nil and S.view.choices.replacing == true
+      return (S.view.choices ~= nil and S.view.choices.replacing == true)
+        or (S.view.panel ~= nil and S.view.panel.showing == true)
     end,
   })
   S.view.elicitation = Elicitation.new({

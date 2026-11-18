@@ -278,6 +278,10 @@ return function(t)
       wait(function()
         return not choices.view:is_open() and #S.view.interactions:pending() == 1
       end, 5000, "the internal fallback")
+      -- A real user leaves the pointer on the internal picker; the panel
+      -- switch must not turn that focus change into a rejection.
+      local picker_win = vim.api.nvim_get_current_win()
+      t.truthy(picker_win ~= nil)
       controller.open()
       wait(function()
         return choices.view:is_open()
@@ -289,6 +293,78 @@ return function(t)
       end, 5000, "the internal answer")
       t.eq("selected", responded.outcome.outcome)
       t.eq("a", responded.outcome.optionId)
+    end)
+
+    t.it("replaces an internal elicitation form without cancelling it", function()
+      local S = setup({ ui = { picker = "internal" } })
+      cleanup(S)
+      local responded
+      S.view.interactions:open("elicitation", {
+        sessionId = "s1",
+        message = "Pick",
+        requestedSchema = {
+          type = "object",
+          properties = { db = { type = "string", enum = { "Postgres", "Redis" } } },
+          required = { "db" },
+        },
+      }, function(response)
+        responded = response
+      end, 11)
+      local choices = S.view.choices
+      wait(function()
+        return choices.view:is_open()
+      end, 5000, "the internal form")
+      controller.hide()
+      wait(function()
+        return not choices.view:is_open() and #S.view.interactions:pending() == 1
+      end, 5000, "the internal form fallback")
+      controller.open()
+      wait(function()
+        return choices.view:is_open()
+      end, 5000, "the internal form after reopen")
+      t.eq(nil, responded, "reopening must not cancel the form")
+      choices.view:select(1)
+      choices.view:submit()
+      wait(function()
+        return responded ~= nil
+      end, 5000, "the internal form answer")
+      t.eq("accept", responded.action)
+      t.eq("Postgres", responded.content.db)
+    end)
+
+    t.it("withdrawing a request closes the real fallback floats", function()
+      local S = setup({ ui = { picker = "internal" } })
+      cleanup(S)
+      S.view.interactions:open("permission", {
+        sessionId = "s1",
+        toolCall = { title = "Run", kind = "execute" },
+        options = { { optionId = "a", name = "Allow", kind = "allow_once" } },
+      }, function() end, 12)
+      local choices = S.view.choices
+      wait(function()
+        return choices.view:is_open()
+      end, 5000, "the component before withdraw")
+      controller.hide()
+      wait(function()
+        return #S.view.interactions:pending() == 1 and not choices.view:is_open()
+      end, 5000, "the internal fallback before withdraw")
+      S.view.interactions:cancel(S.view.interactions.order[1].id, "agent withdrew")
+      wait(function()
+        return #S.view.interactions:pending() == 0
+      end, 5000, "the withdrawn request")
+      vim.wait(100)
+      local float = false
+      for _, win in ipairs(vim.api.nvim_list_wins()) do
+        local config = vim.api.nvim_win_get_config(win)
+        if config.relative ~= "" and config.zindex ~= nil then
+          local ok, name = pcall(vim.api.nvim_buf_get_name, vim.api.nvim_win_get_buf(win))
+          _ = name
+          _ = ok
+          float = true
+        end
+      end
+      -- The picker/detail floats are closed; editor splits may remain.
+      t.eq(false, float, "fallback floats must be closed on withdraw")
     end)
 
     t.it("does not loop when the composer is closed with :q", function()
@@ -340,11 +416,13 @@ return function(t)
       t.cleanup(function()
         vim.notify = original_notify
       end)
-      S.view.interactions:open("permission", {
-        sessionId = "s1",
-        toolCall = { title = "Run", kind = "execute" },
-        options = { { optionId = "a", name = "Allow", kind = "allow_once" } },
-      }, function() end, 10)
+      for index = 1, 2 do
+        S.view.interactions:open("permission", {
+          sessionId = "s1",
+          toolCall = { title = "Run " .. index, kind = "execute" },
+          options = { { optionId = "a", name = "Allow", kind = "allow_once" } },
+        }, function() end, 10 + index)
+      end
       for _ = 1, 5 do
         S.view.choices:refresh()
       end
@@ -354,7 +432,7 @@ return function(t)
           count = count + 1
         end
       end
-      t.eq(1, count, "native notifications are sent once")
+      t.eq(2, count, "each native request is notified exactly once")
     end)
 
     t.it("cancels a permission without options instead of blocking", function()

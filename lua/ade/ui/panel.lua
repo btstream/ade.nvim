@@ -20,6 +20,7 @@ function Panel.new(opts)
     chat = nil,
     input = nil,
     requested = false,
+    showing = false,
     augroup = nil,
   }, Panel)
 end
@@ -96,19 +97,27 @@ end
 ---@return boolean ok
 function Panel:show()
   self.requested = true
-  local ok = self:ensure()
-  local cfg = self.config()
-  if ok and cfg.layout.focus_input_on_open and self.input and self.input:is_visible() then
-    local buf = vim.api.nvim_win_get_buf(self.input.win)
-    if not vim.b[buf].ade_choice then
-      vim.api.nvim_set_current_win(self.input.win)
-      vim.cmd("startinsert")
+  self.showing = true
+  local ok, result = xpcall(function()
+    local ready = self:ensure()
+    local cfg = self.config()
+    if ready and cfg.layout.focus_input_on_open and self.input and self.input:is_visible() then
+      local buf = vim.api.nvim_win_get_buf(self.input.win)
+      if not vim.b[buf].ade_choice then
+        vim.api.nvim_set_current_win(self.input.win)
+        vim.cmd("startinsert")
+      end
     end
+    if self.on_visibility then
+      pcall(self.on_visibility, true)
+    end
+    return ready
+  end, debug.traceback)
+  self.showing = false
+  if not ok then
+    error(result, 0)
   end
-  if self.on_visibility then
-    pcall(self.on_visibility, true)
-  end
-  return ok
+  return result
 end
 
 ---Hide the panel without stopping the session.

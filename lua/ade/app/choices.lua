@@ -26,6 +26,8 @@ function M.new(opts)
     deferred = {},
     handled = {},
     answering = {},
+    auto_answer = {},
+    auto_failed = {},
     notified_native = {},
   }, Choices)
 end
@@ -192,8 +194,11 @@ function Choices:spawn_model(team, item, pending)
       self:refresh()
     end,
     on_submit = function(answers)
-      local choice = answers[1] and answers[1].selected[1]
-      if choice and choice:find("全部批准", 1, true) then
+      local answer = answers[1] or {}
+      local index = (answer.selected_index or {})[1]
+      local picked = index and options[index]
+      local choice = picked and picked.value or answer.selected[1]
+      if choice == "allow_group" then
         team:answer_group(group, true, function(ok, value)
           if not ok then
             self:notify("cannot approve the group: " .. tostring(value and value.message or value), vim.log.levels.WARN)
@@ -203,7 +208,7 @@ function Choices:spawn_model(team, item, pending)
         self:refresh()
         return
       end
-      local allow = choice == "批准"
+      local allow = choice == "allow"
       team:answer(item.id, { allow = allow }, function(ok, value)
         if not ok then
           self:notify(
@@ -266,8 +271,14 @@ function Choices:limit_model(team, item, pending)
       self:refresh()
     end,
     on_submit = function(answers)
-      local choice = answers[1] and answers[1].selected[1]
-      if choice == "继续（重置计数）" then
+      local answer = answers[1] or {}
+      local index = (answer.selected_index or {})[1]
+      local options = { { value = "continue" }, { value = "hold" } }
+      local choice = answer.selected[1]
+      if index and options[index] then
+        choice = options[index].value
+      end
+      if choice == "continue" then
         team:reset_limits(item.team, function()
           self:refresh()
         end)
@@ -341,10 +352,19 @@ function Choices:team_entries(team_id)
               -- A worker permission without options cannot be shown; answer
               -- it with the cancelled outcome as the old picker did.
               local key = "team:" .. row.id .. ":" .. item.id
-              if not self.answering[key] then
-                self.answering[key] = true
-                team:answer(item.id, {}, function()
-                  self.answering[key] = nil
+              if not self.auto_answer[key] and not self.auto_failed[key] then
+                self.auto_answer[key] = true
+                team:answer(item.id, {}, function(ok, value)
+                  self.auto_answer[key] = nil
+                  if not ok then
+                    self.auto_failed[key] = true
+                    self:notify(
+                      "cannot cancel the worker permission: "
+                        .. tostring(value and value.message or value)
+                        .. "（:Ade team answer 重试）",
+                      vim.log.levels.WARN
+                    )
+                  end
                   self:refresh()
                 end)
               end
@@ -542,6 +562,16 @@ function Choices:refresh()
   local mount = self:mount()
   local visible = self:visible() and mount ~= nil
   if acp_pending then
+    local permissions = (self.deps.config and self.deps.config() or {}).permissions or {}
+    if permissions.prompt ~= "select" then
+      -- `show_next` only presents the first pending request; native requests
+      -- deserve one notification each without blocking the team queue.
+      for _, interaction in ipairs(interactions:pending()) do
+        if interaction.type == "permission" then
+          self:present_interaction(interaction)
+        end
+      end
+    end
     if self.current and self.current.kind ~= "acp" then
       self.view:close()
       self.current = nil
@@ -618,15 +648,21 @@ function Choices:show_pending(team_id)
     return
   end
   pcall(vim.cmd, "stopinsert")
-  -- Explicitly asking for the queue clears everything put off with Esc.
+  -- Explicitly asking for the queue clears everything put off with Esc and
+  -- retries permissions whose automatic cancel failed.
   self.deferred = {}
+  self.auto_failed = {}
   self:refresh()
   if self.view:is_open() then
     return
   end
   if interactions and #interactions:pending() > 0 then
     if interactions.shown then
-      self:dismiss_fallback()
+      if not self:fallback_closable() then
+        self:notify("请在已经打开的选择框里回答", vim.log.levels.INFO)
+        return
+      end
+      self:dismiss_fallback(true)
       interactions:unshow(interactions.shown)
     end
     interactions:show_next()

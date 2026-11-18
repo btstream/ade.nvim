@@ -170,6 +170,7 @@ function Permissions:present(interaction)
     title = "Permission required: " .. title,
     items = items,
     width = math.min(90, math.max(50, vim.o.columns - 20)),
+    dismiss_on_leave = false,
     on_choice = function(value)
       if self.valid(interaction) then
         self.answer(interaction, value and value.id or nil)

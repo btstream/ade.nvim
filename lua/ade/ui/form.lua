@@ -12,6 +12,7 @@ local current
 local active_picker
 
 local function pick(opts)
+  opts = vim.tbl_extend("force", { dismiss_on_leave = false }, opts)
   active_picker = picker.select(opts)
   return active_picker
 end

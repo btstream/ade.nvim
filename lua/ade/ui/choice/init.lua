@@ -68,6 +68,7 @@ function View:line_list()
   if status and status ~= "" then
     title = title .. "    " .. tostring(status)
   end
+  title = title .. string.format("    %d/%d", self.tab, #(model.questions or {}) + 1)
   lines[#lines + 1] = " " .. title
   local tabs = {}
   for index, question in ipairs(model.questions or {}) do
@@ -527,7 +528,12 @@ function View:show(model, mount)
   local lines = vim.api.nvim_buf_line_count(self.buf)
   if not self.external then
     local max = mount.max_height or math.max(4, math.floor((vim.o.lines - 2) / 2))
-    pcall(vim.api.nvim_win_set_height, win, math.max(3, math.min(lines, max)))
+    local height = lines
+    local ok, info = pcall(vim.api.nvim_win_text_height, win, { start_row = 0, end_row = -1 })
+    if ok and type(info) == "table" and type(info.height) == "number" then
+      height = info.height
+    end
+    pcall(vim.api.nvim_win_set_height, win, math.max(3, math.min(height, max)))
   end
   return true
 end

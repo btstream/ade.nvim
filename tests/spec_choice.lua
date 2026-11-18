@@ -415,6 +415,76 @@ return function(t)
       close_window()
     end)
 
+    t.it("does not repeat a failing zero-option cancel until asked", function()
+      local win = window()
+      local row = {
+        id = "t1",
+        cwd = "/tmp",
+        state = "active",
+        participants = {},
+        inbox = {
+          {
+            id = "i1",
+            team = "t1",
+            kind = "permission",
+            from = "w1",
+            state = "open",
+            body = "odd",
+            options = {},
+          },
+        },
+      }
+      local calls = {}
+      local team = {
+        list_rows = function()
+          return { row }
+        end,
+        team = function()
+          return row
+        end,
+        answer = function(_, id, fields, cb)
+          calls[#calls + 1] = { id = id, fields = fields, cb = cb }
+        end,
+      }
+      local notices = {}
+      local choices = Choices.new({
+        team = function()
+          return team
+        end,
+        interactions = function()
+          return nil
+        end,
+        notify = function(message)
+          notices[#notices + 1] = message
+        end,
+        input_win = function()
+          return win
+        end,
+        chat_win = function()
+          return win
+        end,
+        external = function()
+          return false
+        end,
+        panel_visible = function()
+          return true
+        end,
+      })
+      choices:refresh()
+      choices:refresh()
+      choices:refresh()
+      t.eq(1, #calls, "the request must be in flight once")
+      calls[1].cb(false, { message = "denied" })
+      vim.wait(20)
+      t.match("cannot cancel", table.concat(notices, "\n"))
+      choices:refresh()
+      t.eq(1, #calls, "a failure must not retry in a loop")
+      choices:show_pending("t1")
+      vim.wait(20)
+      t.eq(2, #calls, "`:Ade team answer` retries it")
+      close_window()
+    end)
+
     t.it("answers a question without options through vim.ui.input", function()
       local team = fake_team({
         {

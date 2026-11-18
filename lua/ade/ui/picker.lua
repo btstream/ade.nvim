@@ -349,7 +349,14 @@ local function internal_select(opts)
     buffer = buf,
     once = true,
     callback = function()
-      cancel()
+      if opts.dismiss_on_leave == false then
+        -- A panel switch may move focus through this float. Close it without
+        -- settling the request; the queue re-presents it (component or
+        -- fallback). Only an explicit choice or Esc/q answers it.
+        close()
+      else
+        cancel()
+      end
     end,
   })
   return { close = cancel }
