@@ -1740,3 +1740,23 @@ resume. Writes go through the store thread as in 18.15 and never block
 delivery. Whenever the service runs without that database (the cases where
 18.15 stores no teams), boards live in memory only and `workflow_save` is
 `-32061` (`"no database"`).
+
+### 19.12 Member labels and owners awaiting approval (W0 v2)
+
+**Labels.** `bus.spawn`, `team.spawn` and workflow members (19.1) gain
+`label?`: a short role label for display, 1..16 characters, one line
+(`-32060` otherwise). Spawn inbox items carry it too.
+
+**`team.list` participant entries** gain `template` (the template name, absent
+for the leader), `agent` (the template's `key.agent`; for the leader the agent
+id of its instance), `model` (the model applied by 19.6, or `null`), and
+`label` (the spawn's `label`, else the template name; `"leader"` for the
+leader). They are persisted with the team and restored with it.
+
+**Owners awaiting approval.** A card's `owner` (19.2) may also be the name of
+an **open** `spawn` inbox item of the team. When that item is refused, or
+becomes `orphaned`, the service clears `owner` on every card that has it (one
+write, `updated_by: "service"`, `team.board_changed`) and sends the leader a
+`notice` naming the cards. When it is approved nothing changes. A name used by
+an open spawn item is reserved: another spawn with that name is `-32060`
+until the item is answered.
