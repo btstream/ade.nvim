@@ -1787,3 +1787,18 @@ option.
 `text`/`option`. The asker receives one `answer` message whose body lists, per
 question, `<header>: <selected labels joined by ", ">` and the free text on the
 next line when given.
+
+### 19.14 Talking to a worker directly (W0 v2)
+
+`team.send` (front ends only) gains:
+
+- `interrupt?: boolean` — only for a `to` that is a worker. When the worker has
+  a bus prompt running, the service sends `session/cancel` for it, waits for
+  its response (at most 30 s, as for the leader in 18.11), then delivers this
+  message **before** anything else queued for the worker. Messages of the
+  cancelled turn are not delivered again (as 18.4). When nothing runs it is an
+  ordinary send. `interrupt` to the leader or `human` is `-32060`.
+- `cc?: ["leader"]` — after the message is accepted, the leader also receives
+  a `notice` from `human` whose body is `"to <worker>: <body>"` (`task`
+  copied; the `[card …]` prefix of 19.3 kept). Only `"leader"` is allowed in
+  `cc`, and only when `to` is a worker (`-32060` otherwise).
