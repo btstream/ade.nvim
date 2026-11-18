@@ -622,6 +622,8 @@ impl Hub {
                     }
                 }
             }
+            self.teams.orphan_leaderless_spawns();
+            self.drain_team_events();
             let (max_team, max_inbox) = self.teams.counters();
             for id in stored {
                 if let Some(snapshot) = self.teams.snapshot_team(&id) {

@@ -556,6 +556,11 @@ impl Hub {
             None | Some(Value::Null) => None,
             Some(value) => Some(crate::team::parse_answers(value)?),
         };
+        if answers.is_some() && (text.is_some() || option.is_some()) {
+            return Err(TeamError::invalid(
+                "use either answers or text/option, not both",
+            ));
+        }
         let before = self.teams.item_by_id(&request);
         let (effect, team) = self
             .teams

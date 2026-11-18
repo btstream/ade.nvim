@@ -305,10 +305,7 @@ fn parse_member(
     let role = optional_string_field(object.get("role"), &format!("{prefix}.role"))?;
     let label = optional_string_field(object.get("label"), &format!("{prefix}.label"))?;
     if label.as_ref().is_some_and(|label| {
-        label.is_empty()
-            || label.chars().count() > 16
-            || label.contains('\n')
-            || label.contains('\r')
+        label.is_empty() || label.chars().count() > 16 || !crate::team::is_one_line(label)
     }) {
         return Err(TeamError::invalid(format!(
             "{prefix}.label must be one line of 1..16 characters"
@@ -697,6 +694,23 @@ mod tests {
         ]})))
         .message
         .contains("workflow.team[0].task"));
+        for label in ["", "12345678901234567", "a\tb"] {
+            assert!(error(workflow(json!({"team": [
+                {"name": "w1", "template": "dev", "label": label}
+            ]})))
+            .message
+            .contains("workflow.team[0].label"));
+        }
+        let labelled = parse_workflow(
+            &workflow(json!({"team": [
+                {"name": "w1", "template": "dev", "label": "reviewer"}
+            ]})),
+            Scope::Project,
+            Some(&config()),
+        )
+        .expect("valid label");
+        assert_eq!(labelled.team[0].label.as_deref(), Some("reviewer"));
+        assert_eq!(labelled.to_json()["team"][0]["label"], "reviewer");
 
         assert!(error(workflow(json!({"columns": []})))
             .message

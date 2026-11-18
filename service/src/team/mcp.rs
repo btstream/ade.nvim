@@ -354,7 +354,7 @@ impl Mcp {
                                 "question": { "type": "string" },
                                 "options": {
                                     "type": "array",
-                                    "minItems": 2,
+                                    "minItems": 0,
                                     "maxItems": 6,
                                     "items": {
                                         "type": "object",
