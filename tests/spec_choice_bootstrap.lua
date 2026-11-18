@@ -11,13 +11,13 @@ return function(t)
     end
   end
 
-  local function setup()
-    ade.setup({
+  local function setup(overrides)
+    ade.setup(vim.tbl_deep_extend("force", {
       agent = "opencode",
       agents = { opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } } },
       ui = {},
       layout = { input_height = 6 },
-    })
+    }, overrides or {}))
     controller.open()
     local S = controller.state()
     wait(function()
@@ -213,16 +213,14 @@ return function(t)
       end, 5000, "the explicit reopen")
     end)
 
-    t.it("survives hiding and reopening the panel", function()
+    t.it("keeps the default vim fallback while the panel is hidden", function()
       local S = setup()
       cleanup(S)
-      -- While hidden the old picker is the fallback; in headless tests it must
-      -- not block on the default vim.ui.select prompt.
       local original_select = vim.ui.select
-      vim.ui.select = function(_, _, cb)
-        if cb then
-          cb(nil)
-        end
+      local fallback_shown = false
+      vim.ui.select = function()
+        fallback_shown = true
+        -- The default prompt cannot be closed; do not answer it.
       end
       t.cleanup(function()
         vim.ui.select = original_select
@@ -240,15 +238,123 @@ return function(t)
         return choices.view:is_open()
       end, 5000, "the first component")
       controller.hide()
+      wait(function()
+        return fallback_shown and #S.view.interactions:pending() == 1
+      end, 5000, "the hidden fallback")
+      t.eq(false, choices.view:is_open())
+      controller.open()
+      vim.wait(150)
+      t.eq(false, choices.view:is_open(), "the unclosable fallback stays on screen")
+      t.truthy(S.view.interactions.shown, "the request is still presented")
+      t.eq(1, #S.view.interactions:pending(), "the request stayed pending")
+      S.view.interactions:answer(S.view.interactions.order[1].id, {
+        outcome = { outcome = "selected", optionId = "a" },
+      })
+      wait(function()
+        return responded ~= nil
+      end, 5000, "the fallback answer")
+      t.eq("a", responded.outcome.optionId)
+    end)
+
+    t.it("replaces an internal picker without rejecting the request", function()
+      local S = setup({ ui = { picker = "internal" } })
+      cleanup(S)
+      local responded
+      S.view.interactions:open("permission", {
+        sessionId = "s1",
+        toolCall = { title = "Run", kind = "execute" },
+        options = {
+          { optionId = "a", name = "Allow", kind = "allow_once" },
+          { optionId = "r", name = "Reject", kind = "reject_once" },
+        },
+      }, function(response)
+        responded = response
+      end, 8)
+      local choices = S.view.choices
+      wait(function()
+        return choices.view:is_open()
+      end, 5000, "the internal first component")
+      controller.hide()
+      wait(function()
+        return not choices.view:is_open() and #S.view.interactions:pending() == 1
+      end, 5000, "the internal fallback")
       controller.open()
       wait(function()
         return choices.view:is_open()
-      end, 5000, "the component after reopening")
+      end, 5000, "the internal component after reopen")
+      t.eq(nil, responded, "replacing the picker must not answer it")
       choices.view:select(1)
       wait(function()
         return responded ~= nil
-      end, 5000, "the answer after reopening")
+      end, 5000, "the internal answer")
+      t.eq("selected", responded.outcome.outcome)
       t.eq("a", responded.outcome.optionId)
+    end)
+
+    t.it("does not loop when the composer is closed with :q", function()
+      local S = setup()
+      cleanup(S)
+      local responded
+      S.view.interactions:open("permission", {
+        sessionId = "s1",
+        toolCall = { title = "Run", kind = "execute" },
+        options = { { optionId = "a", name = "Allow", kind = "allow_once" } },
+      }, function(response)
+        responded = response
+      end, 9)
+      local choices = S.view.choices
+      wait(function()
+        return choices.view:is_open()
+      end, 5000, "the component before :q")
+      local count = 0
+      local original = choices.refresh
+      choices.refresh = function(self_, ...)
+        count = count + 1
+        return original(self_, ...)
+      end
+      local original_select = vim.ui.select
+      vim.ui.select = function() end
+      local win = S.input.win
+      vim.api.nvim_win_close(win, true)
+      vim.wait(400)
+      vim.ui.select = original_select
+      choices.refresh = original
+      t.truthy(count < 25, "refresh must not storm, got " .. count)
+      t.eq(1, #S.view.interactions:pending(), "the request is still pending")
+      S.view.interactions:answer(S.view.interactions.order[1].id, {
+        outcome = { outcome = "selected", optionId = "a" },
+      })
+      wait(function()
+        return responded ~= nil
+      end, 5000, "the :q answer")
+    end)
+
+    t.it("notifies a native permission once, not on every refresh", function()
+      local S = setup({ permissions = { prompt = "native" } })
+      cleanup(S)
+      local notices = {}
+      local original_notify = vim.notify
+      vim.notify = function(message)
+        notices[#notices + 1] = tostring(message)
+      end
+      t.cleanup(function()
+        vim.notify = original_notify
+      end)
+      S.view.interactions:open("permission", {
+        sessionId = "s1",
+        toolCall = { title = "Run", kind = "execute" },
+        options = { { optionId = "a", name = "Allow", kind = "allow_once" } },
+      }, function() end, 10)
+      for _ = 1, 5 do
+        S.view.choices:refresh()
+      end
+      local count = 0
+      for _, message in ipairs(notices) do
+        if message:find("Permission required", 1, true) then
+          count = count + 1
+        end
+      end
+      t.eq(1, count, "native notifications are sent once")
     end)
 
     t.it("cancels a permission without options instead of blocking", function()

@@ -26,6 +26,7 @@ function M.new(opts)
     deferred = {},
     handled = {},
     answering = {},
+    notified_native = {},
   }, Choices)
 end
 
@@ -336,15 +337,28 @@ function Choices:team_entries(team_id)
             }
           elseif item.kind == "permission" then
             approval_count = approval_count + 1
-            open[#open + 1] = {
-              key = "team:" .. row.id .. ":" .. item.id,
-              kind = "approval",
-              team = row.id,
-              item = item,
-              build = function(self_, pending)
-                return self_:team_permission_model(team, item, pending)
-              end,
-            }
+            if #(item.options or {}) == 0 then
+              -- A worker permission without options cannot be shown; answer
+              -- it with the cancelled outcome as the old picker did.
+              local key = "team:" .. row.id .. ":" .. item.id
+              if not self.answering[key] then
+                self.answering[key] = true
+                team:answer(item.id, {}, function()
+                  self.answering[key] = nil
+                  self:refresh()
+                end)
+              end
+            else
+              open[#open + 1] = {
+                key = "team:" .. row.id .. ":" .. item.id,
+                kind = "approval",
+                team = row.id,
+                item = item,
+                build = function(self_, pending)
+                  return self_:team_permission_model(team, item, pending)
+                end,
+              }
+            end
           elseif item.kind == "limit" then
             approval_count = approval_count + 1
             open[#open + 1] = {
@@ -465,13 +479,23 @@ function Choices:show(entry, open)
   return true
 end
 
-function Choices:dismiss_fallback()
+function Choices:dismiss_fallback(replacing)
+  self.replacing = replacing == true
   if self.deps.permission_dismiss then
     pcall(self.deps.permission_dismiss)
   end
   if self.deps.elicitation_dismiss then
     pcall(self.deps.elicitation_dismiss)
   end
+  self.replacing = false
+end
+
+---Whether the fallback picker can be closed from Lua without answering. The
+---default `vim.ui.select` prompt cannot; replacing it would leave a stale
+---prompt on screen next to the component.
+function Choices:fallback_closable()
+  local config = self.deps.config and self.deps.config() or {}
+  return (config.ui or {}).picker == "internal"
 end
 
 ---Recompute the queue and show the next item when possible.
@@ -497,6 +521,17 @@ function Choices:refresh()
     end
   end
   self:update_notice(open, interactions)
+  if interactions then
+    local pending = {}
+    for _, interaction in ipairs(interactions:pending()) do
+      pending[interaction.id] = true
+    end
+    for id in pairs(self.notified_native) do
+      if not pending[id] then
+        self.notified_native[id] = nil
+      end
+    end
+  end
 
   if self.current and not self.view:is_open() then
     if self.current.kind == "acp" and interactions then
@@ -504,7 +539,8 @@ function Choices:refresh()
     end
     self.current = nil
   end
-  local visible = self:visible()
+  local mount = self:mount()
+  local visible = self:visible() and mount ~= nil
   if acp_pending then
     if self.current and self.current.kind ~= "acp" then
       self.view:close()
@@ -512,9 +548,13 @@ function Choices:refresh()
     end
     if visible then
       if interactions.shown and not self.view:is_open() then
-        -- A fallback picker was shown while the panel was hidden; replace it
-        -- with the component now that the composer is back.
-        self:dismiss_fallback()
+        -- A fallback picker was shown while the panel was hidden. Replace it
+        -- only when it can be closed without answering; the default
+        -- vim.ui.select prompt cannot and stays until the person answers.
+        if not self:fallback_closable() then
+          return
+        end
+        self:dismiss_fallback(true)
         interactions:unshow(interactions.shown)
       end
       if not self.view:is_open() then
@@ -529,7 +569,11 @@ function Choices:refresh()
         self.current = nil
       end
       -- No composer: keep the old picker/form so the agent is not blocked.
-      interactions:show_next()
+      -- Never call show_next again while it is already on screen: its floats
+      -- fire WinNew/BufWinEnter and would make refresh loop.
+      if not interactions.shown then
+        interactions:show_next()
+      end
       return
     end
   end
@@ -811,7 +855,12 @@ function Choices:present_interaction(interaction)
   local permissions = config.permissions or {}
   local mount = self:mount()
   if interaction.type == "permission" and permissions.prompt ~= "select" then
-    -- `native` leaves the request to the agent's own UI, as before.
+    -- `native` leaves the request to the agent's own UI, as before. Notify
+    -- once per interaction, not once per refresh.
+    if self.notified_native[interaction.id] then
+      return false
+    end
+    self.notified_native[interaction.id] = true
     if self.deps.permission_present then
       return self.deps.permission_present(interaction)
     end
@@ -890,7 +939,7 @@ end
 function Choices:dismiss()
   self.view:close()
   self.current = nil
-  self:dismiss_fallback()
+  self:dismiss_fallback(false)
   self:refresh()
 end
 

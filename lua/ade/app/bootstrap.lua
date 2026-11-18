@@ -205,6 +205,9 @@ function M.build(ctx, opts, action)
     session = function()
       return S.sess.current
     end,
+    replacing = function()
+      return S.view.choices ~= nil and S.view.choices.replacing == true
+    end,
   })
   S.view.elicitation = Elicitation.new({
     answer = function(interaction, response)

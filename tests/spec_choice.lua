@@ -370,6 +370,51 @@ return function(t)
       close_window()
     end)
 
+    t.it("cancels a worker permission without options instead of hanging", function()
+      local win = window()
+      local team = fake_team({
+        {
+          id = "i1",
+          team = "t1",
+          kind = "permission",
+          from = "w1",
+          state = "open",
+          body = "odd permission",
+          options = {},
+        },
+      })
+      local choices = Choices.new({
+        team = function()
+          return team
+        end,
+        interactions = function()
+          return nil
+        end,
+        notify = function() end,
+        input_win = function()
+          return win
+        end,
+        chat_win = function()
+          return win
+        end,
+        external = function()
+          return false
+        end,
+        panel_visible = function()
+          return true
+        end,
+      })
+      choices:refresh()
+      vim.wait(20)
+      t.eq(false, choices.view:is_open(), "a zero-option permission is not displayed")
+      t.eq("i1", team.answered[1].id)
+      t.eq({}, team.answered[1].fields)
+      choices:refresh()
+      vim.wait(20)
+      t.eq(1, #team.answered, "it is answered once")
+      close_window()
+    end)
+
     t.it("answers a question without options through vim.ui.input", function()
       local team = fake_team({
         {
