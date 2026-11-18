@@ -51,6 +51,57 @@ function Choices:team()
   return ok and team or nil
 end
 
+---Open inbox items live in `team.inbox`, keyed by id (rows keep the snapshot
+---without a live inbox array).
+---@param team table
+---@param team_id string|nil
+---@return table[]
+function Choices:items(team, team_id)
+  local out = {}
+  if type(team.inbox) == "table" then
+    for _, item in pairs(team.inbox) do
+      if not team_id or item.team == team_id then
+        out[#out + 1] = item
+      end
+    end
+  else
+    -- Test doubles and older callers keep items on each row.
+    for _, row in ipairs(team:list_rows()) do
+      if not team_id or row.id == team_id then
+        for _, item in ipairs(row.inbox or {}) do
+          out[#out + 1] = item
+        end
+      end
+    end
+  end
+  table.sort(out, function(a, b)
+    local aa, bb = tostring(a.at or ""), tostring(b.at or "")
+    if aa == bb then
+      return tostring(a.id) < tostring(b.id)
+    end
+    return aa < bb
+  end)
+  return out
+end
+
+---A question item is selectable if any of its questions offers options; a
+---mixed item still shows the free-text question as an input row in the
+---component (B5).
+---@param item table
+---@return boolean
+local function item_has_options(item)
+  if type(item.questions) == "table" then
+    for _, question in ipairs(item.questions) do
+      if type(question.options) == "table" and #question.options > 0 then
+        return true
+      end
+    end
+  end
+  -- A legacy top-level `options` list is answered with `vim.ui.input`
+  -- (`answer_participant`); the component only renders `questions`.
+  return false
+end
+
 function Choices:interactions()
   local ok, interactions = pcall(self.deps.interactions)
   return ok and interactions or nil
@@ -152,11 +203,9 @@ function Choices:spawn_model(team, item, pending)
   local group = item.group
   local in_group = 0
   if group then
-    for _, row in ipairs(team:list_rows()) do
-      for _, other in ipairs(row.inbox or {}) do
-        if other.state == "open" and other.group == group and other.kind == "spawn" then
-          in_group = in_group + 1
-        end
+    for _, other in ipairs(self:items(team)) do
+      if other.state == "open" and other.group == group and other.kind == "spawn" then
+        in_group = in_group + 1
       end
     end
   end
@@ -234,11 +283,12 @@ function Choices:team_permission_model(team, item, pending)
   if #options == 0 then
     options[1] = option("取消请求", "cancel")
     ids["取消请求"] = nil
+  else
+    options[#options + 1] = option("取消请求", "cancel")
   end
   return {
     title = "worker " .. tostring(item.from or "?") .. " 请求权限 · team " .. tostring(item.team),
     status_fn = self:status_fn(item.team),
-    submit_single = true,
     questions = { { header = "Permission", question = item.body or "Permission required", options = options } },
     on_cancel = function()
       -- Esc is "later" for team items, including a worker permission.
@@ -309,89 +359,76 @@ function Choices:team_entries(team_id)
   local open = {}
   local question_count = 0
   local approval_count = 0
-  for _, row in ipairs(team:list_rows()) do
-    if not team_id or row.id == team_id then
-      for _, item in ipairs(row.inbox or {}) do
-        if item.state == "open" then
-          if item.kind == "question" then
-            question_count = question_count + 1
-            local has_options = type(item.questions) == "table" and #item.questions > 0
-            if has_options then
-              local any = false
-              for _, question in ipairs(item.questions) do
-                if type(question.options) == "table" and #question.options > 0 then
-                  any = true
-                end
-              end
-              if any then
-                open[#open + 1] = {
-                  key = "team:" .. row.id .. ":" .. item.id,
-                  kind = "question",
-                  team = row.id,
-                  item = item,
-                  build = function(self_, pending)
-                    return self_:question_model(team, item, pending)
-                  end,
-                }
-              end
-            end
-          elseif item.kind == "spawn" then
-            approval_count = approval_count + 1
-            open[#open + 1] = {
-              key = "team:" .. row.id .. ":" .. item.id,
-              kind = "approval",
-              team = row.id,
-              item = item,
-              build = function(self_, pending)
-                return self_:spawn_model(team, item, pending)
-              end,
-            }
-          elseif item.kind == "permission" then
-            approval_count = approval_count + 1
-            if #(item.options or {}) == 0 then
-              -- A worker permission without options cannot be shown; answer
-              -- it with the cancelled outcome as the old picker did.
-              local key = "team:" .. row.id .. ":" .. item.id
-              if not self.auto_answer[key] and not self.auto_failed[key] then
-                self.auto_answer[key] = true
-                team:answer(item.id, {}, function(ok, value)
-                  self.auto_answer[key] = nil
-                  if not ok then
-                    self.auto_failed[key] = true
-                    self:notify(
-                      "cannot cancel the worker permission: "
-                        .. tostring(value and value.message or value)
-                        .. "（:Ade team answer 重试）",
-                      vim.log.levels.WARN
-                    )
-                  end
-                  self:refresh()
-                end)
-              end
-            else
-              open[#open + 1] = {
-                key = "team:" .. row.id .. ":" .. item.id,
-                kind = "approval",
-                team = row.id,
-                item = item,
-                build = function(self_, pending)
-                  return self_:team_permission_model(team, item, pending)
-                end,
-              }
-            end
-          elseif item.kind == "limit" then
-            approval_count = approval_count + 1
-            open[#open + 1] = {
-              key = "team:" .. row.id .. ":" .. item.id,
-              kind = "approval",
-              team = row.id,
-              item = item,
-              build = function(self_, pending)
-                return self_:limit_model(team, item, pending)
-              end,
-            }
-          end
+  for _, item in ipairs(self:items(team, team_id)) do
+    if item.state == "open" then
+      if item.kind == "question" then
+        question_count = question_count + 1
+        if item_has_options(item) then
+          open[#open + 1] = {
+            key = "team:" .. item.team .. ":" .. item.id,
+            kind = "question",
+            team = item.team,
+            item = item,
+            build = function(self_, pending)
+              return self_:question_model(team, item, pending)
+            end,
+          }
         end
+      elseif item.kind == "spawn" then
+        approval_count = approval_count + 1
+        open[#open + 1] = {
+          key = "team:" .. item.team .. ":" .. item.id,
+          kind = "approval",
+          team = item.team,
+          item = item,
+          build = function(self_, pending)
+            return self_:spawn_model(team, item, pending)
+          end,
+        }
+      elseif item.kind == "permission" then
+        approval_count = approval_count + 1
+        if #(item.options or {}) == 0 then
+          -- A worker permission without options cannot be shown; answer it
+          -- with the cancelled outcome as the old picker did.
+          local key = "team:" .. item.team .. ":" .. item.id
+          if not self.auto_answer[key] and not self.auto_failed[key] then
+            self.auto_answer[key] = true
+            team:answer(item.id, {}, function(ok, value)
+              self.auto_answer[key] = nil
+              if not ok then
+                self.auto_failed[key] = true
+                self:notify(
+                  "cannot cancel the worker permission: "
+                    .. tostring(value and value.message or value)
+                    .. "（:Ade team answer 重试）",
+                  vim.log.levels.WARN
+                )
+              end
+              self:refresh()
+            end)
+          end
+        else
+          open[#open + 1] = {
+            key = "team:" .. item.team .. ":" .. item.id,
+            kind = "approval",
+            team = item.team,
+            item = item,
+            build = function(self_, pending)
+              return self_:team_permission_model(team, item, pending)
+            end,
+          }
+        end
+      elseif item.kind == "limit" then
+        approval_count = approval_count + 1
+        open[#open + 1] = {
+          key = "team:" .. item.team .. ":" .. item.id,
+          kind = "approval",
+          team = item.team,
+          item = item,
+          build = function(self_, pending)
+            return self_:limit_model(team, item, pending)
+          end,
+        }
       end
     end
   end
@@ -428,6 +465,20 @@ function Choices:pending_counts(team_id)
     end
   end
   return { question = questions, approval = approvals }
+end
+
+---How many pending entries the inline component can actually show.
+---Free-text questions are answered with `vim.ui.input`, not selected here.
+---@param team_id string|nil
+---@return integer
+function Choices:selectable_count(team_id)
+  local open = self:team_entries(team_id)
+  local count = #open
+  local interactions = self:interactions()
+  if interactions then
+    count = count + #interactions:pending()
+  end
+  return count
 end
 
 function Choices:update_notice(open, interactions)
@@ -680,6 +731,23 @@ function Choices:show_pending(team_id)
   if first then
     self.current = nil
     self:show(first, open)
+    if not self.view:is_open() then
+      self:notify("先打开聊天窗口（:Ade open）再显示选择组件", vim.log.levels.INFO)
+    end
+    return
+  end
+  local free = 0
+  local team = self:team()
+  for _, row in ipairs(team and self:items(team, team_id) or {}) do
+    if row.state == "open" and row.kind == "question" and not item_has_options(row) then
+      free = free + 1
+    end
+  end
+  if free > 0 then
+    self:notify(
+      "有 " .. free .. " 个提问需要输入；在成员上按 a 或 :Ade team answer <name>",
+      vim.log.levels.INFO
+    )
   else
     self:notify("没有待处理的提问或申请", vim.log.levels.INFO)
   end
@@ -690,37 +758,47 @@ end
 ---@param name string
 function Choices:answer_participant(team_id, name)
   local team = self:team()
-  local row = team and team:team(team_id)
-  local item
-  for _, entry in ipairs(row and row.inbox or {}) do
+  local free, option_entry
+  for _, entry in ipairs(team and self:items(team, team_id) or {}) do
     if entry.state == "open" and entry.kind == "question" and entry.from == name then
-      local has_options = false
-      for _, question in ipairs(entry.questions or {}) do
-        if type(question.options) == "table" and #question.options > 0 then
-          has_options = true
-        end
-      end
-      if not has_options then
-        item = entry
-        break
+      if item_has_options(entry) then
+        option_entry = option_entry or entry
+      else
+        free = free or entry
       end
     end
   end
-  if not item then
-    self:notify("没有来自 " .. tostring(name) .. " 的待回答提问", vim.log.levels.INFO)
+  if option_entry then
+    local open = self:team_entries(team_id)
+    for _, candidate in ipairs(open) do
+      if candidate.item == option_entry then
+        self:show(candidate, open)
+        if not self:is_open() then
+          self:notify("先打开聊天窗口（:Ade open）再显示选择组件", vim.log.levels.INFO)
+        end
+        return
+      end
+    end
+  end
+  if free then
+    vim.ui.input({ prompt = (free.body or "answer") .. ": " }, function(text)
+      if text == nil then
+        return
+      end
+      team:answer(free.id, { text = text }, function(ok, value)
+        if not ok then
+          self:notify("cannot answer: " .. tostring(value and value.message or value), vim.log.levels.WARN)
+        end
+        self:refresh()
+      end)
+    end)
     return
   end
-  vim.ui.input({ prompt = (item.body or "answer") .. ": " }, function(text)
-    if text == nil then
-      return
-    end
-    team:answer(item.id, { text = text }, function(ok, value)
-      if not ok then
-        self:notify("cannot answer: " .. tostring(value and value.message or value), vim.log.levels.WARN)
-      end
-      self:refresh()
-    end)
-  end)
+  if #self:team_entries(team_id) > 0 then
+    self:show_pending(team_id)
+    return
+  end
+  self:notify("没有来自 " .. tostring(name) .. " 的待回答提问", vim.log.levels.INFO)
 end
 
 -- -- ACP requests -----------------------------------------------------------

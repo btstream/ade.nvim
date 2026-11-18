@@ -101,38 +101,6 @@ function M.participant(team, name, board)
   return lines
 end
 
----@param item table
----@return string[]
-function M.inbox(item)
-  local lines = {
-    string.format(
-      "%s %s · %s · from %s",
-      one_line(item.kind),
-      one_line(item.id),
-      one_line(item.state),
-      one_line(item.from)
-    ),
-    "",
-  }
-  for _, line in ipairs(vim.split(item.body or "", "\n", { plain = true })) do
-    lines[#lines + 1] = line
-  end
-  if type(item.options) == "table" and #item.options > 0 then
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = "选项：" .. table.concat(vim.tbl_map(tostring, item.options), " / ")
-  end
-  if item.template then
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = string.format(
-      "模板 %s · 名字 %s · 模型 %s",
-      one_line(item.template),
-      one_line(item.name or "-"),
-      one_line(item.model or "-")
-    )
-  end
-  return lines
-end
-
 ---@param workflow table
 ---@return string[]
 function M.workflow(workflow)

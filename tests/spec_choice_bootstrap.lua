@@ -197,6 +197,7 @@ return function(t)
         participants = {},
         inbox = { item },
       }
+      team.inbox["i1"] = item
       local choices = S.view.choices
       choices:refresh()
       wait(function()

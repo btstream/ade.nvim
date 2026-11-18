@@ -63,38 +63,11 @@ local function typesafe_title(block)
   return value:lower()
 end
 
----A `bus_send` / `bus_ask_human` tool card becomes a message line.
+---A tool card becomes a message line when it is an ade-team tool.
 ---@param block table
 ---@return {title: string, text: string}|nil
 local function bus_tool(block)
-  if block.kind ~= "tool" then
-    return nil
-  end
-  local input = type(block.raw_input) == "table" and block.raw_input or {}
-  local title = typesafe_title(block)
-  -- The pi adapter calls a generic `mcp` tool with `{tool="bus_send", args=...}`;
-  -- direct agents expose `bus_send` or `mcp__ade-team__bus_send`.
-  local proxy = type(input.tool) == "string" and input.tool:lower() or nil
-  local name = proxy or title
-  local args = proxy and type(input.args) == "table" and input.args or input
-  local is_send = name:find("bus_send", 1, true) ~= nil or name:find("bus send", 1, true) ~= nil
-  local is_ask = name:find("bus_ask_human", 1, true) ~= nil or name:find("bus ask human", 1, true) ~= nil
-  if not is_send and not is_ask then
-    -- A tool that happens to have a `body`/`question` argument is not a bus
-    -- message (create-issue and ask-user tools are common false positives).
-    return nil
-  end
-  local body
-  if is_send then
-    local to = args.to or "?"
-    local kind = args.kind or "message"
-    local task = args.task
-    local suffix = task and task ~= "" and task ~= "_" and (" " .. task) or ""
-    body = string.format("→ %s %s%s：%s", to, kind, suffix, tostring(args.body or ""))
-  else
-    body = "asks: " .. tostring(args.question or "")
-  end
-  return { title = title, text = body }
+  return require("ade.ui.team.tools").describe(block)
 end
 
 ---A display-only session for Chat: the source blocks grouped into turns.

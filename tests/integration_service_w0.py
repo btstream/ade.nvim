@@ -126,6 +126,22 @@ class ErrorEditor(base.Editor):
         )
 
 
+def spawn_group(editor):
+    return editor.lua(
+        """
+        local st = require("ade.controller").state()
+        local n, group = 0, nil
+        for _, item in pairs(st.view.team.inbox) do
+          if item.kind == "spawn" and item.state == "open" then
+            n = n + 1
+            group = group or item.group
+          end
+        end
+        return { n = n, group = group }
+        """
+    )
+
+
 def make_editor(case, label, **kwargs):
     editor = W0Editor(case, label, **kwargs)
     case.editors.append(editor)
@@ -151,10 +167,8 @@ def panel_state(editor):
         if impl and impl.tab and impl.tab:is_open() then
           out.tab = true
           out.members = vim.api.nvim_buf_get_lines(impl.tab.buffers.members, 0, -1, false)
-          out.inbox = vim.api.nvim_buf_get_lines(impl.tab.buffers.inbox, 0, -1, false)
           out.board = vim.api.nvim_buf_get_lines(impl.tab.buffers.board, 0, -1, false)
-          out.detail = vim.api.nvim_buf_get_lines(impl.tab.buffers.detail, 0, -1, false)
-          out.title = vim.wo[impl.tab.panels.members].winbar .. vim.wo[impl.tab.panels.detail].winbar
+          out.title = vim.o.tabline
         elseif ui.buf and vim.api.nvim_buf_is_valid(ui.buf) then
           out.lines = vim.api.nvim_buf_get_lines(ui.buf, 0, -1, false)
         end
@@ -290,7 +304,7 @@ def scenario_workflow_start(case):
         ),
         "the wide panel with members",
     )
-    assert "流程：dev" in (panel.get("title") or ""), panel
+    assert "流程 dev" in (panel.get("title") or ""), panel
     assert any("todo" in line or "doing" in line for line in panel["board"]), panel["board"]
     return "a named workflow started two workers, notified the leader with the task, and showed the board"
 
@@ -339,27 +353,23 @@ def scenario_board_cards(case):
 
 
 def scenario_group_approve(case):
-    """3. Two spawns in one turn collapse into one inbox row; A approves both."""
+    """3. Two spawns in one turn form a group; `!` approves both through the UI."""
     editor = make_editor(case, "a", templates=base.template(), spawn_confirm_auto=[])
     editor.connect()
     editor.submit("[spawn-two]")
-    editor.open_panel()
-    panel = editor.wait_panel(
-        lambda value: any("申请启动 2 个 worker" in line for line in value.get("lines", [])),
-        "the grouped spawn row",
+    wait_until(
+        lambda: (lambda value: value if value and value.get("n", 0) >= 2 and value.get("group") else None)(spawn_group(editor)),
+        "the spawn group",
     )
-    group_id = None
-    for line in panel["lines"]:
-        if "i1–i2" in line or "i1-i2" in line:
-            group_id = "item:i1"
-    assert group_id, panel["lines"]
-    cursor_id(editor, group_id)
-    editor.panel_press("A")
-    editor.wait_participant("w1", lambda entry: entry["sessionId"] is not None, "w1 after A")
-    editor.wait_participant("w2", lambda entry: entry["sessionId"] is not None, "w2 after A")
+    editor.open_panel()
+    editor.panel_press("!")
+    wait_until(editor.choice_open, "the choice component")
+    editor.choice_pick("allow")
+    editor.wait_participant("w1", lambda entry: entry["sessionId"] is not None, "w1 after allow")
+    editor.wait_participant("w2", lambda entry: entry["sessionId"] is not None, "w2 after allow")
     approvals = sum((event.get("text") or "").count("approved:") for event in case.agent_events())
     assert approvals >= 2, approvals
-    return "the spawn group was one inbox row and A started both workers"
+    return "the spawn group was approved together through the choice queue"
 
 
 def scenario_activity(case):

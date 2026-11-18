@@ -443,15 +443,13 @@ function View:keys()
   map("d", function()
     self:details()
   end)
+  for _, key in ipairs({ "i", "a", "o", "I", "A", "O", "x", "X", "p", "P", "s", "S", "u", "<C-r>" }) do
+    map(key, function() end)
+  end
   map("K", function()
     self.expanded = not self.expanded
     self:render()
   end)
-  -- Habitual insert keys must not start an insert session in a read-only
-  -- choice buffer (E21) or cancel the request with the first Esc.
-  for _, key in ipairs({ "i", "a", "o", "I", "A", "O", "x", "X", "p", "P", "s", "S", "u", "<C-r>" }) do
-    map(key, function() end)
-  end
 end
 
 ---@param model table
@@ -505,6 +503,9 @@ function View:show(model, mount)
   end
   pcall(vim.api.nvim_set_option_value, "wrap", true, { win = win })
   self:keys()
+  if vim.api.nvim_get_current_win() ~= win then
+    self:notify_message("需要你的选择：切到聊天输入窗口或 :Ade team answer", vim.log.levels.INFO)
+  end
   vim.api.nvim_create_autocmd("InsertLeave", {
     buffer = self.buf,
     callback = function()
@@ -523,7 +524,6 @@ function View:show(model, mount)
       end
     end,
   })
-  pcall(vim.api.nvim_set_current_win, win)
   self:render()
   local lines = vim.api.nvim_buf_line_count(self.buf)
   if not self.external then
