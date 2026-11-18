@@ -481,7 +481,7 @@ pub struct Hub {
     held_timed_out: HashSet<(String, String)>,
     next_held_generation: u64,
     /// (team, participant) -> generation of the latest human interrupt (19.14).
-    interrupt_generation: HashMap<(String, String), u64>,
+    interrupt_generation: HashMap<(String, String), (u64, Option<u64>)>,
     next_interrupt_generation: u64,
     /// Interrupt message ids still queued, in send order, per worker (19.14).
     interrupt_queue: HashMap<(String, String), Vec<u64>>,

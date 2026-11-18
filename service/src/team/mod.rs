@@ -523,10 +523,13 @@ pub struct Participant {
     /// The spawn's display label (19.12).
     #[serde(default)]
     pub label: Option<String>,
-    /// A human interrupt cancelled this turn (19.14): do not count it against
-    /// the turn limits.
+    /// The prompt id of a human-interrupted turn (19.14): do not count it
+    /// against the turn limits.
     #[serde(skip)]
-    pub interrupting: bool,
+    pub interrupting: Option<u64>,
+    /// The prompt id currently running for this participant (19.14).
+    #[serde(skip)]
+    pub prompt_seq: Option<u64>,
 }
 
 impl Participant {
@@ -563,7 +566,8 @@ impl Participant {
             spawn_role: None,
             agent: None,
             label: None,
-            interrupting: false,
+            interrupting: None,
+            prompt_seq: None,
         }
     }
 
@@ -1595,7 +1599,42 @@ impl Teams {
             .get_mut(team_id)
             .and_then(|team| team.participants.get_mut(name))
         {
-            participant.interrupting = true;
+            participant.interrupting = participant.prompt_seq;
+        }
+    }
+
+    /// The prompt id currently running for `name`, if any (19.14).
+    pub fn prompt_seq(&self, team_id: &str, name: &str) -> Option<u64> {
+        self.teams
+            .get(team_id)
+            .and_then(|team| team.participants.get(name))
+            .and_then(|participant| participant.prompt_seq)
+    }
+
+    /// Remember the prompt id a delivery started (19.14).
+    pub fn prompt_started(&mut self, team_id: &str, name: &str, seq: u64) {
+        if let Some(participant) = self
+            .teams
+            .get_mut(team_id)
+            .and_then(|team| team.participants.get_mut(name))
+        {
+            participant.prompt_seq = Some(seq);
+        }
+    }
+
+    /// Whether `seq` is still the running prompt for `name` (19.14). Late
+    /// completions after a forced end are dropped with this.
+    pub fn prompt_is_current(&self, team_id: &str, name: &str, seq: u64) -> bool {
+        self.prompt_seq(team_id, name) == Some(seq)
+    }
+
+    pub fn clear_prompt_seq(&mut self, team_id: &str, name: &str) {
+        if let Some(participant) = self
+            .teams
+            .get_mut(team_id)
+            .and_then(|team| team.participants.get_mut(name))
+        {
+            participant.prompt_seq = None;
         }
     }
 
@@ -1621,6 +1660,12 @@ impl Teams {
             }
         }
         if !out.is_empty() {
+            // The relay-side requests are answered with a cancel; the team's
+            // pending map must forget them too (19.14).
+            let orphaned: std::collections::HashSet<&str> =
+                out.iter().map(|item| item.id.as_str()).collect();
+            team.pending_items
+                .retain(|_, pending| !orphaned.contains(pending.as_str()));
             self.events.push(TeamEvent::Changed(team_id.to_string()));
         }
         out
@@ -2509,6 +2554,7 @@ impl Teams {
             return;
         };
         participant.set_state(ParticipantState::Exited);
+        participant.prompt_seq = None;
         participant.reason = Some(reason.to_string());
         participant.starting = false;
         participant.bus_turn = false;
@@ -2622,6 +2668,7 @@ impl Teams {
         participant.first_prompt = false;
         participant.set_state(ParticipantState::Working);
         participant.bus_turn = true;
+        participant.prompt_seq = None;
         participant.turn_text.clear();
         participant.turn_task = participant.task.clone();
         participant.turn_sender = participant.task_sender.clone();
@@ -2720,8 +2767,10 @@ impl Teams {
         let reported = participant.reported;
         let was_waiting = participant.state == ParticipantState::WaitingHuman;
         let bus_turn = participant.bus_turn;
-        let interrupted = participant.interrupting;
-        participant.interrupting = false;
+        let turn_seq = participant.prompt_seq;
+        let interrupted = participant.interrupting == turn_seq && turn_seq.is_some();
+        participant.interrupting = None;
+        participant.prompt_seq = None;
         participant.bus_turn = false;
         let turn_text = if text.is_empty() {
             participant.turn_text.clone()
@@ -3177,8 +3226,17 @@ impl Teams {
         };
         team.inbox[position].state = ItemState::Answered;
         if matches!(kind, ItemKind::Permission | ItemKind::Request) {
+            let still_waiting = team.inbox.iter().any(|other| {
+                other.id != item_id
+                    && other.state == ItemState::Open
+                    && other.from == from
+                    && matches!(
+                        other.kind,
+                        ItemKind::Question | ItemKind::Permission | ItemKind::Request
+                    )
+            });
             if let Some(participant) = team.participants.get_mut(&from) {
-                if participant.state == ParticipantState::WaitingHuman {
+                if participant.state == ParticipantState::WaitingHuman && !still_waiting {
                     participant.set_state(if participant.bus_turn {
                         ParticipantState::Working
                     } else {

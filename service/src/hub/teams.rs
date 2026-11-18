@@ -74,6 +74,8 @@ pub enum ServiceCall {
         team: String,
         participant: String,
         session: String,
+        /// The relay sequence of this prompt (19.14).
+        seq: u64,
     },
 }
 
@@ -594,8 +596,9 @@ impl Hub {
             self.cancel_participant_turn(&team, &to);
             self.next_interrupt_generation += 1;
             let generation = self.next_interrupt_generation;
+            let prompt_seq = self.teams.prompt_seq(&team, &to);
             self.interrupt_generation
-                .insert((team.clone(), to.clone()), generation);
+                .insert((team.clone(), to.clone()), (generation, prompt_seq));
             let sender = self.command_sender.clone();
             let team_for_timer = team.clone();
             let participant_for_timer = to.clone();
@@ -710,6 +713,8 @@ impl Hub {
         // goes away (19.2).
         self.flush_pending_board(&team, false);
         let (_entry, workers) = self.teams.close(&team)?;
+        self.interrupt_queue.retain(|(id, _), _| id != &team);
+        self.interrupt_generation.retain(|(id, _), _| id != &team);
         for instance in workers {
             let Some(handle) = self.instances.get(&instance) else {
                 continue;
@@ -2032,7 +2037,7 @@ impl Hub {
         &mut self,
         instance: &str,
         agent_id: u64,
-        seq: u64,
+        _seq: u64,
         message: &Value,
     ) {
         let Some(call) = self.driver.remove(&(instance.to_string(), agent_id)) else {
@@ -2279,7 +2284,13 @@ impl Hub {
                 team,
                 participant,
                 session,
+                seq,
             } => {
+                if !self.teams.prompt_is_current(&team, &participant, seq) {
+                    // A forced interrupt deadline already ended this prompt;
+                    // its late completion must not end the next turn.
+                    return;
+                }
                 let (success, error) = turn_outcome(message);
                 let cancelled = message
                     .get("result")
@@ -2293,15 +2304,27 @@ impl Hub {
                 let error = if cancelled { None } else { error };
                 self.teams
                     .turn_finished(instance, success, error, String::new());
+                self.teams.clear_prompt_seq(&team, &participant);
                 self.drain_team_events();
                 self.release_held_prompts(instance, &session, false);
-                let _ = (team, participant, seq);
                 self.team_deliveries();
             }
         }
     }
 
     pub(crate) fn team_deliveries(&mut self) {
+        let alive = |teams: &crate::team::Teams, team: &String, participant: &String| {
+            teams.team(team).is_some_and(|entry| {
+                entry
+                    .participants
+                    .get(participant)
+                    .is_some_and(|p| p.state != crate::team::ParticipantState::Exited)
+            })
+        };
+        self.interrupt_queue
+            .retain(|(team, participant), _| alive(&self.teams, team, participant));
+        self.interrupt_generation
+            .retain(|(team, participant), _| alive(&self.teams, team, participant));
         let mut busy: HashSet<String> = self
             .instances
             .iter()
@@ -2365,11 +2388,13 @@ impl Hub {
             self.driver.insert(
                 (instance.clone(), agent_id),
                 ServiceCall::Prompt {
-                    team,
-                    participant,
+                    team: team.clone(),
+                    participant: participant.clone(),
                     session: session.clone(),
+                    seq,
                 },
             );
+            self.teams.prompt_started(&team, &participant, seq);
             let started = json!({
                 "jsonrpc": "2.0",
                 "method": "_ade/turn_started",
@@ -2466,7 +2491,15 @@ impl Hub {
         generation: u64,
     ) {
         let key = (team.to_string(), participant.to_string());
-        if self.interrupt_generation.get(&key) != Some(&generation) {
+        let Some((saved_generation, prompt_seq)) = self.interrupt_generation.get(&key).copied()
+        else {
+            return;
+        };
+        if saved_generation != generation {
+            return;
+        }
+        if self.teams.prompt_seq(team, participant) != prompt_seq {
+            // The interrupted turn already ended and a new one started.
             return;
         }
         if !self.teams.bus_turn_running(team, participant) {
@@ -2479,6 +2512,7 @@ impl Hub {
         // the queued interrupt (front of the mailbox) can be delivered.
         self.teams
             .turn_finished(&instance, false, None, String::new());
+        self.teams.clear_prompt_seq(team, participant);
         self.drain_team_events();
         self.team_deliveries();
     }

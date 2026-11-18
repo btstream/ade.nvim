@@ -147,9 +147,9 @@ return function(t)
       local watch = setup(t, { config = config })
       local maps = {}
       for _, map in ipairs(vim.api.nvim_buf_get_keymap(watch.input.buf, "n")) do
-        maps[map.lhs] = true
+        maps[map.lhs:lower()] = true
       end
-      t.truthy(maps["<C-S>"] or maps["<C-s>"] or maps["<C-x>"])
+      t.eq(true, maps["<c-x>"], "the second configured send key is bound")
 
       local second = setup(t, {
         config = (function()
@@ -158,9 +158,65 @@ return function(t)
           return copy
         end)(),
       })
+      local c_s = false
       for _, map in ipairs(vim.api.nvim_buf_get_keymap(second.input.buf, "n")) do
-        t.truthy(map.lhs ~= "<C-s>", "send=false must not bind <C-s>")
+        if map.lhs:lower() == "<c-s>" then
+          c_s = true
+        end
       end
+      t.eq(false, c_s, "send=false must not bind <C-s>")
+    end)
+
+    t.it("resizes the composer together with the watch and stays stable", function()
+      local Tab = require("ade.ui.team.layout_tab")
+      local function new_window()
+        local buf = vim.api.nvim_create_buf(false, true)
+        vim.api.nvim_win_set_buf(0, buf)
+        return buf
+      end
+      vim.cmd("tabnew")
+      local tab = Tab.new({})
+      tab.tab = vim.api.nvim_get_current_tabpage()
+      new_window()
+      tab.panels.members = vim.api.nvim_get_current_win()
+      vim.cmd("vsplit")
+      new_window()
+      tab.panels.board = vim.api.nvim_get_current_win()
+      vim.cmd("vsplit")
+      new_window()
+      tab.watch_win = vim.api.nvim_get_current_win()
+      vim.cmd("split")
+      local input_buf = new_window()
+      local input = vim.api.nvim_get_current_win()
+      vim.bo[input_buf].filetype = "ade_team_input"
+      t.cleanup(function()
+        if vim.api.nvim_tabpage_is_valid(tab.tab) then
+          pcall(vim.cmd, "tabclose")
+        end
+      end)
+      t.eq(2, #tab:right_windows(), "the watch and its composer share the column")
+      vim.o.columns = 200
+      tab.members_width = 32
+      tab:resize()
+      local watch_width = vim.api.nvim_win_get_width(tab.watch_win)
+      t.eq(watch_width, vim.api.nvim_win_get_width(input))
+      for _ = 1, 3 do
+        tab:resize()
+      end
+      t.eq(watch_width, vim.api.nvim_win_get_width(tab.watch_win))
+      t.eq(watch_width, vim.api.nvim_win_get_width(input))
+    end)
+
+    t.it("focuses the composer with i", function()
+      local watch = setup(t)
+      vim.api.nvim_set_current_win(watch.win)
+      local maps = {}
+      for _, map in ipairs(vim.api.nvim_buf_get_keymap(watch.buf, "n")) do
+        maps[map.lhs] = map.callback
+      end
+      t.truthy(maps["i"])
+      maps["i"]()
+      t.eq(watch.input.win, vim.api.nvim_get_current_win())
     end)
 
     t.it("keeps a draft per worker and hides the input for the leader", function()

@@ -1570,6 +1570,225 @@ fn an_interrupt_times_out_and_frees_the_worker() {
 }
 
 #[test]
+fn a_stale_interrupt_deadline_does_not_end_the_next_turn() {
+    let mut harness = Harness::new_with_env(
+        "team-interrupt-stale",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+        &[("NVIM_ADE_SERVER_HELD_TIMEOUT_MS", "200")],
+    );
+    let spawned = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template": "dev", "name": "w1", "task": "do [ask-slow]"}),
+    );
+    assert_eq!(spawned["isError"], false, "{spawned}");
+    harness.wait_participant("w1", |entry| entry["state"] == "waiting_human");
+    let sent = harness.client.request(
+        91,
+        "team.send",
+        json!({"team": harness.team, "to": "w1", "kind": "notice", "body": "free [slow]", "interrupt": true}),
+    );
+    assert!(sent["result"].is_object(), "{sent}");
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .any(|event| {
+                    event["event"] == "prompt"
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("free [slow]"))
+                })
+                .then_some(())
+        },
+        "the new turn",
+    );
+    // The old deadline fires while this new turn is still running.
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(
+        harness.participant("w1").unwrap()["state"],
+        "working",
+        "the stale timer must not end the new turn"
+    );
+    std::fs::write(harness.server.dir().join("team-agent.gate"), b"go").expect("gate");
+    wait_for(
+        || (harness.participant("w1").unwrap()["state"] == "idle").then_some(()),
+        "the new turn to finish",
+    );
+}
+
+#[test]
+fn consecutive_interrupts_keep_their_order() {
+    let mut harness = Harness::new_with_env(
+        "team-interrupt-order",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+        &[("NVIM_ADE_SERVER_HELD_TIMEOUT_MS", "150")],
+    );
+    let spawned = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template": "dev", "name": "w1", "task": "do [slow-ignore-cancel]"}),
+    );
+    assert_eq!(spawned["isError"], false, "{spawned}");
+    let (_, worker_session) = team_instance(&mut harness, "w1");
+    harness.wait_participant("w1", |entry| entry["state"] == "working");
+    for body in ["first", "second"] {
+        let sent = harness.client.request(
+            91,
+            "team.send",
+            json!({"team": harness.team, "to": "w1", "kind": "notice", "body": body, "interrupt": true}),
+        );
+        assert!(sent["result"].is_object(), "{sent}");
+    }
+    std::fs::write(harness.server.dir().join("team-agent.gate"), b"go").expect("gate");
+    wait_for(
+        || {
+            // The two queued interrupts are delivered together, in send order.
+            let joined: String = harness
+                .events()
+                .iter()
+                .filter(|event| {
+                    event["event"] == "prompt" && event["session"] == worker_session.as_str()
+                })
+                .filter_map(|event| event["text"].as_str())
+                .collect();
+            match (joined.find("first"), joined.find("second")) {
+                (Some(first), Some(second)) if first < second => Some(()),
+                _ => None,
+            }
+        },
+        "both interrupts in send order",
+    );
+}
+
+#[test]
+fn an_interrupted_turn_does_not_count_against_the_limits() {
+    let mut harness = Harness::new_with_env(
+        "team-interrupt-limits",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+        &[("NVIM_ADE_SERVER_HELD_TIMEOUT_MS", "150")],
+    );
+    let spawned = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template": "dev", "name": "w1", "task": "do [slow-ignore-cancel]"}),
+    );
+    assert_eq!(spawned["isError"], false, "{spawned}");
+    let (_, worker_session) = team_instance(&mut harness, "w1");
+    harness.wait_participant("w1", |entry| entry["state"] == "working");
+    let sent = harness.client.request(
+        91,
+        "team.send",
+        json!({"team": harness.team, "to": "w1", "kind": "notice", "body": "free", "interrupt": true}),
+    );
+    assert!(sent["result"].is_object(), "{sent}");
+    // Let the deadline force-end the ignored turn before the agent returns, so
+    // the late completion is dropped instead of ending the next turn.
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(harness.server.dir().join("team-agent.gate"), b"go").expect("gate");
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .any(|event| {
+                    event["event"] == "prompt"
+                        && event["session"] == worker_session.as_str()
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("free"))
+                })
+                .then_some(())
+        },
+        "the delivered interrupt",
+    );
+    wait_for(
+        || (harness.participant("w1").unwrap()["state"] == "idle").then_some(()),
+        "the worker to go idle",
+    );
+    let worker = harness.participant("w1").unwrap();
+    assert_eq!(
+        worker["turns"]["total"], 1,
+        "the interrupted turn is not counted: {worker}"
+    );
+}
+
+#[test]
+fn an_interrupt_frees_a_worker_waiting_for_an_answer() {
+    let mut harness = Harness::new_with_env(
+        "team-interrupt-waiting",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+        &[("NVIM_ADE_SERVER_HELD_TIMEOUT_MS", "150")],
+    );
+    let spawned = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template": "dev", "name": "w1", "task": "do [ask-slow]"}),
+    );
+    assert_eq!(spawned["isError"], false, "{spawned}");
+    harness.wait_participant("w1", |entry| entry["state"] == "waiting_human");
+    let interrupted = harness.client.request(
+        91,
+        "team.send",
+        json!({"team": harness.team, "to": "w1", "kind": "notice", "body": "free", "interrupt": true}),
+    );
+    assert!(interrupted["result"].is_object(), "{interrupted}");
+    wait_for(
+        || {
+            let entry = harness.team();
+            entry["inbox"]
+                .as_array()
+                .is_some_and(|items| {
+                    items
+                        .iter()
+                        .all(|item| !(item["kind"] == "question" && item["state"] == "open"))
+                })
+                .then_some(())
+        },
+        "the pending question to be cancelled",
+    );
+    wait_for(
+        || {
+            let events = harness.events();
+            events
+                .iter()
+                .any(|event| {
+                    event["event"] == "prompt"
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("free"))
+                })
+                .then_some(())
+        },
+        "the interrupt after a waiting worker",
+    );
+    assert_ne!(
+        harness.participant("w1").unwrap()["state"],
+        "waiting_human",
+        "the worker must leave waiting_human"
+    );
+}
+
+fn team_send_fields(harness: &mut Harness, fields: Value) -> Value {
+    let mut params = json!({"team": harness.team, "to": "w1", "kind": "notice", "body": "x"});
+    if let Value::Object(map) = fields {
+        for (key, value) in map {
+            params[key] = value;
+        }
+    }
+    harness.client.request(91, "team.send", params)
+}
+
+#[test]
 fn interrupt_and_cc_are_validated() {
     let mut harness = Harness::new(
         "team-interrupt-args",
@@ -1583,25 +1802,41 @@ fn interrupt_and_cc_are_validated() {
         json!({"template": "dev", "name": "w1", "task": "work"}),
     );
     assert_eq!(spawned["isError"], false, "{spawned}");
-    let mut bad = |fields: Value| {
-        let mut params = json!({"team": harness.team, "to": "w1", "kind": "notice", "body": "x"});
-        if let Value::Object(map) = fields {
-            for (key, value) in map {
-                params[key] = value;
-            }
-        }
-        harness.client.request(91, "team.send", params)
-    };
+
     let long = "x".repeat(64 * 1024 - 4);
-    let cc_failed = bad(json!({"body": long, "cc": ["leader"]}));
+    let unknown_team = harness.client.request(
+        91,
+        "team.send",
+        json!({"team": "nope", "to": "w1", "kind": "notice", "body": "x"}),
+    );
+    assert_eq!(unknown_team["error"]["code"], -32064, "{unknown_team}");
+    let unknown_participant = harness.client.request(
+        91,
+        "team.send",
+        json!({"team": harness.team, "to": "nope", "kind": "notice", "body": "x"}),
+    );
+    assert_eq!(
+        unknown_participant["error"]["code"], -32064,
+        "{unknown_participant}"
+    );
+
+    let cc_failed = harness.client.request(
+        91,
+        "team.send",
+        json!({"team": harness.team, "to": "w1", "kind": "notice", "body": long, "cc": ["leader"]}),
+    );
     assert!(cc_failed["result"]["id"].is_number(), "{cc_failed}");
     assert!(
         cc_failed["result"]["cc_failed"].as_str().is_some(),
         "the main message still succeeds: {cc_failed}"
     );
 
-    assert!(!bad(json!({"interrupt": true})).get("error").is_some());
-    assert!(!bad(json!({"cc": ["leader"]})).get("error").is_some());
+    assert!(!team_send_fields(&mut harness, json!({"interrupt": true}))
+        .get("error")
+        .is_some());
+    assert!(!team_send_fields(&mut harness, json!({"cc": ["leader"]}))
+        .get("error")
+        .is_some());
     let leader_interrupt = harness.client.request(
         91,
         "team.send",
