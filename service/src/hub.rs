@@ -137,10 +137,14 @@ impl Outbox {
             // The frame was not queued: put the bytes back so is_empty() and
             // flush_outbox still describe the real queue.
             self.queued.fetch_sub(size, Ordering::AcqRel);
-            self.log_close(format_args!(
-                "nvim_ade_server: connection {} closed: outbound queue {} bytes exceeds the {} byte limit",
-                self.conn, total, self.limit
-            ));
+            if *self.closer.borrow() {
+                self.close_logged.store(true, Ordering::Release);
+            } else {
+                self.log_close(format_args!(
+                    "nvim_ade_server: connection {} closed: outbound queue {} bytes exceeds the {} byte limit",
+                    self.conn, total, self.limit
+                ));
+            }
             let _ = self.closer.send(true);
             return false;
         }
@@ -2946,6 +2950,17 @@ mod tests {
         // frame; otherwise is_empty() stays false forever.
         assert!(!outbox.send(&json!({"b": "this frame is much too large for eight bytes"})));
         assert_eq!(queued, outbox.queued_bytes());
+    }
+
+    #[test]
+    fn outbox_writer_gone_rolls_back_and_logs_once() {
+        let (closer, _watch) = watch::channel(false);
+        let (outbox, receiver) = Outbox::with_limit(closer, 64 * 1024, 42);
+        drop(receiver);
+        assert!(!outbox.send(&json!({"a": 1})));
+        assert_eq!(0, outbox.queued_bytes());
+        // A second send must not log again (close_logged is sticky).
+        assert!(!outbox.send(&json!({"a": 2})));
     }
 
     #[tokio::test]

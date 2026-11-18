@@ -169,6 +169,10 @@ function M.full(session, view, opts)
     lines[#lines + 1] = "↑ Load earlier messages (<CR>)"
     meta[#meta + 1] = { kind = "page", page = -1, segments = { { s = 0, e = -1, group = "AdeLink" } } }
   end
+  if view.page and view.page.continuation then
+    lines[#lines + 1] = "（" .. view.page.continuation .. "）"
+    meta[#lines + 1] = { kind = "notice", segments = { { s = 0, e = -1, group = "AdeMuted" } } }
+  end
   for index = first, last do
     local block = session.blocks[index]
     row_starts[index], turn_counts[index], render_order[index] = #lines + 1, turn, block.id

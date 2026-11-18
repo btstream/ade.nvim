@@ -11,6 +11,7 @@ function M.new(cfg)
   return setmetatable({ cfg = cfg }, Page)
 end
 
+---@return integer stop, string|nil continuation
 local function edge(blocks, start, direction, cfg)
   local stop, bytes = start, 0
   for i = start, direction < 0 and 1 or #blocks, direction do
@@ -20,18 +21,38 @@ local function edge(blocks, start, direction, cfg)
     end
     stop, bytes = i, bytes + size
   end
-  -- A page starts on a turn heading, never in the middle of a turn: the
-  -- watch must not show a turn whose heading is on the previous page.
-  if direction < 0 then
-    while stop > 1 and blocks[stop].kind ~= "user" do
-      stop = stop - 1
+  if direction >= 0 or not cfg.turn_start then
+    return stop, nil
+  end
+  -- Optional turn alignment (the watch view only). Backtrack at most one
+  -- extra page of blocks/bytes; a very long turn starts mid-turn and gets a
+  -- continuation heading instead of swallowing the whole history.
+  local added, added_bytes, continuation = 0, 0, false
+  while stop > 1 and not cfg.turn_start(blocks[stop]) do
+    local size = cost(blocks[stop - 1])
+    if added + 1 > cfg.page_blocks or (added_bytes > 0 and added_bytes + size > cfg.page_bytes) then
+      continuation = true
+      break
+    end
+    stop, added, added_bytes = stop - 1, added + 1, added_bytes + size
+  end
+  if continuation and cfg.turn_name then
+    for i = stop - 1, 1, -1 do
+      if cfg.turn_start(blocks[i]) then
+        local name = cfg.turn_name(blocks[i])
+        if name then
+          return stop, name .. " 续"
+        end
+        break
+      end
     end
   end
-  return stop
+  return stop, nil
 end
 
-function Page:set(blocks, first, last)
+function Page:set(blocks, first, last, continuation)
   self.first, self.last = first, last
+  self.continuation = continuation
   self.first_id = blocks[first] and blocks[first].id
   self.last_id = blocks[last] and blocks[last].id
 end
@@ -51,6 +72,7 @@ function Page:sync(session, follow)
   end
   -- The newest block is always materialised: new output must appear without a
   -- manual "load newer" step. Only the older side is paged.
+  local continuation
   if follow or not first then
     -- Keep a reader near the old page when the block that owned its first row
     -- disappeared (e.g. a collapsed turn), rather than jumping to the tail.
@@ -58,9 +80,12 @@ function Page:sync(session, follow)
     if not follow and self.first then
       start = math.max(1, math.min(self.first, n))
     end
-    first = edge(blocks, start, -1, self.cfg)
+    first, continuation = edge(blocks, start, -1, self.cfg)
   end
-  self:set(blocks, first, n)
+  if not continuation and not follow and first ~= nil then
+    continuation = self.continuation
+  end
+  self:set(blocks, first, n, continuation)
   return self.first, self.last
 end
 
@@ -78,14 +103,14 @@ function Page:load(session, direction, pins)
   if direction >= 0 or #blocks == 0 or self.first == 1 then
     return false
   end
-  local first = edge(blocks, self.first - 1, -1, self.cfg)
-  self:set(blocks, first, self.last)
+  local first, continuation = edge(blocks, self.first - 1, -1, self.cfg)
+  self:set(blocks, first, self.last, continuation)
   return true
 end
 
 function Page:beginning(session)
   local blocks = session.blocks
-  self:set(blocks, 1, #blocks)
+  self:set(blocks, 1, #blocks, nil)
 end
 
 ---Return to the newest window, dropping older pages the user no longer reads.
@@ -111,7 +136,12 @@ function Page:trim(session, pins)
     bytes = bytes - cost(blocks[first])
     first = first + 1
   end
-  self:set(blocks, first, n)
+  if self.cfg.turn_start then
+    while first < n and not self.cfg.turn_start(blocks[first]) do
+      first = first + 1
+    end
+  end
+  self:set(blocks, first, n, nil)
 end
 
 function M.selected(view)

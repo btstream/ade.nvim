@@ -951,18 +951,26 @@ function Watch:jump_turn(direction)
     end
     return
   end
-  -- The previous turn lives on an older page: load it and put the cursor on
-  -- the new page's first turn heading once the page has rendered.
-  if direction < 0 and self.chat and self.chat.page and self.chat:load_page(-1) then
-    vim.defer_fn(function()
-      if not (self.win and vim.api.nvim_win_is_valid(self.win)) then
-        return
-      end
-      local turns = self:turn_lines()
-      local line = turns[1] and turns[1].line or 1
-      pcall(vim.api.nvim_win_set_cursor, self.win, { line, 0 })
+  -- The previous turn lives on an older page. Use the chat's page_target so
+  -- the cursor lands on that turn after the asynchronous page render; a busy
+  -- commit queue defers the request instead of silently ignoring the key.
+  if direction < 0 and self.chat and self.chat.page then
+    if self.chat.commit_job then
+      vim.defer_fn(function()
+        if self.chat then
+          self:jump_turn(direction)
+        end
+      end, 50)
+      return
+    end
+    local blocks = self.chat.session and self.chat.session.blocks or {}
+    local index = (self.chat.page.first or 1) - 1
+    while index >= 1 and not (type(blocks[index].id) == "string" and blocks[index].id:match("^watch%-turn%-%d+$")) do
+      index = index - 1
+    end
+    if index >= 1 and self.chat:load_page(-1, blocks[index].id) then
       self.chat.follow = false
-    end, 120)
+    end
   end
 end
 

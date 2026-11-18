@@ -461,7 +461,7 @@ end
 ---Rows written so far during a chunked commit, or nil when idle.
 ---@return {done: integer, total: integer}|nil
 function Chat:commit_status()
-  if not self.commit_job then
+  if not self.commit_job or not self.commit_total then
     return nil
   end
   return { done = self.commit_done or 0, total = self.commit_total or 0 }
@@ -475,9 +475,11 @@ function Chat:commit_layout_async(layout, layout_only, saved_view, chunk_rows, o
   self.layout_epoch = epoch
   local job = { epoch = epoch, version = version }
   self.commit_job = job
-  self.commit_total = #layout.lines
-  self.commit_done = 0
-  local progress = { done = 0 }
+  -- A first paint is worth a progress label; an incremental write at the tail
+  -- of a long history reports absolute rows that mean nothing to the reader.
+  self.commit_total = (full or #(old or {}) == 0) and #layout.lines or nil
+  self.commit_done = self.commit_total and 0 or nil
+  local progress = self.commit_total and { done = 0 } or nil
   local win, width, generation, thoughts = self.win, self.width, CodeHL.generation, self.show_thoughts
   local started = metrics.start(self)
   local co = renderer.write_chunked(buf, layout.lines, layout.meta, old or {}, full, chunk_rows, progress)
@@ -527,7 +529,9 @@ function Chat:commit_layout_async(layout, layout_only, saved_view, chunk_rows, o
       return false
     end
     local ok, err = coroutine.resume(co)
-    self.commit_done = math.min(self.commit_total or 0, progress.done or 0)
+    if self.commit_total and progress then
+      self.commit_done = math.min(self.commit_total, progress.done or 0)
+    end
     if self.on_commit_step then
       pcall(self.on_commit_step, self)
     end
