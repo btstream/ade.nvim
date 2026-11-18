@@ -1223,7 +1223,10 @@ name for `team_spawn` takes the lowest free `w<n>`.
 leader are dropped, then the last `team.changed`. The stop of each worker is
 initiated before that notification; the command does not wait for the processes
 to exit, and the team is gone from `team.list` afterwards. The leader's session
-and instance are left alone. `team.bind_leader` for an existing team with a
+and instance stay (the person keeps the conversation), but a prompt of the
+leader's session that is running when the team closes is cancelled
+(`session/cancel`, as in 18.11), whether it came from the bus or from a front
+end, and prompts held for it are dropped. `team.bind_leader` for an existing team with a
 different session is `-32061`: to change the leader, close the team.
 
 **Watchers.** For a worker instance the watchers play the role of the attached
