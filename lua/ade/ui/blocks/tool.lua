@@ -225,8 +225,18 @@ function M.render_tool(block, ctx)
       local header = one_line(message.title)
       local body = one_line(message.text)
       local line = body ~= "" and (header .. "：" .. body) or header
+      local group, suffix = "AdeNotice", ""
+      if block.status == "failed" then
+        group, suffix = "AdeToolError", " · 失败"
+      elseif block.status == "cancelled" then
+        group, suffix = "AdeToolCancelled", " · 已取消"
+      elseif block.status == "in_progress" or block.status == "pending" then
+        group, suffix = "AdeToolRunning", " · …"
+      end
+      local caret = (ctx.icons and ctx.icons.chevron_right) or "›"
+      line = require("ade.ui.team.text").ellipsis(caret .. " " .. line .. suffix, ctx.width or 80)
       return {
-        { text = line, segments = { { s = 0, e = -1, group = "AdeNotice" } } },
+        { text = line, segments = { { s = 0, e = -1, group = group } } },
         { text = "", segments = nil },
       }
     end
