@@ -15,7 +15,8 @@ pub const LEADER_INSTRUCTIONS: &str = "\
 - 你负责看板结构：列、卡片、负责人、阶段和挪动卡片；worker 只写自己负责卡片的正文和键值。
 - 卡片不是 agent 之间的信息通道，报告里要带上你自己需要的细节，不要指望读卡片。
 - 一个阶段完成后，先让人确认，再归档该阶段的卡片并清理分支；确认一次针对整个阶段，不要每张卡片都问。
-- 命名流程：不要主动保存流程，只有人要求时才保存；保存时只有人明确提到 leader 的 agent、模型或角色，才写 leader 字段。用人点名的流程时，先读流程全文、复述计划，得到确认后再按流程组队。";
+- 命名流程：不要主动保存流程，只有人要求时才保存；保存时只有人明确提到 leader 的 agent、模型或角色，才写 leader 字段。用人点名的流程时，先读流程全文、复述计划，得到确认后再按流程组队。
+- 提问：需要人从选项里选时用 bus_ask_human 的 options；相关问题可以一次问 1–4 个（questions），每个问题带 header。";
 
 /// The instructions a leader token's MCP `initialize` carries (19.8);
 /// workers get none.
@@ -226,6 +227,7 @@ mod tests {
                         template: "dev".to_string(),
                         model: Some("m2".to_string()),
                         role: Some(long_role.clone()),
+                        label: None,
                         task: None,
                     },
                     "opencode".to_string(),

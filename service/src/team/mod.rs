@@ -237,6 +237,46 @@ impl ItemKind {
     }
 }
 
+/// One option of a 19.13 question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// One 19.13 question. The 18.5 form is normalised to one of these.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Question {
+    pub header: String,
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<QuestionOption>>,
+    #[serde(default)]
+    pub multi_select: bool,
+}
+
+impl Question {
+    pub fn to_json(&self) -> Value {
+        let mut out = json!({
+            "header": self.header,
+            "question": self.question,
+            "multi_select": self.multi_select,
+        });
+        if let Some(options) = &self.options {
+            out["options"] = json!(options);
+        }
+        out
+    }
+}
+
+/// One answer to a 19.13 question (`team.answer.answers`).
+#[derive(Debug, Clone, Default)]
+pub struct QuestionAnswer {
+    pub selected: Vec<String>,
+    pub text: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboxItem {
     pub id: String,
@@ -257,6 +297,12 @@ pub struct InboxItem {
     pub model: Option<String>,
     #[serde(default)]
     pub role: Option<String>,
+    /// The spawn's display label (19.12).
+    #[serde(default)]
+    pub label: Option<String>,
+    /// The normalised questions of a question item (19.13).
+    #[serde(default)]
+    pub questions: Option<Vec<Question>>,
     /// The template's agent, for the inbox display (19.6).
     #[serde(default)]
     pub agent: Option<String>,
@@ -295,6 +341,10 @@ impl InboxItem {
                 if let Some(options) = &self.options {
                     out["options"] = json!(options);
                 }
+                if let Some(questions) = &self.questions {
+                    out["questions"] =
+                        json!(questions.iter().map(Question::to_json).collect::<Vec<_>>());
+                }
             }
             ItemKind::Spawn => {
                 out["template"] = json!(self.template);
@@ -307,6 +357,9 @@ impl InboxItem {
                 }
                 if let Some(role) = &self.role {
                     out["role"] = json!(role);
+                }
+                if let Some(label) = &self.label {
+                    out["label"] = json!(label);
                 }
                 if let Some(agent) = &self.agent {
                     out["agent"] = json!(agent);
@@ -464,6 +517,12 @@ pub struct Participant {
     /// The role a spawn appended to the template's role card (19.6).
     #[serde(default)]
     pub spawn_role: Option<String>,
+    /// The template's agent id (19.12); the leader stores its instance agent.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// The spawn's display label (19.12).
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 impl Participant {
@@ -498,6 +557,8 @@ impl Participant {
             state_since: now_ms(),
             model: None,
             spawn_role: None,
+            agent: None,
+            label: None,
         }
     }
 
@@ -585,6 +646,9 @@ impl Team {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TeamEvent {
     Changed(String),
+    /// A board write from the state layer (19.12); the hub persists and
+    /// announces it like a `bus.board_update`.
+    Board(String, u64),
     Inbox(String, String),
     /// An item whose team is already gone (the last `team.inbox` before the
     /// closing `team.changed`).
@@ -739,6 +803,11 @@ pub struct Teams {
     workflows: workflow::StoredWorkflows,
     /// cwd -> project key, so git runs at most once per cwd.
     project_keys: HashMap<String, String>,
+    /// Tests inspect the board of a closed team after it is removed.
+    #[cfg(test)]
+    closed_boards: HashMap<String, board::Board>,
+    #[cfg(test)]
+    closed_reserved: HashMap<String, HashSet<String>>,
 }
 
 impl Teams {
@@ -758,11 +827,26 @@ impl Teams {
             next_group: 0,
             workflows: workflow::StoredWorkflows::new(),
             project_keys: HashMap::new(),
+            #[cfg(test)]
+            closed_boards: HashMap::new(),
+            #[cfg(test)]
+            closed_reserved: HashMap::new(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
         self.teams.is_empty()
+    }
+
+    /// The board a closed team had after its spawn cleanup (tests only).
+    #[cfg(test)]
+    pub fn closed_board(&self, team: &str) -> Option<&board::Board> {
+        self.closed_boards.get(team)
+    }
+
+    #[cfg(test)]
+    pub fn closed_reserved_names(&self, team: &str) -> Option<&HashSet<String>> {
+        self.closed_reserved.get(team)
     }
 
     pub fn is_closed(&self, team: &str) -> bool {
@@ -1154,7 +1238,13 @@ impl Teams {
 
     /// Move a suspended team to active once; returns the entry to send. The
     /// caller starts the participants and then calls `finish_resume`.
-    pub fn start_resume(&mut self, team_id: &str, instance: &str, session: &str) -> Value {
+    pub fn start_resume(
+        &mut self,
+        team_id: &str,
+        instance: &str,
+        session: &str,
+        agent: &str,
+    ) -> Value {
         let config = self
             .teams
             .get(team_id)
@@ -1171,6 +1261,7 @@ impl Teams {
             if let Some(leader) = team.participants.get_mut("leader") {
                 leader.instance = Some(instance.to_string());
                 leader.session = Some(session.to_string());
+                leader.agent = Some(agent.to_string());
                 leader.set_state(ParticipantState::Idle);
                 leader.starting = false;
             }
@@ -1217,6 +1308,7 @@ impl Teams {
         instance: &str,
         session: &str,
         token_id: &str,
+        agent: &str,
     ) -> Result<BindOutcome, TeamError> {
         let Some(record) = self.token_records.get(token_id) else {
             return Err(TeamError::not_allowed("unknown leader token"));
@@ -1256,7 +1348,7 @@ impl Teams {
                         "team": team_entry(&self.teams[&team_id])
                     })));
                 }
-                let entry = self.start_resume(&team_id, instance, session);
+                let entry = self.start_resume(&team_id, instance, session, agent);
                 if let Some(record) = self.token_records.get_mut(token_id) {
                     record.bound = true;
                     record.team = Some(team_id.clone());
@@ -1276,6 +1368,13 @@ impl Teams {
                         "the team already has a different leader session",
                     ));
                 }
+            }
+            if let Some(leader) = self
+                .teams
+                .get_mut(&team_id)
+                .and_then(|team| team.participants.get_mut("leader"))
+            {
+                leader.agent = Some(agent.to_string());
             }
             if let Some(record) = self.token_records.get_mut(token_id) {
                 record.bound = true;
@@ -1322,6 +1421,7 @@ impl Teams {
         let mut leader = Participant::new("leader", Role::Leader);
         leader.instance = Some(instance.to_string());
         leader.session = Some(session.to_string());
+        leader.agent = Some(agent.to_string());
         team.participants.insert("leader".to_string(), leader);
         let entry = team_entry(&team);
         self.by_cwd.insert(cwd, id.clone());
@@ -1350,6 +1450,63 @@ impl Teams {
         json!({ "teams": teams })
     }
 
+    /// 19.12: clear `owner` from the cards of a refused/orphaned spawn and
+    /// tell the leader which cards changed.
+    fn clear_owners_after_spawn(
+        &mut self,
+        team_id: &str,
+        name: &str,
+        reason: &str,
+        notify_leader: bool,
+    ) {
+        let now = now_ms();
+        let Some(team) = self.teams.get_mut(team_id) else {
+            return;
+        };
+        match team.board.clear_owner(name, now) {
+            Ok(Some((rev, cards))) => {
+                self.events.push(TeamEvent::Board(team_id.to_string(), rev));
+                if notify_leader {
+                    let body = format!(
+                        "owner cleared on {}: spawn request {name} {reason}",
+                        cards.join(", ")
+                    );
+                    let _ = self.send_message(
+                        team_id,
+                        "human",
+                        "leader",
+                        Kind::Notice,
+                        &body,
+                        None,
+                        vec![],
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!(
+                    "nvim_ade_server: cannot clear owner {name} of team {team_id}: {}",
+                    error.message
+                );
+                if notify_leader {
+                    let body = format!(
+                        "cannot clear owner {name}: {} (cards may still name it)",
+                        error.message
+                    );
+                    let _ = self.send_message(
+                        team_id,
+                        "human",
+                        "leader",
+                        Kind::Notice,
+                        &body,
+                        None,
+                        vec![],
+                    );
+                }
+            }
+        }
+    }
+
     pub fn close(&mut self, team_id: &str) -> Result<(Value, Vec<String>), TeamError> {
         let Some(team) = self.teams.get_mut(team_id) else {
             return Err(TeamError::unknown("unknown team"));
@@ -1360,11 +1517,21 @@ impl Teams {
         team.closed = true;
         team.current_group = None;
         let mut orphaned = Vec::new();
+        let mut orphaned_spawns = Vec::new();
         for item in &mut team.inbox {
             if item.kind == ItemKind::Spawn && item.state == ItemState::Open {
                 item.state = ItemState::Orphaned;
+                orphaned_spawns.push(item.name.clone());
                 orphaned.push(item.to_json());
             }
+        }
+        // 19.12: an orphaned spawn no longer owns cards and its name is free
+        // again. The board row is deleted with the team, so this is memory
+        // only and needs no notice.
+        let now = now_ms();
+        for name in orphaned_spawns.into_iter().flatten() {
+            team.reserved_names.remove(&name);
+            let _ = team.board.clear_owner(&name, now);
         }
         let workers: Vec<String> = team
             .workers()
@@ -1375,6 +1542,12 @@ impl Teams {
         if let Some(leader) = team.participants.get_mut("leader") {
             leader.mailbox.clear();
         }
+        #[cfg(test)]
+        self.closed_boards
+            .insert(team_id.to_string(), team.board.clone());
+        #[cfg(test)]
+        self.closed_reserved
+            .insert(team_id.to_string(), team.reserved_names.clone());
         let mut entry = team_entry(team);
         entry["state"] = json!("closed");
         let id = team.id.clone();
@@ -1516,6 +1689,8 @@ impl Teams {
                 task: None,
                 model: None,
                 role: None,
+                label: None,
+                questions: None,
                 agent: None,
                 group: None,
                 instance: None,
@@ -1626,6 +1801,8 @@ impl Teams {
             task: None,
             model: None,
             role: None,
+            label: None,
+            questions: None,
             agent: None,
             group: None,
             instance: Some(instance.to_string()),
@@ -1658,47 +1835,118 @@ impl Teams {
         question: &str,
         options: Option<Vec<String>>,
     ) -> Result<String, TeamError> {
-        let id = self.next_inbox_id();
-        let team = self
-            .teams
-            .get_mut(team_id)
-            .ok_or_else(|| TeamError::unknown("unknown team"))?;
-        if team.closed {
-            return Err(TeamError::unknown("team closed"));
-        }
-        let Some(participant) = team.participants.get_mut(from) else {
-            return Err(TeamError::unknown("unknown participant"));
-        };
-        if participant.state == ParticipantState::Exited {
-            return Err(TeamError::unknown("participant exited"));
-        }
-        if question.len() > MAX_BODY_BYTES {
-            return Err(TeamError::invalid("question is too long"));
+        if question.is_empty() || question.len() > MAX_BODY_BYTES {
+            return Err(TeamError::invalid("question must be 1..64 KiB"));
         }
         if let Some(options) = &options {
+            if options.len() > 6 {
+                return Err(TeamError::invalid("options must have at most 6 entries"));
+            }
+            let mut seen = HashSet::new();
             for option in options {
-                if option.len() > MAX_REF_BYTES {
-                    return Err(TeamError::invalid("option is too long"));
+                if option.is_empty()
+                    || option.chars().count() > 60
+                    || !is_one_line(option)
+                    || option.contains(", ")
+                {
+                    return Err(TeamError::invalid(
+                        "options must be one line of 1..60 characters without ', '",
+                    ));
+                }
+                if !seen.insert(option.as_str()) {
+                    return Err(TeamError::invalid(format!(
+                        "option {option} is already used"
+                    )));
                 }
             }
         }
+        // 19.13: the 18.5 form is one question with the header "Question".
+        // One legacy option is not a choice: keep it as a text hint.
+        let single = options
+            .as_ref()
+            .filter(|options| options.len() == 1)
+            .map(|options| options[0].clone());
+        let normalized_question = match &single {
+            Some(option) => format!("{question}\n{option}"),
+            None => question.to_string(),
+        };
+        let normalized_options =
+            options
+                .as_ref()
+                .filter(|options| options.len() >= 2)
+                .map(|options| {
+                    options
+                        .iter()
+                        .map(|label| QuestionOption {
+                            label: label.clone(),
+                            description: None,
+                        })
+                        .collect()
+                });
+        let questions = vec![Question {
+            header: "Question".to_string(),
+            question: normalized_question,
+            options: normalized_options,
+            multi_select: false,
+        }];
+        self.ask_human_questions(team_id, from, questions, options)
+    }
+
+    /// `bus.ask_human` with 19.13 `questions`; `legacy_options` keeps the 18.5
+    /// top-level `options` on the inbox item.
+    pub fn ask_human_questions(
+        &mut self,
+        team_id: &str,
+        from: &str,
+        questions: Vec<Question>,
+        legacy_options: Option<Vec<String>>,
+    ) -> Result<String, TeamError> {
+        if questions.is_empty() || questions.len() > 4 {
+            return Err(TeamError::invalid("questions must have 1..4 entries"));
+        }
+        {
+            let team = self
+                .teams
+                .get(team_id)
+                .ok_or_else(|| TeamError::unknown("unknown team"))?;
+            if team.closed {
+                return Err(TeamError::unknown("team closed"));
+            }
+            let Some(participant) = team.participants.get(from) else {
+                return Err(TeamError::unknown("unknown participant"));
+            };
+            if participant.state == ParticipantState::Exited {
+                return Err(TeamError::unknown("participant exited"));
+            }
+        }
+        let id = self.next_inbox_id();
+        let team = self.teams.get_mut(team_id).expect("checked above");
+        let Some(participant) = team.participants.get_mut(from) else {
+            unreachable!("checked above")
+        };
+        let body = questions
+            .first()
+            .map(|question| question.question.clone())
+            .unwrap_or_default();
         participant.set_state(ParticipantState::WaitingHuman);
         let item = InboxItem {
             id: id.clone(),
             team: team.id.clone(),
             kind: ItemKind::Question,
             from: from.to_string(),
-            body: question.to_string(),
+            body,
             at: now_ms(),
             state: ItemState::Open,
-            options,
+            options: legacy_options,
             template: None,
             name: None,
             task: None,
             model: None,
             role: None,
+            label: None,
             agent: None,
             group: None,
+            questions: Some(questions),
             instance: None,
             session: None,
             tool_call: None,
@@ -1845,6 +2093,24 @@ impl Teams {
         role: Option<&str>,
         task: Option<&str>,
     ) -> Result<SpawnOutcome, TeamError> {
+        self.request_spawn_labeled(team_id, template, name, model, role, task, None)
+    }
+
+    /// `bus.spawn` with the 19.12 `label`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_spawn_labeled(
+        &mut self,
+        team_id: &str,
+        template: &str,
+        name: Option<&str>,
+        model: Option<&str>,
+        role: Option<&str>,
+        task: Option<&str>,
+        label: Option<&str>,
+    ) -> Result<SpawnOutcome, TeamError> {
+        if let Some(label) = label {
+            validate_label(label)?;
+        }
         let group = self.next_spawn_group(team_id);
         let spawn_item_id = self.next_inbox_id();
         let team = self
@@ -1861,7 +2127,7 @@ impl Teams {
         let name = spawn_name(team, template, name, task)?;
         let auto = team.config.spawn_auto.contains(template);
         if auto {
-            spawn_participant(team, &name, template, model, role, task)?;
+            spawn_participant(team, &name, template, model, role, task, label)?;
             team.order.push(name.clone());
             let team_id = team.id.clone();
             self.events.push(TeamEvent::Changed(team_id.clone()));
@@ -1894,6 +2160,8 @@ impl Teams {
             task: task.map(str::to_string),
             model: model.map(str::to_string),
             role: role.map(str::to_string),
+            label: label.map(str::to_string),
+            questions: None,
             agent,
             group,
             instance: None,
@@ -1929,6 +2197,24 @@ impl Teams {
         role: Option<&str>,
         task: Option<&str>,
     ) -> Result<SpawnRequest, TeamError> {
+        self.request_spawn_human_labeled(team_id, template, name, model, role, task, None)
+    }
+
+    /// `team.spawn`/`team.start` with the 19.12 `label`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_spawn_human_labeled(
+        &mut self,
+        team_id: &str,
+        template: &str,
+        name: Option<&str>,
+        model: Option<&str>,
+        role: Option<&str>,
+        task: Option<&str>,
+        label: Option<&str>,
+    ) -> Result<SpawnRequest, TeamError> {
+        if let Some(label) = label {
+            validate_label(label)?;
+        }
         let team = self
             .teams
             .get_mut(team_id)
@@ -1941,7 +2227,7 @@ impl Teams {
         }
         validate_spawn_choice(team, template, model, role)?;
         let name = spawn_name(team, template, name, task)?;
-        spawn_participant(team, &name, template, model, role, task)?;
+        spawn_participant(team, &name, template, model, role, task, label)?;
         team.order.push(name.clone());
         let team_id = team.id.clone();
         self.events.push(TeamEvent::Changed(team_id.clone()));
@@ -2447,6 +2733,8 @@ impl Teams {
                 task: None,
                 model: None,
                 role: None,
+                label: None,
+                questions: None,
                 agent: None,
                 group: None,
                 instance: None,
@@ -2481,6 +2769,8 @@ impl Teams {
                 task: None,
                 model: None,
                 role: None,
+                label: None,
+                questions: None,
                 agent: None,
                 group: None,
                 instance: None,
@@ -2543,6 +2833,18 @@ impl Teams {
         option: Option<String>,
         allow: Option<bool>,
     ) -> Result<(AnswerEffect, String), TeamError> {
+        self.answer_with(item_id, None, text, option, allow)
+    }
+
+    /// `team.answer` with the 19.13 `answers` array.
+    pub fn answer_with(
+        &mut self,
+        item_id: &str,
+        answers: Option<Vec<QuestionAnswer>>,
+        text: Option<String>,
+        option: Option<String>,
+        allow: Option<bool>,
+    ) -> Result<(AnswerEffect, String), TeamError> {
         let (team_id, position) = self
             .teams
             .iter()
@@ -2576,12 +2878,114 @@ impl Teams {
                 && other.state == ItemState::Open
         });
         let agent_id = item.agent_id.clone();
-        let answer_message_id = team.next_message();
+        let mut refused_spawn: Option<(String, String)> = None;
 
         let effect = match kind {
             ItemKind::Question => {
-                let answer = text.or(option).unwrap_or_default();
+                let answer = match answers {
+                    Some(answers) => {
+                        let questions = item
+                            .questions
+                            .as_ref()
+                            .ok_or_else(|| TeamError::invalid("item has no questions"))?;
+                        if answers.len() != questions.len() {
+                            return Err(TeamError::invalid(format!(
+                                "answers must have {} entries",
+                                questions.len()
+                            )));
+                        }
+                        let mut lines = Vec::new();
+                        for (question, answer) in questions.iter().zip(answers.iter()) {
+                            if !question.multi_select && answer.selected.len() > 1 {
+                                return Err(TeamError::invalid(format!(
+                                    "{} is not multi-select",
+                                    question.header
+                                )));
+                            }
+                            let labels: Vec<&str> = question
+                                .options
+                                .as_ref()
+                                .map(|options| {
+                                    options.iter().map(|option| option.label.as_str()).collect()
+                                })
+                                .unwrap_or_default();
+                            for (index, label) in answer.selected.iter().enumerate() {
+                                if !labels.contains(&label.as_str()) {
+                                    return Err(TeamError::invalid(format!(
+                                        "{} has no option {label}",
+                                        question.header
+                                    )));
+                                }
+                                if answer.selected[..index].contains(label) {
+                                    return Err(TeamError::invalid(format!(
+                                        "{} selects {label} twice",
+                                        question.header
+                                    )));
+                                }
+                            }
+                            let free = answer.text.as_deref().unwrap_or("").trim();
+                            if answer.selected.is_empty() && free.is_empty() {
+                                return Err(TeamError::invalid(format!(
+                                    "{} needs a selected option or text",
+                                    question.header
+                                )));
+                            }
+                            let mut line = if answer.selected.is_empty() {
+                                format!("{}:", question.header)
+                            } else {
+                                format!("{}: {}", question.header, answer.selected.join(", "))
+                            };
+                            if !free.is_empty() {
+                                line.push('\n');
+                                line.push_str(free);
+                            }
+                            lines.push(line);
+                        }
+                        lines.join("\n")
+                    }
+                    None => {
+                        if let Some(questions) = &item.questions {
+                            if questions.len() > 1 {
+                                return Err(TeamError::invalid(
+                                    "answers are required for several questions",
+                                ));
+                            }
+                        }
+                        // 18.5 compatibility: `text` wins and is not checked
+                        // against the options; `option` is only a selection
+                        // when the question has options, else free text.
+                        match text {
+                            Some(text) => text,
+                            None => match option {
+                                Some(option) => {
+                                    let question = item.questions.as_ref().and_then(|q| q.first());
+                                    let has_options = question.is_some_and(|question| {
+                                        question
+                                            .options
+                                            .as_ref()
+                                            .is_some_and(|options| !options.is_empty())
+                                    });
+                                    if has_options {
+                                        let known = question
+                                            .and_then(|question| question.options.as_ref())
+                                            .is_some_and(|options| {
+                                                options.iter().any(|entry| entry.label == option)
+                                            });
+                                        if !known {
+                                            return Err(TeamError::invalid(format!(
+                                                "the question has no option {option}"
+                                            )));
+                                        }
+                                    }
+                                    option
+                                }
+                                None => String::new(),
+                            },
+                        }
+                    }
+                };
                 validate_body(&answer)?;
+                let answer_message_id = team.next_message();
                 if let Some(participant) = team.participants.get_mut(&from) {
                     participant.set_state(if still_waiting {
                         ParticipantState::WaitingHuman
@@ -2615,6 +3019,7 @@ impl Teams {
                 if allowed {
                     if team.live_workers() as u64 >= team.config.max_workers {
                         team.reserved_names.remove(&name);
+                        refused_spawn = Some((name, "refused: worker limit".to_string()));
                         AnswerEffect::Ack
                     } else {
                         spawn_participant(
@@ -2624,6 +3029,7 @@ impl Teams {
                             model.as_deref(),
                             role.as_deref(),
                             task.as_deref(),
+                            item.label.as_deref(),
                         )?;
                         team.order.push(name.clone());
                         AnswerEffect::Spawn(SpawnRequest {
@@ -2637,6 +3043,7 @@ impl Teams {
                     }
                 } else {
                     team.reserved_names.remove(&name);
+                    refused_spawn = Some((name, "refused".to_string()));
                     AnswerEffect::Ack
                 }
             }
@@ -2671,6 +3078,9 @@ impl Teams {
         team.pending_items.retain(|_, pending| pending != &item_id);
         self.events.push(TeamEvent::Inbox(team_id.clone(), item_id));
         self.events.push(TeamEvent::Changed(team_id.clone()));
+        if let Some((name, reason)) = refused_spawn {
+            self.clear_owners_after_spawn(&team_id, &name, &reason, true);
+        }
         Ok((effect, team_id))
     }
 
@@ -2927,6 +3337,7 @@ impl Teams {
         let team_id = team.id.clone();
         self.by_instance.remove(instance);
         self.revoke_instance_unbound(instance);
+        let mut orphaned_spawns = Vec::new();
         if let Some(leader) = self.teams.get_mut(&team_id) {
             let items: Vec<String> = leader
                 .inbox
@@ -2934,14 +3345,26 @@ impl Teams {
                 .filter(|item| item.state == ItemState::Open && item.from == "leader")
                 .map(|item| item.id.clone())
                 .collect();
+            orphaned_spawns = leader
+                .inbox
+                .iter()
+                .filter(|item| items.contains(&item.id) && item.kind == ItemKind::Spawn)
+                .filter_map(|item| item.name.clone())
+                .collect();
             for item in &mut leader.inbox {
                 if items.contains(&item.id) {
                     item.state = ItemState::Orphaned;
                 }
             }
+            for name in &orphaned_spawns {
+                leader.reserved_names.remove(name);
+            }
             for id in items {
                 self.events.push(TeamEvent::Inbox(team_id.clone(), id));
             }
+        }
+        for name in orphaned_spawns {
+            self.clear_owners_after_spawn(&team_id, &name, "orphaned", true);
         }
         self.events.push(TeamEvent::Changed(team_id));
     }
@@ -2966,13 +3389,25 @@ impl Teams {
             .filter(|item| item.state == ItemState::Open && item.from == "leader")
             .map(|item| item.id.clone())
             .collect();
+        let orphaned_spawns: Vec<String> = team
+            .inbox
+            .iter()
+            .filter(|item| orphaned.contains(&item.id) && item.kind == ItemKind::Spawn)
+            .filter_map(|item| item.name.clone())
+            .collect();
         for item in &mut team.inbox {
             if orphaned.contains(&item.id) {
                 item.state = ItemState::Orphaned;
             }
         }
+        for name in &orphaned_spawns {
+            team.reserved_names.remove(name);
+        }
         for item in orphaned {
             self.events.push(TeamEvent::Inbox(team_id.clone(), item));
+        }
+        for name in orphaned_spawns {
+            self.clear_owners_after_spawn(&team_id, &name, "orphaned", true);
         }
         self.revoke_instance_tokens(instance);
         self.events.push(TeamEvent::Changed(team_id));
@@ -3059,6 +3494,7 @@ fn spawn_participant(
     model: Option<&str>,
     role: Option<&str>,
     task: Option<&str>,
+    label: Option<&str>,
 ) -> Result<(), TeamError> {
     validate_spawn_choice(team, template, model, role)?;
     let config = team
@@ -3077,6 +3513,8 @@ fn spawn_participant(
     ));
     participant.model = model.map(str::to_string).or_else(|| config.model.clone());
     participant.spawn_role = role.map(str::to_string);
+    participant.agent = Some(config.key.agent.clone());
+    participant.label = label.map(str::to_string);
     participant.first_prompt = true;
     participant.starting = true;
     if let Some(task) = task {
@@ -3149,6 +3587,206 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// "One line": no control characters and no Unicode line separators.
+pub(crate) fn is_one_line(text: &str) -> bool {
+    !text
+        .chars()
+        .any(|ch| ch.is_control() || ch == '\u{2028}' || ch == '\u{2029}')
+}
+
+/// A display label for a participant (19.12): 1..16 characters, one line.
+pub fn validate_label(label: &str) -> Result<(), TeamError> {
+    if label.is_empty() || label.chars().count() > 16 || !is_one_line(label) {
+        return Err(TeamError::invalid(
+            "label must be one line of 1..16 characters",
+        ));
+    }
+    Ok(())
+}
+
+fn only_keys(
+    object: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+    what: &str,
+) -> Result<(), TeamError> {
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(TeamError::invalid(format!(
+                "{what} has unknown field {key}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn question_string(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    what: &str,
+) -> Result<String, TeamError> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| TeamError::invalid(format!("{what}.{key} must be a string")))
+}
+
+/// Parse the 19.13 `questions` array.
+pub fn parse_questions(value: &Value) -> Result<Vec<Question>, TeamError> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| TeamError::invalid("questions must be an array"))?;
+    if items.is_empty() || items.len() > 4 {
+        return Err(TeamError::invalid("questions must have 1..4 entries"));
+    }
+    let mut questions = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let what = format!("questions[{index}]");
+        let object = item
+            .as_object()
+            .ok_or_else(|| TeamError::invalid(format!("{what} must be an object")))?;
+        only_keys(
+            object,
+            &["header", "question", "options", "multi_select"],
+            &what,
+        )?;
+        let header = question_string(object, "header", &what)?;
+        if header.is_empty() || header.chars().count() > 12 || !is_one_line(&header) {
+            return Err(TeamError::invalid(format!(
+                "{what}.header must be one line of 1..12 characters"
+            )));
+        }
+        let question = question_string(object, "question", &what)?;
+        if question.is_empty() || question.len() > 4 * 1024 {
+            return Err(TeamError::invalid(format!(
+                "{what}.question is longer than 4 KiB"
+            )));
+        }
+        let multi_select = match object.get("multi_select") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => {
+                return Err(TeamError::invalid(format!(
+                    "{what}.multi_select must be a boolean"
+                )))
+            }
+        };
+        let options = match object.get("options") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(options)) => {
+                if !options.is_empty() && !(2..=6).contains(&options.len()) {
+                    return Err(TeamError::invalid(format!(
+                        "{what}.options must have 0 or 2..6 entries"
+                    )));
+                }
+                let mut parsed = Vec::new();
+                for (option_index, option) in options.iter().enumerate() {
+                    let at = format!("{what}.options[{option_index}]");
+                    let object = option
+                        .as_object()
+                        .ok_or_else(|| TeamError::invalid(format!("{at} must be an object")))?;
+                    only_keys(object, &["label", "description"], &at)?;
+                    let label = question_string(object, "label", &at)?;
+                    if label.is_empty()
+                        || label.chars().count() > 60
+                        || !is_one_line(&label)
+                        || label.contains(", ")
+                    {
+                        return Err(TeamError::invalid(format!(
+                            "{at}.label must be one line of 1..60 characters without ', '"
+                        )));
+                    }
+                    if parsed
+                        .iter()
+                        .any(|option: &QuestionOption| option.label == label)
+                    {
+                        return Err(TeamError::invalid(format!(
+                            "{at}.label {label} is already used"
+                        )));
+                    }
+                    let description = match object.get("description") {
+                        None | Some(Value::Null) => None,
+                        Some(Value::String(text)) if text.chars().count() <= 200 => {
+                            Some(text.clone())
+                        }
+                        Some(Value::String(_)) => {
+                            return Err(TeamError::invalid(format!(
+                                "{at}.description is longer than 200 characters"
+                            )))
+                        }
+                        Some(_) => {
+                            return Err(TeamError::invalid(format!(
+                                "{at}.description must be a string"
+                            )))
+                        }
+                    };
+                    parsed.push(QuestionOption { label, description });
+                }
+                Some(parsed)
+            }
+            Some(_) => {
+                return Err(TeamError::invalid(format!(
+                    "{what}.options must be an array"
+                )))
+            }
+        };
+        questions.push(Question {
+            header,
+            question,
+            options,
+            multi_select,
+        });
+    }
+    Ok(questions)
+}
+
+/// Parse `team.answer.answers` (19.13).
+pub fn parse_answers(value: &Value) -> Result<Vec<QuestionAnswer>, TeamError> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| TeamError::invalid("answers must be an array"))?;
+    let mut answers = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let what = format!("answers[{index}]");
+        let object = item
+            .as_object()
+            .ok_or_else(|| TeamError::invalid(format!("{what} must be an object")))?;
+        only_keys(object, &["selected", "text"], &what)?;
+        let selected = match object.get("selected") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(values)) => {
+                let mut labels = Vec::new();
+                for value in values {
+                    let Some(label) = value.as_str() else {
+                        return Err(TeamError::invalid(format!(
+                            "{what}.selected must be strings"
+                        )));
+                    };
+                    if labels.iter().any(|known: &String| known == label) {
+                        return Err(TeamError::invalid(format!(
+                            "{what}.selected {label} is already used"
+                        )));
+                    }
+                    labels.push(label.to_string());
+                }
+                labels
+            }
+            Some(_) => {
+                return Err(TeamError::invalid(format!(
+                    "{what}.selected must be an array"
+                )))
+            }
+        };
+        let text = match object.get("text") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) => Some(text.clone()),
+            Some(_) => return Err(TeamError::invalid(format!("{what}.text must be a string"))),
+        };
+        answers.push(QuestionAnswer { selected, text });
+    }
+    Ok(answers)
+}
+
 fn team_entry(team: &Team) -> Value {
     let participants: Vec<Value> = team
         .order
@@ -3159,6 +3797,23 @@ fn team_entry(team: &Team) -> Value {
                 .task_turns
                 .get(&(participant.name.clone(), participant.task.clone()))
                 .unwrap_or(&0);
+            let template = participant
+                .template
+                .as_ref()
+                .and_then(|name| team.config.templates.get(name));
+            let agent = participant
+                .agent
+                .clone()
+                .or_else(|| template.map(|template| template.key.agent.clone()));
+            let model = participant
+                .model
+                .clone()
+                .or_else(|| template.and_then(|template| template.model.clone()));
+            let label = participant
+                .label
+                .clone()
+                .or_else(|| participant.template.clone())
+                .unwrap_or_else(|| "leader".to_string());
             let mut out = json!({
                 "name": participant.name,
                 "role": participant.role.as_str(),
@@ -3171,7 +3826,14 @@ fn team_entry(team: &Team) -> Value {
                 "turns": { "task": task_count, "total": participant.turns_total },
                 "activity": participant.activity,
                 "state_since": participant.state_since,
+                "agent": agent,
+                "model": model,
+                "label": label,
             });
+            // 19.12: `template` is absent for the leader, not null.
+            if let Some(template) = &participant.template {
+                out["template"] = json!(template);
+            }
             if let Some(reason) = &participant.reason {
                 out["reason"] = json!(reason);
             }
@@ -3538,6 +4200,24 @@ impl Teams {
                     if matches!(item.kind, ItemKind::Permission | ItemKind::Request) {
                         item.state = ItemState::Orphaned;
                     }
+                    // A question stored before 19.13 has no `questions`; make
+                    // it answerable with the new `answers` form.
+                    if item.kind == ItemKind::Question && item.questions.is_none() {
+                        item.questions = Some(vec![Question {
+                            header: "Question".to_string(),
+                            question: item.body.clone(),
+                            options: item.options.as_ref().map(|options| {
+                                options
+                                    .iter()
+                                    .map(|label| QuestionOption {
+                                        label: label.clone(),
+                                        description: None,
+                                    })
+                                    .collect()
+                            }),
+                            multi_select: false,
+                        }]);
+                    }
                     item
                 })
                 .collect();
@@ -3596,6 +4276,40 @@ impl Teams {
         self.next_inbox = self.next_inbox.max(highest_inbox);
         self.next_group = self.next_group.max(highest_group);
         (stored, expired)
+    }
+
+    /// After a restart, a leaderless team cannot answer its open spawn items.
+    /// Orphan them, release their names and clear the cards they own (19.12).
+    pub fn orphan_leaderless_spawns(&mut self) {
+        let ids: Vec<String> = self
+            .teams
+            .iter()
+            .filter(|(_, team)| team.leaderless && !team.closed)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let mut names = Vec::new();
+            if let Some(team) = self.teams.get_mut(&id) {
+                for item in &mut team.inbox {
+                    if item.kind == ItemKind::Spawn && item.state == ItemState::Open {
+                        item.state = ItemState::Orphaned;
+                        names.push(item.name.clone());
+                        self.events
+                            .push(TeamEvent::Inbox(id.clone(), item.id.clone()));
+                    }
+                }
+                for name in names.iter().flatten() {
+                    team.reserved_names.remove(name);
+                }
+            }
+            if names.is_empty() {
+                continue;
+            }
+            for name in names.into_iter().flatten() {
+                self.clear_owners_after_spawn(&id, &name, "orphaned", false);
+            }
+            self.events.push(TeamEvent::Changed(id));
+        }
     }
 
     pub fn is_suspended(&self, team: &str) -> bool {
@@ -4050,7 +4764,9 @@ mod tests {
         let (_server, token) = teams
             .leader_server("i1", "/p", "/p")
             .expect("leader server");
-        teams.bind_leader("i1", "s1", &token).expect("bind leader");
+        teams
+            .bind_leader("i1", "s1", &token, "opencode")
+            .expect("bind leader");
         let list = teams.list();
         let id = list["teams"][0]["id"].as_str().unwrap().to_string();
         (teams, id)
@@ -4538,10 +5254,10 @@ mod tests {
         teams.configure("/p", config(json!({}))).unwrap();
         assert!(teams.leader_server("i1", "/other", "/p").is_err());
         let (_server, first) = teams.leader_server("i1", "/p", "/p").unwrap();
-        teams.bind_leader("i1", "s1", &first).unwrap();
+        teams.bind_leader("i1", "s1", &first, "opencode").unwrap();
         assert!(teams.leader_server("i2", "/p", "/p").is_err());
         let (_server, second) = teams.leader_server("i1", "/p", "/p").unwrap();
-        assert!(teams.bind_leader("i1", "s2", &second).is_err());
+        assert!(teams.bind_leader("i1", "s2", &second, "opencode").is_err());
     }
 
     #[test]
@@ -4632,7 +5348,9 @@ mod tests {
         let (_server, token) = restored
             .leader_server("i9", "/new", "/new")
             .expect("leader");
-        let outcome = restored.bind_leader("i9", "s9", &token).expect("bind");
+        let outcome = restored
+            .bind_leader("i9", "s9", &token, "opencode")
+            .expect("bind");
         let BindOutcome::Active(value) = outcome else {
             panic!("a new cwd team is not a resume");
         };
@@ -4654,9 +5372,13 @@ mod tests {
             None,
         );
         let (_server, token) = restored.leader_server("i1", "/p", "/p").unwrap();
-        let first = restored.bind_leader("i1", "s1", &token).unwrap();
+        let first = restored
+            .bind_leader("i1", "s1", &token, "opencode")
+            .unwrap();
         assert!(matches!(first, BindOutcome::Resume { .. }), "{first:?}");
-        let second = restored.bind_leader("i1", "s1", &token).unwrap();
+        let second = restored
+            .bind_leader("i1", "s1", &token, "opencode")
+            .unwrap();
         assert!(
             matches!(second, BindOutcome::Active(_)),
             "a second bind while resuming must not resume again: {second:?}"
@@ -4690,6 +5412,8 @@ mod tests {
             body: "permission".to_string(),
             at: 1,
             state: ItemState::Open,
+            label: None,
+            questions: None,
             options: None,
             template: None,
             name: None,
@@ -4956,7 +5680,7 @@ mod tests {
         restored
             .configure("/p", config(json!({"spawn_confirm": {"auto": []}})))
             .expect("configure");
-        restored.start_resume(&team, "i1", "s1");
+        restored.start_resume(&team, "i1", "s1", "opencode");
         let SpawnOutcome::Awaiting { request, .. } = restored
             .request_spawn(&team, "dev", Some("w3"), None, None, None)
             .unwrap()
@@ -5225,5 +5949,612 @@ mod tests {
             config.workflows["review"].team[0].model.as_deref(),
             Some("m1")
         );
+    }
+
+    #[test]
+    fn participant_entries_carry_agent_model_and_label() {
+        let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": ["dev"]}}));
+        let entry = teams.entry(&team).unwrap();
+        let leader = &entry["participants"][0];
+        assert_eq!(leader["name"], "leader");
+        assert_eq!(leader["agent"], "opencode");
+        assert_eq!(leader["model"], Value::Null);
+        assert_eq!(leader["label"], "leader");
+        assert!(
+            leader.get("template").is_none(),
+            "leader has no template key"
+        );
+
+        let outcome = teams
+            .request_spawn_labeled(
+                &team,
+                "dev",
+                Some("w1"),
+                Some("m1"),
+                None,
+                None,
+                Some("reviewer"),
+            )
+            .expect("spawn with a label");
+        assert!(matches!(outcome, SpawnOutcome::Started(_)), "{outcome:?}");
+        let entry = teams.entry(&team).unwrap();
+        let worker = entry["participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|participant| participant["name"] == "w1")
+            .expect("w1");
+        assert_eq!(worker["template"], "dev");
+        assert_eq!(worker["agent"], "a");
+        assert_eq!(worker["model"], "m1");
+        assert_eq!(worker["label"], "reviewer");
+
+        // Without a label the template name is the display label (19.12).
+        teams
+            .request_spawn(&team, "dev", Some("w2"), None, None, None)
+            .expect("spawn without a label");
+        let entry = teams.entry(&team).unwrap();
+        let worker = entry["participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|participant| participant["name"] == "w2")
+            .expect("w2");
+        assert_eq!(worker["label"], "dev");
+    }
+
+    #[test]
+    fn a_spawn_blocked_by_max_workers_clears_the_owner() {
+        let (mut teams, team) = fixture(json!({
+            "max_workers": 2,
+            "spawn_confirm": {"auto": []}
+        }));
+        let SpawnOutcome::Awaiting { request, .. } = teams
+            .request_spawn(&team, "dev", Some("w1"), None, None, None)
+            .expect("pending spawn")
+        else {
+            panic!("the spawn must await approval");
+        };
+        // One live worker fills the limit by the time the request is approved.
+        teams
+            .request_spawn_human(&team, "dev", Some("w0"), None, None, None)
+            .expect("first worker");
+        teams.teams.get_mut(&team).unwrap().config.max_workers = 1;
+        teams
+            .board_update(
+                &team,
+                &json!({
+                    "columns": ["todo"],
+                    "upsert": [{"id": "C1", "title": "one", "column": "todo", "owner": "w1"}]
+                }),
+                1,
+            )
+            .expect("owner awaiting approval");
+        teams
+            .answer(&request, None, None, Some(true))
+            .expect("approval at the limit");
+        let card = &teams.team(&team).unwrap().board.cards[0];
+        assert_eq!(card.owner, None, "the failed approval must clear the owner");
+        let read = teams.read(&team, "leader", None).unwrap();
+        assert!(read["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["kind"] == "notice"
+                && message["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("worker limit"))));
+    }
+
+    #[test]
+    fn leader_exit_orphans_a_spawn_and_releases_its_name_and_owner() {
+        let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}}));
+        let SpawnOutcome::Awaiting { request, name } = teams
+            .request_spawn(&team, "dev", Some("w1"), None, None, None)
+            .expect("pending spawn")
+        else {
+            panic!("the spawn must await approval");
+        };
+        teams
+            .board_update(
+                &team,
+                &json!({
+                    "columns": ["todo"],
+                    "upsert": [{"id": "C1", "title": "one", "column": "todo", "owner": "w1"}]
+                }),
+                1,
+            )
+            .unwrap();
+        teams.leader_exited("i1", "crash");
+        let team_ref = teams.team(&team).unwrap();
+        assert_eq!(team_ref.board.cards[0].owner, None);
+        assert!(!team_ref.reserved_names.contains(&name));
+        assert_eq!(
+            team_ref
+                .inbox
+                .iter()
+                .find(|item| item.id == request)
+                .map(|item| item.state),
+            Some(ItemState::Orphaned)
+        );
+    }
+
+    #[test]
+    fn close_orphans_spawns_without_leaving_a_dirty_board() {
+        let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}}));
+        teams
+            .request_spawn(&team, "dev", Some("w1"), None, None, None)
+            .expect("pending spawn");
+        teams
+            .board_update(
+                &team,
+                &json!({
+                    "columns": ["todo"],
+                    "upsert": [{"id": "C1", "title": "one", "column": "todo", "owner": "w1"}]
+                }),
+                1,
+            )
+            .unwrap();
+        teams.close(&team).expect("close");
+        assert!(teams.team(&team).is_none());
+        let board = teams.closed_board(&team).expect("closed board");
+        assert_eq!(board.cards[0].owner, None);
+        assert_eq!(board.cards[0].updated_by, "service");
+        let reserved = teams.closed_reserved_names(&team).expect("reserved names");
+        assert!(!reserved.contains("w1"), "the name must be released");
+    }
+
+    #[test]
+    fn a_restored_leaderless_team_orphans_spawns_and_clears_owners() {
+        let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}}));
+        let SpawnOutcome::Awaiting { request, name } = teams
+            .request_spawn(&team, "dev", Some("w1"), None, None, None)
+            .expect("pending spawn")
+        else {
+            panic!("the spawn must await approval");
+        };
+        teams
+            .board_update(
+                &team,
+                &json!({
+                    "columns": ["todo"],
+                    "upsert": [{"id": "C1", "title": "one", "column": "todo", "owner": "w1"}]
+                }),
+                1,
+            )
+            .unwrap();
+        let board = teams.team(&team).unwrap().board.clone();
+        let board_json = serde_json::to_string(&board).unwrap();
+        teams
+            .teams
+            .get_mut(&team)
+            .unwrap()
+            .participants
+            .get_mut("leader")
+            .unwrap()
+            .state = ParticipantState::Exited;
+        let snapshot = teams.snapshot_team(&team).expect("snapshot");
+        let (max_team, max_inbox) = teams.counters();
+        let mut restored = Teams::new(new_shared_tokens());
+        restored
+            .configure("/p", config(json!({"spawn_confirm": {"auto": []}})))
+            .unwrap();
+        restored.restore(
+            vec![(team.clone(), snapshot)],
+            max_team,
+            max_inbox,
+            now_ms(),
+            None,
+        );
+        restored
+            .restore_board(&team, board.rev, &board_json, vec![])
+            .expect("board");
+        restored.orphan_leaderless_spawns();
+        let team_ref = restored.team(&team).unwrap();
+        assert!(team_ref.leaderless);
+        assert!(!team_ref.reserved_names.contains(&name));
+        assert_eq!(team_ref.board.cards[0].owner, None);
+        assert_eq!(
+            team_ref
+                .inbox
+                .iter()
+                .find(|item| item.id == request)
+                .map(|item| item.state),
+            Some(ItemState::Orphaned)
+        );
+    }
+
+    #[test]
+    fn a_restored_pending_spawn_keeps_its_owner_until_answered() {
+        let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}}));
+        let SpawnOutcome::Awaiting { request, name } = teams
+            .request_spawn(&team, "dev", Some("w1"), None, None, None)
+            .expect("pending spawn")
+        else {
+            panic!("the spawn must await approval");
+        };
+        teams
+            .board_update(
+                &team,
+                &json!({
+                    "columns": ["todo"],
+                    "upsert": [{"id": "C1", "title": "one", "column": "todo", "owner": "w1"}]
+                }),
+                1,
+            )
+            .unwrap();
+        let board = teams.team(&team).unwrap().board.clone();
+        let board_json = serde_json::to_string(&board).unwrap();
+        let snapshot = teams.snapshot_team(&team).expect("snapshot");
+        let (max_team, max_inbox) = teams.counters();
+        let mut restored = Teams::new(new_shared_tokens());
+        restored
+            .configure("/p", config(json!({"spawn_confirm": {"auto": []}})))
+            .unwrap();
+        restored.restore(
+            vec![(team.clone(), snapshot)],
+            max_team,
+            max_inbox,
+            now_ms(),
+            None,
+        );
+        restored
+            .restore_board(&team, board.rev, &board_json, vec![])
+            .expect("board");
+        let team_ref = restored.team(&team).unwrap();
+        assert!(team_ref.reserved_names.contains(&name));
+        assert_eq!(team_ref.board.cards[0].owner.as_deref(), Some("w1"));
+        assert_eq!(
+            team_ref
+                .inbox
+                .iter()
+                .find(|item| item.id == request)
+                .map(|item| item.state),
+            Some(ItemState::Open)
+        );
+    }
+
+    #[test]
+    fn identity_fields_survive_a_restore() {
+        let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": ["dev"]}}));
+        teams
+            .request_spawn_labeled(
+                &team,
+                "dev",
+                Some("w1"),
+                Some("m1"),
+                None,
+                None,
+                Some("reviewer"),
+            )
+            .expect("spawn");
+        let json = teams.snapshot_team(&team).expect("snapshot");
+        let (max_team, max_inbox) = teams.counters();
+        let mut restored = Teams::new(new_shared_tokens());
+        restored.configure("/p", config(json!({}))).unwrap();
+        restored.restore(
+            vec![(team.clone(), json)],
+            max_team,
+            max_inbox,
+            now_ms(),
+            None,
+        );
+        let entry = restored.entry(&team).unwrap();
+        let worker = entry["participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|participant| participant["name"] == "w1")
+            .expect("w1");
+        assert_eq!(worker["template"], "dev");
+        assert_eq!(worker["agent"], "a");
+        assert_eq!(worker["model"], "m1");
+        assert_eq!(worker["label"], "reviewer");
+    }
+
+    #[test]
+    fn labels_are_one_line_and_short() {
+        let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": ["dev"]}}));
+        for label in ["", "a\nb", "12345678901234567"] {
+            let error = teams
+                .request_spawn_labeled(&team, "dev", Some("w1"), None, None, None, Some(label))
+                .expect_err(label);
+            assert_eq!(error.code, INVALID_TEAM_PARAM, "{error:?}");
+        }
+    }
+
+    #[test]
+    fn questions_are_normalised_validated_and_answered() {
+        let (mut teams, team) = fixture(json!({}));
+        assert!(parse_questions(&json!([])).is_err());
+        assert!(parse_questions(&json!([{"header": "1234567890123", "question": "?"}])).is_err());
+        assert!(parse_questions(
+            &json!([{"header": "h", "question": "?", "options": [{"label": "one"}]}])
+        )
+        .is_err());
+        assert!(parse_questions(&json!([{"header": "h", "question": "?", "unknown": 1}])).is_err());
+
+        // 18.5 remains one question with the header "Question".
+        let legacy = teams
+            .ask_human(
+                &team,
+                "leader",
+                "keep the API?",
+                Some(vec!["yes".to_string()]),
+            )
+            .expect("legacy question");
+        let entry = teams.entry(&team).unwrap();
+        let item = &entry["inbox"][0];
+        assert_eq!(item["questions"][0]["header"], "Question");
+        // One legacy option is not a choice: it becomes a text hint.
+        assert!(item["questions"][0].get("options").is_none());
+        assert!(item["questions"][0]["question"]
+            .as_str()
+            .is_some_and(|question| question.contains("yes")));
+        assert_eq!(item["options"][0], "yes");
+        teams
+            .answer(&legacy, Some("yes".to_string()), None, None)
+            .expect("legacy answer");
+
+        let questions = parse_questions(&json!([
+            {
+                "header": "范围",
+                "question": "保留旧 API 吗？",
+                "options": [
+                    {"label": "保留", "description": "对调用方没有影响"},
+                    {"label": "删除"}
+                ]
+            },
+            {
+                "header": "测试",
+                "question": "跑哪些？",
+                "options": [{"label": "单元"}, {"label": "集成"}],
+                "multi_select": true
+            }
+        ]))
+        .expect("questions");
+        let request = teams
+            .ask_human_questions(&team, "leader", questions, None)
+            .expect("ask");
+        let entry = teams.entry(&team).unwrap();
+        let item = entry["inbox"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == request)
+            .expect("question item");
+        assert_eq!(item["questions"].as_array().unwrap().len(), 2);
+        assert_eq!(item["questions"][0]["header"], "范围");
+        assert_eq!(item["questions"][1]["multi_select"], true);
+
+        let answers = parse_answers(&json!([
+            {"selected": ["保留"]},
+            {"selected": ["单元", "集成"], "text": "再加 e2e"}
+        ]))
+        .expect("answers");
+        teams
+            .answer_with(&request, Some(answers), None, None, None)
+            .expect("answer");
+        let read = teams.read(&team, "leader", None).unwrap();
+        let answer = read["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| {
+                message["kind"] == "answer"
+                    && message["body"]
+                        .as_str()
+                        .is_some_and(|body| body.contains("范围"))
+            })
+            .expect("answer message");
+        assert_eq!(answer["body"], "范围: 保留\n测试: 单元, 集成\n再加 e2e");
+
+        // 19.13 validation: non-empty question, unique labels/selected, no
+        // control characters, no ", " in a label.
+        assert!(parse_questions(&json!([{"header": "h", "question": ""}])).is_err());
+        assert!(parse_questions(&json!([{
+            "header": "h",
+            "question": "q",
+            "options": [{"label": "same"}, {"label": "same"}]
+        }]))
+        .is_err());
+        assert!(parse_questions(&json!([{
+            "header": "h",
+            "question": "q",
+            "options": [{"label": "a, b"}, {"label": "c"}]
+        }]))
+        .is_err());
+        assert!(parse_questions(&json!([{
+            "header": "h\t",
+            "question": "q"
+        }]))
+        .is_err());
+        assert!(parse_answers(&json!([
+            {"selected": ["a", "a"]}
+        ]))
+        .is_err());
+        let duplicate_selected = teams
+            .ask_human_questions(
+                &team,
+                "leader",
+                parse_questions(&json!([{
+                    "header": "h",
+                    "question": "q",
+                    "options": [{"label": "a"}, {"label": "b"}]
+                }]))
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+        assert!(teams
+            .answer_with(
+                &duplicate_selected,
+                Some(vec![QuestionAnswer {
+                    selected: vec!["a".to_string(), "a".to_string()],
+                    text: None
+                }]),
+                None,
+                None,
+                None
+            )
+            .is_err());
+
+        // The 18.5 form applies the same checks after normalisation.
+        for legacy in [
+            (String::new(), None),
+            ("q".to_string(), Some(vec![String::new()])),
+            (
+                "q".to_string(),
+                Some(vec!["a".to_string(), "a".to_string()]),
+            ),
+            ("q".to_string(), Some(vec!["a, b".to_string()])),
+            ("q".to_string(), Some(vec!["a\tb".to_string()])),
+        ] {
+            assert!(teams
+                .ask_human(&team, "leader", &legacy.0, legacy.1)
+                .is_err());
+        }
+        // A rejected ask does not burn an inbox id.
+        let before = teams.counters();
+        assert!(teams
+            .ask_human_questions(
+                "nope",
+                "leader",
+                parse_questions(&json!([{"header": "h", "question": "q"}])).unwrap(),
+                None,
+            )
+            .is_err());
+        assert_eq!(before, teams.counters());
+
+        // 18.5 compatibility: `text` wins over `option`; an option on a
+        // question without options is free text.
+        let legacy = teams
+            .ask_human(
+                &team,
+                "leader",
+                "pick",
+                Some(vec!["a".to_string(), "b".to_string()]),
+            )
+            .unwrap();
+        teams
+            .answer(
+                &legacy,
+                Some("typed".to_string()),
+                Some("nope".to_string()),
+                None,
+            )
+            .expect("text wins, option is not checked");
+        let free = teams.ask_human(&team, "leader", "free?", None).unwrap();
+        teams
+            .answer(&free, None, Some("anything".to_string()), None)
+            .expect("option on a question without options is text");
+
+        // Count, labels and single-select are checked; free text always works.
+        let request = teams
+            .ask_human_questions(
+                &team,
+                "leader",
+                parse_questions(&json!([{
+                    "header": "h",
+                    "question": "q",
+                    "options": [{"label": "a"}, {"label": "b"}]
+                }]))
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+        assert!(teams
+            .answer_with(
+                &request,
+                Some(parse_answers(&json!([])).unwrap()),
+                None,
+                None,
+                None
+            )
+            .is_err());
+        assert!(teams
+            .answer_with(
+                &request,
+                Some(vec![QuestionAnswer {
+                    selected: vec!["nope".to_string()],
+                    text: None
+                }]),
+                None,
+                None,
+                None
+            )
+            .is_err());
+        assert!(teams
+            .answer_with(
+                &request,
+                Some(vec![QuestionAnswer {
+                    selected: vec!["a".to_string(), "b".to_string()],
+                    text: None
+                }]),
+                None,
+                None,
+                None
+            )
+            .is_err());
+        teams
+            .answer_with(
+                &request,
+                Some(vec![QuestionAnswer {
+                    selected: Vec::new(),
+                    text: Some("自由文本".to_string()),
+                }]),
+                None,
+                None,
+                None,
+            )
+            .expect("free text answer");
+    }
+
+    #[test]
+    fn a_pending_spawn_can_own_a_card_and_refusal_clears_it() {
+        let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}}));
+        let SpawnOutcome::Awaiting { request, name } = teams
+            .request_spawn(&team, "dev", Some("w1"), None, None, None)
+            .expect("spawn")
+        else {
+            panic!("the spawn must await approval");
+        };
+        assert_eq!(name, "w1");
+        teams
+            .board_update(
+                &team,
+                &json!({
+                    "columns": ["todo"],
+                    "upsert": [{"id": "C1", "title": "one", "column": "todo", "owner": "w1"}]
+                }),
+                1,
+            )
+            .expect("the pending name can own a card");
+        // An open spawn reserves the name.
+        assert!(teams
+            .request_spawn(&team, "dev", Some("w1"), None, None, None)
+            .is_err());
+
+        teams
+            .answer(&request, None, None, Some(false))
+            .expect("refuse");
+        let board = teams.entry(&team).unwrap()["board_rev"].clone();
+        assert!(board.as_u64().unwrap_or(0) > 0);
+        let card = &teams.team(&team).unwrap().board.cards[0];
+        assert_eq!(card.owner, None);
+        assert_eq!(card.updated_by, "service");
+        let events = teams.drain_events();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, TeamEvent::Board(id, _) if id == &team)));
+        let read = teams.read(&team, "leader", None).unwrap();
+        assert!(read["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["kind"] == "notice"
+                && message["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("owner cleared on C1"))));
     }
 }

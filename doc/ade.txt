@@ -1369,6 +1369,21 @@ leader 聊”。多个团队时标题栏显示 [1/2]，]t / [t 切换。
 箱里合并成一组显示（例如“leader 申请启动 3 个 worker：w1 …、w2 …、
 reviewer …”）；A 全部批准，a 逐个处理。
 
+需要选择时 ~
+                                                     *ade-teams-choice*
+需要你从选项里选时（带选项的提问、spawn 申请、worker 权限、回合上限、
+agent 自己的权限请求和表单），聊天输入窗口会临时换成选择组件；草稿、
+附件和撤销历史留在原输入缓冲区。
+
+- Tab / Shift-Tab（也接受左右、h/l）切换问题，↑↓/jk 选择，1-9 直接选，
+  Space 多选，Enter 确认，Esc 稍后（agent 的权限/表单是取消）。
+- 没有选项的提问不占组件：只提示，用 :Ade team answer 或在成员上按 a
+  回答。
+- 面板隐藏时只提示；:Ade open 或 :Ade team answer 后显示。
+- 组件缓冲区也是 ade_input（edgy 需要），并设置 b:ade_choice：ade 自己
+  的补全、提交、附件、图片和草稿逻辑不生效。你自己的 FileType ade_input
+  按键会作用到组件，同名时组件优先。
+
 观察窗口 ~
                                                              *ade-teams-watch*
 在成员上按 <CR> 或 w 打开右侧的观察窗口，用来完整查看这个人的工作过程。
