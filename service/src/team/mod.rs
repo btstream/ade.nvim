@@ -1842,8 +1842,19 @@ impl Teams {
             if options.len() > 6 {
                 return Err(TeamError::invalid("options must have at most 6 entries"));
             }
+            let single_hint = options.len() == 1;
             let mut seen = HashSet::new();
             for option in options {
+                // A single 18.5 option becomes a text hint, as before: keep its
+                // old 1 KiB allowance instead of the 19.13 label limits.
+                if single_hint {
+                    if option.is_empty() || option.len() > MAX_REF_BYTES || !is_one_line(option) {
+                        return Err(TeamError::invalid(
+                            "the option hint must be one line of 1..1024 bytes",
+                        ));
+                    }
+                    continue;
+                }
                 if option.is_empty()
                     || option.chars().count() > 60
                     || !is_one_line(option)
@@ -6407,13 +6418,21 @@ mod tests {
                 "q".to_string(),
                 Some(vec!["a".to_string(), "a".to_string()]),
             ),
-            ("q".to_string(), Some(vec!["a, b".to_string()])),
+            (
+                "q".to_string(),
+                Some(vec!["a, b".to_string(), "c".to_string()]),
+            ),
             ("q".to_string(), Some(vec!["a\tb".to_string()])),
         ] {
             assert!(teams
                 .ask_human(&team, "leader", &legacy.0, legacy.1)
                 .is_err());
         }
+        // A single 18.5 option stays a text hint and keeps its old 1 KiB limit.
+        let hint = "h".repeat(500);
+        assert!(teams
+            .ask_human(&team, "leader", "hint?", Some(vec![hint]))
+            .is_ok());
         // A rejected ask does not burn an inbox id.
         let before = teams.counters();
         assert!(teams

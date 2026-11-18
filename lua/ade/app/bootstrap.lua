@@ -241,7 +241,16 @@ function M.build(ctx, opts, action)
       ctx.open()
     end,
     permission_present = function(interaction)
+      if not S.view.permissions.valid(interaction) then
+        return false
+      end
       return S.view.permissions:present(interaction)
+    end,
+    permission_dismiss = function()
+      S.view.permissions:dismiss_presented()
+    end,
+    elicitation_dismiss = function()
+      S.view.elicitation:dismiss()
     end,
     permission_details = function(interaction)
       local request = interaction.request or {}
@@ -256,12 +265,14 @@ function M.build(ctx, opts, action)
     end,
   })
   local choice_group = vim.api.nvim_create_augroup("AdeChoices", { clear = true })
-  vim.api.nvim_create_autocmd({ "InsertLeave", "CursorHold" }, {
+  vim.api.nvim_create_autocmd({ "InsertLeave", "CursorHold", "WinClosed", "WinNew", "BufWinEnter", "TabEnter" }, {
     group = choice_group,
     callback = function()
-      if S.view.choices then
-        S.view.choices:refresh()
-      end
+      vim.schedule(function()
+        if S.view.choices then
+          S.view.choices:refresh()
+        end
+      end)
     end,
   })
   -- The service-side rule sets (PROTOCOL.md 17). Created before the policy
@@ -917,6 +928,13 @@ function M.build(ctx, opts, action)
     on_windows_ready = function()
       ctx.update_chat_title()
       ctx.refresh_chrome()
+    end,
+    on_visibility = function()
+      if S.view.choices then
+        vim.schedule(function()
+          S.view.choices:refresh()
+        end)
+      end
     end,
   })
 

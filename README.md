@@ -821,6 +821,7 @@ teams = {
 | `:Ade team` | 打开统一面板（成员 / 收件箱 / 看板 / 详情）；没有团队时显示可用流程（光标所在流程按 `S` 启动，`<CR>` 看全文） |
 | `:Ade team start [流程]` | 按流程启动团队 |
 | `:Ade team close` | 确认后结束当前 cwd 的团队 |
+| `:Ade team answer [名字]` | 显示待处理的选项；带名字时用输入框回答该成员的无选项提问 |
 | `:Ade workflows` | 列出/查看/删除命名流程（`<CR>` 全文，`d` 删除，`q` 关闭） |
 
 补全：`:Ade team <Tab>` 补全 `start` / `close`；`:Ade team start <Tab>` 补全配置里的

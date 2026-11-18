@@ -1296,6 +1296,10 @@ team 人数不能超过 max_workers，否则 setup 报错（写明流程名和�
     结束当前 cwd 的团队（确认后 team.close）。当前 cwd 没有团队时提示，
     不会关闭别的目录的团队。
 
+:Ade team answer [名字]                                 *:Ade-team-answer*
+    显示待处理的选项（提问、spawn、权限、上限）；带名字时用输入框回答该
+    成员没有选项的提问。
+
 :Ade workflows                                                *:Ade-workflows*
     列出命名流程：名字、范围、一行说明、成员。<CR> 看全文，d 删除（只限
     project 和 user；config/builtin 提示不能删），q 关闭。

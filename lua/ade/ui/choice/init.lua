@@ -19,9 +19,10 @@ end
 local function dispose_cmp(buf)
   local ok, cmp = pcall(require, "cmp")
   if ok and type(cmp) == "table" and type(cmp.setup) == "table" and type(cmp.setup.buffer) == "function" then
-    pcall(cmp.setup.buffer, { enabled = false })
+    vim.api.nvim_buf_call(buf, function()
+      pcall(cmp.setup.buffer, { enabled = false })
+    end)
   end
-  _ = buf
 end
 
 ---@param text string
@@ -35,7 +36,7 @@ function View:notify_message(message, level)
 end
 
 function View:answer(index)
-  return self.answers[index] or { selected = {}, text = nil, skipped = false }
+  return self.answers[index] or { selected = {}, selected_index = {}, text = nil, skipped = false }
 end
 
 function View:answered(index)
@@ -63,17 +64,19 @@ function View:line_list()
   local lines = {}
   local maps = { options = {} }
   local title = tostring(model.title or "需要选择")
-  if model.status and model.status ~= "" then
-    title = title .. "    " .. tostring(model.status)
+  local status = model.status_fn and model.status_fn() or model.status
+  if status and status ~= "" then
+    title = title .. "    " .. tostring(status)
   end
   lines[#lines + 1] = " " .. title
   local tabs = {}
   for index, question in ipairs(model.questions or {}) do
     local header = tostring(question.header or ("Q" .. index))
+    local marker = self:answered(index) and "☒" or "☐"
     if self.tab == index then
-      tabs[#tabs + 1] = "[" .. header .. "]"
+      tabs[#tabs + 1] = "[" .. marker .. " " .. header .. "]"
     else
-      tabs[#tabs + 1] = " " .. header .. " "
+      tabs[#tabs + 1] = " " .. marker .. " " .. header .. " "
     end
   end
   tabs[#tabs + 1] = self.tab == #(model.questions or {}) + 1 and "[提交]" or " 提交 "
@@ -82,7 +85,11 @@ function View:line_list()
   local count = #(model.questions or {})
   if self.tab <= count then
     local question = model.questions[self.tab]
-    for _, line in ipairs(split_lines(question.question)) do
+    local question_lines = split_lines(question.question)
+    if self.external and not self.expanded and #question_lines > 2 then
+      question_lines = { question_lines[1], question_lines[2], " …（K 展开）" }
+    end
+    for _, line in ipairs(question_lines) do
       lines[#lines + 1] = " " .. line
     end
     lines[#lines + 1] = ""
@@ -179,6 +186,11 @@ function View:begin_custom(line)
     return
   end
   local answer = self:answer(self.tab)
+  local question = self.model.questions[self.tab] or {}
+  if not question.multi_select then
+    answer.selected = {}
+    answer.selected_index = {}
+  end
   self.custom = true
   self.custom_line = line
   vim.bo[self.buf].modifiable = true
@@ -238,26 +250,38 @@ function View:select(index)
   end
   if question.multi_select then
     local next_selected = {}
+    local next_index = {}
     local removed = false
-    for _, label in ipairs(answer.selected) do
-      if label == option.label then
+    for _, index_value in ipairs(answer.selected_index or {}) do
+      if index_value == index then
         removed = true
       else
-        next_selected[#next_selected + 1] = label
+        next_index[#next_index + 1] = index_value
+        local label = options[index_value] and options[index_value].label
+        if label then
+          next_selected[#next_selected + 1] = label
+        end
       end
     end
     if not removed then
+      next_index[#next_index + 1] = index
       next_selected[#next_selected + 1] = option.label
     end
     answer.selected = next_selected
+    answer.selected_index = next_index
     answer.text = nil
     answer.skipped = false
     self:render()
   else
     answer.selected = { option.label }
+    answer.selected_index = { index }
     answer.text = nil
     answer.skipped = false
-    self:advance()
+    if self.model.submit_single and #(self.model.questions or {}) == 1 then
+      self:submit()
+    else
+      self:advance()
+    end
   end
 end
 
@@ -289,9 +313,17 @@ function View:submit()
     local answer = self:answer(index)
     answers[index] = {
       selected = vim.deepcopy(answer.selected),
+      selected_index = vim.deepcopy(answer.selected_index or {}),
       text = answer.text,
       skipped = answer.skipped,
     }
+  end
+  if self.model.validate then
+    local ok, problem = self.model.validate(answers)
+    if not ok then
+      self:notify_message(tostring(problem or "invalid answer"), vim.log.levels.WARN)
+      return
+    end
   end
   local on_submit = self.model.on_submit
   self:close()
@@ -410,6 +442,15 @@ function View:keys()
   map("d", function()
     self:details()
   end)
+  map("K", function()
+    self.expanded = not self.expanded
+    self:render()
+  end)
+  -- Habitual insert keys must not start an insert session in a read-only
+  -- choice buffer (E21) or cancel the request with the first Esc.
+  for _, key in ipairs({ "i", "a", "o", "I", "A", "O", "x", "X", "p", "P", "s", "S", "u", "<C-r>" }) do
+    map(key, function() end)
+  end
 end
 
 ---@param model table
@@ -424,17 +465,27 @@ function View:show(model, mount)
   self.model = model
   self.answers = {}
   for index = 1, #(model.questions or {}) do
-    self.answers[index] = { selected = {}, text = nil, skipped = false }
+    local initial = model.initial and model.initial[index] or {}
+    self.answers[index] = {
+      selected = vim.deepcopy(initial.selected or {}),
+      selected_index = vim.deepcopy(initial.selected_index or {}),
+      text = initial.text,
+      skipped = initial.skipped == true,
+    }
   end
   self.tab = 1
   self.cursor = 1
   self.custom = false
+  self.expanded = false
   self.win = win
   self.original_buf = vim.api.nvim_win_get_buf(win)
   self.saved_winbar = vim.api.nvim_get_option_value("winbar", { win = win })
   self.saved_wrap = vim.api.nvim_get_option_value("wrap", { win = win })
   self.saved_height = vim.api.nvim_win_get_height(win)
   self.external = mount.external == true
+  if vim.api.nvim_get_mode().mode:sub(1, 1) == "i" then
+    pcall(vim.cmd, "stopinsert")
+  end
   self.buf = vim.api.nvim_create_buf(false, true)
   vim.bo[self.buf].buftype = "nofile"
   vim.bo[self.buf].bufhidden = "wipe"
@@ -453,6 +504,25 @@ function View:show(model, mount)
   end
   pcall(vim.api.nvim_set_option_value, "wrap", true, { win = win })
   self:keys()
+  vim.api.nvim_create_autocmd("InsertLeave", {
+    buffer = self.buf,
+    callback = function()
+      if self.custom then
+        local text = ""
+        if self.custom_line and self.custom_line <= vim.api.nvim_buf_line_count(self.buf) then
+          text = vim.api.nvim_buf_get_lines(self.buf, self.custom_line - 1, self.custom_line, false)[1] or ""
+          text = text:gsub("^%s*其他:%s*", "")
+        end
+        if text ~= "" then
+          self:answer(self.tab).text = text
+        end
+        self.custom = false
+        vim.bo[self.buf].modifiable = false
+        self:render()
+      end
+    end,
+  })
+  pcall(vim.api.nvim_set_current_win, win)
   self:render()
   local lines = vim.api.nvim_buf_line_count(self.buf)
   if not self.external then

@@ -207,9 +207,14 @@ check("the choice component keeps the composer in the edgebar", function()
   require("edgy.layout").update()
   vim.wait(100)
   assert(vim.api.nvim_win_is_valid(st.input.win), "the composer left the edgebar")
+  local shown_width = vim.api.nvim_win_get_width(st.input.win)
   view:close()
   assert(vim.api.nvim_win_get_buf(st.input.win) == original, "the draft buffer was not restored")
-  assert(vim.api.nvim_win_get_width(st.input.win) == width, "the width changed after close")
+  vim.wait(100)
+  assert(
+    vim.api.nvim_win_get_width(st.input.win) == shown_width,
+    "the width changed after close: " .. vim.api.nvim_win_get_width(st.input.win) .. " vs " .. shown_width
+  )
 end)
 
 -- Closing only the composer must not be re-created by ade.

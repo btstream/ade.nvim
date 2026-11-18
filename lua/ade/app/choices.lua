@@ -21,7 +21,26 @@ function M.new(opts)
     current = nil,
     signature = nil,
     notified = {},
+    -- Keys the person put off with Esc, answered with "hold", or whose answer
+    -- is in flight. They stay pending but are not shown until asked for.
+    deferred = {},
+    handled = {},
+    answering = {},
   }, Choices)
+end
+
+function Choices:status_fn(team_id)
+  return function()
+    local counts = self:pending_counts(team_id)
+    local total = counts.question + counts.approval
+    return total > 1 and ("还有 " .. (total - 1) .. " 个待处理") or nil
+  end
+end
+
+function Choices:defer(key)
+  if key then
+    self.deferred[key] = true
+  end
 end
 
 function Choices:team()
@@ -96,7 +115,7 @@ function Choices:question_model(team, item, pending)
   end
   return {
     title = who .. " 提问 · team " .. tostring(item.team),
-    status = pending > 1 and ("还有 " .. (pending - 1) .. " 个待处理") or nil,
+    status_fn = self:status_fn(item.team),
     questions = questions,
     on_cancel = function()
       self:refresh()
@@ -124,7 +143,6 @@ function Choices:answer_question(team, item, questions, answers)
     self:refresh()
   end)
   self:refresh()
-  _ = questions
 end
 
 function Choices:spawn_model(team, item, pending)
@@ -161,7 +179,7 @@ function Choices:spawn_model(team, item, pending)
   end
   return {
     title = "启动 worker " .. tostring(item.name or "?") .. " · team " .. tostring(item.team),
-    status = pending > 1 and ("还有 " .. (pending - 1) .. " 个待处理") or nil,
+    status_fn = self:status_fn(item.team),
     questions = {
       {
         header = "Spawn",
@@ -208,20 +226,24 @@ function Choices:team_permission_model(team, item, pending)
     ids[label] = entry.optionId
   end
   if #options == 0 then
-    return nil
+    options[1] = option("取消请求", "cancel")
+    ids["取消请求"] = nil
   end
   return {
     title = "worker " .. tostring(item.from or "?") .. " 请求权限 · team " .. tostring(item.team),
-    status = pending > 1 and ("还有 " .. (pending - 1) .. " 个待处理") or nil,
+    status_fn = self:status_fn(item.team),
+    submit_single = true,
     questions = { { header = "Permission", question = item.body or "Permission required", options = options } },
     on_cancel = function()
-      team:answer(item.id, {}, function()
-        self:refresh()
-      end)
+      -- Esc is "later" for team items, including a worker permission.
+      self:refresh()
     end,
     on_submit = function(answers)
-      local label = answers[1] and answers[1].selected[1]
-      team:answer(item.id, { option = label and ids[label] or nil }, function()
+      local answer = answers[1] or {}
+      local index = (answer.selected_index or {})[1]
+      local entry = index and (item.options or {})[index]
+      local label = answer.selected[1]
+      team:answer(item.id, { option = entry and entry.optionId or (label and ids[label]) or nil }, function()
         self:refresh()
       end)
     end,
@@ -231,7 +253,7 @@ end
 function Choices:limit_model(team, item, pending)
   return {
     title = "回合上限 · " .. tostring(item.from or "team"),
-    status = pending > 1 and ("还有 " .. (pending - 1) .. " 个待处理") or nil,
+    status_fn = self:status_fn(item.team),
     questions = {
       {
         header = "Limit",
@@ -249,6 +271,8 @@ function Choices:limit_model(team, item, pending)
           self:refresh()
         end)
       else
+        -- "Keep paused" is an answer for the purposes of the queue.
+        self.handled["team:" .. item.team .. ":" .. item.id] = true
         self:refresh()
       end
     end,
@@ -337,6 +361,18 @@ function Choices:team_entries(team_id)
       end
     end
   end
+  table.sort(open, function(left, right)
+    local function key(entry)
+      local number = tonumber(tostring(entry.team):match("^t(%d+)$"))
+      return number or 0, entry.key
+    end
+    local ln, lk = key(left)
+    local rn, rk = key(right)
+    if ln ~= rn then
+      return ln < rn
+    end
+    return lk < rk
+  end)
   return open, question_count, approval_count
 end
 
@@ -398,6 +434,7 @@ function Choices:show(entry, open)
   local cancel = model.on_cancel
   model.on_cancel = function()
     self.current = nil
+    self:defer(entry.key)
     if cancel then
       pcall(cancel)
     end
@@ -406,6 +443,11 @@ function Choices:show(entry, open)
   local submit = model.on_submit
   model.on_submit = function(answers)
     self.current = nil
+    self.answering[entry.key] = true
+    vim.defer_fn(function()
+      self.answering[entry.key] = nil
+      self:refresh()
+    end, 2000)
     if submit then
       pcall(submit, answers)
     end
@@ -423,59 +465,104 @@ function Choices:show(entry, open)
   return true
 end
 
+function Choices:dismiss_fallback()
+  if self.deps.permission_dismiss then
+    pcall(self.deps.permission_dismiss)
+  end
+  if self.deps.elicitation_dismiss then
+    pcall(self.deps.elicitation_dismiss)
+  end
+end
+
 ---Recompute the queue and show the next item when possible.
 function Choices:refresh()
-  local team = self:team()
   local open = self:team_entries(nil)
   local interactions = self:interactions()
   local acp_pending = interactions and #interactions:pending() > 0 or false
-  self:update_notice(open, interactions)
-  if self.current and not self.view:is_open() then
-    self.current = nil
+  local keys = {}
+  for _, entry in ipairs(open) do
+    keys[entry.key] = true
   end
-
-  if self.current and self.current.kind ~= "acp" then
-    local still = false
-    for _, entry in ipairs(open) do
-      if entry.key == self.current.key then
-        still = true
-        break
+  for _, set in ipairs({ self.deferred, self.handled, self.answering }) do
+    for key in pairs(set) do
+      if not keys[key] then
+        set[key] = nil
       end
     end
-    if not still then
-      self.view:close()
-      self.current = nil
+  end
+  local showable = {}
+  for _, entry in ipairs(open) do
+    if not self.deferred[entry.key] and not self.handled[entry.key] and not self.answering[entry.key] then
+      showable[#showable + 1] = entry
     end
   end
+  self:update_notice(open, interactions)
+
+  if self.current and not self.view:is_open() then
+    if self.current.kind == "acp" and interactions then
+      interactions:unshow(self.current.id)
+    end
+    self.current = nil
+  end
+  local visible = self:visible()
   if acp_pending then
-    if self.current and self.current.kind == "team" then
+    if self.current and self.current.kind ~= "acp" then
       self.view:close()
       self.current = nil
     end
-    if self:visible() and not (interactions.shown and self.view:is_open()) then
+    if visible then
+      if interactions.shown and not self.view:is_open() then
+        -- A fallback picker was shown while the panel was hidden; replace it
+        -- with the component now that the composer is back.
+        self:dismiss_fallback()
+        interactions:unshow(interactions.shown)
+      end
+      if not self.view:is_open() then
+        interactions:show_next()
+      end
+      if interactions.shown or self.view:is_open() then
+        return
+      end
+    else
+      if self.view:is_open() then
+        self.view:close()
+        self.current = nil
+      end
+      -- No composer: keep the old picker/form so the agent is not blocked.
       interactions:show_next()
+      return
+    end
+  end
+  if not visible then
+    if self.view:is_open() then
+      self.view:close()
+      self.current = nil
     end
     return
   end
-  if self.current then
+  if self.current and self.view:is_open() then
     return
   end
-  if not self:visible() or vim.fn.mode():sub(1, 1) == "i" or vim.fn.getcmdwintype() ~= "" then
+  if vim.fn.mode():sub(1, 1) == "i" or vim.fn.getcmdwintype() ~= "" then
     return
   end
-  if #open > 0 then
-    self:show(open[1], open)
+  if showable[1] then
+    self:show(showable[1], open)
   end
 end
 
 ---Force the queue on screen (the `:Ade team answer` command).
 ---@param team_id string|nil
 function Choices:show_pending(team_id)
+  local open = self:team_entries(team_id)
+  local interactions = self:interactions()
   if not self:visible() then
-    local count = 0
-    local open = self:team_entries(team_id)
-    count = #open
-    local interactions = self:interactions()
+    local count = #open
+    for _, entry in ipairs(open) do
+      if self.handled[entry.key] then
+        count = count - 1
+      end
+    end
     if interactions then
       count = count + #interactions:pending()
     end
@@ -487,20 +574,35 @@ function Choices:show_pending(team_id)
     return
   end
   pcall(vim.cmd, "stopinsert")
-  local interactions = self:interactions()
+  -- Explicitly asking for the queue clears everything put off with Esc.
+  self.deferred = {}
+  self:refresh()
+  if self.view:is_open() then
+    return
+  end
   if interactions and #interactions:pending() > 0 then
+    if interactions.shown then
+      self:dismiss_fallback()
+      interactions:unshow(interactions.shown)
+    end
     interactions:show_next()
     if self.view:is_open() then
       return
     end
   end
-  self.current = nil
-  local open = self:team_entries(team_id)
-  if #open == 0 then
-    self:notify("没有待处理的提问或申请", vim.log.levels.INFO)
-    return
+  local first
+  for _, entry in ipairs(open) do
+    if not self.handled[entry.key] then
+      first = entry
+      break
+    end
   end
-  self:show(open[1], open)
+  if first then
+    self.current = nil
+    self:show(first, open)
+  else
+    self:notify("没有待处理的提问或申请", vim.log.levels.INFO)
+  end
 end
 
 ---Answer a question without options with the composer input.
@@ -566,11 +668,14 @@ function Choices:permission_model(interaction)
       end
     end,
     on_submit = function(answers)
-      local label = answers[1] and answers[1].selected[1]
-      local option_id
-      for _, entry in ipairs(options) do
-        if entry.label == label then
-          option_id = entry.value
+      local answer = answers[1] or {}
+      local index = (answer.selected_index or {})[1]
+      local option_id = index and (request.options or {})[index] and request.options[index].optionId
+      if not option_id then
+        for _, entry in ipairs(request.options or {}) do
+          if entry.name == answer.selected[1] then
+            option_id = entry.optionId
+          end
         end
       end
       self:answer_acp(interaction, { outcome = { outcome = "selected", optionId = option_id } })
@@ -589,16 +694,12 @@ function Choices:elicitation_model(interaction)
   end
   local fields = parsed.fields
   local questions = {}
-  local mapping = {}
+  local initial = {}
   for index, field in ipairs(fields) do
     local options = {}
     if field.kind == "boolean" then
       options = { option("是", true), option("否", false) }
-    elseif field.kind == "choice" then
-      for _, entry in ipairs(field.options) do
-        options[#options + 1] = option(entry.label, entry.value, { description = entry.description })
-      end
-    elseif field.kind == "multi" then
+    elseif field.kind == "choice" or field.kind == "multi" then
       for _, entry in ipairs(field.options) do
         options[#options + 1] = option(entry.label, entry.value, { description = entry.description })
       end
@@ -606,84 +707,116 @@ function Choices:elicitation_model(interaction)
     if not field.required then
       options[#options + 1] = option("跳过", nil, { skip = true })
     end
-    questions[#questions + 1] = {
+    questions[index] = {
       header = tostring(field.title or field.key),
       question = tostring(field.description or field.title or field.key),
       options = options,
       multi_select = field.kind == "multi",
-      allow_custom = field.kind == "choice" or field.kind == "multi",
+      -- "Other" is only offered when the schema has a `<key>_custom` slot.
+      allow_custom = field.custom_key ~= nil and (field.kind == "choice" or field.kind == "multi"),
       free_text = field.kind == "text" or field.kind == "number" or field.kind == "integer",
     }
-    mapping[index] = field
-  end
-  return {
-    title = tostring(request.message or "Agent question"),
-    questions = questions,
-    on_submit = function(answers)
-      local values = {}
-      for index, field in ipairs(fields) do
-        local answer = answers[index] or {}
-        if not answer.skipped then
-          if field.kind == "multi" then
-            local picked = {}
-            for _, label in ipairs(answer.selected) do
-              for _, entry in ipairs(field.options) do
-                if entry.label == label then
-                  picked[#picked + 1] = entry.value
-                end
-              end
-            end
-            if answer.text and answer.text ~= "" then
-              if field.custom_key then
-                values[field.custom_key] = answer.text
-              end
-            elseif #picked > 0 then
-              values[field.key] = picked
-            end
-          elseif field.kind == "choice" then
-            local value = answer.selected[1]
-            if value ~= nil then
-              for _, entry in ipairs(field.options) do
-                if entry.label == value then
-                  values[field.key] = entry.value
-                end
-              end
-            end
-            if answer.text and answer.text ~= "" then
-              if field.custom_key then
-                values[field.custom_key] = answer.text
-              else
-                values[field.key] = answer.text
-              end
-            end
-          elseif field.kind == "boolean" then
-            values[field.key] = answer.selected[1] == "是"
-          elseif answer.text and answer.text ~= "" then
-            if field.kind == "number" or field.kind == "integer" then
-              values[field.key] = tonumber(answer.text) or answer.text
-            else
-              values[field.key] = answer.text
+    -- Preselect the schema default exactly as the old form did.
+    local default = field.default
+    if default ~= nil then
+      if field.kind == "boolean" then
+        initial[index] = { selected = { default and "是" or "否" } }
+      elseif field.kind == "multi" then
+        local labels = {}
+        local indexes = {}
+        for _, value in ipairs(type(default) == "table" and default or {}) do
+          for option_index, entry in ipairs(field.options) do
+            if entry.value == value then
+              labels[#labels + 1] = entry.label
+              indexes[#indexes + 1] = option_index
             end
           end
         end
+        initial[index] = { selected = labels, selected_index = indexes }
+      elseif field.kind == "choice" then
+        for option_index, entry in ipairs(field.options) do
+          if entry.value == default then
+            initial[index] = { selected = { entry.label }, selected_index = { option_index } }
+          end
+        end
+      else
+        initial[index] = { text = tostring(default) }
       end
-      local problem = schema.validate(fields, values)
-      if problem then
-        self:notify("form: " .. problem, vim.log.levels.WARN)
-        self.current = nil
-        self:present_interaction(interaction)
-        return
-      end
-      self:answer_acp(interaction, { action = "accept", content = values })
-    end,
-    on_cancel = function()
-      self:answer_acp(interaction, { action = "cancel" })
-    end,
+    end
+  end
+  local model = {
+    title = tostring(request.message or "Agent question"),
+    questions = questions,
+    initial = initial,
   }
+  local function values_from(answers)
+    local values = {}
+    for index, field in ipairs(fields) do
+      local answer = answers[index] or {}
+      if not answer.skipped then
+        if field.kind == "multi" then
+          local picked = {}
+          for _, option_index in ipairs(answer.selected_index or {}) do
+            local entry = field.options[option_index]
+            if entry then
+              picked[#picked + 1] = entry.value
+            end
+          end
+          if #picked > 0 then
+            values[field.key] = picked
+          end
+          if field.custom_key and answer.text and answer.text ~= "" then
+            values[field.custom_key] = answer.text
+          end
+        elseif field.kind == "choice" then
+          local option_index = (answer.selected_index or {})[1]
+          local entry = option_index and field.options[option_index]
+          if entry then
+            values[field.key] = entry.value
+          end
+          if field.custom_key and answer.text and answer.text ~= "" then
+            values[field.custom_key] = answer.text
+          end
+        elseif field.kind == "boolean" then
+          values[field.key] = (answer.selected or {})[1] == "是"
+        elseif answer.text ~= nil and answer.text ~= "" then
+          values[field.key] = answer.text
+        end
+      end
+    end
+    return values
+  end
+  model.validate = function(answers)
+    local ok, content = schema.validate(fields, values_from(answers))
+    if ok then
+      self.pending_content = content
+      return true
+    end
+    return false, content
+  end
+  model.on_submit = function()
+    local content = self.pending_content
+    self.pending_content = nil
+    self:answer_acp(interaction, { action = "accept", content = content })
+  end
+  model.on_cancel = function()
+    self.pending_content = nil
+    self:answer_acp(interaction, { action = "cancel" })
+  end
+  return model
 end
 
 function Choices:present_interaction(interaction)
+  local config = self.deps.config and self.deps.config() or {}
+  local permissions = config.permissions or {}
   local mount = self:mount()
+  if interaction.type == "permission" and permissions.prompt ~= "select" then
+    -- `native` leaves the request to the agent's own UI, as before.
+    if self.deps.permission_present then
+      return self.deps.permission_present(interaction)
+    end
+    return false
+  end
   if not self:visible() or not mount then
     -- No composer to borrow (panel hidden or no window). ACP requests are
     -- blocking, so keep the old picker/form as the single-agent fallback.
@@ -698,6 +831,17 @@ function Choices:present_interaction(interaction)
   local model
   if interaction.type == "permission" then
     model = self:permission_model(interaction)
+    if not model then
+      -- The old picker cancelled a permission without options; do the same
+      -- instead of leaving the agent (and the queue) blocked.
+      self:notify("the agent sent a permission request without options; cancelling it", vim.log.levels.WARN)
+      self:cancel_acp(interaction)
+      return false
+    end
+    model.submit_single = true
+    if permissions.show_details ~= false and self.deps.permission_details then
+      pcall(self.deps.permission_details, interaction)
+    end
   elseif interaction.type == "elicitation" then
     local request = interaction.request or {}
     local url = request.url or (request._meta and request._meta.url)
@@ -746,6 +890,7 @@ end
 function Choices:dismiss()
   self.view:close()
   self.current = nil
+  self:dismiss_fallback()
   self:refresh()
 end
 

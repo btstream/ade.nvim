@@ -80,6 +80,34 @@ return function(t)
       close_window()
     end)
 
+    t.it("leaves custom text mode when insert mode ends and keeps the text", function()
+      local win = window()
+      local view = Choice.new({ notify = function() end })
+      view:show({
+        title = "other",
+        questions = {
+          {
+            header = "Q",
+            question = "pick",
+            options = { { label = "A" }, { label = "B" } },
+            allow_custom = true,
+          },
+        },
+        on_submit = function() end,
+      }, { win = win, external = false, max_height = 8 })
+      view:select(3) -- Other
+      t.eq(true, view.custom)
+      t.eq(0, #view.answers[1].selected, "Other clears the single selection")
+      vim.api.nvim_buf_set_lines(view.buf, view.custom_line - 1, view.custom_line, false, { " 其他: typed" })
+      vim.cmd("stopinsert")
+      vim.api.nvim_exec_autocmds("InsertLeave", { buffer = view.buf })
+      vim.wait(20)
+      t.eq(false, view.custom)
+      t.eq("typed", view.answers[1].text)
+      view:close()
+      close_window()
+    end)
+
     t.it("does not resize under edgy and restores the native height", function()
       local win = window()
       local view = Choice.new({ notify = function() end })
@@ -394,6 +422,9 @@ return function(t)
         interactions = function()
           return interactions
         end,
+        config = function()
+          return { permissions = { prompt = "select", show_details = false } }
+        end,
         notify = function() end,
         input_win = function()
           return win
@@ -421,7 +452,6 @@ return function(t)
       }
       t.eq(true, choices:present_interaction(interaction))
       choices.view:select(1)
-      choices.view:submit()
       t.eq("selected", answered.response.outcome.outcome)
       t.eq("a", answered.response.outcome.optionId)
       _ = cancelled
