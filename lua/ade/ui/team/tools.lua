@@ -48,11 +48,34 @@ local SHAPE = {
   end,
 }
 
+---@param block table
+---@param raw table
+---@return boolean|nil confirmed true, false when another server is named
+local function server_ok(block, raw)
+  local candidates = {
+    raw.server,
+    raw.mcpServer,
+    raw.mcp_server,
+    type(raw._meta) == "table" and (raw._meta.server or raw._meta.mcpServer) or nil,
+    type(block._meta) == "table" and (block._meta.server or block._meta.mcpServer) or nil,
+    type(block.meta) == "table" and (block.meta.server or block.meta.mcpServer) or nil,
+    block.server,
+  }
+  for _, value in ipairs(candidates) do
+    if type(value) == "string" and value ~= "" then
+      local server = value:lower():gsub("^mcp__", ""):gsub("__$", "")
+      return server == "ade-team" or server == "ade_team"
+    end
+  end
+  return nil
+end
+
+---Only an explicit `mcp__ade-team__` / `ade-team_` name counts here.
 local function canonical(name)
   name = tostring(name or ""):lower()
   local server, rest = name:match("^mcp__([^_]+)__(.+)$")
   if server then
-    if server ~= "ade-team" and server ~= "ade_team" then
+    if server ~= "ade-team" then
       return nil
     end
     rest = rest:gsub("%.", "_")
@@ -63,29 +86,56 @@ local function canonical(name)
     prefixed = prefixed:gsub("%.", "_")
     return SHAPE[prefixed] and prefixed or nil
   end
-  -- ACP blocks often carry the bare tool name in `title`/`tool_name`
-  -- (opencode: `bus_send`). Exact whole-name matching keeps `Read
-  -- board_update.lua` and shell titles out.
-  name = name:gsub("%.", "_")
-  if SHAPE[name] then
+  return nil
+end
+
+---A bare tool name is only accepted with source evidence (`_meta.server`).
+---@param block table
+---@param raw table
+---@return string|nil
+local function bare_name(block, raw)
+  local name = block.tool_name or block.name
+  if type(name) ~= "string" then
+    local title = one_line(block.title or "")
+    if title:find("%s") then
+      return nil
+    end
+    name = title
+  end
+  name = tostring(name or ""):lower():gsub("%.", "_")
+  if not SHAPE[name] then
+    return nil
+  end
+  if server_ok(block, raw) == true then
     return name
   end
   return nil
 end
 
----The proxy (`mcp({tool=..., args=...})`) wraps the real call.
+---The proxy (`mcp({tool=..., args=...})`) wraps the real call. A named
+---`server` field must be ade-team; without one the argument shape must match.
 ---@param block table
 ---@return string|nil name, table args
 local function proxy(block)
   local raw = type(block.raw_input) == "table" and block.raw_input or {}
-  if type(raw.tool) == "string" and type(raw.args) == "table" then
-    local name = raw.tool:lower():gsub("%.", "_")
-    local stripped = name:match("^ade%-team[_%:](.+)$") or name
-    if SHAPE[stripped] then
-      return stripped, raw.args
-    end
+  if type(raw.tool) ~= "string" or type(raw.args) ~= "table" then
+    return nil, raw
   end
-  return nil, raw
+  local explicit = canonical(raw.tool)
+  local name = explicit or raw.tool:lower():gsub("%.", "_")
+  if not SHAPE[name] then
+    return nil, raw
+  end
+  local server = server_ok(block, raw)
+  if server == false then
+    return nil, raw
+  end
+  if explicit then
+    return name, raw.args
+  end
+  -- No explicit server: the proxy structure plus the expected arguments is
+  -- the evidence available to us.
+  return name, raw.args
 end
 
 ---@param block table
@@ -95,19 +145,15 @@ local function identify(block)
     return nil, {}
   end
   local raw = type(block.raw_input) == "table" and block.raw_input or {}
-  local name = canonical(block.tool_name) or canonical(block.name)
+  local name = canonical(block.tool_name) or canonical(block.name) or canonical(one_line(block.title or ""))
   if name then
     return name, raw
   end
-  -- A title only counts when it is exactly an explicit prefixed tool name.
-  local title = one_line(block.title or "")
-  if title ~= "" and not title:find("%s") then
-    name = canonical(title)
-    if name then
-      return name, raw
-    end
+  name = bare_name(block, raw)
+  if name then
+    return name, raw
   end
-  -- pi's MCP proxy: `mcp({tool = "bus_send", args = {...}})`.
+  -- pi's MCP proxy: `mcp({server = "ade-team", tool = "bus_send", args = {}})`.
   local proxy_name, proxy_args = proxy(block)
   if proxy_name then
     local is_proxy = block.tool_name == "mcp"

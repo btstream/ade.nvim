@@ -180,24 +180,19 @@ function Tab:open()
         -- user drag. `resize()` already reasserted the recorded widths.
         return
       end
-      local changed = false
+      -- A terminal resize is not a user drag: keep the recorded widths so a
+      -- later refresh scales them again (N6).
+      if self.applied_columns and vim.o.columns ~= self.applied_columns then
+        self.applied_columns = vim.o.columns
+        return
+      end
       local members = self.panels.members
-      if members and vim.api.nvim_win_is_valid(members) then
-        local width = vim.api.nvim_win_get_width(members)
-        if width ~= self.members_width then
-          self.members_width = width
-          changed = true
-        end
-      end
+      local members_width = members and vim.api.nvim_win_is_valid(members) and vim.api.nvim_win_get_width(members)
+        or nil
       local right = self:right_win()
-      if right then
-        local width = vim.api.nvim_win_get_width(right)
-        if width ~= self.watch_width then
-          self.watch_width = width
-          changed = true
-        end
-      end
-      if changed then
+      local right_width = right and vim.api.nvim_win_get_width(right) or nil
+      local current = vim.api.nvim_get_current_win()
+      if self:record_resize(members_width, right_width, current) then
         -- Re-render with the new width so truncation follows the user's drag.
         vim.schedule(function()
           self:refresh()
@@ -293,9 +288,10 @@ function Tab:resize()
   end
   local members = math.max(4, math.min(tonumber(self.members_width) or 32, math.max(4, vim.o.columns - 20)))
   local rights = self:right_windows()
+  local right_width
   if #rights > 0 then
     local available = math.max(24, vim.o.columns - members - 2)
-    local right_width = self.watch_width or math.max(20, math.floor(available * 0.48))
+    right_width = self.watch_width or math.max(20, math.floor(available * 0.48))
     right_width = math.max(16, math.min(right_width, available - 20))
     for _, win in ipairs(rights) do
       self:set_width(win, right_width)
@@ -304,6 +300,35 @@ function Tab:resize()
   -- Last: resizing the right column can shave a cell off a fixed-width member
   -- pane, and that rounding must not become the recorded width (M1).
   self:set_width(self.panels.members, members)
+  self.applied_members = members
+  self.applied_right = right_width
+  self.applied_columns = vim.o.columns
+end
+
+---Record only the window the person dragged. When a member drag also shrinks
+---the right column passively, the current window disambiguates (N6).
+---@param members_width integer|nil
+---@param right_width integer|nil
+---@param current integer|nil
+---@return boolean recorded
+function Tab:record_resize(members_width, right_width, current)
+  local changed_members = members_width and self.applied_members and members_width ~= self.applied_members
+  local changed_right = right_width and self.applied_right and right_width ~= self.applied_right
+  if not changed_members and not changed_right then
+    return false
+  end
+  if changed_members and not changed_right then
+    self.members_width = members_width
+  elseif changed_right and not changed_members then
+    self.watch_width = right_width
+  elseif current == self.panels.members and changed_members then
+    self.members_width = members_width
+  elseif current == self:right_win() and changed_right then
+    self.watch_width = right_width
+  else
+    return false
+  end
+  return true
 end
 
 function Tab:set_lines(name, lines, marks)
@@ -333,17 +358,19 @@ function Tab:refresh()
   self.ids = rendered.ids
   self.marks = rendered.marks or {}
   self.last_lines = self.last_lines or {}
+  self.last_marks = self.last_marks or {}
   for _, name in ipairs(PANELS) do
     local lines = rendered[name] or {}
-    if not vim.deep_equal(self.last_lines[name], lines) then
-      local marks = {}
-      for _, mark in ipairs(rendered.marks or {}) do
-        if mark.panel == name then
-          marks[#marks + 1] = mark
-        end
+    local marks = {}
+    for _, mark in ipairs(rendered.marks or {}) do
+      if mark.panel == name then
+        marks[#marks + 1] = mark
       end
+    end
+    if not vim.deep_equal(self.last_lines[name], lines) or not vim.deep_equal(self.last_marks[name], marks) then
       self:set_lines(name, lines, marks)
       self.last_lines[name] = vim.deepcopy(lines)
+      self.last_marks[name] = vim.deepcopy(marks)
     end
   end
 end
@@ -449,7 +476,7 @@ function Tab:close()
   self.closing = true
   self.tab, self.original_tab = nil, nil
   self.panels, self.buffers, self.meta, self.ids, self.marks = {}, {}, {}, {}, {}
-  self.last_lines = {}
+  self.last_lines, self.last_marks = {}, {}
   self.watch_win, self.leader_windows = nil, nil
   if self.group then
     pcall(vim.api.nvim_del_augroup_by_id, self.group)

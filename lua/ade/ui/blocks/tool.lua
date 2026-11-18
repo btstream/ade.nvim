@@ -234,7 +234,12 @@ function M.render_tool(block, ctx)
         group, suffix = "AdeToolRunning", " · …"
       end
       local caret = (ctx.icons and ctx.icons.chevron_right) or "›"
-      line = require("ade.ui.team.text").ellipsis(caret .. " " .. line .. suffix, ctx.width or 80)
+      local Text = require("ade.ui.team.text")
+      local width = ctx.width or 80
+      -- Reserve the suffix so a failure marker is never the part that gets
+      -- cut off on a narrow window (N3).
+      local main = Text.ellipsis(caret .. " " .. line, math.max(0, width - Text.width(suffix)))
+      line = Text.ellipsis(main .. suffix, width)
       return {
         { text = line, segments = { { s = 0, e = -1, group = group } } },
         { text = "", segments = nil },

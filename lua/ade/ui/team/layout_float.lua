@@ -45,7 +45,7 @@ function Panel:is_open()
   return self.win ~= nil and vim.api.nvim_win_is_valid(self.win)
 end
 
----The cursor line's target: `team_id|participant` or `item:<id>`.
+---The cursor line's target: `team_id|participant`, `card:<team>|<id>`, ...
 ---@return string|nil kind
 ---@return string|nil a
 ---@return string|nil b
@@ -57,9 +57,6 @@ function Panel:current()
   local id = self.ids and self.ids[lnum]
   if type(id) ~= "string" then
     return nil
-  end
-  if id:sub(1, 5) == "item:" then
-    return "item", id:sub(6)
   end
   if id:sub(1, 5) == "card:" then
     local team, card = id:sub(6):match("^([^|]+)|(.+)$")
@@ -105,11 +102,11 @@ function Panel:lines()
     for _, entry in ipairs({
       { "m", "send a message to a participant" },
       { "p / r / c", "pause / resume / cancel the participant" },
-      { "<CR> / w", "watch the participant's transcript" },
+      { "<CR> / w", "card detail / watch the participant" },
       { "s", "start a worker from a template" },
       { "D", "remove an exited worker's worktree" },
       { "a / !", "answer a participant's pending choice / list them" },
-      { "<CR>", "card detail or watch the participant" },
+      { "m", "message a participant or the leader about a card" },
       { "R", "reset limits" },
       { "x", "close the team" },
       { "g?", "toggle this help" },
@@ -196,7 +193,12 @@ function Panel:lines()
     local board = self.team:board(team.id)
     if board then
       add("", nil)
-      add(string.format("   看板 · rev %s", tostring(board.rev or "?")), nil)
+      local rev = tonumber(board.rev)
+      local label = rev and ("看板 · rev " .. rev) or "看板"
+      if board.unavailable then
+        label = "看板"
+      end
+      add("   " .. label, nil)
       local states = {}
       for _, participant in ipairs(team.participants or {}) do
         states[participant.name] = {
@@ -270,16 +272,16 @@ function Panel:refresh()
   require("ade.ui.team.text").apply_marks(self.buf, self.ns, marks)
 end
 
----The team id for the cursor line, whether it is a team, participant or item.
+---The team id for the cursor line, including board cards and archived stages.
 ---@return string|nil
 function Panel:team_of_current()
-  local kind, a, b = self:current()
-  if kind == "participant" or kind == "team" then
+  local kind, a = self:current()
+  if kind == "team" or kind == "participant" or kind == "card" or kind == "stage" then
     return a
   end
-  if kind == "item" then
-    local item = self.team:item(a)
-    return item and item.team or nil
+  if kind == "workflow" then
+    local row = self.team:list_rows()[1]
+    return row and row.id or nil
   end
   return nil
 end
@@ -327,8 +329,13 @@ function Panel:open()
     local kind, team, name = self:current()
     if kind == "participant" and name then
       queue:answer_participant(team, name)
-    else
-      queue:show_pending(self:team_of_current() or (self.team:list_rows()[1] or {}).id)
+      return
+    end
+    local team_id = self:team_of_current() or (self.team:list_rows()[1] or {}).id
+    local open = queue:team_entries(team_id)
+    queue:show_pending(team_id)
+    if #open > 0 and not queue:is_open() then
+      self:notify("先打开聊天窗口（:Ade open）再显示选择组件")
     end
   end)
   self:map("!", function()
@@ -337,7 +344,12 @@ function Panel:open()
       self:notify("选择组件尚未就绪")
       return
     end
-    queue:show_pending(self:team_of_current() or (self.team:list_rows()[1] or {}).id)
+    local team_id = self:team_of_current() or (self.team:list_rows()[1] or {}).id
+    local open = queue:team_entries(team_id)
+    queue:show_pending(team_id)
+    if #open > 0 and not queue:is_open() then
+      self:notify("先打开聊天窗口（:Ade open）再显示选择组件")
+    end
   end)
   self:map("H", function()
     self:history_current()
@@ -368,30 +380,34 @@ function Panel:open()
       end)
     end
   end)
-  self:map("<CR>", function()
-    self:detail_current()
-  end)
-  self:map("zh", function()
-    local team = self:team_of_current()
-    if team then
-      self.scrolls = self.scrolls or {}
-      self.scrolls[team] = math.max(0, (self.scrolls[team] or 0) - 1)
-      self:refresh()
+  local function scroll_board(delta)
+    local team = self:team_of_current() or (self.team:list_rows()[1] or {}).id
+    if not team then
+      return
     end
+    local board = self.team:board(team)
+    local columns = board and #(board.columns or {}) or 1
+    local max_scroll = math.max(0, columns - 1)
+    self.scrolls = self.scrolls or {}
+    self.scrolls[team] = math.max(0, math.min(max_scroll, (self.scrolls[team] or 0) + delta))
+    self:refresh()
+  end
+  self:map("zh", function()
+    scroll_board(-1)
   end)
   self:map("zl", function()
-    local team = self:team_of_current()
-    if team then
-      self.scrolls = self.scrolls or {}
-      self.scrolls[team] = (self.scrolls[team] or 0) + 1
-      self:refresh()
-    end
+    scroll_board(1)
   end)
   self:map("w", function()
     self:open_watch_current()
   end)
   self:map("<CR>", function()
-    self:open_watch_current()
+    local kind = self:current()
+    if kind == "participant" then
+      self:open_watch_current()
+    else
+      self:detail_current()
+    end
   end)
   self:map("S", function()
     self:start_workflow_current()
@@ -582,6 +598,21 @@ end
 ---Send one message to the participant under the cursor.
 function Panel:send_current()
   local kind, team, name = self:current()
+  if kind == "card" and name then
+    if self:refuse_stale(team) then
+      return
+    end
+    vim.ui.input({ prompt = "message about " .. tostring(name) .. ": " }, function(body)
+      if not body or body == "" then
+        return
+      end
+      self.team:send(team, "leader", "notice", body, { card = name }, function(ok, value)
+        self:report(ok, value)
+        self.team:refresh()
+      end)
+    end)
+    return
+  end
   if kind ~= "participant" or name == nil or name == "human" or self:refuse_stale(team) then
     return
   end
@@ -809,6 +840,7 @@ end
 function Panel:popup(title, lines)
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].filetype = "ade_team_detail"
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
   local width = math.min(100, math.max(50, math.floor(vim.o.columns * 0.8)))

@@ -1856,7 +1856,7 @@ return function(t)
       service:watch_update("inst-w", "sess-w", {
         sessionUpdate = "tool_call",
         toolCallId = "call-bus",
-        title = "bus_send",
+        title = "ade-team_bus_send",
         status = "completed",
         rawInput = { to = "leader", kind = "report", task = "T4", body = "tests pass" },
       })

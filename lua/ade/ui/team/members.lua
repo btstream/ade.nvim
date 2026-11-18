@@ -115,7 +115,8 @@ local function add_role(line, entry, name, budget, role_hl)
   if label ~= "" then
     if Text.width(label) >= budget then
       line:add(Text.ellipsis(label, budget), role_hl)
-      return detail ~= "" and detail or nil
+      local combined = detail ~= "" and (label .. " " .. detail) or label
+      return combined ~= "" and combined or nil
     end
     line:add(label, role_hl)
     used = Text.width(label) + 1
@@ -276,9 +277,10 @@ function M.lines(team, width, opts)
       saw_leader = true
     elseif saw_leader then
       local label = string.format(" workers %d/%d ", live, max_workers)
+      local rule = Text.glyphs().horizontal
       local left = math.max(2, math.floor((width - Text.width(label)) / 2))
-      local line = string.rep("─", left) .. label
-      line = line .. string.rep("─", math.max(0, width - Text.width(line)))
+      local line = string.rep(rule, left) .. label
+      line = line .. string.rep(rule, math.max(0, width - Text.width(line)))
       lines[#lines + 1] = Text.truncate(line, width)
       meta[#lines] = { kind = "separator", team = team.id }
       saw_leader = false

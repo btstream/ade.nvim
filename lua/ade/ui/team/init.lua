@@ -324,10 +324,24 @@ function Dashboard:tabline_text()
   if #rows > 1 then
     suffix = string.format(" [%d/%d]", index, #rows)
   end
+  local cwd = tostring(team.cwd)
+  if vim.o.columns < 140 then
+    local count_text = string.format("? 待回答 %d  ⚑ 待批准 %d ", q, a)
+    local budget = math.max(8, vim.o.columns - vim.fn.strdisplaywidth(count_text) - 58)
+    cwd = vim.fn.fnamemodify(cwd, ":~")
+    if vim.fn.strdisplaywidth(cwd) > budget then
+      local tail = cwd:match("([^/]+/[^/]+)$") or vim.fn.fnamemodify(cwd, ":t")
+      cwd = "…/" .. vim.fn.fnamemodify(tail, ":t")
+      if vim.fn.strdisplaywidth(cwd) > budget then
+        cwd = "…" .. vim.fn.fnamemodify(cwd, ":t")
+      end
+      cwd = require("ade.ui.team.text").truncate(cwd, budget)
+    end
+  end
   local head = string.format(
     " ade.nvim · team %s · %s%s · %s · workers %d/%d · turns %s/%s │ 流程 %s%s",
     tostring(team.id),
-    tostring(team.cwd),
+    cwd,
     suffix,
     state,
     workers,
@@ -354,6 +368,12 @@ function Dashboard:install_tabline()
   self:update_tabline()
   if not self.tabline_group then
     self.tabline_group = vim.api.nvim_create_augroup("AdeTeamTabline" .. tostring(vim.uv.hrtime()), { clear = true })
+    vim.api.nvim_create_autocmd("TabEnter", {
+      group = self.tabline_group,
+      callback = function()
+        self:update_tabline()
+      end,
+    })
     vim.api.nvim_create_autocmd("User", {
       group = self.tabline_group,
       pattern = "AdeChoicesChanged",
@@ -368,6 +388,16 @@ end
 
 function Dashboard:update_tabline()
   if not (self.tab and self.tab:is_open()) then
+    return
+  end
+  -- The title belongs to the dashboard tab; every other tab keeps the saved
+  -- tabline instead of showing this team (N8).
+  if vim.api.nvim_get_current_tabpage() ~= self.tab.tab then
+    if self.saved_tabline then
+      pcall(function()
+        vim.o.tabline = self.saved_tabline
+      end)
+    end
     return
   end
   local text = self:tabline_text():gsub("%%", "%%%%")
@@ -488,7 +518,14 @@ function Dashboard:handle_key(key)
   if key == "zh" or key == "zl" then
     if team then
       self.scrolls = self.scrolls or {}
-      local max_columns = math.max(0, #((self:board(self:team_by_id(team)) or {}).columns or {}) - 1)
+      local board = self:board(self:team_by_id(team)) or {}
+      local columns = #(board.columns or {})
+      local width = 80
+      if self.tab and self.tab:is_open() and self.tab.panels.board then
+        width = vim.api.nvim_win_get_width(self.tab.panels.board)
+      end
+      local visible = Board.visible_columns(width, columns, false)
+      local max_columns = math.max(0, columns - visible)
       local value = (self.scrolls[team] or 0) + (key == "zl" and 1 or -1)
       self.scrolls[team] = math.max(0, math.min(max_columns, value))
       self:refresh()
@@ -532,8 +569,11 @@ function Dashboard:handle_key(key)
     if key == "a" and kind == "participant" and obj and team then
       queue:answer_participant(team, obj)
     else
-      local ok, counts = pcall(queue.pending_counts, queue, team)
-      local pending = ok and counts and ((counts.question or 0) + (counts.approval or 0)) or 0
+      local ok, pending = pcall(queue.selectable_count, queue, team)
+      if not ok then
+        local counts = queue:pending_counts(team) or {}
+        pending = (counts.question or 0) + (counts.approval or 0)
+      end
       queue:show_pending(team)
       -- The component borrows the composer window. With the board in its own
       -- tab the composer may be hidden, so mount the leader column and retry.

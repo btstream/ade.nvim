@@ -387,6 +387,20 @@ function Choices:pending_counts(team_id)
   return { question = questions, approval = approvals }
 end
 
+---How many pending entries the inline component can actually show.
+---Free-text questions are answered with `vim.ui.input`, not selected here.
+---@param team_id string|nil
+---@return integer
+function Choices:selectable_count(team_id)
+  local open = self:team_entries(team_id)
+  local count = #open
+  local interactions = self:interactions()
+  if interactions then
+    count = count + #interactions:pending()
+  end
+  return count
+end
+
 function Choices:update_notice(open, interactions)
   local keys = {}
   for _, entry in ipairs(open) do
@@ -524,7 +538,24 @@ function Choices:show_pending(team_id)
   self.current = nil
   local open = self:team_entries(team_id)
   if #open == 0 then
-    self:notify("没有待处理的提问或申请", vim.log.levels.INFO)
+    local free = 0
+    local team = self:team()
+    for _, row in ipairs(team and self:items(team, team_id) or {}) do
+      if row.state == "open" and row.kind == "question" then
+        local first = type(row.questions) == "table" and row.questions[1] or nil
+        if not (first and type(first.options) == "table" and #first.options > 0) then
+          free = free + 1
+        end
+      end
+    end
+    if free > 0 then
+      self:notify(
+        "有 " .. free .. " 个提问需要输入；在成员上按 a 或 :Ade team answer <name>",
+        vim.log.levels.INFO
+      )
+    else
+      self:notify("没有待处理的提问或申请", vim.log.levels.INFO)
+    end
     return
   end
   self:show(open[1], open)
@@ -535,36 +566,49 @@ end
 ---@param name string
 function Choices:answer_participant(team_id, name)
   local team = self:team()
-  local item
+  local free, option_entry
   for _, entry in ipairs(team and self:items(team, team_id) or {}) do
     if entry.state == "open" and entry.kind == "question" and entry.from == name then
-      local has_options = false
-      for _, question in ipairs(entry.questions or {}) do
-        if type(question.options) == "table" and #question.options > 0 then
-          has_options = true
-        end
-      end
-      if not has_options then
-        item = entry
-        break
+      local first = type(entry.questions) == "table" and entry.questions[1] or nil
+      local has_options = first and type(first.options) == "table" and #first.options > 0
+      if has_options then
+        option_entry = option_entry or entry
+      else
+        free = free or entry
       end
     end
   end
-  if not item then
-    self:notify("没有来自 " .. tostring(name) .. " 的待回答提问", vim.log.levels.INFO)
+  if free then
+    vim.ui.input({ prompt = (free.body or "answer") .. ": " }, function(text)
+      if text == nil then
+        return
+      end
+      team:answer(free.id, { text = text }, function(ok, value)
+        if not ok then
+          self:notify("cannot answer: " .. tostring(value and value.message or value), vim.log.levels.WARN)
+        end
+        self:refresh()
+      end)
+    end)
     return
   end
-  vim.ui.input({ prompt = (item.body or "answer") .. ": " }, function(text)
-    if text == nil then
-      return
-    end
-    team:answer(item.id, { text = text }, function(ok, value)
-      if not ok then
-        self:notify("cannot answer: " .. tostring(value and value.message or value), vim.log.levels.WARN)
+  if option_entry then
+    local open = self:team_entries(team_id)
+    for _, candidate in ipairs(open) do
+      if candidate.item == option_entry then
+        self:show(candidate, open)
+        if not self:is_open() then
+          self:notify("先打开聊天窗口（:Ade open）再显示选择组件", vim.log.levels.INFO)
+        end
+        return
       end
-      self:refresh()
-    end)
-  end)
+    end
+  end
+  if #self:team_entries(team_id) > 0 then
+    self:show_pending(team_id)
+    return
+  end
+  self:notify("没有来自 " .. tostring(name) .. " 的待回答提问", vim.log.levels.INFO)
 end
 
 -- -- ACP requests -----------------------------------------------------------

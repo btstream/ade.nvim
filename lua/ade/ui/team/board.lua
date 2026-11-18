@@ -144,6 +144,15 @@ local function column_layout(available, count, single)
   return 1, math.max(20, math.min(COLUMN_MAX, available - 2))
 end
 
+---How many columns fit in `available` cells (used by the scroll clamp).
+---@param available integer
+---@param count integer
+---@param single boolean|nil
+---@return integer
+function M.visible_columns(available, count, single)
+  return (column_layout(available, count, single))
+end
+
 ---@param board table
 ---@param states table<string, table>
 ---@param opts {scroll: integer|nil, expanded: table<string, boolean>|nil, width: integer|nil, team: table|nil, single_column: boolean|nil}
@@ -195,8 +204,8 @@ function M.lines(board, states, opts)
     end
   end
 
-  local scroll = math.max(0, math.min(tonumber(opts.scroll) or 0, math.max(0, #columns - 1)))
-  local visible_count, cell_width = column_layout(width, math.min(#columns, #columns - scroll), opts.single_column)
+  local visible_count, cell_width = column_layout(width, #columns, opts.single_column)
+  local scroll = math.max(0, math.min(tonumber(opts.scroll) or 0, math.max(0, #columns - visible_count)))
   local visible = {}
   for index = scroll + 1, math.min(#columns, scroll + visible_count) do
     visible[#visible + 1] = {
@@ -209,6 +218,12 @@ function M.lines(board, states, opts)
   if #visible > 0 then
     local glyphs = Text.glyphs()
     local cells = {}
+    if visible_count < #columns then
+      local first, last = scroll + 1, scroll + #visible
+      local position = first == last and string.format("列 %d/%d · %s", first, #columns, columns[first])
+        or string.format("列 %d-%d/%d", first, last, #columns)
+      add(Text.new_line():add(string.format("‹ %s · zh/zl ›", position)), { kind = "board_hint" })
+    end
 
     local header = Text.new_line()
     for _, item in ipairs(visible) do

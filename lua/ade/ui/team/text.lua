@@ -127,7 +127,7 @@ function M.glyphs()
       bottom_left = "+",
       bottom_right = "+",
       horizontal = "-",
-      vertical = "|",
+      vertical = ":",
       bar = "|",
       leader = "*",
       worker = "o",

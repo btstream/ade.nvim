@@ -463,9 +463,26 @@ return function(t)
         rev = 1,
         columns = { "待开发", "doing" },
         cards = {},
-      }, {}, { width = 80, scroll = 1 })
+      }, {}, { width = 50, scroll = 1 })
       t.falsy(table.concat(scrolled, "\n"):find("待开发", 1, true))
-      t.match("doing", scrolled[1])
+      t.match("doing", table.concat(scrolled, "\n"))
+      t.match("列 2/2", table.concat(scrolled, "\n"))
+      local four = { rev = 1, columns = { "a", "b", "c", "d" }, cards = {} }
+      local first_page = Board.lines(four, {}, { width = 50, scroll = 0 })
+      local second_page = Board.lines(four, {}, { width = 50, scroll = 1 })
+      t.match("列 1/4", table.concat(first_page, "\n"))
+      t.match("列 2/4", table.concat(second_page, "\n"))
+      local function page_width(lines)
+        local out = {}
+        for _, line in ipairs(lines) do
+          if line:find("┃", 1, true) then
+            out[#out + 1] = vim.fn.strdisplaywidth(line)
+          end
+        end
+        return table.concat(out, ",")
+      end
+      t.eq(page_width(first_page), page_width(second_page), "scrolling keeps column widths")
+
       local unavailable = Board.lines({ unavailable = true, rev = 3 }, {}, { width = 80 })
       t.match("看板不可用", table.concat(unavailable, "\n"))
       local empty = Board.lines(nil, {}, { width = 80 })
@@ -562,6 +579,24 @@ return function(t)
       t.eq(before, widths(), "a refresh must not squeeze the mounted leader")
       t.eq(true, vim.api.nvim_win_get_width(chat.win) >= 16, "the chat keeps a usable width")
       t.eq(true, vim.api.nvim_win_get_width(input.win) >= 16, "the input keeps a usable width")
+      -- Only a window the person drags is recorded; a passively resized
+      -- neighbour is not (N6).
+      local tab = UI.tab
+      local old_members, old_watch = tab.members_width, tab.watch_width
+      tab.applied_members, tab.applied_right, tab.watch_width = 32, 30, nil
+      t.eq(true, tab:record_resize(40, 20, tab.panels.members))
+      t.eq(40, tab.members_width)
+      t.eq(nil, tab.watch_width)
+      tab.watch_width = nil
+      t.eq(true, tab:record_resize(32, 24, tab:right_win()))
+      t.eq(24, tab.watch_width)
+      tab.watch_width = nil
+      t.eq(false, tab:record_resize(36, 18, tab.panels.board))
+      t.eq(nil, tab.watch_width)
+      tab.members_width, tab.watch_width = old_members, old_watch
+      tab.applied_members, tab.applied_right = nil, nil
+      vim.cmd("stopinsert")
+
       local original_tab = UI._impl.leader_mounted and UI._impl.leader_mounted.original_tab or nil
       vim.api.nvim_set_current_win(UI.tab.panels.members)
       vim.api.nvim_feedkeys("q", "x", false)
@@ -756,6 +791,14 @@ return function(t)
       t.eq(40, vim.api.nvim_win_get_width(UI.tab.panels.members))
       t.eq(true, vim.api.nvim_get_option_value("winfixwidth", { win = UI.tab.panels.members }))
       t.eq(2, vim.o.showtabline)
+      -- Other tabs keep the saved tabline.
+      local saved = UI.saved_tabline
+      vim.cmd("tabnew")
+      vim.wait(20)
+      t.eq(saved, vim.o.tabline)
+      vim.cmd("tabclose")
+      vim.wait(20)
+      t.match("team t1", vim.o.tabline)
       vim.wait(250)
       vim.api.nvim_win_set_width(UI.tab.panels.members, 48)
       -- Headless nvim does not deliver WinResized for API resizes; a real drag
@@ -848,7 +891,7 @@ return function(t)
       for _, block in ipairs({
         {
           kind = "tool",
-          tool_name = "bus_send",
+          tool_name = "ade-team_bus_send",
           raw_input = { to = "w1", kind = "task", task = "C1", body = "do it" },
         },
         {
@@ -868,7 +911,7 @@ return function(t)
       end
       local rendered = require("ade.ui.blocks").render_block({
         kind = "tool",
-        tool_name = "bus_send",
+        tool_name = "ade-team_bus_send",
         status = "completed",
         raw_input = { to = "w1", kind = "task", task = "C1", body = "do it" },
       }, {
@@ -1110,6 +1153,35 @@ return function(t)
         raw_input = { name = "w1", template = "coder" },
       })
       t.match("…", pending)
+      for _, width in ipairs({ 20, 30, 40 }) do
+        ctx.width = width
+        for _, status in ipairs({ "failed", "in_progress", "completed" }) do
+          local text = render({
+            kind = "tool",
+            tool_name = "ade-team_bus_send",
+            status = status,
+            raw_input = {
+              to = "w1",
+              kind = "task",
+              body = "do a very long thing that goes on and on and on and on",
+            },
+          })
+          t.truthy(vim.fn.strdisplaywidth(text:gsub("\n.*", "")) <= width, text)
+          if status == "failed" then
+            t.match("失败", text)
+          elseif status == "in_progress" then
+            t.match("…", text)
+          end
+        end
+      end
+      ctx.width = 30
+      local spawn_failed = render({
+        kind = "tool",
+        tool_name = "ade-team_team_spawn",
+        status = "failed",
+        raw_input = { name = "worker-long-name", template = "coder", model = "a/very-long-model-name" },
+      })
+      t.match("失败", spawn_failed)
       ctx.width = 12
       ctx.icons = blocks.icon_set("ascii")
       local short = render({
@@ -1238,6 +1310,58 @@ return function(t)
       t.eq("card", kind)
       t.eq("t1", team_id)
       t.eq("T1", card)
+
+      -- Scrolling works from a card row, reports the position and clamps.
+      for _ = 1, 5 do
+        vim.api.nvim_feedkeys("zl", "x", false)
+      end
+      local float_text = table.concat(vim.api.nvim_buf_get_lines(UI.buf, 0, -1, false), "\n")
+      t.match("列 2/2", float_text)
+      vim.api.nvim_feedkeys("zh", "x", false)
+      t.match("列 1/2", table.concat(vim.api.nvim_buf_get_lines(UI.buf, 0, -1, false), "\n"))
+      -- Put the cursor back on T1 for the card actions.
+      vim.api.nvim_feedkeys("zl", "x", false)
+      for lnum, id in pairs(UI.ids or {}) do
+        if id == "card:t1|T1" then
+          vim.api.nvim_win_set_cursor(UI.win, { lnum, 0 })
+        end
+      end
+
+      -- <CR> opens the card popup in the float.
+      vim.api.nvim_set_current_win(UI.win)
+      for lnum, id in pairs(UI.ids or {}) do
+        if id == "card:t1|T1" then
+          card_line = lnum
+        end
+      end
+      vim.api.nvim_win_set_cursor(UI.win, { card_line, 0 })
+      local check_kind = UI:current()
+      t.eq("card", check_kind)
+      vim.cmd("stopinsert")
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+      wait(function()
+        for _, win in ipairs(vim.api.nvim_list_wins()) do
+          if vim.bo[vim.api.nvim_win_get_buf(win)].filetype == "ade_team_detail" then
+            return true
+          end
+        end
+        return false
+      end, 5000, "the float card popup")
+      for _, win in ipairs(vim.api.nvim_list_wins()) do
+        if vim.bo[vim.api.nvim_win_get_buf(win)].filetype == "ade_team_detail" then
+          pcall(vim.api.nvim_win_close, win, true)
+        end
+      end
+
+      -- m on a card messages the leader about the card.
+      vim.ui.input = function(_, cb)
+        cb("please check the float card")
+      end
+      vim.api.nvim_feedkeys("m", "x", false)
+      wait(function()
+        local sends = service.team_sends or {}
+        return #sends > 0 and sends[#sends].card == "T1"
+      end, 5000, "the float card message")
     end)
 
     t.it("ascii borders keep alignment under ambiwidth=double", function()
@@ -1250,8 +1374,78 @@ return function(t)
       local text = table.concat(lines, "\n")
       t.falsy(text:find("┃", 1, true))
       t.falsy(text:find("╭", 1, true))
+      t.falsy(text:find("||", 1, true))
       t.match("%|", text)
       t.match("%+", text)
+      local Members = require("ade.ui.team.members")
+      local members = Members.lines({
+        id = "t1",
+        participants = {
+          { name = "leader", agent = "claude", model = "opus", state = "idle" },
+          { name = "w1", label = "coder", agent = "pi", model = "gpt", state = "working" },
+        },
+      }, 40)
+      local member_text = table.concat(members, "\n")
+      t.falsy(member_text:find("─", 1, true))
+      t.match("%-", member_text)
+    end)
+
+    t.it("free-text questions do not mount the leader, option questions use the queue", function()
+      wide(t)
+      local service, dir = start_service(t, "v2-free-question")
+      setup(t, "v2-free-question", service, dir)
+      controller.connect()
+      wait_ready()
+      controller.open()
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      service:team_inbox({
+        id = "i1",
+        team = "t1",
+        kind = "question",
+        from = "w1",
+        body = "type an answer",
+        state = "open",
+      })
+      wait(function()
+        return team():item("i1") ~= nil
+      end, 5000, "the free-text question")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      local queue = UI:choices()
+      t.eq(0, queue:selectable_count("t1"))
+      t.eq(1, (queue:pending_counts("t1") or {}).question)
+      local function press(lhs)
+        for _, map in ipairs(vim.api.nvim_buf_get_keymap(UI.tab.buffers.members, "n")) do
+          if map.lhs == lhs then
+            map.callback()
+            return true
+          end
+        end
+        return false
+      end
+      t.eq(true, press("!"))
+      t.eq(nil, UI._impl.leader_mounted, "! must not mount the leader for free text")
+
+      service:team_inbox({
+        id = "i2",
+        team = "t1",
+        kind = "question",
+        from = "reviewer",
+        body = "pick one",
+        questions = { { question = "pick one", options = { { label = "A" }, { label = "B" } } } },
+        state = "open",
+      })
+      wait(function()
+        return team():item("i2") ~= nil
+      end, 5000, "the option question")
+      queue:answer_participant("t1", "reviewer")
+      wait(function()
+        return queue:is_open()
+      end, 5000, "the option question in the component")
+      queue.view:cancel()
     end)
 
     t.it("coalesces frequent dashboard refreshes", function()
