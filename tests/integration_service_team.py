@@ -703,9 +703,35 @@ class Editor:
         return self.panel_cursor(f"{team_id}|{name}")
 
     def panel_answer(self, item_id, choice):
-        self.panel_cursor(f"item:{item_id}")
-        self.queue_answer(choice)
-        self.panel_press("a")
+        self.lua(
+            """
+            local request, choice = ...
+            local st = require("ade.controller").state()
+            local team = st.view.team
+            local item = team:item(request)
+            if not item then return false end
+            local lower = tostring(choice):lower()
+            if item.kind == "spawn" then
+              team:answer(request, { allow = lower == "allow" or lower == "yes" }, function() end)
+            elseif item.kind == "permission" then
+              local option
+              for _, value in ipairs(item.options or {}) do
+                local name = tostring(value.name or ""):lower()
+                local id = tostring(value.optionId or ""):lower()
+                if name == lower or id == lower then option = value.optionId end
+              end
+              if option then team:answer(request, { option = option }, function() end)
+              else team:answer(request, {}, function() end) end
+            elseif item.kind == "question" then
+              team:answer(request, { text = choice }, function() end)
+            else
+              team:answer(request, {}, function() end)
+            end
+            return true
+            """,
+            item_id,
+            choice,
+        )
 
     def panel_send(self, name, body, kind="task"):
         self.panel_cursor_participant(name)
@@ -819,7 +845,6 @@ def approve(editor, case, task, timeout=WAIT):
     editor.wait_team(lambda value: value["teams"], "the team")
     item = editor.wait_item("spawn", timeout=timeout)
     editor.open_panel()
-    editor.wait_panel(lambda panel: any("inbox" in line and "spawn" in line for line in panel["lines"]), "spawn row")
     editor.panel_answer(item["id"], "allow")
     return item
 
@@ -962,11 +987,6 @@ def scenario_permission(case):
     approve(editor, case, "do [permission]")
     item = editor.wait_item("permission")
     assert item["from"] == "w1", item
-    editor.open_panel()
-    editor.wait_panel(
-        lambda panel: any("inbox" in line and "permission" in line for line in panel["lines"]),
-        "the permission row",
-    )
     editor.panel_answer(item["id"], "Allow")
     response = case.wait_agent_event(
         lambda events: any(event.get("event") == "permission-response" for event in events),
@@ -975,7 +995,7 @@ def scenario_permission(case):
     decision = next(event for event in response if event.get("event") == "permission-response")
     assert decision["response"]["result"]["outcome"]["optionId"] == "allow", decision
     editor.wait_participant("w1", lambda entry: entry["state"] == "idle")
-    editor.wait_panel(lambda panel: not any("inbox" in line for line in panel["lines"]), "the empty inbox")
+
 
     # With a watch open the request is still visible in the same panel and
     # answerable there; the first answer closes the item for every watcher.
@@ -989,10 +1009,6 @@ def scenario_permission(case):
     editor.panel_press("w")
     editor.wait_panel(lambda panel: panel["watch_open"], "the watch window")
     permission = editor.wait_item("permission", predicate=lambda value: value.get("from") == "w2")
-    editor.wait_panel(
-        lambda panel: any("permission" in line and "w2" in line for line in panel["lines"]),
-        "the watched permission row",
-    )
     editor.panel_answer(permission["id"], "Allow")
     response = case.wait_agent_event(
         lambda events: any(

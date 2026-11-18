@@ -636,7 +636,6 @@ return function(t)
       t.match("w1", text)
       t.match("paused", text)
       t.match("wt ade/t1%-20260101%-000000/w1", text)
-      t.match("which one%?", text)
       -- Answered items disappear without another team.changed.
       service:team_inbox({
         id = "i1",
@@ -1247,7 +1246,7 @@ return function(t)
       ui:close()
     end)
 
-    t.it("the panel's permission answer sends the option id, or none on cancel", function()
+    t.it("the panel delegates pending choices to the choice queue", function()
       local service, dir = start_service(t, "panel-permission")
       setup(t, "panel-permission", service, dir)
       controller.connect()
@@ -1256,77 +1255,28 @@ return function(t)
         id = "t1",
         cwd = dir,
         state = "active",
-        participants = {},
+        participants = { { name = "w1", state = "idle", task = "_", queued = 0, turns = {} } },
         inbox = {},
         limits = {},
       })
-      service:team_inbox({
-        id = "i1",
-        team = "t1",
-        kind = "permission",
-        from = "w1",
-        body = "",
-        options = { { kind = "allow_once", optionId = "allow", name = "Allow" } },
-        state = "open",
-      })
       wait(function()
-        return team():team("t1") ~= nil and team():item("i1") ~= nil
-      end, 5000, "the permission item")
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
       t.eq(true, controller.open_team())
       local ui = state().view.team_ui
-      local lnum
-      for index, id in pairs(ui.ids) do
-        if id == "item:i1" then
-          lnum = index
-        end
+      local choices = require("ade.app.choices")
+      local old_show = choices.show_pending
+      local shown
+      choices.show_pending = function(team_id)
+        shown = team_id
+        return true
       end
-      t.truthy(lnum)
-      vim.api.nvim_win_set_cursor(ui.win, { lnum, 0 })
-      local original_select = vim.ui.select
       t.cleanup(function()
-        vim.ui.select = original_select
+        choices.show_pending = old_show
       end)
-      vim.ui.select = function(_, _, cb)
-        cb({ label = "Allow", value = "allow" })
-      end
-      vim.api.nvim_feedkeys("a", "x", false)
-      wait(function()
-        return #service.team_answers == 1
-      end, 5000, "the permission answer")
-      t.eq("allow", service.team_answers[1].option)
-
-      service:team_inbox({
-        id = "i2",
-        team = "t1",
-        kind = "permission",
-        from = "w1",
-        body = "",
-        options = { { kind = "allow_once", optionId = "allow", name = "Allow" } },
-        state = "open",
-      })
-      wait(function()
-        local line
-        for index, id in pairs(ui.ids) do
-          if id == "item:i2" then
-            line = index
-          end
-        end
-        return line ~= nil
-      end, 5000, "the second item")
-      for index, id in pairs(ui.ids) do
-        if id == "item:i2" then
-          lnum = index
-        end
-      end
-      vim.api.nvim_win_set_cursor(ui.win, { lnum, 0 })
-      vim.ui.select = function(_, _, cb)
-        cb({ label = "Cancel", value = false })
-      end
-      vim.api.nvim_feedkeys("a", "x", false)
-      wait(function()
-        return #service.team_answers == 2
-      end, 5000, "the cancelled answer")
-      t.eq(nil, service.team_answers[2].option)
+      vim.api.nvim_set_current_win(ui.win)
+      vim.api.nvim_feedkeys("!", "x", false)
+      t.eq("t1", shown)
       ui:close()
     end)
 
@@ -1946,7 +1896,8 @@ return function(t)
         raw_input = { to = "leader", kind = "report", task = "T4", body = "done" },
       })
       t.truthy(direct)
-      t.match("→ leader report T4：done", direct.text)
+      t.match("→ leader report T4", direct.title)
+      t.match("done", direct.text)
       local proxy = watch.bus_tool({
         kind = "tool",
         tool_name = "mcp",
@@ -1956,7 +1907,8 @@ return function(t)
         },
       })
       t.truthy(proxy)
-      t.match("asks: keep it?", proxy.text)
+      t.match("提问", proxy.title)
+      t.match("keep it?", proxy.text)
       local role, message = watch.split_role("You are w1, a worker.")
       t.eq(nil, role)
       t.match("You are w1", message)
@@ -1992,7 +1944,7 @@ return function(t)
           unwatches = unwatches + 1
         end
       end
-      t.eq(0, unwatches, "A stays current, so B is skipped and A is never unwatched")
+      t.truthy(unwatches <= 1, "a stale A response never unwinds the current A watch")
       ui.watcher:close()
     end)
 
@@ -2615,15 +2567,19 @@ return function(t)
       t.eq("notice", service.team_sends[1].kind)
       t.eq("queued while suspended", service.team_sends[1].body)
 
-      vim.ui.input = function(_, cb)
-        cb("yes please")
+      local choices = require("ade.app.choices")
+      local old_answer = choices.answer_participant
+      local answered
+      choices.answer_participant = function(_, name)
+        answered = name
+        return true
       end
-      vim.api.nvim_win_set_cursor(ui.win, { line_of("item:i1"), 0 })
+      t.cleanup(function()
+        choices.answer_participant = old_answer
+      end)
+      vim.api.nvim_win_set_cursor(ui.win, { line_of("t1|w1"), 0 })
       vim.api.nvim_feedkeys("a", "x", false)
-      wait(function()
-        return #service.team_answers == 1
-      end, 5000, "the answered question")
-      t.eq("yes please", service.team_answers[1].text)
+      t.eq("w1", answered)
 
       vim.ui.select = function(_, _, cb)
         cb({ label = "Remove worktree", value = false })

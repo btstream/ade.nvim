@@ -217,10 +217,12 @@ return function(t)
       wait(function()
         return UI.tab ~= nil and UI.tab:is_open()
       end, 5000, "the wide tab")
-      t.eq(4, #{ UI.tab.panels.members, UI.tab.panels.inbox, UI.tab.panels.board, UI.tab.panels.detail })
-      for _, win in ipairs({ UI.tab.panels.members, UI.tab.panels.inbox, UI.tab.panels.board, UI.tab.panels.detail }) do
+      t.eq(2, #{ UI.tab.panels.members, UI.tab.panels.board })
+      for _, win in ipairs({ UI.tab.panels.members, UI.tab.panels.board }) do
         t.truthy(vim.api.nvim_win_is_valid(win))
       end
+      t.eq(nil, UI.tab.panels.inbox)
+      t.eq(nil, UI.tab.panels.detail)
       wait(function()
         local text = table.concat(vim.api.nvim_buf_get_lines(UI.tab.buffers.members, 0, -1, false), "\n")
         return text:find("w1", 1, true) and text:find("执行 cargo test", 1, true)
@@ -229,16 +231,12 @@ return function(t)
       t.match("●", members)
       t.match("↳", members)
       t.match("wt ade/t1/w1", members)
-      local inbox = table.concat(vim.api.nvim_buf_get_lines(UI.tab.buffers.inbox, 0, -1, false), "\n")
-      t.match("i21–i22", inbox)
-      t.match("申请启动 2 个 worker", inbox)
-      t.match("w2 opencode/m2", inbox)
       wait(function()
         local board = table.concat(vim.api.nvim_buf_get_lines(UI.tab.buffers.board, 0, -1, false), "\n")
         return board:find("T1", 1, true) and board:find("待开发", 1, true)
       end, 5000, "the board")
-      t.match("流程：dev", vim.wo[UI.tab.panels.members].winbar .. vim.wo[UI.tab.panels.board].winbar)
-      t.match("阶段 S1", vim.wo[UI.tab.panels.board].winbar)
+      t.match("流程 dev", vim.o.tabline)
+      t.match("阶段 S1", vim.o.tabline)
       local before_win = vim.api.nvim_get_current_win()
       vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Tab>", true, false, true), "x", false)
       t.truthy(vim.api.nvim_get_current_win() ~= before_win, "Tab cycles panes")
@@ -300,13 +298,26 @@ return function(t)
       t.truthy(#vim.api.nvim_buf_get_keymap(UI.tab.buffers.board, "n") > 0, "board keys")
       UI.tab.dashboard:handle_key("cr")
       wait(function()
-        local text = table.concat(vim.api.nvim_buf_get_lines(UI.tab.buffers.detail, 0, -1, false), "\n")
-        return text:find("已修复", 1, true) and text:find("tests=✓ 42", 1, true)
-      end, 5000, "the card detail")
+        for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+          if vim.bo[buf].filetype == "ade_team_detail" then
+            local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+            if text:find("已修复", 1, true) and text:find("tests=✓ 42", 1, true) then
+              return true
+            end
+          end
+        end
+        return false
+      end, 5000, "the card detail popup")
       wait(function()
-        local marks = vim.api.nvim_buf_get_extmarks(UI.tab.buffers.members, UI.tab.dashboard.link_ns, 0, -1, {})
+        local marks = vim.api.nvim_buf_get_extmarks(UI.tab.buffers.board, UI.tab.cursor_ns, 0, -1, {})
         return #marks > 0
-      end, 5000, "the owner highlight")
+      end, 5000, "the card cursor highlight")
+      for _, win in ipairs(vim.api.nvim_list_wins()) do
+        local buf = vim.api.nvim_win_get_buf(win)
+        if vim.bo[buf].filetype == "ade_team_detail" then
+          pcall(vim.api.nvim_win_close, win, true)
+        end
+      end
       -- Card message carries `card`.
       local original_input = vim.ui.input
       t.cleanup(function()
@@ -410,9 +421,6 @@ return function(t)
         updated_at = 1,
       })
       t.falsy(detail[1]:find("\n", 1, true), detail[1])
-      local inbox_detail =
-        Detail.inbox({ kind = "question", id = "i1", state = "open", from = "w1\nsecond", body = "a\nb" })
-      t.falsy(inbox_detail[1]:find("\n", 1, true), inbox_detail[1])
       local member_detail = Detail.participant(
         {
           participants = {
@@ -465,55 +473,7 @@ return function(t)
       t.match("按 L 去和 leader 聊", table.concat(empty, "\n"))
     end)
 
-    t.it("group A approves all spawns and S starts the selected workflow", function()
-      wide(t)
-      local service, dir = start_service(t, "actions")
-      setup(t, "actions", service, dir)
-      controller.connect()
-      wait_ready()
-      service:team_changed(base_team(dir))
-      service:team_inbox({
-        id = "i31",
-        team = "t1",
-        kind = "spawn",
-        from = "leader",
-        name = "w2",
-        template = "opencode",
-        group = "g2",
-        state = "open",
-        body = "spawn",
-      })
-      service:team_inbox({
-        id = "i32",
-        team = "t1",
-        kind = "spawn",
-        from = "leader",
-        name = "w3",
-        template = "opencode",
-        group = "g2",
-        state = "open",
-        body = "spawn",
-      })
-      wait(function()
-        return team():item("i32") ~= nil
-      end, 5000, "the spawn group")
-      t.eq(true, controller.open_team())
-      local UI = ui()
-      local group_line
-      for index, id in pairs(UI.tab.ids.inbox or {}) do
-        if id == "item:i31" then
-          group_line = index
-        end
-      end
-      t.truthy(group_line)
-      vim.api.nvim_set_current_win(UI.tab.panels.inbox)
-      vim.api.nvim_win_set_cursor(UI.tab.panels.inbox, { group_line, 0 })
-      vim.api.nvim_feedkeys("A", "x", false)
-      wait(function()
-        return #(service.team_answer_groups or {}) == 1
-      end, 5000, "the group answer")
-      t.eq("g2", service.team_answer_groups[1].group)
-
+    t.it("S starts the selected workflow from the empty state", function()
       wide(t)
       local service2, dir2 = start_service(t, "empty", {
         team_workflows = {
@@ -684,7 +644,7 @@ return function(t)
       end, 5000, "the team")
       t.eq(true, controller.open_team())
       local UI = ui()
-      vim.api.nvim_win_close(UI.tab.panels.inbox, true)
+      vim.api.nvim_win_close(UI.tab.panels.board, true)
       wait(function()
         return UI.tab == nil
       end, 5000, "the whole dashboard closing")
@@ -733,54 +693,6 @@ return function(t)
       t.eq(nil, chat.win, "a hidden panel is not reopened")
     end)
 
-    t.it("the narrow float keeps the group A key", function()
-      local service, dir = start_service(t, "narrow-actions")
-      setup(t, "narrow-actions", service, dir)
-      controller.connect()
-      wait_ready()
-      service:team_changed(base_team(dir))
-      service:team_inbox({
-        id = "i41",
-        team = "t1",
-        kind = "spawn",
-        from = "leader",
-        name = "w2",
-        template = "opencode",
-        group = "g4",
-        state = "open",
-        body = "spawn",
-      })
-      service:team_inbox({
-        id = "i42",
-        team = "t1",
-        kind = "spawn",
-        from = "leader",
-        name = "w3",
-        template = "opencode",
-        group = "g4",
-        state = "open",
-        body = "spawn",
-      })
-      wait(function()
-        return team():item("i42") ~= nil
-      end, 5000, "the narrow spawn group")
-      t.eq(true, controller.open_team())
-      local UI = ui()
-      local line
-      for index, id in pairs(UI.ids or {}) do
-        if id == "item:i41" or id == "item:i42" then
-          line = index
-        end
-      end
-      t.truthy(line)
-      vim.api.nvim_set_current_win(UI.win)
-      vim.api.nvim_win_set_cursor(UI.win, { line, 0 })
-      vim.api.nvim_feedkeys("A", "x", false)
-      wait(function()
-        return #(service.team_answer_groups or {}) == 1
-      end, 5000, "the narrow group answer")
-    end)
-
     t.it("setup can run again while the dashboard is open", function()
       wide(t)
       local service, dir = start_service(t, "setup-again")
@@ -797,6 +709,175 @@ return function(t)
       end)
       t.truthy(ok, tostring(err))
       t.truthy(controller.state().view.team_ui, "the dashboard view exists after setup")
+    end)
+
+    t.it("tabline shows the title and pending counts and members keep their width", function()
+      wide(t)
+      local service, dir = start_service(t, "v2-layout")
+      setup(t, "v2-layout", service, dir)
+      controller.connect()
+      wait_ready()
+      controller.state().config.teams.dashboard.members_width = 40
+      local choices = require("ade.app.choices")
+      local old_counts = choices.pending_counts
+      choices.pending_counts = function()
+        return { question = 2, approval = 1 }
+      end
+      t.cleanup(function()
+        choices.pending_counts = old_counts
+      end)
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      wait(function()
+        return UI.tab.panels.members ~= nil
+      end, 5000, "the tab")
+      t.match("team t1", vim.o.tabline)
+      t.match("? 待回答 2", vim.o.tabline)
+      t.match("⚑ 待批准 1", vim.o.tabline)
+      t.eq(40, vim.api.nvim_win_get_width(UI.tab.panels.members))
+      t.eq(true, vim.api.nvim_get_option_value("winfixwidth", { win = UI.tab.panels.members }))
+      vim.api.nvim_win_set_width(UI.tab.panels.members, 48)
+      vim.cmd("doautocmd VimResized")
+      t.eq(48, vim.api.nvim_win_get_width(UI.tab.panels.members))
+    end)
+
+    t.it("member roles and board frames use the v2 style", function()
+      wide(t)
+      local service, dir = start_service(t, "v2-style", { team_board = sample_board() })
+      setup(t, "v2-style", service, dir)
+      controller.connect()
+      wait_ready()
+      controller.state().config.teams.dashboard.members_width = 80
+      local entry = base_team(dir)
+      entry.participants[2].label = "coder"
+      entry.participants[2].agent = "opencode"
+      entry.participants[2].model = "opencode/deepseek-v4.1-flash"
+      service:team_changed(entry)
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      wait(function()
+        local text = table.concat(vim.api.nvim_buf_get_lines(UI.tab.buffers.members, 0, -1, false), "\n")
+        return text:find("coder", 1, true) and text:find("deepseek-v4.1-flash", 1, true)
+      end, 5000, "role member row")
+      local members = table.concat(vim.api.nvim_buf_get_lines(UI.tab.buffers.members, 0, -1, false), "\n")
+      t.match("★", members)
+      t.match("◆", members)
+      t.match("workers", members)
+      local member_marks =
+        vim.api.nvim_buf_get_extmarks(UI.tab.buffers.members, UI.tab.mark_ns, 0, -1, { details = true })
+      local member_groups = {}
+      for _, mark in ipairs(member_marks) do
+        member_groups[mark[4].hl_group] = true
+      end
+      local role_group = false
+      for group in pairs(member_groups) do
+        if group:find("AdeTeamRole", 1, true) then
+          role_group = true
+        end
+      end
+      t.truthy(role_group, vim.inspect(member_groups))
+      wait(function()
+        local text = table.concat(vim.api.nvim_buf_get_lines(UI.tab.buffers.board, 0, -1, false), "\n")
+        return text:find("┃", 1, true) and text:find("╭", 1, true)
+      end, 5000, "framed board")
+      local marks = vim.api.nvim_buf_get_extmarks(UI.tab.buffers.board, UI.tab.mark_ns, 0, -1, { details = true })
+      local groups = {}
+      for _, mark in ipairs(marks) do
+        groups[mark[4].hl_group] = true
+      end
+      t.truthy(groups.AdeBoardColumn1, vim.inspect(groups))
+    end)
+
+    t.it("main chat shows ade-team tool calls as messages", function()
+      local Tools = require("ade.ui.team.tools")
+      for _, block in ipairs({
+        {
+          kind = "tool",
+          tool_name = "bus_send",
+          raw_input = { to = "w1", kind = "task", task = "C1", body = "do it" },
+        },
+        {
+          kind = "tool",
+          tool_name = "mcp__ade-team__board_update",
+          raw_input = { upsert = { { id = "C1" }, { id = "C2" } } },
+        },
+        {
+          kind = "tool",
+          tool_name = "mcp",
+          raw_input = { tool = "workflow_save", args = { workflow = { name = "review_by_pi" } } },
+        },
+      }) do
+        local message = Tools.describe(block)
+        t.truthy(message)
+        t.falsy(message.text:find("{", 1, true))
+      end
+      local rendered = require("ade.ui.blocks").render_block({
+        kind = "tool",
+        tool_name = "bus_send",
+        status = "completed",
+        raw_input = { to = "w1", kind = "task", task = "C1", body = "do it" },
+      }, {
+        icons = require("ade.ui.blocks").icon_set("unicode"),
+        width = 80,
+        config = { ui = {} },
+      })
+      local text = table.concat(
+        vim.tbl_map(function(line)
+          return line.text or ""
+        end, rendered),
+        "\n"
+      )
+      t.match("→ w1 task C1：do it", text)
+      t.falsy(text:find("rawInput", 1, true))
+    end)
+
+    t.it("a and ! call the choice queue for members", function()
+      wide(t)
+      local service, dir = start_service(t, "v2-choices")
+      setup(t, "v2-choices", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      local choices = require("ade.app.choices")
+      local old_answer, old_show = choices.answer_participant, choices.show_pending
+      local answered, shown
+      choices.answer_participant = function(_, name)
+        answered = name
+        return true
+      end
+      choices.show_pending = function(team_id)
+        shown = team_id
+        return true
+      end
+      t.cleanup(function()
+        choices.answer_participant = old_answer
+        choices.show_pending = old_show
+      end)
+      local line
+      for index, id in pairs(UI.tab.ids.members or {}) do
+        if id == "t1|w1" then
+          line = index
+        end
+      end
+      t.truthy(line)
+      vim.api.nvim_set_current_win(UI.tab.panels.members)
+      vim.api.nvim_win_set_cursor(UI.tab.panels.members, { line, 0 })
+      vim.api.nvim_feedkeys("a", "x", false)
+      t.eq("w1", answered)
+      vim.api.nvim_feedkeys("!", "x", false)
+      t.eq("t1", shown)
     end)
 
     t.it("coalesces frequent dashboard refreshes", function()
@@ -837,8 +918,7 @@ return function(t)
       vim.wait(120)
       t.truthy(count <= 2, "a burst of three changes coalesces into at most two paints")
       wait(function()
-        local text = table.concat(vim.api.nvim_buf_get_lines(UI.tab.buffers.inbox, 0, -1, false), "\n")
-        return text:find("i43", 1, true) ~= nil
+        return vim.o.tabline:find("team t1", 1, true) ~= nil
       end, 5000, "the final state after the merged refresh")
     end)
   end)
