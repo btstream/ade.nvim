@@ -10,7 +10,7 @@ function M.label(entry)
   return require("ade.ui.team.text").one_line(entry.label or entry.template or entry.name or "")
 end
 
----Stable 1..6 index for one label.
+---Stable 1..6 index for one label (fallback when no palette is available).
 ---@param label string
 ---@return integer
 function M.index(label)
@@ -21,28 +21,50 @@ function M.index(label)
   return hash % 6 + 1
 end
 
+---Assign `AdeTeamRole1..6` by first appearance so a team's labels never
+---collide until there are more than six distinct labels.
+---@param participants table[]|nil
+---@return table<string, integer>
+function M.palette(participants)
+  local out, next_index = {}, 0
+  for _, entry in ipairs(participants or {}) do
+    if entry.name ~= "leader" and entry.role ~= "leader" then
+      local label = M.label(entry)
+      if label ~= "" and not out[label] then
+        next_index = next_index % 6 + 1
+        out[label] = next_index
+      end
+    end
+  end
+  return out
+end
+
 ---@param entry table|nil
+---@param palette table<string, integer>|nil
 ---@return string
-function M.hl(entry)
-  if type(entry) == "table" and entry.name == "leader" then
+function M.hl(entry, palette)
+  if type(entry) == "table" and (entry.name == "leader" or entry.role == "leader") then
     return "AdeTeamLeader"
   end
-  return "AdeTeamRole" .. tostring(M.index(M.label(entry)))
+  local label = M.label(entry)
+  local index = palette and palette[label] or M.index(label)
+  return "AdeTeamRole" .. tostring(index)
 end
 
 ---@param entry table|nil
 ---@return string
 function M.symbol(entry)
+  local glyphs = require("ade.ui.team.text").glyphs()
   if type(entry) ~= "table" then
-    return "◇"
+    return glyphs.waiting
   end
   if entry.name == "leader" or entry.role == "leader" then
-    return "★"
+    return glyphs.leader
   end
   if entry.state == "waiting_human" then
-    return "◇"
+    return glyphs.waiting
   end
-  return "◆"
+  return glyphs.worker
 end
 
 ---Short model name: the part after the provider slash.

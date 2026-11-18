@@ -8,7 +8,6 @@ local Watch = require("ade.ui.team.watch")
 local Members = require("ade.ui.team.members")
 local Board = require("ade.ui.team.board")
 local Roles = require("ade.ui.team.roles")
-local Choices = require("ade.app.choices")
 local Detail = require("ade.ui.team.detail")
 local History = require("ade.ui.team.history")
 
@@ -48,7 +47,6 @@ function M.dashboard(opts)
     refresh_timer = nil,
     pending = false,
     link_ns = vim.api.nvim_create_namespace("ade-team-link"),
-    follower = nil,
   }, Dashboard)
   self.watcher = Watch.new({
     team = opts.team,
@@ -121,15 +119,27 @@ function Dashboard:team_by_id(id)
   end
 end
 
+---The inline choice queue, built by bootstrap (worker2's component).
+---@return table|nil
+function Dashboard:choices()
+  local ok, controller = pcall(require, "ade.controller")
+  if not ok then
+    return nil
+  end
+  local state = controller.state()
+  return state and state.view and state.view.choices or nil
+end
+
 function Dashboard:states(team)
   local out = {}
+  local palette = Roles.palette(team and team.participants)
   for _, participant in ipairs(team and team.participants or {}) do
     out[participant.name] = {
       icon = Members.state_icon(participant),
       symbol = Roles.symbol(participant),
       state = participant.state,
       state_text = Members.state_label(participant),
-      role_hl = Roles.hl(participant),
+      role_hl = Roles.hl(participant, palette),
       label = Roles.label(participant),
       agent = participant.agent,
       model = participant.model,
@@ -153,56 +163,6 @@ function Dashboard:scroll(team_id)
   self.scrolls = self.scrolls or {}
   self.scrolls[team_id] = self.scrolls[team_id] or 0
   return self.scrolls[team_id]
-end
-
-function Dashboard:title(team)
-  local rows = self.team:list_rows()
-  local cfg = self.config() or {}
-  local teams_cfg = type(cfg.teams) == "table" and cfg.teams or {}
-  local state = tostring(team.state)
-  if self.team:is_stale(team.id) then
-    state = "stale"
-  end
-  local workers, max_workers = 0, tonumber(teams_cfg.max_workers) or 3
-  for _, participant in ipairs(team.participants or {}) do
-    if participant.name ~= "leader" and participant.name ~= "human" and participant.state ~= "exited" then
-      workers = workers + 1
-    end
-  end
-  local limits = team.limits or {}
-  local selected = ""
-  if #rows > 1 then
-    local index = 1
-    for position, row in ipairs(rows) do
-      if row.id == team.id then
-        index = position
-      end
-    end
-    selected = string.format(" [%d/%d] ", index, #rows)
-  end
-  return string.format(
-    " ade.nvim · team %s · %s%s  %s · workers %d/%d · turns %s/%s · board rev %s",
-    tostring(team.id),
-    tostring(team.cwd),
-    selected,
-    state,
-    workers,
-    max_workers,
-    tostring(limits.turns_total or 0),
-    tostring(limits.max_turns_total or "?"),
-    tostring(team.board_rev or 0)
-  )
-end
-
-function Dashboard:workflow_line(team)
-  local name = team.workflow_name
-  local label = name and tostring(name) or (team.board_rev and tonumber(team.board_rev) > 0 and "自定义" or "默认")
-  local progress = Board.stage_progress(team.stages)
-  local line = " 流程：" .. label
-  if progress then
-    line = line .. " · " .. progress
-  end
-  return line
 end
 
 function Dashboard:render_tab(tab)
@@ -246,7 +206,7 @@ function Dashboard:render_tab(tab)
   end
   local cfg = self.config() or {}
   local workers_max = tonumber((type(cfg.teams) == "table" and cfg.teams.max_workers) or 3) or 3
-  local lines, ids, meta, marks = Members.lines(team, members_width - 1, {
+  local lines, ids, meta, marks = Members.lines(team, math.max(8, members_width - 1), {
     messages = messages,
     max_workers = workers_max,
   })
@@ -265,7 +225,7 @@ function Dashboard:render_tab(tab)
   end
   local board_width = 60
   if tab.panels.board and vim.api.nvim_win_is_valid(tab.panels.board) then
-    board_width = math.max(24, vim.api.nvim_win_get_width(tab.panels.board) - 2)
+    board_width = math.max(24, vim.api.nvim_win_get_width(tab.panels.board))
   end
   local board = self:board(team)
   local board_lines, board_meta, board_ids, board_marks = Board.lines(board, self:states(team), {
@@ -356,15 +316,16 @@ function Dashboard:tabline_text()
   local state = self.team:is_stale(team.id) and "stale" or tostring(team.state)
   local flow = team.workflow_name and tostring(team.workflow_name) or "default"
   local progress = Board.stage_progress(team.stages) or ""
-  local counts = Choices.pending_counts(team.id) or {}
+  local queue = self:choices()
+  local counts = queue and queue:pending_counts(team.id) or {}
   local q = tonumber(counts.question) or 0
   local a = tonumber(counts.approval) or 0
   local suffix = ""
   if #rows > 1 then
     suffix = string.format(" [%d/%d]", index, #rows)
   end
-  return string.format(
-    " ade.nvim · team %s · %s%s · %s · workers %d/%d · turns %s/%s │ 流程 %s%s │ ? 待回答 %d  ⚑ 待批准 %d ",
+  local head = string.format(
+    " ade.nvim · team %s · %s%s · %s · workers %d/%d · turns %s/%s │ 流程 %s%s",
     tostring(team.id),
     tostring(team.cwd),
     suffix,
@@ -374,14 +335,22 @@ function Dashboard:tabline_text()
     tostring(limits.turns_total or 0),
     tostring(limits.max_turns_total or "?"),
     flow,
-    progress ~= "" and (" · " .. progress) or "",
-    q,
-    a
+    progress ~= "" and (" · " .. progress) or ""
   )
+  local tail = string.format(" │ ? 待回答 %d  ⚑ 待批准 %d ", q, a)
+  -- On a narrow screen the pending counts are the part that must survive.
+  if vim.o.columns < 140 then
+    return " " .. string.format("? 待回答 %d  ⚑ 待批准 %d ", q, a) .. "│" .. head
+  end
+  return head .. tail
 end
 
 function Dashboard:install_tabline()
   self.saved_tabline = self.saved_tabline or vim.o.tabline
+  self.saved_showtabline = self.saved_showtabline or vim.o.showtabline
+  pcall(function()
+    vim.o.showtabline = 2
+  end)
   self:update_tabline()
   if not self.tabline_group then
     self.tabline_group = vim.api.nvim_create_augroup("AdeTeamTabline" .. tostring(vim.uv.hrtime()), { clear = true })
@@ -414,6 +383,12 @@ function Dashboard:restore_tabline()
     end)
     self.saved_tabline = nil
   end
+  if self.saved_showtabline then
+    pcall(function()
+      vim.o.showtabline = self.saved_showtabline
+    end)
+    self.saved_showtabline = nil
+  end
   if self.tabline_group then
     pcall(vim.api.nvim_del_augroup_by_id, self.tabline_group)
     self.tabline_group = nil
@@ -430,7 +405,6 @@ function Dashboard:attach_keys(buf)
     ["<CR>"] = "cr",
     ["m"] = "m",
     ["a"] = "a",
-    ["A"] = "A",
     ["!"] = "choices",
     ["w"] = "w",
     ["p"] = "p",
@@ -532,8 +506,6 @@ function Dashboard:handle_key(key)
       self:refresh()
     elseif kind == "workflow" and info then
       self:show_detail(Detail.workflow(info.workflow), "流程 " .. tostring(info.workflow.name))
-    elseif kind == "title" and team then
-      self:show_detail({ self:title(self:team_by_id(team)), self:workflow_line(self:team_by_id(team)) }, "团队")
     end
     return
   end
@@ -551,20 +523,25 @@ function Dashboard:handle_key(key)
     end
     return
   end
-  if key == "a" then
-    if kind == "participant" and obj and team then
-      Choices.answer_participant(team, obj)
-    else
-      self:answer_current(false)
+  if key == "a" or key == "choices" then
+    local queue = self:choices()
+    if not queue then
+      self:notify("选择组件尚未就绪", vim.log.levels.WARN)
+      return
     end
-    return
-  end
-  if key == "A" then
-    self:answer_current(true)
-    return
-  end
-  if key == "choices" then
-    Choices.show_pending(team)
+    if key == "a" and kind == "participant" and obj and team then
+      queue:answer_participant(team, obj)
+    else
+      local ok, counts = pcall(queue.pending_counts, queue, team)
+      local pending = ok and counts and ((counts.question or 0) + (counts.approval or 0)) or 0
+      queue:show_pending(team)
+      -- The component borrows the composer window. With the board in its own
+      -- tab the composer may be hidden, so mount the leader column and retry.
+      if pending > 0 and not queue:is_open() then
+        self:mount_leader()
+        queue:show_pending(team)
+      end
+    end
     self:update_tabline()
     return
   end
@@ -635,11 +612,12 @@ function Dashboard:handle_key(key)
 end
 
 function Dashboard:show_detail(lines, title)
+  -- Focus moves into the popup, so paint the board cursor before that.
+  self:update_board_cursor()
   self:popup(title or "详情", lines)
 end
 
 function Dashboard:popup(title, lines)
-  local previous = vim.api.nvim_get_current_win()
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].bufhidden = "wipe"
   vim.bo[buf].filetype = "ade_team_detail"
@@ -664,7 +642,7 @@ function Dashboard:popup(title, lines)
   vim.keymap.set("n", "<Esc>", function()
     pcall(vim.api.nvim_win_close, win, true)
   end, { buffer = buf, nowait = true, silent = true })
-  pcall(vim.api.nvim_set_current_win, previous)
+  -- Focus stays in the popup so `q`/`<Esc>` can close it (M7).
 end
 
 function Dashboard:send_to_participant(team, name)
@@ -707,102 +685,6 @@ function Dashboard:send_card(team, card)
       self.team:refresh()
     end)
   end)
-end
-
-function Dashboard:answer_current(group)
-  local kind, team_id, obj, info = self:layout_current()
-  if kind == "inbox_group" and info then
-    if group then
-      self.team:answer_group(info.group, true, function(ok, value)
-        self:report(ok, value)
-        self.team:refresh()
-      end)
-    else
-      local item = self.team:item(info.item_ids[1])
-      if item then
-        self:answer_item(item)
-      end
-    end
-    return
-  end
-  if kind ~= "inbox" or type(obj) ~= "table" then
-    return
-  end
-  self:answer_item(obj)
-end
-
-function Dashboard:answer_item(item)
-  if self:refuse_stale(item.team) then
-    return
-  end
-  local function answer(fields)
-    self.team:answer(item.id, fields, function(ok, value)
-      self:report(ok, value)
-      self.team:refresh()
-    end)
-  end
-  if item.kind == "spawn" then
-    vim.ui.select({ { label = "allow", value = true }, { label = "refuse", value = false } }, {
-      prompt = "spawn " .. tostring(item.name or item.template),
-      format_item = function(entry)
-        return entry.label
-      end,
-    }, function(choice)
-      if choice ~= nil then
-        answer({ allow = choice.value == true })
-      end
-    end)
-  elseif item.kind == "permission" then
-    local choices = {}
-    for _, option in ipairs(item.options or {}) do
-      choices[#choices + 1] = { label = option.name or option.optionId, value = option.optionId }
-    end
-    choices[#choices + 1] = { label = "Cancel", value = false }
-    vim.ui.select(choices, {
-      prompt = "permission",
-      format_item = function(entry)
-        return entry.label
-      end,
-    }, function(choice)
-      if choice == nil then
-        return
-      end
-      if choice.value == false then
-        answer({})
-      else
-        answer({ option = choice.value })
-      end
-    end)
-  elseif item.kind == "question" and type(item.options) == "table" and #item.options > 0 then
-    vim.ui.select(item.options, {
-      prompt = item.body or "question",
-      format_item = tostring,
-    }, function(choice)
-      if choice ~= nil then
-        answer({ text = choice })
-      end
-    end)
-  elseif item.kind == "request" then
-    vim.ui.input({ prompt = "JSON result: " }, function(text)
-      if not text or text == "" then
-        return
-      end
-      local ok, parsed = pcall(vim.json.decode, text)
-      if not ok or type(parsed) ~= "table" then
-        self:notify("the result must be a JSON object or array")
-        return
-      end
-      answer({ text = vim.json.encode(parsed) })
-    end)
-  elseif item.kind == "question" then
-    vim.ui.input({ prompt = item.body or "answer: " }, function(text)
-      if text and text ~= "" then
-        answer({ text = text })
-      end
-    end)
-  else
-    answer({})
-  end
 end
 
 function Dashboard:remove_worktree(team, name)
@@ -994,14 +876,24 @@ function Dashboard:mount_leader()
     pcall(vim.api.nvim_set_current_tabpage, self.tab.tab)
   end
   local layout = require("ade.layout")
+  if self.tab and self.tab.begin_resize then
+    self.tab:begin_resize()
+  end
   local chat_win = layout.create_chat_win(chat.buf, nil)
   local input_win = chat_win and layout.create_input_win(input.buf, chat_win) or nil
   if not (chat_win and input_win) then
+    if self.tab and self.tab.end_resize then
+      self.tab:end_resize()
+    end
     self:notify("unable to move the leader chat to the watch column")
     if panel then
       panel:show()
     end
     return
+  end
+  if self.tab then
+    self.tab:set_leader_windows(chat_win, input_win)
+    self.tab:end_resize()
   end
   chat.win = chat_win
   input.win = input_win
@@ -1054,6 +946,9 @@ function Dashboard:unmount_leader()
     if win and vim.api.nvim_win_is_valid(win) then
       pcall(vim.api.nvim_win_close, win, true)
     end
+  end
+  if self.tab and self.tab.clear_leader_windows then
+    self.tab:clear_leader_windows()
   end
   local panel = mounted.panel or (self.panel and self.panel() or nil)
   local show = panel ~= nil and panel.requested ~= false

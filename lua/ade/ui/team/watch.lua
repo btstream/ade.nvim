@@ -272,14 +272,10 @@ local function build_session(source, opts)
         for body_index, block in ipairs(group.body) do
           local message_block = bus_tool(block)
           if message_block then
-            local message_text = message_block.title
-            if message_block.text ~= "" then
-              message_text = message_text .. "：" .. message_block.text
-            end
             add({
               kind = "message",
-              title = "",
-              text = message_text,
+              title = message_block.title ~= "" and message_block.title or "bus",
+              text = message_block.text,
               id = "watch-bus-" .. tostring(block.id or body_index) .. "-" .. body_index,
             }, "watch-bus-" .. tostring(block.id or body_index) .. "-" .. body_index)
           else

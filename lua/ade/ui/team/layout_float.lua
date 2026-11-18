@@ -25,6 +25,7 @@ function M.new(opts)
     watch_win = nil,
     watch_buf = nil,
     help = false,
+    ns = vim.api.nvim_create_namespace("ade-team-float-marks"),
   }, Panel)
   panel.watcher = Watch.new({
     team = opts.team,
@@ -60,8 +61,8 @@ function Panel:current()
   if id:sub(1, 5) == "item:" then
     return "item", id:sub(6)
   end
-  if id:sub(1, 6) == "card:" then
-    local team, card = id:sub(7):match("^([^|]+)|(.+)$")
+  if id:sub(1, 5) == "card:" then
+    local team, card = id:sub(6):match("^([^|]+)|(.+)$")
     return "card", team, card
   end
   if id:sub(1, 6) == "stage:" then
@@ -78,13 +79,25 @@ function Panel:current()
   return "participant", team, name
 end
 
----@return string[]
+---@return string[], table<integer, string>, table[]
 function Panel:lines()
-  local lines, ids = {}, {}
+  local lines, ids, marks = {}, {}, {}
   local rows = self.team:list_rows()
-  local function add(text, id)
+  local width = 80
+  if self:is_open() then
+    width = vim.api.nvim_win_get_width(self.win)
+  end
+  local function add(text, id, relative)
     lines[#lines + 1] = text
     ids[#lines] = id
+    for _, mark in ipairs(relative or {}) do
+      marks[#marks + 1] = {
+        line = #lines,
+        start = (mark.start or 0) + 3,
+        stop = (mark.stop or 0) + 3,
+        group = mark.group,
+      }
+    end
   end
   add(" ade.nvim · team", nil)
   add("", nil)
@@ -161,9 +174,24 @@ function Panel:lines()
       nil
     )
     local Members = require("ade.ui.team.members")
-    local member_lines, member_ids = Members.lines(team, math.max(40, vim.o.columns - 8))
+    local Roles = require("ade.ui.team.roles")
+    local palette = Roles.palette(team.participants)
+    local member_lines, member_ids, _, member_marks = Members.lines(team, math.max(8, width - 4), {
+      messages = {},
+      max_workers = cfg_teams.max_workers,
+    })
+    local member_line_of = {}
     for index, text in ipairs(member_lines) do
+      member_line_of[index] = #lines + 1
       add("   " .. text, member_ids[index])
+    end
+    for _, mark in ipairs(member_marks) do
+      marks[#marks + 1] = {
+        line = member_line_of[mark.line] or mark.line,
+        start = (mark.start or 0) + 3,
+        stop = (mark.stop or 0) + 3,
+        group = mark.group,
+      }
     end
     local board = self.team:board(team.id)
     if board then
@@ -171,17 +199,24 @@ function Panel:lines()
       add(string.format("   看板 · rev %s", tostring(board.rev or "?")), nil)
       local states = {}
       for _, participant in ipairs(team.participants or {}) do
-        states[participant.name] =
-          { icon = require("ade.ui.team.members").state_icon(participant), state = participant.state }
+        states[participant.name] = {
+          icon = Members.state_icon(participant),
+          symbol = Roles.symbol(participant),
+          state = participant.state,
+          state_text = Members.state_label(participant),
+          role_hl = Roles.hl(participant, palette),
+        }
       end
       self.scrolls = self.scrolls or {}
       self.expanded_stages = self.expanded_stages or {}
-      local board_lines, board_meta, board_ids = Board.lines(board, states, {
+      local board_lines, board_meta, board_ids, board_marks = Board.lines(board, states, {
         scroll = self.scrolls[team.id] or 0,
         expanded = self.expanded_stages[team.id] or {},
-        width = math.max(50, vim.o.columns - 8),
+        width = math.max(24, width - 4),
         team = team,
+        single_column = true,
       })
+      local board_line_of = {}
       for index, text in ipairs(board_lines) do
         local id = board_ids[index]
         if not id and board_meta[index] then
@@ -195,12 +230,21 @@ function Panel:lines()
         if id and id:sub(1, 5) == "card:" then
           id = "card:" .. team.id .. "|" .. id:sub(6)
         end
+        board_line_of[index] = #lines + 1
         add("   " .. text, id)
+      end
+      for _, mark in ipairs(board_marks) do
+        marks[#marks + 1] = {
+          line = board_line_of[mark.line] or mark.line,
+          start = (mark.start or 0) + 3,
+          stop = (mark.stop or 0) + 3,
+          group = mark.group,
+        }
       end
     end
     add("", nil)
   end
-  return lines, ids
+  return lines, ids, marks
 end
 
 function Panel:refresh()
@@ -218,11 +262,12 @@ function Panel:refresh()
   if #rows > 0 then
     self.had_teams = true
   end
-  local lines, ids = self:lines()
+  local lines, ids, marks = self:lines()
   self.ids = ids
   vim.bo[self.buf].modifiable = true
   vim.api.nvim_buf_set_lines(self.buf, 0, -1, false, lines)
   vim.bo[self.buf].modifiable = false
+  require("ade.ui.team.text").apply_marks(self.buf, self.ns, marks)
 end
 
 ---The team id for the cursor line, whether it is a team, participant or item.
@@ -268,20 +313,31 @@ function Panel:open()
     self.help = not self.help
     self:refresh()
   end)
+  local function choices()
+    local controller = require("ade.controller")
+    local state = controller.state()
+    return state and state.view and state.view.choices or nil
+  end
   self:map("a", function()
+    local queue = choices()
+    if not queue then
+      self:notify("选择组件尚未就绪")
+      return
+    end
     local kind, team, name = self:current()
     if kind == "participant" and name then
-      require("ade.app.choices").answer_participant(team, name)
+      queue:answer_participant(team, name)
     else
-      self:answer_current()
+      queue:show_pending(self:team_of_current() or (self.team:list_rows()[1] or {}).id)
     end
   end)
   self:map("!", function()
-    local team = self:team_of_current() or (self.team:list_rows()[1] or {}).id
-    require("ade.app.choices").show_pending(team)
-  end)
-  self:map("A", function()
-    self:answer_group_current()
+    local queue = choices()
+    if not queue then
+      self:notify("选择组件尚未就绪")
+      return
+    end
+    queue:show_pending(self:team_of_current() or (self.team:list_rows()[1] or {}).id)
   end)
   self:map("H", function()
     self:history_current()
@@ -377,6 +433,20 @@ function Panel:open()
     self:close()
   end)
   self.augroup = vim.api.nvim_create_augroup("AdeTeam", { clear = true })
+  vim.api.nvim_create_autocmd("VimResized", {
+    group = self.augroup,
+    callback = function()
+      vim.schedule(function()
+        local cfg = self.config and self.config() or {}
+        local wide = tonumber(((cfg.teams or {}).dashboard or {}).wide) or 160
+        if vim.o.columns >= wide then
+          pcall(function()
+            require("ade.controller").open_team()
+          end)
+        end
+      end)
+    end,
+  })
   vim.api.nvim_create_autocmd("BufWipeout", {
     group = self.augroup,
     buffer = self.buf,
@@ -658,137 +728,6 @@ function Panel:remove_worktree_current()
   end)
 end
 
----Answer the inbox item under the cursor.
-function Panel:answer_current()
-  local kind, item_id = self:current()
-  if kind ~= "item" then
-    return
-  end
-  local item = self.team:item(item_id)
-  if not item or item.state ~= "open" then
-    return
-  end
-  if self:refuse_stale(item.team) then
-    return
-  end
-  if
-    self.team:is_suspended(item.team)
-    and item.kind ~= "question"
-    and item.kind ~= "message"
-    and item.kind ~= "limit"
-  then
-    self:suspended_notice()
-    return
-  end
-  local function answer(fields)
-    self.team:answer(item_id, fields, function(ok, value)
-      self:report(ok, value)
-      self.team:refresh()
-    end)
-  end
-  local function select(opts, cb)
-    self.interacting = true
-    vim.ui.select(opts.items, opts, function(choice)
-      self:interaction_done()
-      cb(choice)
-    end)
-  end
-  local function input(prompt, cb)
-    self.interacting = true
-    vim.ui.input({ prompt = prompt }, function(text)
-      self:interaction_done()
-      cb(text)
-    end)
-  end
-  if item.kind == "spawn" then
-    select({
-      prompt = "spawn " .. tostring(item.name or item.template),
-      items = { { label = "allow", value = true }, { label = "refuse", value = false } },
-      format_item = function(entry)
-        return entry.label
-      end,
-    }, function(choice)
-      if choice ~= nil then
-        answer({ allow = choice.value == true })
-      end
-    end)
-    return
-  end
-  if item.kind == "permission" then
-    local items = {}
-    for _, option in ipairs(item.options or {}) do
-      items[#items + 1] = { label = option.name or option.optionId, value = option.optionId }
-    end
-    items[#items + 1] = { label = "Cancel", value = false }
-    select({
-      prompt = "permission",
-      items = items,
-      format_item = function(entry)
-        return entry.label
-      end,
-    }, function(choice)
-      if choice == nil then
-        return
-      end
-      if choice.value == false then
-        -- Cancelled: the answer carries no option at all.
-        answer({})
-      else
-        answer({ option = choice.value })
-      end
-    end)
-    return
-  end
-  if item.kind == "question" and type(item.options) == "table" and #item.options > 0 then
-    select({
-      prompt = item.body or "question",
-      items = item.options,
-      format_item = function(entry)
-        return tostring(entry)
-      end,
-    }, function(choice)
-      if choice ~= nil then
-        answer({ text = choice })
-      end
-    end)
-    return
-  end
-  if item.kind == "request" then
-    local function ask()
-      input("JSON result: ", function(text)
-        if not text or text == "" then
-          return
-        end
-        local ok, parsed = pcall(vim.json.decode, text)
-        if not ok or type(parsed) ~= "table" then
-          self:notify("the result must be a JSON object or array")
-          ask()
-          return
-        end
-        answer({ text = vim.json.encode(parsed) })
-      end)
-    end
-    ask()
-    return
-  end
-  if item.kind == "question" then
-    input(item.body or "answer: ", function(text)
-      if text and text ~= "" then
-        answer({ text = text })
-      end
-    end)
-    return
-  end
-  -- message/limit items accept any answer as an acknowledgement.
-  answer({})
-end
-
----Render a watched session in the read-only watch view.
----
----Kept as the app's `on_watch` callback; the view itself owns the window,
----turn grouping and the read-only Chat instance.
----@param session table|nil
----@param title string|nil
 function Panel:watch(session, title)
   self.watcher:on_watch(session, title)
   self.watch_win, self.watch_buf = self.watcher.win, self.watcher.buf
@@ -891,25 +830,6 @@ function Panel:popup(title, lines)
   vim.keymap.set("n", "<Esc>", function()
     pcall(vim.api.nvim_win_close, win, true)
   end, { buffer = buf, nowait = true, silent = true })
-end
-
-function Panel:answer_group_current()
-  local kind, item_id = self:current()
-  if kind ~= "item" or not item_id then
-    return
-  end
-  local item = self.team:item(item_id)
-  if not item then
-    return
-  end
-  if not item.group then
-    self:answer_current()
-    return
-  end
-  self.team:answer_group(item.group, true, function(ok, value)
-    self:report(ok, value)
-    self.team:refresh()
-  end)
 end
 
 function Panel:history_current()

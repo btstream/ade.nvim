@@ -29,6 +29,39 @@ function Choices:team()
   return ok and team or nil
 end
 
+---Open inbox items live in `team.inbox`, keyed by id (rows keep the snapshot
+---without a live inbox array).
+---@param team table
+---@param team_id string|nil
+---@return table[]
+function Choices:items(team, team_id)
+  local out = {}
+  if type(team.inbox) == "table" then
+    for _, item in pairs(team.inbox) do
+      if not team_id or item.team == team_id then
+        out[#out + 1] = item
+      end
+    end
+  else
+    -- Test doubles and older callers keep items on each row.
+    for _, row in ipairs(team:list_rows()) do
+      if not team_id or row.id == team_id then
+        for _, item in ipairs(row.inbox or {}) do
+          out[#out + 1] = item
+        end
+      end
+    end
+  end
+  table.sort(out, function(a, b)
+    local aa, bb = tostring(a.at or ""), tostring(b.at or "")
+    if aa == bb then
+      return tostring(a.id) < tostring(b.id)
+    end
+    return aa < bb
+  end)
+  return out
+end
+
 function Choices:interactions()
   local ok, interactions = pcall(self.deps.interactions)
   return ok and interactions or nil
@@ -131,11 +164,9 @@ function Choices:spawn_model(team, item, pending)
   local group = item.group
   local in_group = 0
   if group then
-    for _, row in ipairs(team:list_rows()) do
-      for _, other in ipairs(row.inbox or {}) do
-        if other.state == "open" and other.group == group and other.kind == "spawn" then
-          in_group = in_group + 1
-        end
+    for _, other in ipairs(self:items(team)) do
+      if other.state == "open" and other.group == group and other.kind == "spawn" then
+        in_group = in_group + 1
       end
     end
   end
@@ -273,67 +304,63 @@ function Choices:team_entries(team_id)
   local open = {}
   local question_count = 0
   local approval_count = 0
-  for _, row in ipairs(team:list_rows()) do
-    if not team_id or row.id == team_id then
-      for _, item in ipairs(row.inbox or {}) do
-        if item.state == "open" then
-          if item.kind == "question" then
-            question_count = question_count + 1
-            local has_options = type(item.questions) == "table" and #item.questions > 0
-            if has_options then
-              local any = false
-              for _, question in ipairs(item.questions) do
-                if type(question.options) == "table" and #question.options > 0 then
-                  any = true
-                end
-              end
-              if any then
-                open[#open + 1] = {
-                  key = "team:" .. row.id .. ":" .. item.id,
-                  kind = "question",
-                  team = row.id,
-                  item = item,
-                  build = function(self_, pending)
-                    return self_:question_model(team, item, pending)
-                  end,
-                }
-              end
+  for _, item in ipairs(self:items(team, team_id)) do
+    if item.state == "open" then
+      if item.kind == "question" then
+        question_count = question_count + 1
+        local has_options = type(item.questions) == "table" and #item.questions > 0
+        if has_options then
+          local any = false
+          for _, question in ipairs(item.questions) do
+            if type(question.options) == "table" and #question.options > 0 then
+              any = true
             end
-          elseif item.kind == "spawn" then
-            approval_count = approval_count + 1
+          end
+          if any then
             open[#open + 1] = {
-              key = "team:" .. row.id .. ":" .. item.id,
-              kind = "approval",
-              team = row.id,
+              key = "team:" .. item.team .. ":" .. item.id,
+              kind = "question",
+              team = item.team,
               item = item,
               build = function(self_, pending)
-                return self_:spawn_model(team, item, pending)
-              end,
-            }
-          elseif item.kind == "permission" then
-            approval_count = approval_count + 1
-            open[#open + 1] = {
-              key = "team:" .. row.id .. ":" .. item.id,
-              kind = "approval",
-              team = row.id,
-              item = item,
-              build = function(self_, pending)
-                return self_:team_permission_model(team, item, pending)
-              end,
-            }
-          elseif item.kind == "limit" then
-            approval_count = approval_count + 1
-            open[#open + 1] = {
-              key = "team:" .. row.id .. ":" .. item.id,
-              kind = "approval",
-              team = row.id,
-              item = item,
-              build = function(self_, pending)
-                return self_:limit_model(team, item, pending)
+                return self_:question_model(team, item, pending)
               end,
             }
           end
         end
+      elseif item.kind == "spawn" then
+        approval_count = approval_count + 1
+        open[#open + 1] = {
+          key = "team:" .. item.team .. ":" .. item.id,
+          kind = "approval",
+          team = item.team,
+          item = item,
+          build = function(self_, pending)
+            return self_:spawn_model(team, item, pending)
+          end,
+        }
+      elseif item.kind == "permission" then
+        approval_count = approval_count + 1
+        open[#open + 1] = {
+          key = "team:" .. item.team .. ":" .. item.id,
+          kind = "approval",
+          team = item.team,
+          item = item,
+          build = function(self_, pending)
+            return self_:team_permission_model(team, item, pending)
+          end,
+        }
+      elseif item.kind == "limit" then
+        approval_count = approval_count + 1
+        open[#open + 1] = {
+          key = "team:" .. item.team .. ":" .. item.id,
+          kind = "approval",
+          team = item.team,
+          item = item,
+          build = function(self_, pending)
+            return self_:limit_model(team, item, pending)
+          end,
+        }
       end
     end
   end
@@ -508,9 +535,8 @@ end
 ---@param name string
 function Choices:answer_participant(team_id, name)
   local team = self:team()
-  local row = team and team:team(team_id)
   local item
-  for _, entry in ipairs(row and row.inbox or {}) do
+  for _, entry in ipairs(team and self:items(team, team_id) or {}) do
     if entry.state == "open" and entry.kind == "question" and entry.from == name then
       local has_options = false
       for _, question in ipairs(entry.questions or {}) do

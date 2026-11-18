@@ -1,4 +1,8 @@
--- The wide v2 dashboard: members and board, plus an optional watch column.
+-- The wide dashboard: members and board, plus an optional right column
+-- (watch window or the mounted leader chat/input). Widths are byte-agnostic;
+-- window widths are display cells by definition.
+local Text = require("ade.ui.team.text")
+
 local M = {}
 
 local Tab = {}
@@ -21,10 +25,13 @@ function M.new(dashboard)
     cursor_ns = vim.api.nvim_create_namespace("ade-team-board-cursor"),
     active = "members",
     watch_win = nil,
+    leader_windows = nil,
     group = nil,
     closing = false,
     members_width = nil,
     watch_width = nil,
+    resizing = false,
+    resize_token = 0,
   }, Tab)
 end
 
@@ -62,16 +69,45 @@ function Tab:make_window(name)
   vim.wo[win].signcolumn = "no"
   vim.wo[win].foldcolumn = "0"
   vim.wo[win].cursorline = true
+  vim.wo[win].wrap = false
   if name == "members" then
-    vim.wo[win].wrap = false
     pcall(function()
       vim.wo[win].winfixwidth = true
     end)
-  else
-    vim.wo[win].wrap = false
   end
   self.panels[name] = win
   return win
+end
+
+---Our own resizes must not be mistaken for a user drag.
+function Tab:begin_resize()
+  self.resizing = true
+  self.resize_token = (self.resize_token or 0) + 1
+  -- `WinResized` can arrive a tick after a programmatic split; keep a small
+  -- window in which such events are our own, not a user drag (M1).
+  self.ignore_until = (vim.uv.now() or 0) + 200
+end
+
+function Tab:end_resize()
+  self.resize_token = (self.resize_token or 0) + 1
+  local token = self.resize_token
+  vim.schedule(function()
+    if self.resize_token == token then
+      self.resizing = false
+    end
+  end)
+end
+
+---@param win integer|nil
+---@param width integer
+function Tab:set_width(win, width)
+  if not (win and vim.api.nvim_win_is_valid(win)) then
+    return
+  end
+  if vim.api.nvim_win_get_width(win) == width then
+    return
+  end
+  pcall(vim.api.nvim_win_set_width, win, width)
 end
 
 function Tab:open()
@@ -84,6 +120,7 @@ function Tab:open()
   local cfg = self.dashboard.config() or {}
   local dashboard_cfg = type(cfg.teams) == "table" and (cfg.teams.dashboard or {}) or {}
   self.members_width = math.max(16, math.min(120, tonumber(dashboard_cfg.members_width) or 32))
+  self.watch_width = nil
   self.original_tab = vim.api.nvim_get_current_tabpage()
   vim.cmd("tabnew")
   self.tab = vim.api.nvim_get_current_tabpage()
@@ -92,13 +129,14 @@ function Tab:open()
   if scratch ~= self.buffers.members and vim.api.nvim_buf_is_valid(scratch) then
     pcall(vim.api.nvim_buf_delete, scratch, { force = true })
   end
-  vim.cmd("vsplit")
-  local board = self:make_window("board")
+  self:begin_resize()
   local equalalways = vim.o.equalalways
   vim.o.equalalways = false
-  pcall(vim.api.nvim_win_set_width, members, self.members_width)
-  pcall(vim.api.nvim_win_set_width, board, math.max(24, vim.o.columns - self.members_width - 1))
+  vim.cmd("vsplit")
+  self:make_window("board")
+  self:set_width(members, self.members_width)
   vim.o.equalalways = equalalways
+  self:end_resize()
   for _, name in ipairs(PANELS) do
     self.dashboard:attach_keys(self.buffers[name])
   end
@@ -119,19 +157,51 @@ function Tab:open()
     group = self.group,
     callback = function()
       vim.schedule(function()
-        self:resize()
+        local cfg = self.dashboard.config() or {}
+        local wide = tonumber(((cfg.teams or {}).dashboard or {}).wide) or 160
+        if vim.o.columns < wide then
+          pcall(function()
+            require("ade.controller").open_team()
+          end)
+          return
+        end
+        self:refresh()
       end)
     end,
   })
   vim.api.nvim_create_autocmd("WinResized", {
     group = self.group,
     callback = function()
-      -- Record manual resizes only; never force sizes here.
-      if self.panels.members and vim.api.nvim_win_is_valid(self.panels.members) then
-        self.members_width = vim.api.nvim_win_get_width(self.panels.members)
+      if self.closing then
+        return
       end
-      if self.watch_win and vim.api.nvim_win_is_valid(self.watch_win) then
-        self.watch_width = vim.api.nvim_win_get_width(self.watch_win)
+      if self.ignore_until and (vim.uv.now() or 0) < self.ignore_until then
+        -- A split/close is still settling; this is our own rounding, not a
+        -- user drag. `resize()` already reasserted the recorded widths.
+        return
+      end
+      local changed = false
+      local members = self.panels.members
+      if members and vim.api.nvim_win_is_valid(members) then
+        local width = vim.api.nvim_win_get_width(members)
+        if width ~= self.members_width then
+          self.members_width = width
+          changed = true
+        end
+      end
+      local right = self:right_win()
+      if right then
+        local width = vim.api.nvim_win_get_width(right)
+        if width ~= self.watch_width then
+          self.watch_width = width
+          changed = true
+        end
+      end
+      if changed then
+        -- Re-render with the new width so truncation follows the user's drag.
+        vim.schedule(function()
+          self:refresh()
+        end)
       end
     end,
   })
@@ -169,22 +239,71 @@ function Tab:open()
   return true
 end
 
+---@return integer|nil
+function Tab:right_win()
+  if self.watch_win and vim.api.nvim_win_is_valid(self.watch_win) then
+    return self.watch_win
+  end
+  local mounted = self.leader_windows
+  if mounted then
+    for _, win in ipairs({ mounted.chat, mounted.input }) do
+      if win and vim.api.nvim_win_is_valid(win) then
+        return win
+      end
+    end
+  end
+  return nil
+end
+
+function Tab:right_windows()
+  local out = {}
+  if self.watch_win and vim.api.nvim_win_is_valid(self.watch_win) then
+    out[#out + 1] = self.watch_win
+  end
+  local mounted = self.leader_windows
+  if mounted then
+    for _, win in ipairs({ mounted.chat, mounted.input }) do
+      if win and vim.api.nvim_win_is_valid(win) then
+        out[#out + 1] = win
+      end
+    end
+  end
+  return out
+end
+
+---Register the leader chat/input windows as the right column (B3).
+---@param chat integer
+---@param input integer
+function Tab:set_leader_windows(chat, input)
+  self.leader_windows = { chat = chat, input = input }
+  self:resize()
+  self:refresh()
+end
+
+function Tab:clear_leader_windows()
+  self.leader_windows = nil
+  self:resize()
+end
+
+---Only set widths we own. The board fills whatever remains, so a refresh can
+---never squeeze a mounted leader chat (B3).
 function Tab:resize()
   if not self:is_open() then
     return
   end
-  local width = vim.o.columns
-  local members = math.max(16, math.min(120, self.members_width or 32))
-  pcall(vim.api.nvim_win_set_width, self.panels.members, members)
-  if self.watch_win and vim.api.nvim_win_is_valid(self.watch_win) then
-    local remaining = math.max(20, width - members - 1)
-    local board_width = math.floor(remaining * 0.52)
-    local watch_width = math.max(20, remaining - board_width)
-    pcall(vim.api.nvim_win_set_width, self.panels.board, board_width)
-    pcall(vim.api.nvim_win_set_width, self.watch_win, watch_width)
-  else
-    pcall(vim.api.nvim_win_set_width, self.panels.board, math.max(24, width - members - 1))
+  local members = math.max(4, math.min(tonumber(self.members_width) or 32, math.max(4, vim.o.columns - 20)))
+  local rights = self:right_windows()
+  if #rights > 0 then
+    local available = math.max(24, vim.o.columns - members - 2)
+    local right_width = self.watch_width or math.max(20, math.floor(available * 0.48))
+    right_width = math.max(16, math.min(right_width, available - 20))
+    for _, win in ipairs(rights) do
+      self:set_width(win, right_width)
+    end
   end
+  -- Last: resizing the right column can shave a cell off a fixed-width member
+  -- pane, and that rounding must not become the recorded width (M1).
+  self:set_width(self.panels.members, members)
 end
 
 function Tab:set_lines(name, lines, marks)
@@ -195,24 +314,15 @@ function Tab:set_lines(name, lines, marks)
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
-  vim.api.nvim_buf_clear_namespace(buf, self.mark_ns, 0, -1)
-  for _, mark in ipairs(marks or {}) do
-    local line = tonumber(mark.line or mark[1])
-    if line and line >= 1 then
-      pcall(vim.api.nvim_buf_set_extmark, buf, self.mark_ns, line - 1, mark.start or 0, {
-        end_row = line - 1,
-        end_col = mark.stop or -1,
-        hl_group = mark.group,
-        priority = 100,
-      })
-    end
-  end
+  Text.apply_marks(buf, self.mark_ns, marks)
 end
 
 function Tab:refresh()
   if not self:is_open() then
     return
   end
+  -- Sizes first: the board renders to the window width it is about to get.
+  self:resize()
   local ok, rendered = pcall(self.dashboard.render_tab, self.dashboard, self)
   if not ok then
     local message = "dashboard error: " .. tostring(rendered)
@@ -236,7 +346,6 @@ function Tab:refresh()
       self.last_lines[name] = vim.deepcopy(lines)
     end
   end
-  self:resize()
 end
 
 function Tab:cursor_panel()
@@ -249,21 +358,23 @@ function Tab:cursor_panel()
   return nil, win
 end
 
+---Current object under the cursor. Board cells use byte offsets.
 function Tab:current()
   local panel, win = self:cursor_panel()
   if not panel then
     return nil
   end
-  local line = vim.api.nvim_win_get_cursor(win)[1]
+  local cursor = vim.api.nvim_win_get_cursor(win)
+  local line = cursor[1]
+  local column = cursor[2] -- already a byte offset
   local entries = self.meta[panel] or {}
   local info = entries[line]
   if not info then
     return nil
   end
   if panel == "board" and info.cells then
-    local column = vim.api.nvim_win_get_cursor(win)[2] + 1
     for _, cell in ipairs(info.cells) do
-      if column >= cell.start + 1 and column <= cell.stop then
+      if column >= cell.start and column < cell.stop then
         if cell.card then
           return "card", nil, cell.card, cell
         end
@@ -306,19 +417,29 @@ function Tab:open_watch_host()
   if not (board and vim.api.nvim_win_is_valid(board)) then
     return nil
   end
+  self:begin_resize()
+  local equalalways = vim.o.equalalways
+  vim.o.equalalways = false
   vim.api.nvim_set_current_win(board)
   vim.cmd("botright vsplit")
   self.watch_win = vim.api.nvim_get_current_win()
   self:resize()
+  vim.o.equalalways = equalalways
+  self:end_resize()
   return self.watch_win
 end
 
 function Tab:close_watch_host()
   local win = self.watch_win
   self.watch_win = nil
+  self:begin_resize()
   if win and vim.api.nvim_win_is_valid(win) then
     pcall(vim.api.nvim_win_close, win, true)
   end
+  -- Closing the right column must not let the members pane absorb a rounding
+  -- cell and persist it as a user choice (M1).
+  self:resize()
+  self:end_resize()
 end
 
 function Tab:close()
@@ -329,7 +450,7 @@ function Tab:close()
   self.tab, self.original_tab = nil, nil
   self.panels, self.buffers, self.meta, self.ids, self.marks = {}, {}, {}, {}, {}
   self.last_lines = {}
-  self.watch_win = nil
+  self.watch_win, self.leader_windows = nil, nil
   if self.group then
     pcall(vim.api.nvim_del_augroup_by_id, self.group)
     self.group = nil
