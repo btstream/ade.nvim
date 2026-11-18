@@ -74,6 +74,8 @@ pub enum ServiceCall {
         team: String,
         participant: String,
         session: String,
+        /// The relay sequence of this prompt (19.14).
+        seq: u64,
     },
 }
 
@@ -520,13 +522,125 @@ impl Hub {
             task = task.or(default_task);
         }
         let refs = team_refs(params)?;
+        let interrupt = optional_bool(params, "interrupt")?.unwrap_or(false);
+        let cc = match params.get("cc") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(items)) => {
+                let mut names = Vec::new();
+                for item in items {
+                    let Some(name) = item.as_str() else {
+                        return Err(TeamError::invalid("cc must contain participant names"));
+                    };
+                    names.push(name.to_string());
+                }
+                names
+            }
+            Some(_) => return Err(TeamError::invalid("cc must be an array")),
+        };
+        let Some(entry) = self.teams.team(&team) else {
+            return Err(TeamError::unknown("unknown team"));
+        };
+        let role = if to == "human" {
+            None
+        } else {
+            match entry.participants.get(&to) {
+                Some(participant) => Some(participant.role),
+                None => return Err(TeamError::unknown("unknown participant")),
+            }
+        };
+        if interrupt {
+            if kind == Kind::Control {
+                return Err(TeamError::invalid(
+                    "interrupt is not allowed for control messages",
+                ));
+            }
+            if role != Some(Role::Worker) {
+                return Err(TeamError::invalid("interrupt is only allowed for a worker"));
+            }
+        }
+        for name in &cc {
+            if name != "leader" || role != Some(Role::Worker) {
+                return Err(TeamError::invalid(
+                    "cc only accepts \"leader\" and only when to is a worker",
+                ));
+            }
+        }
         let id =
             self.teams
                 .send_message(&team, "human", &to, kind, &body, task.as_deref(), refs)?;
+        let mut cc_failed = None;
+        if interrupt && self.teams.bus_turn_running(&team, &to) {
+            let queue_key = (team.clone(), to.clone());
+            let mut earlier = self.interrupt_queue.remove(&queue_key).unwrap_or_default();
+            earlier.retain(|queued| self.teams.message_queued(&team, &to, *queued));
+            let after = earlier.len();
+            self.teams.prioritize_message(&team, &to, id, after);
+            earlier.push(id);
+            self.interrupt_queue.insert(queue_key, earlier);
+            self.teams.mark_interrupting(&team, &to);
+            let orphaned = self.teams.orphan_open_items(&team, &to);
+            for item in orphaned {
+                let Some(instance) = item.instance.clone() else {
+                    continue;
+                };
+                let Some(agent_id) = item.agent_id.clone() else {
+                    continue;
+                };
+                let response = if item.kind == ItemKind::Permission {
+                    json!({ "outcome": { "outcome": "cancelled" } })
+                } else {
+                    json!({ "action": "cancel" })
+                };
+                self.answer_pending(&instance, agent_id, response);
+            }
+            self.cancel_participant_turn(&team, &to);
+            self.next_interrupt_generation += 1;
+            let generation = self.next_interrupt_generation;
+            let prompt_seq = self.teams.prompt_seq(&team, &to);
+            self.interrupt_generation
+                .insert((team.clone(), to.clone()), (generation, prompt_seq));
+            let sender = self.command_sender.clone();
+            let team_for_timer = team.clone();
+            let participant_for_timer = to.clone();
+            let timeout = std::env::var("NVIM_ADE_SERVER_HELD_TIMEOUT_MS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(30_000);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(timeout)).await;
+                let _ = sender
+                    .send(Command::TeamInterruptDeadline {
+                        team: team_for_timer,
+                        participant: participant_for_timer,
+                        generation,
+                    })
+                    .await;
+            });
+        }
+        for name in cc {
+            if name == "leader" {
+                let notice = format!("to {to}: {body}");
+                if let Err(error) = self.teams.send_message(
+                    &team,
+                    "human",
+                    "leader",
+                    Kind::Notice,
+                    &notice,
+                    task.as_deref(),
+                    vec![],
+                ) {
+                    cc_failed = Some(error.message);
+                }
+            }
+        }
         if kind == Kind::Control && body == "cancel" {
             self.cancel_participant_turn(&team, &to);
         }
-        Ok((json!({ "id": id }), true))
+        let mut result = json!({ "id": id });
+        if let Some(message) = cc_failed {
+            result["cc_failed"] = json!(message);
+        }
+        Ok((result, true))
     }
 
     fn team_read(&mut self, params: &Value) -> Result<Value, TeamError> {
@@ -599,6 +713,8 @@ impl Hub {
         // goes away (19.2).
         self.flush_pending_board(&team, false);
         let (_entry, workers) = self.teams.close(&team)?;
+        self.interrupt_queue.retain(|(id, _), _| id != &team);
+        self.interrupt_generation.retain(|(id, _), _| id != &team);
         for instance in workers {
             let Some(handle) = self.instances.get(&instance) else {
                 continue;
@@ -1921,7 +2037,7 @@ impl Hub {
         &mut self,
         instance: &str,
         agent_id: u64,
-        seq: u64,
+        _seq: u64,
         message: &Value,
     ) {
         let Some(call) = self.driver.remove(&(instance.to_string(), agent_id)) else {
@@ -2168,7 +2284,13 @@ impl Hub {
                 team,
                 participant,
                 session,
+                seq,
             } => {
+                if !self.teams.prompt_is_current(&team, &participant, seq) {
+                    // A forced interrupt deadline already ended this prompt;
+                    // its late completion must not end the next turn.
+                    return;
+                }
                 let (success, error) = turn_outcome(message);
                 let cancelled = message
                     .get("result")
@@ -2182,15 +2304,27 @@ impl Hub {
                 let error = if cancelled { None } else { error };
                 self.teams
                     .turn_finished(instance, success, error, String::new());
+                self.teams.clear_prompt_seq(&team, &participant);
                 self.drain_team_events();
                 self.release_held_prompts(instance, &session, false);
-                let _ = (team, participant, seq);
                 self.team_deliveries();
             }
         }
     }
 
     pub(crate) fn team_deliveries(&mut self) {
+        let alive = |teams: &crate::team::Teams, team: &String, participant: &String| {
+            teams.team(team).is_some_and(|entry| {
+                entry
+                    .participants
+                    .get(participant)
+                    .is_some_and(|p| p.state != crate::team::ParticipantState::Exited)
+            })
+        };
+        self.interrupt_queue
+            .retain(|(team, participant), _| alive(&self.teams, team, participant));
+        self.interrupt_generation
+            .retain(|(team, participant), _| alive(&self.teams, team, participant));
         let mut busy: HashSet<String> = self
             .instances
             .iter()
@@ -2254,11 +2388,13 @@ impl Hub {
             self.driver.insert(
                 (instance.clone(), agent_id),
                 ServiceCall::Prompt {
-                    team,
-                    participant,
+                    team: team.clone(),
+                    participant: participant.clone(),
                     session: session.clone(),
+                    seq,
                 },
             );
+            self.teams.prompt_started(&team, &participant, seq);
             let started = json!({
                 "jsonrpc": "2.0",
                 "method": "_ade/turn_started",
@@ -2346,6 +2482,39 @@ impl Hub {
         }
         self.held_timed_out.insert(key);
         self.release_held_prompts(instance, session, true);
+    }
+
+    pub(crate) fn worker_interrupt_deadline(
+        &mut self,
+        team: &str,
+        participant: &str,
+        generation: u64,
+    ) {
+        let key = (team.to_string(), participant.to_string());
+        let Some((saved_generation, prompt_seq)) = self.interrupt_generation.get(&key).copied()
+        else {
+            return;
+        };
+        if saved_generation != generation {
+            return;
+        }
+        if self.teams.prompt_seq(team, participant) != prompt_seq {
+            // The interrupted turn already ended and a new one started.
+            return;
+        }
+        if !self.teams.bus_turn_running(team, participant) {
+            return;
+        }
+        let Some(instance) = self.teams.participant_instance(team, participant) else {
+            return;
+        };
+        // The agent ignored session/cancel. End the bus turn as 18.11 does, so
+        // the queued interrupt (front of the mailbox) can be delivered.
+        self.teams
+            .turn_finished(&instance, false, None, String::new());
+        self.teams.clear_prompt_seq(team, participant);
+        self.drain_team_events();
+        self.team_deliveries();
     }
 
     fn release_held_prompts(&mut self, instance: &str, session: &str, timed_out: bool) {

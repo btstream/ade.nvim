@@ -191,6 +191,12 @@ pub enum Command {
         session: String,
         generation: u64,
     },
+    /// A worker interrupt waited 30 s for its cancelled bus turn (19.14).
+    TeamInterruptDeadline {
+        team: String,
+        participant: String,
+        generation: u64,
+    },
     /// Stop every instance. The hub notifies [`Hub::stopped`] when done.
     Shutdown,
     /// Every instance stopped during shutdown: the hub can end its loop.
@@ -474,6 +480,11 @@ pub struct Hub {
     held_generation: HashMap<(String, String), u64>,
     held_timed_out: HashSet<(String, String)>,
     next_held_generation: u64,
+    /// (team, participant) -> generation of the latest human interrupt (19.14).
+    interrupt_generation: HashMap<(String, String), (u64, Option<u64>)>,
+    next_interrupt_generation: u64,
+    /// Interrupt message ids still queued, in send order, per worker (19.14).
+    interrupt_queue: HashMap<(String, String), Vec<u64>>,
     /// Spawns waiting for their git worktree, by (team, participant).
     pending_worktrees: HashMap<(String, String), PendingWorktree>,
     /// `team.remove_worktree` requests waiting for git, by (team, participant).
@@ -537,6 +548,9 @@ impl Hub {
             held_generation: HashMap::new(),
             held_timed_out: HashSet::new(),
             next_held_generation: 0,
+            interrupt_generation: HashMap::new(),
+            next_interrupt_generation: 0,
+            interrupt_queue: HashMap::new(),
             pending_worktrees: HashMap::new(),
             pending_removals: HashMap::new(),
             team_sender,
@@ -716,6 +730,14 @@ impl Hub {
                 generation,
             } => {
                 self.team_deadline(&instance, &session, generation);
+                self.update_busy();
+            }
+            Command::TeamInterruptDeadline {
+                team,
+                participant,
+                generation,
+            } => {
+                self.worker_interrupt_deadline(&team, &participant, generation);
                 self.update_busy();
             }
             Command::Authenticated { conn, participant } => {

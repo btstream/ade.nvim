@@ -131,7 +131,11 @@ M.defaults = {
     limits = { max_turns_per_task = 30, max_turns_total = 200 },
     templates = {},
     -- Team panel layout (W0f): below this width the panel uses a float.
-    dashboard = { wide = 160, members_width = 32 },
+    dashboard = {
+      wide = 160,
+      members_width = 32,
+      keys = { interrupt = "<M-CR>" },
+    },
   },
 
   completion = {
@@ -1346,6 +1350,30 @@ function M.validate(cfg)
   end
   if type(dashboard.wide) ~= "number" or dashboard.wide % 1 ~= 0 or dashboard.wide < 40 or dashboard.wide > 10000 then
     fail("teams.dashboard.wide must be an integer between 40 and 10000")
+  end
+  if dashboard.keys ~= nil then
+    if type(dashboard.keys) ~= "table" then
+      fail("teams.dashboard.keys must be a table")
+    end
+    local interrupt = dashboard.keys.interrupt
+    if interrupt == nil or (type(interrupt) ~= "string" and type(interrupt) ~= "table" and interrupt ~= false) then
+      fail("teams.dashboard.keys.interrupt must be a key, a list or false")
+    end
+    if type(interrupt) == "string" and interrupt == "" then
+      fail("teams.dashboard.keys.interrupt must not be empty")
+    end
+    local ok, keymaps = pcall(require, "ade.ui.keymaps")
+    if ok then
+      local send = keymaps.expand(cfg.keymaps.input.send, { "n", "i" })
+      local armed = keymaps.expand(interrupt, { "n", "i" })
+      for _, left in ipairs(send) do
+        for _, right in ipairs(armed) do
+          if left.lhs == right.lhs and left.mode == right.mode then
+            fail("teams.dashboard.keys.interrupt clashes with keymaps.input.send: " .. left.lhs)
+          end
+        end
+      end
+    end
   end
   if
     dashboard.members_width ~= nil

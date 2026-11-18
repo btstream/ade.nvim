@@ -255,6 +255,17 @@ function Tab:right_windows()
   if self.watch_win and vim.api.nvim_win_is_valid(self.watch_win) then
     out[#out + 1] = self.watch_win
   end
+  -- The worker watch composer is a second window in this tab's right column;
+  -- it must resize with the watch (W0 worker chat, 19.14).
+  local wins = self:is_open() and vim.api.nvim_tabpage_list_wins(self.tab) or {}
+  for _, win in ipairs(wins) do
+    if win ~= self.watch_win and vim.api.nvim_win_is_valid(win) then
+      local buf = vim.api.nvim_win_get_buf(win)
+      if vim.bo[buf].filetype == "ade_team_input" then
+        out[#out + 1] = win
+      end
+    end
+  end
   local mounted = self.leader_windows
   if mounted then
     for _, win in ipairs({ mounted.chat, mounted.input }) do

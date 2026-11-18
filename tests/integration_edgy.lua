@@ -217,6 +217,21 @@ check("the choice component keeps the composer in the edgebar", function()
   )
 end)
 
+check("the worker watch input filetype is not an edgy view", function()
+  local before = #vim.api.nvim_list_wins()
+  vim.cmd("vsplit")
+  local win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].filetype = "ade_team_input"
+  vim.api.nvim_win_set_buf(win, buf)
+  require("edgy.layout").update()
+  vim.wait(100)
+  assert(vim.api.nvim_win_is_valid(win), "edgy closed the watch input")
+  assert(#vim.api.nvim_list_wins() == before + 1, "edgy moved another window")
+  assert(st.chat:is_visible() and st.input:is_visible(), "the chat views changed")
+  vim.api.nvim_win_close(win, true)
+end)
+
 -- Closing only the composer must not be re-created by ade.
 vim.api.nvim_win_close(st.input.win, true)
 vim.wait(200)
