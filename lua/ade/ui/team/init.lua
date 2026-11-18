@@ -324,39 +324,45 @@ function Dashboard:tabline_text()
   if #rows > 1 then
     suffix = string.format(" [%d/%d]", index, #rows)
   end
-  local cwd = tostring(team.cwd)
-  if vim.o.columns < 140 then
-    local count_text = string.format("? 待回答 %d  ⚑ 待批准 %d ", q, a)
-    local budget = math.max(8, vim.o.columns - vim.fn.strdisplaywidth(count_text) - 58)
-    cwd = vim.fn.fnamemodify(cwd, ":~")
+  local function head_for(cwd)
+    return string.format(
+      " ade.nvim · team %s · %s%s · %s · workers %d/%d · turns %s/%s │ 流程 %s%s",
+      tostring(team.id),
+      cwd,
+      suffix,
+      state,
+      workers,
+      max_workers,
+      tostring(limits.turns_total or 0),
+      tostring(limits.max_turns_total or "?"),
+      flow,
+      progress ~= "" and (" · " .. progress) or ""
+    )
+  end
+  local Text = require("ade.ui.team.text")
+  local full_cwd = vim.fn.fnamemodify(tostring(team.cwd), ":~")
+  local head = head_for(full_cwd)
+  local count_text = string.format("? 待回答 %d  ⚑ 待批准 %d ", q, a)
+  local narrow = vim.o.columns < 140
+  if narrow then
+    -- Measure what is actually left after the counts and the fixed parts of
+    -- the head; the old constant estimate was too small (N8).
+    local fixed = vim.fn.strdisplaywidth(head) - vim.fn.strdisplaywidth(full_cwd)
+    local budget = math.max(6, vim.o.columns - vim.fn.strdisplaywidth(count_text) - 1 - fixed)
+    local cwd = full_cwd
     if vim.fn.strdisplaywidth(cwd) > budget then
       local tail = cwd:match("([^/]+/[^/]+)$") or vim.fn.fnamemodify(cwd, ":t")
       cwd = "…/" .. vim.fn.fnamemodify(tail, ":t")
       if vim.fn.strdisplaywidth(cwd) > budget then
         cwd = "…" .. vim.fn.fnamemodify(cwd, ":t")
       end
-      cwd = require("ade.ui.team.text").truncate(cwd, budget)
+      cwd = Text.truncate(cwd, budget)
     end
+    head = head_for(cwd)
   end
-  local head = string.format(
-    " ade.nvim · team %s · %s%s · %s · workers %d/%d · turns %s/%s │ 流程 %s%s",
-    tostring(team.id),
-    cwd,
-    suffix,
-    state,
-    workers,
-    max_workers,
-    tostring(limits.turns_total or 0),
-    tostring(limits.max_turns_total or "?"),
-    flow,
-    progress ~= "" and (" · " .. progress) or ""
-  )
   local tail = string.format(" │ ? 待回答 %d  ⚑ 待批准 %d ", q, a)
-  -- On a narrow screen the pending counts are the part that must survive.
-  if vim.o.columns < 140 then
-    return " " .. string.format("? 待回答 %d  ⚑ 待批准 %d ", q, a) .. "│" .. head
-  end
-  return head .. tail
+  local text = narrow and (" " .. count_text .. "│" .. head) or (head .. tail)
+  return Text.truncate(text, math.max(1, vim.o.columns))
 end
 
 function Dashboard:install_tabline()

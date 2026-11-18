@@ -62,6 +62,24 @@ function Choices:items(team, team_id)
   return out
 end
 
+---A question item is selectable if any of its questions offers options; a
+---mixed item still shows the free-text question as an input row in the
+---component (B5).
+---@param item table
+---@return boolean
+local function item_has_options(item)
+  if type(item.questions) == "table" then
+    for _, question in ipairs(item.questions) do
+      if type(question.options) == "table" and #question.options > 0 then
+        return true
+      end
+    end
+  end
+  -- A legacy top-level `options` list is answered with `vim.ui.input`
+  -- (`answer_participant`); the component only renders `questions`.
+  return false
+end
+
 function Choices:interactions()
   local ok, interactions = pcall(self.deps.interactions)
   return ok and interactions or nil
@@ -308,25 +326,16 @@ function Choices:team_entries(team_id)
     if item.state == "open" then
       if item.kind == "question" then
         question_count = question_count + 1
-        local has_options = type(item.questions) == "table" and #item.questions > 0
-        if has_options then
-          local any = false
-          for _, question in ipairs(item.questions) do
-            if type(question.options) == "table" and #question.options > 0 then
-              any = true
-            end
-          end
-          if any then
-            open[#open + 1] = {
-              key = "team:" .. item.team .. ":" .. item.id,
-              kind = "question",
-              team = item.team,
-              item = item,
-              build = function(self_, pending)
-                return self_:question_model(team, item, pending)
-              end,
-            }
-          end
+        if item_has_options(item) then
+          open[#open + 1] = {
+            key = "team:" .. item.team .. ":" .. item.id,
+            kind = "question",
+            team = item.team,
+            item = item,
+            build = function(self_, pending)
+              return self_:question_model(team, item, pending)
+            end,
+          }
         end
       elseif item.kind == "spawn" then
         approval_count = approval_count + 1
@@ -541,11 +550,8 @@ function Choices:show_pending(team_id)
     local free = 0
     local team = self:team()
     for _, row in ipairs(team and self:items(team, team_id) or {}) do
-      if row.state == "open" and row.kind == "question" then
-        local first = type(row.questions) == "table" and row.questions[1] or nil
-        if not (first and type(first.options) == "table" and #first.options > 0) then
-          free = free + 1
-        end
+      if row.state == "open" and row.kind == "question" and not item_has_options(row) then
+        free = free + 1
       end
     end
     if free > 0 then
@@ -569,12 +575,22 @@ function Choices:answer_participant(team_id, name)
   local free, option_entry
   for _, entry in ipairs(team and self:items(team, team_id) or {}) do
     if entry.state == "open" and entry.kind == "question" and entry.from == name then
-      local first = type(entry.questions) == "table" and entry.questions[1] or nil
-      local has_options = first and type(first.options) == "table" and #first.options > 0
-      if has_options then
+      if item_has_options(entry) then
         option_entry = option_entry or entry
       else
         free = free or entry
+      end
+    end
+  end
+  if option_entry then
+    local open = self:team_entries(team_id)
+    for _, candidate in ipairs(open) do
+      if candidate.item == option_entry then
+        self:show(candidate, open)
+        if not self:is_open() then
+          self:notify("先打开聊天窗口（:Ade open）再显示选择组件", vim.log.levels.INFO)
+        end
+        return
       end
     end
   end
@@ -591,18 +607,6 @@ function Choices:answer_participant(team_id, name)
       end)
     end)
     return
-  end
-  if option_entry then
-    local open = self:team_entries(team_id)
-    for _, candidate in ipairs(open) do
-      if candidate.item == option_entry then
-        self:show(candidate, open)
-        if not self:is_open() then
-          self:notify("先打开聊天窗口（:Ade open）再显示选择组件", vim.log.levels.INFO)
-        end
-        return
-      end
-    end
   end
   if #self:team_entries(team_id) > 0 then
     self:show_pending(team_id)

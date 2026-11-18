@@ -286,6 +286,27 @@ function Panel:team_of_current()
   return nil
 end
 
+---The team that owns `line`, from the nearest preceding id. Hint and spacer
+---lines have no id, so this must not fall back to an unrelated team (B3).
+---@param line integer
+---@return string|nil
+function Panel:team_at_line(line)
+  for index = line, 1, -1 do
+    local id = self.ids and self.ids[index]
+    if type(id) == "string" then
+      local team = id:match("^team:(.+)$")
+      if team then
+        return team
+      end
+      team = id:match("^card:([^|]+)|") or id:match("^stage:([^|]*)|") or id:match("^([^|]+)|")
+      if team then
+        return team
+      end
+    end
+  end
+  return nil
+end
+
 function Panel:open()
   self.interacting = false
   if self:is_open() then
@@ -332,9 +353,9 @@ function Panel:open()
       return
     end
     local team_id = self:team_of_current() or (self.team:list_rows()[1] or {}).id
-    local open = queue:team_entries(team_id)
+    local pending = queue.selectable_count and queue:selectable_count(team_id) or 0
     queue:show_pending(team_id)
-    if #open > 0 and not queue:is_open() then
+    if pending > 0 and not queue:is_open() then
       self:notify("先打开聊天窗口（:Ade open）再显示选择组件")
     end
   end)
@@ -345,9 +366,9 @@ function Panel:open()
       return
     end
     local team_id = self:team_of_current() or (self.team:list_rows()[1] or {}).id
-    local open = queue:team_entries(team_id)
+    local pending = queue.selectable_count and queue:selectable_count(team_id) or 0
     queue:show_pending(team_id)
-    if #open > 0 and not queue:is_open() then
+    if pending > 0 and not queue:is_open() then
       self:notify("先打开聊天窗口（:Ade open）再显示选择组件")
     end
   end)
@@ -381,7 +402,8 @@ function Panel:open()
     end
   end)
   local function scroll_board(delta)
-    local team = self:team_of_current() or (self.team:list_rows()[1] or {}).id
+    local line = self:is_open() and vim.api.nvim_win_get_cursor(self.win)[1] or 1
+    local team = self:team_at_line(line)
     if not team then
       return
     end

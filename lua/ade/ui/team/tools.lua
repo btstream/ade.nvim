@@ -61,7 +61,10 @@ local function server_ok(block, raw)
     type(block.meta) == "table" and (block.meta.server or block.meta.mcpServer) or nil,
     block.server,
   }
-  for _, value in ipairs(candidates) do
+  -- Fixed indices: the list intentionally has holes (a missing `_meta`),
+  -- and `ipairs` would stop at the first nil.
+  for index = 1, 7 do
+    local value = candidates[index]
     if type(value) == "string" and value ~= "" then
       local server = value:lower():gsub("^mcp__", ""):gsub("__$", "")
       return server == "ade-team" or server == "ade_team"

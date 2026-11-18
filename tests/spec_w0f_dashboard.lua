@@ -1435,17 +1435,50 @@ return function(t)
         kind = "question",
         from = "reviewer",
         body = "pick one",
-        questions = { { question = "pick one", options = { { label = "A" }, { label = "B" } } } },
+        questions = {
+          { question = "type free text" },
+          { question = "pick one", options = { { label = "A" }, { label = "B" } } },
+        },
         state = "open",
       })
       wait(function()
         return team():item("i2") ~= nil
       end, 5000, "the option question")
+      t.eq(1, queue:selectable_count("t1"), "one mixed question is selectable")
       queue:answer_participant("t1", "reviewer")
       wait(function()
         return queue:is_open()
       end, 5000, "the option question in the component")
       queue.view:cancel()
+    end)
+
+    t.it("float scrolling follows the team above the hint line", function()
+      local Float = require("ade.ui.team.layout_float")
+      local panel = Float.new({
+        team = {
+          list_rows = function()
+            return {}
+          end,
+          board = function()
+            return { columns = {} }
+          end,
+        },
+        config = function()
+          return { teams = {}, layout = {} }
+        end,
+      })
+      panel.ids = {
+        [1] = "team:t1",
+        [2] = "t1|leader",
+        [5] = "card:t1|C1",
+        [7] = "team:t2",
+        [8] = "card:t2|C9",
+        [10] = nil,
+      }
+      t.eq("t1", panel:team_at_line(6))
+      t.eq("t2", panel:team_at_line(9))
+      t.eq("t2", panel:team_at_line(10))
+      t.eq(nil, panel:team_at_line(0))
     end)
 
     t.it("coalesces frequent dashboard refreshes", function()
