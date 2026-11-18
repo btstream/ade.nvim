@@ -219,6 +219,18 @@ local function hidden_lines(block)
 end
 
 function M.render_tool(block, ctx)
+  if not block.expanded then
+    local message = require("ade.ui.team.tools").describe(block)
+    if message then
+      local header = one_line(message.title)
+      local body = one_line(message.text)
+      local line = body ~= "" and (header .. "：" .. body) or header
+      return {
+        { text = line, segments = { { s = 0, e = -1, group = "AdeNotice" } } },
+        { text = "", segments = nil },
+      }
+    end
+  end
   local ic = ctx.icons
   local glyph, glyph_hl = tool_icon(block, ic)
   local caret = block.expanded and ic.chevron_down or ic.chevron_right
