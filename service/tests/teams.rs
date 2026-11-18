@@ -346,8 +346,6 @@ impl Harness {
             .unwrap_or(Value::Null)
     }
 
-    /// The next `team.board_changed` rev for this team, skipping other
-    /// notifications.
     /// Wait until a `team.board_changed` at or after `rev` arrives, skipping
     /// earlier frames still queued from previous writes.
     fn wait_board_changed_at_least(&mut self, rev: u64) -> Option<u64> {
@@ -359,6 +357,8 @@ impl Harness {
         }
     }
 
+    /// The next `team.board_changed` rev for this team, skipping other
+    /// notifications.
     fn next_board_changed(&mut self, timeout: Duration) -> Option<u64> {
         let deadline = Instant::now() + timeout;
         loop {

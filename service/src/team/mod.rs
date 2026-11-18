@@ -803,6 +803,11 @@ pub struct Teams {
     workflows: workflow::StoredWorkflows,
     /// cwd -> project key, so git runs at most once per cwd.
     project_keys: HashMap<String, String>,
+    /// Tests inspect the board of a closed team after it is removed.
+    #[cfg(test)]
+    closed_boards: HashMap<String, board::Board>,
+    #[cfg(test)]
+    closed_reserved: HashMap<String, HashSet<String>>,
 }
 
 impl Teams {
@@ -822,11 +827,26 @@ impl Teams {
             next_group: 0,
             workflows: workflow::StoredWorkflows::new(),
             project_keys: HashMap::new(),
+            #[cfg(test)]
+            closed_boards: HashMap::new(),
+            #[cfg(test)]
+            closed_reserved: HashMap::new(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
         self.teams.is_empty()
+    }
+
+    /// The board a closed team had after its spawn cleanup (tests only).
+    #[cfg(test)]
+    pub fn closed_board(&self, team: &str) -> Option<&board::Board> {
+        self.closed_boards.get(team)
+    }
+
+    #[cfg(test)]
+    pub fn closed_reserved_names(&self, team: &str) -> Option<&HashSet<String>> {
+        self.closed_reserved.get(team)
     }
 
     pub fn is_closed(&self, team: &str) -> bool {
@@ -1522,6 +1542,12 @@ impl Teams {
         if let Some(leader) = team.participants.get_mut("leader") {
             leader.mailbox.clear();
         }
+        #[cfg(test)]
+        self.closed_boards
+            .insert(team_id.to_string(), team.board.clone());
+        #[cfg(test)]
+        self.closed_reserved
+            .insert(team_id.to_string(), team.reserved_names.clone());
         let mut entry = team_entry(team);
         entry["state"] = json!("closed");
         let id = team.id.clone();
@@ -1809,16 +1835,28 @@ impl Teams {
         question: &str,
         options: Option<Vec<String>>,
     ) -> Result<String, TeamError> {
-        if question.len() > MAX_BODY_BYTES {
-            return Err(TeamError::invalid("question is too long"));
+        if question.is_empty() || question.len() > MAX_BODY_BYTES {
+            return Err(TeamError::invalid("question must be 1..64 KiB"));
         }
         if let Some(options) = &options {
             if options.len() > 6 {
                 return Err(TeamError::invalid("options must have at most 6 entries"));
             }
+            let mut seen = HashSet::new();
             for option in options {
-                if option.len() > MAX_REF_BYTES {
-                    return Err(TeamError::invalid("option is too long"));
+                if option.is_empty()
+                    || option.chars().count() > 60
+                    || !is_one_line(option)
+                    || option.contains(", ")
+                {
+                    return Err(TeamError::invalid(
+                        "options must be one line of 1..60 characters without ', '",
+                    ));
+                }
+                if !seen.insert(option.as_str()) {
+                    return Err(TeamError::invalid(format!(
+                        "option {option} is already used"
+                    )));
                 }
             }
         }
@@ -1866,20 +1904,26 @@ impl Teams {
         if questions.is_empty() || questions.len() > 4 {
             return Err(TeamError::invalid("questions must have 1..4 entries"));
         }
+        {
+            let team = self
+                .teams
+                .get(team_id)
+                .ok_or_else(|| TeamError::unknown("unknown team"))?;
+            if team.closed {
+                return Err(TeamError::unknown("team closed"));
+            }
+            let Some(participant) = team.participants.get(from) else {
+                return Err(TeamError::unknown("unknown participant"));
+            };
+            if participant.state == ParticipantState::Exited {
+                return Err(TeamError::unknown("participant exited"));
+            }
+        }
         let id = self.next_inbox_id();
-        let team = self
-            .teams
-            .get_mut(team_id)
-            .ok_or_else(|| TeamError::unknown("unknown team"))?;
-        if team.closed {
-            return Err(TeamError::unknown("team closed"));
-        }
+        let team = self.teams.get_mut(team_id).expect("checked above");
         let Some(participant) = team.participants.get_mut(from) else {
-            return Err(TeamError::unknown("unknown participant"));
+            unreachable!("checked above")
         };
-        if participant.state == ParticipantState::Exited {
-            return Err(TeamError::unknown("participant exited"));
-        }
         let body = questions
             .first()
             .map(|question| question.question.clone())
@@ -6053,6 +6097,11 @@ mod tests {
             .unwrap();
         teams.close(&team).expect("close");
         assert!(teams.team(&team).is_none());
+        let board = teams.closed_board(&team).expect("closed board");
+        assert_eq!(board.cards[0].owner, None);
+        assert_eq!(board.cards[0].updated_by, "service");
+        let reserved = teams.closed_reserved_names(&team).expect("reserved names");
+        assert!(!reserved.contains("w1"), "the name must be released");
     }
 
     #[test]
@@ -6349,6 +6398,33 @@ mod tests {
                 None
             )
             .is_err());
+
+        // The 18.5 form applies the same checks after normalisation.
+        for legacy in [
+            (String::new(), None),
+            ("q".to_string(), Some(vec![String::new()])),
+            (
+                "q".to_string(),
+                Some(vec!["a".to_string(), "a".to_string()]),
+            ),
+            ("q".to_string(), Some(vec!["a, b".to_string()])),
+            ("q".to_string(), Some(vec!["a\tb".to_string()])),
+        ] {
+            assert!(teams
+                .ask_human(&team, "leader", &legacy.0, legacy.1)
+                .is_err());
+        }
+        // A rejected ask does not burn an inbox id.
+        let before = teams.counters();
+        assert!(teams
+            .ask_human_questions(
+                "nope",
+                "leader",
+                parse_questions(&json!([{"header": "h", "question": "q"}])).unwrap(),
+                None,
+            )
+            .is_err());
+        assert_eq!(before, teams.counters());
 
         // 18.5 compatibility: `text` wins over `option`; an option on a
         // question without options is free text.
