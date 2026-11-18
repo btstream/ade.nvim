@@ -575,6 +575,15 @@ end
 ---Recompute the queue and show the next item when possible.
 function Choices:refresh()
   local open = self:team_entries(nil)
+  -- A team that closed takes its pending choices with it, including the one
+  -- currently on screen (a local close may arrive before `team.changed`).
+  local team_model = self:team()
+  if self.current and self.current.team and team_model and not team_model:team(self.current.team) then
+    if self.view:is_open() then
+      self.view:close()
+    end
+    self.current = nil
+  end
   local interactions = self:interactions()
   local acp_pending = interactions and #interactions:pending() > 0 or false
   local keys = {}

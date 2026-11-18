@@ -1161,6 +1161,41 @@ function Dashboard:load_workflows()
   end)
 end
 
+---A team disappeared: closed here, by another front end, or by the service.
+---The panel closes only when this was its last team; otherwise it moves to
+---the next team. A watch on the closed team is closed too.
+---@param team_id string
+function Dashboard:team_closed(team_id)
+  if type(team_id) ~= "string" then
+    return
+  end
+  if self.watcher:current_team() == team_id then
+    self.watcher:close()
+    if self.tab and self.tab:is_open() then
+      self.tab:close_watch_host()
+    end
+    self.watch_win, self.watch_buf = self.watcher.win, self.watcher.buf
+  end
+  if not self:is_open() then
+    return
+  end
+  if self.selected_id and self.selected_id ~= team_id and self:team_by_id(self.selected_id) then
+    -- The panel is showing another team: repaint without the closed one.
+    self:refresh()
+    return
+  end
+  local rows = self.team:list_rows()
+  if #rows == 0 then
+    -- This was the only team: close the tab/float and put the leader chat
+    -- back where it was.
+    self:close()
+    return
+  end
+  self.index = math.max(1, math.min(self.index or 1, #rows))
+  self.selected_id = rows[self.index].id
+  self:refresh()
+end
+
 function Dashboard:close(quiet)
   if self.refresh_timer then
     pcall(function()
@@ -1278,6 +1313,29 @@ function M.new(opts)
     watcher:close()
     if self._impl then
       return self._impl:close(quiet)
+    end
+  end
+  ---Close what belongs to a team that disappeared. The facade owns the shared
+  ---watch view, so this works even when the panel was never opened.
+  ---@param team_id string
+  function proxy:team_closed(team_id)
+    if type(team_id) ~= "string" then
+      return
+    end
+    if watcher:current_team() == team_id then
+      watcher:close()
+      rawset(self, "watch_win", watcher.win)
+      rawset(self, "watch_buf", watcher.buf)
+    end
+    if self._impl then
+      if self._impl.team_closed then
+        return self._impl:team_closed(team_id)
+      end
+      -- The narrow float lists every team in one window; it closes itself
+      -- when the last team is gone.
+      if self._impl.is_open and self._impl:is_open() then
+        return self._impl:refresh()
+      end
     end
   end
   function proxy:is_open()

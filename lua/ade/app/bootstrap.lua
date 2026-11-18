@@ -469,6 +469,16 @@ function M.build(ctx, opts, action)
         end
       end)
     end,
+    on_closed = function(team_id)
+      vim.schedule(function()
+        if S.view.team_ui then
+          S.view.team_ui:team_closed(team_id)
+        end
+        if S.view.choices then
+          S.view.choices:refresh()
+        end
+      end)
+    end,
     runtime = function()
       return S.sess.runtime
     end,

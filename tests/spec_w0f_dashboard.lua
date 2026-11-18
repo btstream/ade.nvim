@@ -1364,6 +1364,51 @@ return function(t)
       end, 5000, "the float card message")
     end)
 
+    t.it("the narrow float moves to the next team and closes with its last", function()
+      local service, dir = start_service(t, "close-float")
+      setup(t, "close-float", service, dir)
+      controller.state().config.teams.dashboard.wide = 300
+      controller.connect()
+      wait_ready()
+      service:team_changed(base_team(dir, { id = "t1" }))
+      service:team_changed(base_team(dir, { id = "t2" }))
+      wait(function()
+        return team():team("t1") ~= nil and team():team("t2") ~= nil
+      end, 5000, "both teams")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      wait(function()
+        return UI.win ~= nil and vim.api.nvim_win_is_valid(UI.win)
+      end, 5000, "the float")
+      t.eq(nil, UI.tab)
+      local header
+      for lnum, id in pairs(UI.ids or {}) do
+        if id == "team:t1" then
+          header = lnum
+        end
+      end
+      t.truthy(header)
+      vim.api.nvim_set_current_win(UI.win)
+      vim.api.nvim_win_set_cursor(UI.win, { header, 0 })
+      service:team_changed(vim.tbl_extend("force", base_team(dir, { id = "t1" }), { state = "closed" }))
+      wait(function()
+        return team():team("t1") == nil and UI:is_open() and UI:team_of_current() == "t2"
+      end, 5000, "the next team in the float")
+      service:team_changed(vim.tbl_extend("force", base_team(dir, { id = "t2" }), { state = "closed" }))
+      wait(function()
+        return not UI:is_open() and team():team("t2") == nil
+      end, 5000, "the closed float")
+      -- Reopening shows the empty state.
+      t.eq(true, controller.open_team())
+      wait(function()
+        if not (UI.win and vim.api.nvim_win_is_valid(UI.win)) then
+          return false
+        end
+        local text = table.concat(vim.api.nvim_buf_get_lines(UI.buf, 0, -1, false), "\n")
+        return text:find("还没有团队", 1, true) ~= nil
+      end, 5000, "the empty float")
+    end)
+
     t.it("ascii borders keep alignment under ambiwidth=double", function()
       local old = vim.o.ambiwidth
       t.cleanup(function()
@@ -1479,6 +1524,146 @@ return function(t)
       t.eq("t2", panel:team_at_line(9))
       t.eq("t2", panel:team_at_line(10))
       t.eq(nil, panel:team_at_line(0))
+    end)
+
+    t.it("a local close closes the only dashboard and restores the leader chat", function()
+      wide(t)
+      local service, dir = start_service(t, "close-local", { team_board = sample_board() })
+      setup(t, "close-local", service, dir)
+      controller.connect()
+      wait_ready()
+      controller.open()
+      local chat = controller.state().view.chat
+      wait(function()
+        return chat.win ~= nil and vim.api.nvim_win_is_valid(chat.win)
+      end, 10000, "the main chat")
+      -- Let the connect/adoption after `open` settle, so the panel keeps its
+      -- tab instead of following the dashboard tab opened next.
+      vim.wait(300)
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      wait(function()
+        return UI.tab ~= nil and UI.tab:is_open()
+      end, 5000, "the wide tab")
+      local leader_line
+      for index, id in pairs(UI.tab.ids.members or {}) do
+        if id == "t1|leader" then
+          leader_line = index
+        end
+      end
+      t.truthy(leader_line)
+      vim.api.nvim_set_current_win(UI.tab.panels.members)
+      vim.api.nvim_win_set_cursor(UI.tab.panels.members, { leader_line, 0 })
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+      wait(function()
+        return UI._impl.leader_mounted ~= nil
+      end, 5000, "the leader mount")
+      local original = UI._impl.leader_mounted.original_tab
+      team():close("t1")
+      wait(function()
+        return not UI:is_open() and UI._impl.leader_mounted == nil
+      end, 5000, "the closed dashboard")
+      t.eq(true, vim.api.nvim_win_is_valid(chat.win), "the leader chat is back in its window")
+      t.eq(original, vim.api.nvim_win_get_tabpage(chat.win), "the leader chat is back in its tab")
+      t.eq(nil, team():team("t1"))
+      -- Reopening shows the empty state, not a stale team.
+      t.eq(true, controller.open_team())
+      wait(function()
+        if not (UI.tab and UI.tab:is_open()) then
+          return false
+        end
+        local text = table.concat(vim.api.nvim_buf_get_lines(UI.tab.buffers.members, 0, -1, false), "\n")
+        return text:find("还没有团队", 1, true) ~= nil
+      end, 5000, "the empty team panel")
+    end)
+
+    t.it("the panel's x closes the team and the dashboard", function()
+      wide(t)
+      local service, dir = start_service(t, "close-x")
+      setup(t, "close-x", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      wait(function()
+        return UI.tab ~= nil and UI.tab:is_open()
+      end, 5000, "the wide tab")
+      local original_select = vim.ui.select
+      vim.ui.select = function(items, _, cb)
+        cb(items[1])
+      end
+      t.cleanup(function()
+        vim.ui.select = original_select
+      end)
+      UI:close_team("t1")
+      wait(function()
+        return not UI:is_open() and team():team("t1") == nil
+      end, 5000, "the closed dashboard")
+    end)
+
+    t.it("a close from another front end closes the only dashboard", function()
+      wide(t)
+      local service, dir = start_service(t, "close-remote")
+      setup(t, "close-remote", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      wait(function()
+        return UI.tab ~= nil and UI.tab:is_open()
+      end, 5000, "the wide tab")
+      service:team_changed(vim.tbl_extend("force", base_team(dir), { state = "closed" }))
+      wait(function()
+        return not UI:is_open() and team():team("t1") == nil
+      end, 5000, "the closed dashboard")
+    end)
+
+    t.it("with several teams it switches to the next and closes its watch", function()
+      wide(t)
+      local service, dir = start_service(t, "close-many")
+      setup(t, "close-many", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed(base_team(dir, { id = "t2" }))
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil and team():team("t2") ~= nil
+      end, 5000, "both teams")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      wait(function()
+        return UI.tab ~= nil and UI.tab:is_open()
+      end, 5000, "the wide tab")
+      t.eq("t1", UI._impl.selected_id)
+      UI.watcher:open("t1", "w1")
+      wait(function()
+        return UI.watcher.win ~= nil and vim.api.nvim_win_is_valid(UI.watcher.win)
+      end, 5000, "the watch column")
+      service:team_changed(vim.tbl_extend("force", base_team(dir), { state = "closed" }))
+      wait(function()
+        return team():team("t1") == nil and UI._impl.selected_id == "t2"
+      end, 5000, "the next team")
+      t.eq(true, UI.tab:is_open(), "another team keeps the panel open")
+      t.eq(nil, UI.watcher.participant, "the watch on the closed team is closed")
+      t.eq(nil, UI.watcher.win)
+      local current = UI:current_team()
+      t.eq("t2", current and current.id, "the panel shows the next team")
+      service:team_changed(vim.tbl_extend("force", base_team(dir, { id = "t2" }), { state = "closed" }))
+      wait(function()
+        return not UI:is_open() and team():team("t2") == nil
+      end, 5000, "the closed dashboard")
     end)
 
     t.it("coalesces frequent dashboard refreshes", function()

@@ -709,10 +709,40 @@ impl Hub {
 
     fn team_close(&mut self, params: &Value) -> Result<Value, TeamError> {
         let team = required_team_string(params, "team")?;
+        // Capture the leader before `teams.close` removes the team. Its session
+        // and instance stay alive, but a running prompt (bus or front end) is
+        // cancelled like any other turn; held front-end prompts are dropped.
+        let leader = self
+            .teams
+            .team(&team)
+            .and_then(|row| row.leader_instance.clone().zip(row.leader_session.clone()));
         // Pending worker writes are flushed before the team (and its board)
         // goes away (19.2).
         self.flush_pending_board(&team, false);
         let (_entry, workers) = self.teams.close(&team)?;
+        if let Some((instance, session)) = leader {
+            let running = self
+                .instances
+                .get(&instance)
+                .map(|handle| {
+                    self.bus_prompt_active(&instance, &session)
+                        || handle
+                            .attached
+                            .iter()
+                            .any(|conn| handle.relay.prompt_active(*conn, &session))
+                })
+                .unwrap_or(false);
+            if running {
+                if let Some(handle) = self.instances.get(&instance) {
+                    handle.control.send_frame(json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/cancel",
+                        "params": { "sessionId": session },
+                    }));
+                }
+            }
+            self.cancel_held_session(&instance, &session);
+        }
         self.interrupt_queue.retain(|(id, _), _| id != &team);
         self.interrupt_generation.retain(|(id, _), _| id != &team);
         for instance in workers {
@@ -2419,9 +2449,17 @@ impl Hub {
         session: &str,
         message: &Value,
     ) -> bool {
-        // Any service prompt on an attached instance is a leader bus prompt;
-        // after `team.close` the team is gone but the running prompt is still
-        // cancelled/handled the same way.
+        // Only a leader of a live team waits behind a bus prompt. After
+        // `team.close` the conversation continues as a plain session (there
+        // is no bus turn left whose completion could release the prompt),
+        // and the held prompts were already dropped by close.
+        if !self
+            .teams
+            .team_of_instance(instance)
+            .is_some_and(|team| team.is_leader_instance(instance))
+        {
+            return false;
+        }
         if !self.bus_prompt_active(instance, session) {
             return false;
         }

@@ -242,6 +242,50 @@ return function(t)
       end, 5000, "the explicit reopen")
     end)
 
+    t.it("drops a closed team's pending choices and the one on screen", function()
+      local S = setup()
+      cleanup(S)
+      local team = S.view.team
+      local function item(id, team_id, body)
+        return {
+          id = id,
+          team = team_id,
+          kind = "question",
+          from = "w1",
+          state = "open",
+          body = body,
+          questions = {
+            { header = "Q", question = body, options = { { label = "yes" }, { label = "no" } } },
+          },
+        }
+      end
+      local first = item("i1", "t1", "close me")
+      local second = item("i2", "t2", "keep me")
+      for _, entry in ipairs({ { "t1", first }, { "t2", second } }) do
+        team.teams[entry[1]] = {
+          id = entry[1],
+          cwd = S.config.cwd or vim.fn.getcwd(),
+          state = "active",
+          participants = {},
+          inbox = { entry[2] },
+        }
+        team.inbox[entry[2].id] = entry[2]
+      end
+      local choices = S.view.choices
+      choices:refresh()
+      wait(function()
+        return choices.view:is_open() and choices.current and choices.current.team == "t1"
+      end, 5000, "the first team's question")
+      team:forget_team("t1")
+      team:closed("t1")
+      wait(function()
+        return not (choices.current and choices.current.team == "t1")
+      end, 5000, "the closed team's question")
+      t.eq(0, #choices:team_entries("t1"), "no t1 item stays queued")
+      t.eq(1, #choices:team_entries("t2"), "the other team's item stays queued")
+      choices:dismiss()
+    end)
+
     t.it("keeps the default vim fallback while the panel is hidden", function()
       local S = setup()
       cleanup(S)

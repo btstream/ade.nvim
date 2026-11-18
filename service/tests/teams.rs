@@ -3592,8 +3592,119 @@ fn a_refused_spawn_sends_the_documented_notice() {
 }
 
 #[test]
-fn team_close_still_lets_the_person_preempt_a_running_bus_prompt() {
-    let mut harness = Harness::new("team-close-priority", json!({}), None);
+fn team_close_cancels_a_running_leader_bus_prompt() {
+    let mut harness = Harness::new("team-close-bus-cancel", json!({}), None);
+    harness.send("leader", "task", "[slow]");
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .any(|event| {
+                    event["event"] == "prompt"
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("[slow]"))
+                })
+                .then_some(())
+        },
+        "the leader bus prompt",
+    );
+    harness
+        .client
+        .request(110, "team.close", json!({"team": harness.team}));
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .any(|event| event["event"] == "cancel" && event["session"] == harness.session)
+                .then_some(())
+        },
+        "session/cancel for the leader bus prompt",
+    );
+    // The leader instance and session stay usable after close.
+    harness.client.notify(
+        "tunnel.send",
+        json!({
+            "instance": harness.instance,
+            "message": {
+                "jsonrpc": "2.0", "id": 61, "method": "session/prompt",
+                "params": {"sessionId": harness.session, "prompt": [{"type":"text","text":"after close"}]},
+            },
+        }),
+    );
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .any(|event| event["event"] == "prompt" && event["text"] == "after close")
+                .then_some(())
+        },
+        "the leader prompt after close",
+    );
+}
+
+#[test]
+fn team_close_cancels_a_running_leader_frontend_prompt() {
+    let mut harness = Harness::new("team-close-frontend-cancel", json!({}), None);
+    harness.client.notify(
+        "tunnel.send",
+        json!({
+            "instance": harness.instance,
+            "message": {
+                "jsonrpc": "2.0", "id": 70, "method": "session/prompt",
+                "params": {"sessionId": harness.session, "prompt": [{"type":"text","text":"[slow]"}]},
+            },
+        }),
+    );
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .any(|event| event["event"] == "prompt" && event["text"] == "[slow]")
+                .then_some(())
+        },
+        "the leader front-end prompt",
+    );
+    harness
+        .client
+        .request(111, "team.close", json!({"team": harness.team}));
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .any(|event| event["event"] == "cancel" && event["session"] == harness.session)
+                .then_some(())
+        },
+        "session/cancel for the leader front-end prompt",
+    );
+}
+
+#[test]
+fn team_close_does_not_cancel_an_idle_leader() {
+    let mut harness = Harness::new("team-close-idle-leader", json!({}), None);
+    harness
+        .client
+        .request(112, "team.close", json!({"team": harness.team}));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !harness
+            .events()
+            .iter()
+            .any(|event| event["event"] == "cancel"),
+        "an idle leader must not receive session/cancel"
+    );
+}
+
+#[test]
+fn team_close_drops_a_prompt_held_for_the_leader() {
+    let mut harness = Harness::new("team-close-held", json!({}), None);
+    // The bus prompt ignores `session/cancel` (mimicking an agent that is slow
+    // to stop), so the person's prompt stays held until the team closes.
     harness.send("leader", "task", "[slow-ignore-cancel]");
     wait_for(
         || {
@@ -3608,11 +3719,8 @@ fn team_close_still_lets_the_person_preempt_a_running_bus_prompt() {
                 })
                 .then_some(())
         },
-        "the bus prompt",
+        "the running bus prompt",
     );
-    harness
-        .client
-        .request(110, "team.close", json!({"team": harness.team}));
     harness.client.notify(
         "tunnel.send",
         json!({
@@ -3629,34 +3737,20 @@ fn team_close_still_lets_the_person_preempt_a_running_bus_prompt() {
             .events()
             .iter()
             .any(|event| event["event"] == "prompt" && event["text"] == "idle"),
-        "the human prompt must be held until the bus prompt is cancelled"
+        "the human prompt is held behind the bus prompt"
     );
-    harness.client.notify(
-        "tunnel.send",
-        json!({
-            "instance": harness.instance,
-            "message": {"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":harness.session}},
-        }),
-    );
-    wait_for(
-        || {
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while Instant::now() < deadline {
-                let Some(frame) = harness.client.try_recv(Duration::from_millis(100)) else {
-                    continue;
-                };
-                if frame["method"] == "tunnel.recv"
-                    && frame["params"]["message"]["id"] == 60
-                    && frame["params"]["message"]["error"]["code"] == -32800
-                {
-                    return Some(());
-                }
-            }
-            None
-        },
-        "the withdrawn held prompt after close",
-    );
-    std::fs::write(harness.server.dir().join("team-agent.gate"), b"go").expect("gate");
+    harness
+        .client
+        .request(113, "team.close", json!({"team": harness.team}));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut dropped = false;
+    while Instant::now() < deadline && !dropped {
+        let frame = harness.client.next_notification(Duration::from_millis(500));
+        dropped = frame["method"] == "tunnel.recv"
+            && frame["params"]["message"]["id"] == 60
+            && frame["params"]["message"]["error"]["code"] == -32800;
+    }
+    assert!(dropped, "the held prompt is rejected by close");
 }
 
 fn workflow_config(extra: Value) -> Value {

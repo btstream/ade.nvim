@@ -35,6 +35,7 @@ Team.__index = Team
 ---  notify: fun(message: string, level: integer|nil),
 ---  on_changed: fun(), on_inbox: fun(item: table)|nil,
 ---  on_watch: fun(session: table|nil, title: string|nil)|nil,
+---  on_closed: fun(team_id: string)|nil,
 ---  runtime: fun(): table|nil}
 ---@return table
 function M.new(opts)
@@ -47,6 +48,7 @@ function M.new(opts)
     on_changed = opts.on_changed or function() end,
     on_inbox = opts.on_inbox,
     on_watch = opts.on_watch,
+    on_closed = opts.on_closed,
     on_turn = opts.on_turn,
     get_runtime = opts.runtime,
     teams = {},
@@ -765,6 +767,16 @@ function Team:changed()
   pcall(self.on_changed)
 end
 
+---A team disappeared: closed here, by another front end, or by the service.
+---The local caches are already updated; the panel uses this to close or move
+---to the next team.
+---@param team_id string
+function Team:closed(team_id)
+  if type(self.on_closed) == "function" then
+    pcall(self.on_closed, team_id)
+  end
+end
+
 ---@param payload table
 function Team:on_changed_payload(payload)
   local team = type(payload) == "table" and (payload.team or payload) or nil
@@ -794,6 +806,7 @@ function Team:on_changed_payload(payload)
       -- The team is gone; there is nothing left to unwatch on the service.
       self:unwatch(true)
     end
+    self:closed(team.id)
   else
     self.teams[team.id] = team
     if team.state ~= "suspended" then
@@ -1074,6 +1087,7 @@ function Team:close(team, cb)
       -- The reply may arrive before `team.changed(closed)`; the local state
       -- must not keep a team that is already gone (19.7 "start over").
       self:forget_team(team)
+      self:closed(team)
       self:changed()
     end
     if cb then

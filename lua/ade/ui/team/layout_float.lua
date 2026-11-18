@@ -560,9 +560,42 @@ function Panel:interaction_done()
   end)
 end
 
+---A team disappeared. The float lists every team, so it closes only when the
+---last one is gone; otherwise the cursor moves to another team.
+---@param team_id string
+function Panel:team_closed(team_id)
+  if type(team_id) ~= "string" then
+    return
+  end
+  if self.watcher and self.watcher:current_team() == team_id then
+    self.watcher:close()
+  end
+  if not self:is_open() then
+    return
+  end
+  local shown = self:team_of_current()
+  self:refresh()
+  if not self:is_open() or shown ~= team_id then
+    return
+  end
+  local rows = self.team:list_rows()
+  local next_team = rows[1]
+  if next_team then
+    for lnum, id in pairs(self.ids or {}) do
+      if id == "team:" .. tostring(next_team.id) then
+        pcall(vim.api.nvim_win_set_cursor, self.win, { lnum, 0 })
+        break
+      end
+    end
+  end
+end
+
 function Panel:close()
   self.interacting = false
   self.watch_pending = false
+  -- A later `:Ade team` starts fresh: with no teams it shows the empty state
+  -- instead of closing the window immediately.
+  self.had_teams = nil
   if self.watcher then
     self.watcher:close()
   else
