@@ -1317,7 +1317,10 @@ function Team:_watch_schedule(entry)
   vim.defer_fn(function()
     entry.render_scheduled = false
     if self.watching == entry then
-      self:_watch_rendered()
+      local ok, err = pcall(self._watch_rendered, self)
+      if not ok then
+        log.error("watch render failed: %s", tostring(err))
+      end
     end
   end, 50)
 end

@@ -900,6 +900,53 @@ return function(t)
       m:unwatch()
     end)
 
+    t.it("skips a failing replay frame and still completes the watch", function()
+      local reducer = require("ade.session.reducer")
+      local original = reducer.apply
+      local calls = 0
+      reducer.apply = function(session, update)
+        calls = calls + 1
+        if calls == 1 then
+          error("synthetic reducer failure")
+        end
+        return original(session, update)
+      end
+      t.cleanup(function()
+        reducer.apply = original
+      end)
+      local service, dir = start_service(t, "watch-bad-frame", {
+        team_watch = {
+          instance = "inst-w",
+          sessionId = "sess-w",
+          replay = {
+            { sessionUpdate = "agent_message_chunk", content = { type = "text", text = "BAD" } },
+            { sessionUpdate = "agent_message_chunk", content = { type = "text", text = "GOOD" } },
+          },
+        },
+      })
+      setup(t, "watch-bad-frame", service, dir)
+      controller.connect()
+      wait_ready()
+      local m = team()
+      local ok = nil
+      m:watch("t1", "w1", true, function(result)
+        ok = result
+      end)
+      wait(function()
+        return ok == true
+      end, 5000, "the watch after a bad frame")
+      wait(function()
+        for _, block in ipairs(m.watching.session.blocks or {}) do
+          if (block.text or ""):find("GOOD", 1, true) then
+            return true
+          end
+        end
+        return false
+      end, 5000, "the valid frame")
+      t.eq(nil, m.watch_inflight)
+      m:unwatch()
+    end)
+
     t.it("drops frames from a watch superseded during its replay", function()
       local service, dir = start_service(t, "watch-stale", {
         team_watch = {
@@ -938,6 +985,71 @@ return function(t)
       local joined = table.concat(text, "\n")
       t.match("FRESH B", joined)
       t.falsy(joined:find("STALE A", 1, true), "stale frames must be dropped")
+      m:unwatch()
+    end)
+
+    t.it("pages a long watch and jumps to the previous turn across pages", function()
+      local replay = {}
+      for turn = 1, 40 do
+        replay[#replay + 1] = {
+          sessionUpdate = "user_message_chunk",
+          content = { type = "text", text = "turn " .. turn },
+        }
+        replay[#replay + 1] = {
+          sessionUpdate = "agent_message_chunk",
+          content = { type = "text", text = "answer " .. turn },
+        }
+      end
+      local service, dir = start_service(t, "watch-pages", {
+        team_watch = { instance = "inst-w", sessionId = "sess-w", replay = replay },
+      })
+      setup(t, "watch-pages", service, dir)
+      controller.connect()
+      wait_ready()
+      local m = team()
+      local ok = false
+      m:watch("t1", "w1", true, function(result)
+        ok = result
+      end)
+      wait(function()
+        return ok
+      end, 5000, "team.watch")
+      local ui = state().view.team_ui
+      ui:watch(m.watching.session, "t1/w1")
+      local watch = ui.watcher
+      wait(function()
+        return watch.chat and watch.chat.page and not watch.chat.commit_job
+      end, 5000, "the paged watch")
+      local page = watch.chat.page
+      t.truthy(page.first > 1, "the watch pages old turns")
+      local before_first = page.first
+      local old_first = watch.chat.session.blocks[page.first]
+      t.match("^watch%-turn%-", old_first.id)
+      local previous = tonumber(old_first.id:match("(%d+)$"))
+      vim.api.nvim_set_current_win(watch.win)
+      vim.api.nvim_win_set_cursor(watch.win, { 1, 0 })
+      watch:jump_turn(-1)
+      wait(function()
+        return watch.chat.page.first < before_first and not watch.chat.commit_job and not watch.chat.layout_job
+      end, 5000, "the older page")
+      local cursor = vim.api.nvim_win_get_cursor(watch.win)[1]
+      local line = vim.api.nvim_buf_get_lines(watch.win and watch.buf or -1, cursor - 1, cursor, false)[1] or ""
+      t.match("── turn " .. tostring(previous - 1), line, "jump to the previous turn heading")
+      t.eq(watch.chat.session.blocks[watch.chat.page.first].kind, "system")
+      -- Collapsing a visible turn keeps the reader on the same heading/page.
+      local visible = watch:turn_lines()
+      local heading = visible[2] or visible[1]
+      t.truthy(heading)
+      vim.api.nvim_win_set_cursor(watch.win, { heading.line, 0 })
+      local page_before_fold = watch.chat.page.first
+      watch:toggle_at_cursor()
+      wait(function()
+        return not watch.chat.commit_job and not watch.chat.layout_job
+      end, 5000, "the collapsed turn")
+      local folded_line = vim.api.nvim_buf_get_lines(watch.buf, heading.line - 1, heading.line, false)[1] or ""
+      t.match("── turn %d+", folded_line, "the reader stays on the heading")
+      t.eq(page_before_fold, watch.chat.page.first)
+      watch:close()
       m:unwatch()
     end)
 

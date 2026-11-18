@@ -66,10 +66,9 @@ return function(t)
         local s = history(40)
         chat:set_session(s)
         ready(chat, s)
-        t.eq(35, chat.page.first)
+        t.eq(36, chat.page.first)
         t.eq(40, chat.page.last)
-        t.eq("user", s.blocks[chat.page.first].kind, "a page starts on a turn heading")
-        t.eq(6, vim.tbl_count(chat.cache))
+        t.eq(5, vim.tbl_count(chat.cache))
         t.eq(40, #s.blocks)
         t.eq(-1, chat.meta[1].page)
         t.eq(nil, chat.meta[1].block_id)
@@ -89,12 +88,12 @@ return function(t)
         local before = viewport.capture(chat)
         t.truthy(chat:load_page(-1))
         ready(chat, s)
-        t.eq(29, chat.page.first)
+        t.eq(31, chat.page.first)
         t.eq(40, chat.page.last)
         local after = viewport.capture(chat)
         t.eq(before.cursor.id, after.cursor.id)
         t.eq(before.cursor.offset, after.cursor.offset)
-        t.eq(12, vim.tbl_count(chat.cache))
+        t.eq(10, vim.tbl_count(chat.cache))
       end)
     end)
 
@@ -131,7 +130,7 @@ return function(t)
         local expected = eager:transcript()
         eager:destroy()
         t.eq(expected, chat:transcript())
-        t.eq(6, vim.tbl_count(chat.cache))
+        t.eq(5, vim.tbl_count(chat.cache))
         t.eq(nil, s.blocks[1]._md_user)
         t.falsy(table.concat(chat.lines_cache, "\n"):find("Message 1\n", 1, true))
       end)
@@ -282,11 +281,11 @@ return function(t)
         local s = history(40)
         chat:set_session(s)
         ready(chat, s)
-        t.eq(35, chat.page.first)
+        t.eq(36, chat.page.first)
         vim.api.nvim_win_set_cursor(chat.win, { 1, 0 })
         t.truthy(chat:activate_page())
         ready(chat, s)
-        t.eq(29, chat.page.first)
+        t.eq(31, chat.page.first)
         t.eq(40, chat.page.last)
         vim.api.nvim_win_set_cursor(chat.win, { 1, 0 })
         vim.api.nvim_win_call(chat.win, function()
@@ -321,7 +320,7 @@ return function(t)
         ready(chat, s)
         t.eq(40, chat.width)
         t.eq(40, chat.page.last)
-        t.eq(6, vim.tbl_count(chat.cache))
+        t.eq(5, vim.tbl_count(chat.cache))
         t.eq(s.version, chat.render_version)
       end)
     end)
@@ -347,6 +346,49 @@ return function(t)
         t.match("new output", table.concat(chat.lines_cache, "\n"))
         t.falsy(chat.follow, "reading older history must not resume following")
       end)
+    end)
+    t.it("aligns watch pages on synthetic turn headings within one budget", function()
+      local s = State.new("watch-page", "/tmp")
+      for turn = 1, 40 do
+        s:append({ id = "watch-turn-" .. turn, kind = "system", text = "── turn " .. turn })
+        s:append({ id = "watch-prompt-" .. turn, kind = "message", text = "prompt " .. turn })
+      end
+      local turn_start = function(block)
+        return type(block.id) == "string" and block.id:match("^watch%-turn%-%d+$") ~= nil
+      end
+      local p = Page.new({
+        page_blocks = 24,
+        page_bytes = 1024 * 1024,
+        max_blocks = 48,
+        turn_start = turn_start,
+        turn_name = function(block)
+          local n = block.id:match("^watch%-turn%-(%d+)$")
+          return n and ("回合 " .. n) or nil
+        end,
+      })
+      p:sync(s, true)
+      t.truthy(p.first > 1, "watch page must not load the whole history")
+      t.match("^watch%-turn%-", s.blocks[p.first].id, "page starts at a turn heading")
+      t.eq(nil, p.continuation)
+
+      local long = State.new("watch-long", "/tmp")
+      long:append({ id = "watch-turn-1", kind = "system", text = "── turn 1" })
+      for index = 1, 80 do
+        long:append({ id = "watch-body-" .. index, kind = "agent", text = "body " .. index })
+      end
+      local q = Page.new({
+        page_blocks = 12,
+        page_bytes = 1024 * 1024,
+        max_blocks = 48,
+        turn_start = turn_start,
+        turn_name = function(block)
+          local n = block.id:match("^watch%-turn%-(%d+)$")
+          return n and ("回合 " .. n) or nil
+        end,
+      })
+      q:sync(long, true)
+      t.eq("回合 1 续", q.continuation, "a long turn starts mid-turn with a heading")
+      t.truthy(q.first > 1)
     end)
   end)
 end

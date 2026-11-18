@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const LOG_NAME: &str = "nvim_ade_server.log";
 pub const ROTATED_NAME: &str = "nvim_ade_server.log.1";
+const ROTATING_NAME: &str = "nvim_ade_server.log.rotating";
 pub const MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 struct Logger {
@@ -20,6 +21,7 @@ struct Logger {
     written: u64,
     limit: u64,
     rotate_failed: bool,
+    retry_at: Option<std::time::Instant>,
 }
 
 static LOGGER: OnceLock<Mutex<Option<Logger>>> = OnceLock::new();
@@ -63,6 +65,7 @@ pub fn init(dir: &Path, limit: u64) -> io::Result<()> {
         written,
         limit: limit.max(256),
         rotate_failed: false,
+        retry_at: None,
     });
     Ok(())
 }
@@ -126,15 +129,24 @@ fn sanitize(text: &str) -> String {
 fn rotate(logger: &mut Logger) -> io::Result<()> {
     let path = path(&logger.dir);
     let rotated = logger.dir.join(ROTATED_NAME);
-    let _ = std::fs::remove_file(&rotated);
+    let rotating = logger.dir.join(ROTATING_NAME);
+    // Stage the current file first; the old .1 is only removed once the new
+    // generation is safely staged.
+    let _ = std::fs::remove_file(&rotating);
     if path.exists() {
-        std::fs::rename(&path, &rotated)?;
+        std::fs::rename(&path, &rotating)?;
+    }
+    let _ = std::fs::remove_file(&rotated);
+    if rotating.exists() && std::fs::rename(&rotating, &rotated).is_err() {
+        let _ = std::fs::rename(&rotating, &path);
+        return Err(io::Error::other("cannot rotate the service log"));
     }
     match open(&logger.dir) {
         Ok((file, written)) => {
             logger.file = Some(file);
             logger.written = written;
             logger.rotate_failed = false;
+            logger.retry_at = None;
             Ok(())
         }
         Err(error) => {
@@ -162,10 +174,18 @@ pub fn log(args: std::fmt::Arguments<'_>) {
         return;
     }
     if logger.written + entry.len() as u64 > logger.limit {
-        if let Err(error) = rotate(logger) {
-            if !logger.rotate_failed {
-                logger.rotate_failed = true;
-                eprintln!("nvim_ade_server: cannot rotate the service log: {error}");
+        let ready = logger
+            .retry_at
+            .map(|when| std::time::Instant::now() >= when)
+            .unwrap_or(true);
+        if ready {
+            if let Err(error) = rotate(logger) {
+                logger.retry_at =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+                if !logger.rotate_failed {
+                    logger.rotate_failed = true;
+                    eprintln!("nvim_ade_server: cannot rotate the service log: {error}");
+                }
             }
         }
     }
@@ -262,12 +282,16 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("dir");
         init(&dir, 4096).expect("init");
-        log(format_args!("client name\nforged line"));
+        log(format_args!("MARK-ESCAPE client name\nforged line"));
         reset_for_test();
         let text = std::fs::read_to_string(path(&dir)).expect("log");
         assert!(text.contains("client name\\nforged line"), "{text}");
         assert!(text.contains("T") && text.contains("Z"), "{text}");
-        assert_eq!(1, text.lines().count(), "{text}");
+        let marked = text
+            .lines()
+            .filter(|line| line.contains("MARK-ESCAPE"))
+            .count();
+        assert_eq!(1, marked, "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
