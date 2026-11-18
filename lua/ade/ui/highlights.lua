@@ -24,6 +24,26 @@ M.groups = {
   AdeBorder = { link = "FloatBorder" },
   AdeTitle = { link = "Title" },
 
+  -- Team dashboard v2: one colour per role label, one background per board
+  -- column. Users can override any of these groups directly.
+  AdeTeamRole1 = { link = "Function" },
+  AdeTeamRole2 = { link = "String" },
+  AdeTeamRole3 = { link = "Constant" },
+  AdeTeamRole4 = { link = "Type" },
+  AdeTeamRole5 = { link = "Identifier" },
+  AdeTeamRole6 = { link = "Special" },
+  AdeTeamLeader = { link = "Title" },
+  AdeTeamMuted = { link = "Comment" },
+  AdeBoardColumn1 = { fg = "#11111b", bg = "#89b4fa" },
+  AdeBoardColumn2 = { fg = "#11111b", bg = "#a6e3a1" },
+  AdeBoardColumn3 = { fg = "#11111b", bg = "#f9e2af" },
+  AdeBoardColumn4 = { fg = "#11111b", bg = "#f5c2e7" },
+  AdeBoardColumn5 = { fg = "#11111b", bg = "#94e2d5" },
+  AdeBoardColumn6 = { fg = "#11111b", bg = "#cba6f7" },
+  AdeBoardCard = { link = "NormalFloat" },
+  AdeBoardCardBorder = { link = "FloatBorder" },
+  AdeBoardCardCursor = { link = "Search" },
+
   -- Toolbar. The panel maps `WinBar` to `AdeToolbar`, so a region that only
   -- sets a foreground still paints the bar's background: the bar reads as one
   -- strip, and only the glyph colour changes between states.

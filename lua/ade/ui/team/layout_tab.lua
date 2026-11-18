@@ -1,14 +1,12 @@
--- The wide team dashboard: a tabpage with members, inbox, board and detail
--- (W0f 6.1), plus a right-hand watch column.
+-- The wide v2 dashboard: members and board, plus an optional watch column.
 local M = {}
 
 local Tab = {}
 Tab.__index = Tab
 
-local PANELS = { "members", "inbox", "board", "detail" }
+local PANELS = { "members", "board" }
 
 ---@param dashboard table
----@return table
 function M.new(dashboard)
   return setmetatable({
     dashboard = dashboard,
@@ -18,10 +16,15 @@ function M.new(dashboard)
     buffers = {},
     meta = {},
     ids = {},
+    marks = {},
+    mark_ns = vim.api.nvim_create_namespace("ade-team-board-marks"),
+    cursor_ns = vim.api.nvim_create_namespace("ade-team-board-cursor"),
     active = "members",
     watch_win = nil,
     group = nil,
     closing = false,
+    members_width = nil,
+    watch_width = nil,
   }, Tab)
 end
 
@@ -58,8 +61,15 @@ function Tab:make_window(name)
   vim.wo[win].relativenumber = false
   vim.wo[win].signcolumn = "no"
   vim.wo[win].foldcolumn = "0"
-  vim.wo[win].wrap = name == "detail"
   vim.wo[win].cursorline = true
+  if name == "members" then
+    vim.wo[win].wrap = false
+    pcall(function()
+      vim.wo[win].winfixwidth = true
+    end)
+  else
+    vim.wo[win].wrap = false
+  end
   self.panels[name] = win
   return win
 end
@@ -71,6 +81,9 @@ function Tab:open()
     self:refresh()
     return true
   end
+  local cfg = self.dashboard.config() or {}
+  local dashboard_cfg = type(cfg.teams) == "table" and (cfg.teams.dashboard or {}) or {}
+  self.members_width = math.max(16, math.min(120, tonumber(dashboard_cfg.members_width) or 32))
   self.original_tab = vim.api.nvim_get_current_tabpage()
   vim.cmd("tabnew")
   self.tab = vim.api.nvim_get_current_tabpage()
@@ -81,54 +94,45 @@ function Tab:open()
   end
   vim.cmd("vsplit")
   local board = self:make_window("board")
-  vim.api.nvim_set_current_win(members)
-  vim.cmd("split")
-  local inbox = self:make_window("inbox")
-  vim.cmd("botright split")
-  local detail = self:make_window("detail")
   local equalalways = vim.o.equalalways
   vim.o.equalalways = false
-  local width = vim.o.columns
-  pcall(vim.api.nvim_win_set_width, members, math.floor(width * 0.4))
-  pcall(vim.api.nvim_win_set_width, inbox, math.floor(width * 0.4))
-  pcall(vim.api.nvim_win_set_height, detail, math.max(6, math.floor((vim.o.lines - vim.o.cmdheight) * 0.25)))
+  pcall(vim.api.nvim_win_set_width, members, self.members_width)
+  pcall(vim.api.nvim_win_set_width, board, math.max(24, vim.o.columns - self.members_width - 1))
   vim.o.equalalways = equalalways
   for _, name in ipairs(PANELS) do
     self.dashboard:attach_keys(self.buffers[name])
   end
   self.group = vim.api.nvim_create_augroup("AdeTeamTab" .. self.tab, { clear = true })
-  vim.api.nvim_create_autocmd("WinEnter", {
-    group = self.group,
-    callback = function()
-      local win = vim.api.nvim_get_current_win()
-      for _, name in ipairs(PANELS) do
-        if self.panels[name] == win then
-          self.active = name
-          self.dashboard:update_detail()
-          break
-        end
+  local function enter()
+    local win = vim.api.nvim_get_current_win()
+    for _, name in ipairs(PANELS) do
+      if self.panels[name] == win then
+        self.active = name
+        self.dashboard:update_board_cursor()
+        break
       end
-    end,
-  })
-  vim.api.nvim_create_autocmd("CursorMoved", {
-    group = self.group,
-    callback = function()
-      local win = vim.api.nvim_get_current_win()
-      for _, name in ipairs(PANELS) do
-        if self.panels[name] == win then
-          self.active = name
-          self.dashboard:update_detail()
-          break
-        end
-      end
-    end,
-  })
+    end
+  end
+  vim.api.nvim_create_autocmd("WinEnter", { group = self.group, callback = enter })
+  vim.api.nvim_create_autocmd("CursorMoved", { group = self.group, callback = enter })
   vim.api.nvim_create_autocmd("VimResized", {
     group = self.group,
     callback = function()
       vim.schedule(function()
         self:resize()
       end)
+    end,
+  })
+  vim.api.nvim_create_autocmd("WinResized", {
+    group = self.group,
+    callback = function()
+      -- Record manual resizes only; never force sizes here.
+      if self.panels.members and vim.api.nvim_win_is_valid(self.panels.members) then
+        self.members_width = vim.api.nvim_win_get_width(self.panels.members)
+      end
+      if self.watch_win and vim.api.nvim_win_is_valid(self.watch_win) then
+        self.watch_width = vim.api.nvim_win_get_width(self.watch_win)
+      end
     end,
   })
   vim.api.nvim_create_autocmd("WinClosed", {
@@ -160,10 +164,8 @@ function Tab:open()
       end)
     end,
   })
-  self:resize()
   self:refresh()
   vim.api.nvim_set_current_win(members)
-  self.dashboard:update_detail()
   return true
 end
 
@@ -172,27 +174,20 @@ function Tab:resize()
     return
   end
   local width = vim.o.columns
-  local watch = self.watch_win and vim.api.nvim_win_is_valid(self.watch_win)
-  local left = watch and math.floor(width * 0.30) or math.floor(width * 0.40)
-  if self.panels.members and vim.api.nvim_win_is_valid(self.panels.members) then
-    pcall(vim.api.nvim_win_set_width, self.panels.members, left)
-  end
-  if self.panels.inbox and vim.api.nvim_win_is_valid(self.panels.inbox) then
-    pcall(vim.api.nvim_win_set_width, self.panels.inbox, left)
-  end
-  if watch then
-    pcall(vim.api.nvim_win_set_width, self.watch_win, math.floor(width * 0.34))
-  end
-  if self.panels.detail and vim.api.nvim_win_is_valid(self.panels.detail) then
-    pcall(
-      vim.api.nvim_win_set_height,
-      self.panels.detail,
-      math.max(6, math.floor((vim.o.lines - vim.o.cmdheight) * 0.25))
-    )
+  local members = math.max(16, math.min(120, self.members_width or 32))
+  pcall(vim.api.nvim_win_set_width, self.panels.members, members)
+  if self.watch_win and vim.api.nvim_win_is_valid(self.watch_win) then
+    local remaining = math.max(20, width - members - 1)
+    local board_width = math.floor(remaining * 0.52)
+    local watch_width = math.max(20, remaining - board_width)
+    pcall(vim.api.nvim_win_set_width, self.panels.board, board_width)
+    pcall(vim.api.nvim_win_set_width, self.watch_win, watch_width)
+  else
+    pcall(vim.api.nvim_win_set_width, self.panels.board, math.max(24, width - members - 1))
   end
 end
 
-function Tab:set_lines(name, lines)
+function Tab:set_lines(name, lines, marks)
   local buf = self.buffers[name]
   if not buf or not vim.api.nvim_buf_is_valid(buf) then
     return
@@ -200,6 +195,18 @@ function Tab:set_lines(name, lines)
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
+  vim.api.nvim_buf_clear_namespace(buf, self.mark_ns, 0, -1)
+  for _, mark in ipairs(marks or {}) do
+    local line = tonumber(mark.line or mark[1])
+    if line and line >= 1 then
+      pcall(vim.api.nvim_buf_set_extmark, buf, self.mark_ns, line - 1, mark.start or 0, {
+        end_row = line - 1,
+        end_col = mark.stop or -1,
+        hl_group = mark.group,
+        priority = 100,
+      })
+    end
+  end
 end
 
 function Tab:refresh()
@@ -210,27 +217,24 @@ function Tab:refresh()
   if not ok then
     local message = "dashboard error: " .. tostring(rendered)
     vim.notify(message, vim.log.levels.ERROR)
-    rendered =
-      { members = { message }, inbox = { message }, board = { message }, detail = { message }, meta = {}, ids = {} }
+    rendered = { members = { message }, board = { message }, meta = {}, ids = {}, marks = {} }
   end
   self.meta = rendered.meta
   self.ids = rendered.ids
+  self.marks = rendered.marks or {}
   self.last_lines = self.last_lines or {}
-  local detail_win = self.panels.detail
-  local detail_cursor
-  if detail_win and vim.api.nvim_win_is_valid(detail_win) then
-    detail_cursor = vim.api.nvim_win_get_cursor(detail_win)
-  end
   for _, name in ipairs(PANELS) do
     local lines = rendered[name] or {}
     if not vim.deep_equal(self.last_lines[name], lines) then
-      self:set_lines(name, lines)
+      local marks = {}
+      for _, mark in ipairs(rendered.marks or {}) do
+        if mark.panel == name then
+          marks[#marks + 1] = mark
+        end
+      end
+      self:set_lines(name, lines, marks)
       self.last_lines[name] = vim.deepcopy(lines)
     end
-  end
-  if detail_cursor and detail_win and vim.api.nvim_win_is_valid(detail_win) then
-    local count = vim.api.nvim_buf_line_count(self.buffers.detail)
-    pcall(vim.api.nvim_win_set_cursor, detail_win, { math.min(detail_cursor[1], count), detail_cursor[2] })
   end
   self:resize()
 end
@@ -283,7 +287,6 @@ function Tab:cycle(direction)
   if target and vim.api.nvim_win_is_valid(target) then
     vim.api.nvim_set_current_win(target)
     self.active = PANELS[index]
-    self.dashboard:update_detail()
   end
 end
 
@@ -295,8 +298,6 @@ function Tab:focus(name)
   end
 end
 
----Create the host window for the watch column (right side of the tab).
----@return integer|nil
 function Tab:open_watch_host()
   if self.watch_win and vim.api.nvim_win_is_valid(self.watch_win) then
     return self.watch_win
@@ -323,11 +324,10 @@ end
 function Tab:close()
   local original = self.original_tab
   local tab = self.tab
-  local panels = self.panels
-  self.ade_buffers = self.buffers
+  local buffers = self.buffers
   self.closing = true
   self.tab, self.original_tab = nil, nil
-  self.panels, self.buffers, self.meta, self.ids = {}, {}, {}, {}
+  self.panels, self.buffers, self.meta, self.ids, self.marks = {}, {}, {}, {}, {}
   self.last_lines = {}
   self.watch_win = nil
   if self.group then
@@ -335,20 +335,15 @@ function Tab:close()
     self.group = nil
   end
   local tabs = vim.api.nvim_list_tabpages()
-  local buffers = self.ade_buffers or {}
   if tab and vim.api.nvim_tabpage_is_valid(tab) then
     if #tabs > 1 then
       pcall(vim.cmd, "tabclose " .. vim.api.nvim_tabpage_get_number(tab))
     else
-      -- Closing the last tab is E784. Keep the normal chat/input windows when
-      -- they are present (leader mounted or panel restored); otherwise keep one
-      -- normal empty window. Dashboard windows are all closed.
       local wins = vim.api.nvim_tabpage_list_wins(tab)
       local keep = {}
       for _, win in ipairs(wins) do
         if vim.api.nvim_win_is_valid(win) then
-          local buf = vim.api.nvim_win_get_buf(win)
-          local ft = vim.bo[buf].filetype
+          local ft = vim.bo[vim.api.nvim_win_get_buf(win)].filetype
           if ft == "ade_chat" or ft == "ade_input" then
             keep[win] = true
           end

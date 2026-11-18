@@ -131,7 +131,7 @@ M.defaults = {
     limits = { max_turns_per_task = 30, max_turns_total = 200 },
     templates = {},
     -- Team panel layout (W0f): below this width the panel uses a float.
-    dashboard = { wide = 160 },
+    dashboard = { wide = 160, members_width = 32 },
   },
 
   completion = {
@@ -1346,6 +1346,17 @@ function M.validate(cfg)
   end
   if type(dashboard.wide) ~= "number" or dashboard.wide % 1 ~= 0 or dashboard.wide < 40 or dashboard.wide > 10000 then
     fail("teams.dashboard.wide must be an integer between 40 and 10000")
+  end
+  if
+    dashboard.members_width ~= nil
+    and (
+      type(dashboard.members_width) ~= "number"
+      or dashboard.members_width % 1 ~= 0
+      or dashboard.members_width < 16
+      or dashboard.members_width > 120
+    )
+  then
+    fail("teams.dashboard.members_width must be an integer between 16 and 120")
   end
 
   local limits = teams.limits

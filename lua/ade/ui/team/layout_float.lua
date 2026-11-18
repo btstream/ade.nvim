@@ -6,7 +6,6 @@
 local Watch = require("ade.ui.team.watch")
 local Board = require("ade.ui.team.board")
 local Detail = require("ade.ui.team.detail")
-local Inbox = require("ade.ui.team.inbox")
 
 local M = {}
 
@@ -96,7 +95,8 @@ function Panel:lines()
       { "<CR> / w", "watch the participant's transcript" },
       { "s", "start a worker from a template" },
       { "D", "remove an exited worker's worktree" },
-      { "a", "answer the inbox item under the cursor" },
+      { "a / !", "answer a participant's pending choice / list them" },
+      { "<CR>", "card detail or watch the participant" },
       { "R", "reset limits" },
       { "x", "close the team" },
       { "g?", "toggle this help" },
@@ -160,43 +160,10 @@ function Panel:lines()
       ),
       nil
     )
-    for _, entry in ipairs(team.participants or {}) do
-      local turns = entry.turns or {}
-      local marks = {}
-      if entry.paused then
-        marks[#marks + 1] = "paused"
-      end
-      local worktree = entry.worktree
-      local branch = type(worktree) == "table" and worktree.branch or nil
-      add(
-        string.format(
-          "   %-10s %-13s task %-8s queued %d turns %s/%s%s%s",
-          tostring(entry.name),
-          tostring(entry.state),
-          tostring(entry.task or "-"),
-          tonumber(entry.queued) or 0,
-          tostring(turns.task or 0),
-          tostring(turns.total or 0),
-          #marks > 0 and (" (" .. table.concat(marks, ",") .. ")") or "",
-          branch and ("  wt " .. tostring(branch)) or ""
-        ),
-        team.id .. "|" .. tostring(entry.name)
-      )
-      if entry.activity and type(entry.activity.text) == "string" and entry.activity.text ~= "" then
-        add("      ↳ " .. (entry.activity.text:gsub("[\r\n]+", " ")):sub(1, 100), nil)
-      end
-    end
-    -- Follow `team.inbox` (the notification stream), not the inbox snapshot
-    -- that happened to be inside the last `team.changed`.
-    local items = {}
-    for _, item in pairs(self.team.inbox) do
-      if item.team == team.id and item.state == "open" then
-        items[#items + 1] = item
-      end
-    end
-    local inbox_lines, inbox_ids = Inbox.lines(team, items, math.max(50, vim.o.columns - 8))
-    for index, text in ipairs(inbox_lines) do
-      add("   inbox " .. text, inbox_ids[index])
+    local Members = require("ade.ui.team.members")
+    local member_lines, member_ids = Members.lines(team, math.max(40, vim.o.columns - 8))
+    for index, text in ipairs(member_lines) do
+      add("   " .. text, member_ids[index])
     end
     local board = self.team:board(team.id)
     if board then
@@ -302,7 +269,16 @@ function Panel:open()
     self:refresh()
   end)
   self:map("a", function()
-    self:answer_current()
+    local kind, team, name = self:current()
+    if kind == "participant" and name then
+      require("ade.app.choices").answer_participant(team, name)
+    else
+      self:answer_current()
+    end
+  end)
+  self:map("!", function()
+    local team = self:team_of_current() or (self.team:list_rows()[1] or {}).id
+    require("ade.app.choices").show_pending(team)
   end)
   self:map("A", function()
     self:answer_group_current()
@@ -866,11 +842,6 @@ function Panel:detail_current()
   if kind == "card" and obj then
     local team = self.team:team(team_id)
     self:popup("卡片 " .. tostring(obj), Detail.card(team, self:find_card(team_id, obj)))
-  elseif kind == "item" and obj then
-    local item = self.team:item(obj)
-    if item then
-      self:popup("收件箱 " .. tostring(item.id), Detail.inbox(item))
-    end
   elseif kind == "stage" and obj ~= nil then
     self.expanded_stages = self.expanded_stages or {}
     local expanded = self.expanded_stages[team_id] or {}
