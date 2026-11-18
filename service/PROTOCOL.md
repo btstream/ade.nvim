@@ -1760,3 +1760,30 @@ write, `updated_by: "service"`, `team.board_changed`) and sends the leader a
 `notice` naming the cards. When it is approved nothing changes. A name used by
 an open spawn item is reserved: another spawn with that name is `-32060`
 until the item is answered.
+
+### 19.13 Several questions in one `bus.ask_human` (W0 v2)
+
+`bus.ask_human` (tool `bus_ask_human`) accepts either the 18.5 form
+`{question, options?}` or:
+
+```
+{ "questions": [ {
+    "header":       string,     // 1..12 characters, one line (the tab label)
+    "question":     string,     // up to 4 KiB
+    "options":      [ { "label": string, "description": string? } ]?,  // 0 or 2..6; label 1..60 chars, description up to 200
+    "multi_select": boolean?    // default false
+} ] }                           // 1..4 entries
+```
+
+Anything else is `-32060`. The 18.5 form is normalised to one question with
+`header: "Question"` and each option string as a `label`. The `question` inbox
+item carries the normalised `questions` (and keeps `body`/`options` for the 18.5
+form). The person may always answer a question with free text instead of an
+option.
+
+`team.answer` for a question item accepts `answers: [{selected: [label], text?}]`
+(one entry per question, in order; `selected` empty when only `text` is given;
+`-32060` when the count or a label does not match) as well as the 18.5
+`text`/`option`. The asker receives one `answer` message whose body lists, per
+question, `<header>: <selected labels joined by ", ">` and the free text on the
+next line when given.
