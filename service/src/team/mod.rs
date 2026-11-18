@@ -1493,7 +1493,7 @@ impl Teams {
             }
             Ok(None) => {}
             Err(error) => {
-                eprintln!(
+                crate::svc_log!(
                     "nvim_ade_server: cannot clear owner {name} of team {team_id}: {}",
                     error.message
                 );
@@ -4254,7 +4254,7 @@ impl Teams {
             let mut snapshot: TeamSnapshot = match serde_json::from_str(&json) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
-                    eprintln!("nvim_ade_server: deleting an unreadable team {id}: {error}");
+                    crate::svc_log!("nvim_ade_server: deleting an unreadable team {id}: {error}");
                     expired.push(id);
                     continue;
                 }
@@ -4263,7 +4263,7 @@ impl Teams {
                 snapshot.id = id.clone();
             }
             if snapshot.cwd.is_empty() {
-                eprintln!("nvim_ade_server: deleting team {id} without a cwd");
+                crate::svc_log!("nvim_ade_server: deleting team {id} without a cwd");
                 expired.push(id);
                 continue;
             }

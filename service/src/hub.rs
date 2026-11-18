@@ -53,14 +53,11 @@ fn team_expiry_tick_ms() -> u64 {
 
 /// Maximum bytes queued for one connection (PROTOCOL.md section 7).
 pub const MAX_OUTBOX_BYTES: usize = 64 * 1024 * 1024;
-/// Frames that may sit in the writer queue before the connection counts as
-/// unable to keep up.
-const OUTBOX_FRAMES: usize = 1024;
-
 /// Frames queued for one connection, serialised and newline-terminated.
 #[derive(Debug, Clone)]
 pub struct Outbox {
-    frames: mpsc::Sender<Vec<u8>>,
+    conn: u64,
+    frames: mpsc::UnboundedSender<Vec<u8>>,
     queued: Arc<AtomicUsize>,
     closer: watch::Sender<bool>,
     limit: usize,
@@ -68,15 +65,20 @@ pub struct Outbox {
 
 impl Outbox {
     /// Create the queue and the receiving side used by the writer task.
-    pub fn new(closer: watch::Sender<bool>) -> (Self, OutboxReceiver) {
-        Self::with_limit(closer, MAX_OUTBOX_BYTES)
+    pub fn new(closer: watch::Sender<bool>, conn: u64) -> (Self, OutboxReceiver) {
+        Self::with_limit(closer, MAX_OUTBOX_BYTES, conn)
     }
 
-    pub fn with_limit(closer: watch::Sender<bool>, limit: usize) -> (Self, OutboxReceiver) {
-        let (frames, receiver) = mpsc::channel(OUTBOX_FRAMES);
+    pub fn with_limit(
+        closer: watch::Sender<bool>,
+        limit: usize,
+        conn: u64,
+    ) -> (Self, OutboxReceiver) {
+        let (frames, receiver) = mpsc::unbounded_channel();
         let queued = Arc::new(AtomicUsize::new(0));
         (
             Self {
+                conn,
                 frames,
                 queued: Arc::clone(&queued),
                 closer,
@@ -114,7 +116,7 @@ impl Outbox {
         let mut bytes = match serde_json::to_vec(value) {
             Ok(bytes) => bytes,
             Err(error) => {
-                eprintln!("nvim_ade_server: cannot serialize a frame: {error}");
+                crate::svc_log!("nvim_ade_server: cannot serialize a frame: {error}");
                 return true;
             }
         };
@@ -122,12 +124,22 @@ impl Outbox {
 
         let total = self.queued.fetch_add(bytes.len(), Ordering::AcqRel) + bytes.len();
         if total > self.limit {
+            crate::svc_log!(
+                "nvim_ade_server: connection {} closed: outbound queue {} bytes exceeds the {} byte limit",
+                self.conn,
+                total,
+                self.limit
+            );
             let _ = self.closer.send(true);
             return false;
         }
-        if self.frames.try_send(bytes).is_err() {
-            // Either the writer is gone or the frame queue is saturated; both
-            // mean this connection cannot keep up.
+        if self.frames.send(bytes).is_err() {
+            // Only the writer task dropping the receiver can fail here; a full
+            // queue is back pressure and waits in the unbounded channel.
+            crate::svc_log!(
+                "nvim_ade_server: connection {} closed: writer task is gone",
+                self.conn
+            );
             let _ = self.closer.send(true);
             return false;
         }
@@ -141,7 +153,7 @@ impl Outbox {
 /// meaningful for a graceful close.
 #[derive(Debug)]
 pub struct OutboxReceiver {
-    frames: mpsc::Receiver<Vec<u8>>,
+    frames: mpsc::UnboundedReceiver<Vec<u8>>,
     queued: Arc<AtomicUsize>,
 }
 
@@ -578,7 +590,7 @@ impl Hub {
         self.recorder = recorder;
         if enabled {
             let rows = self.recorder.load_teams().unwrap_or_else(|error| {
-                eprintln!("nvim_ade_server: cannot load stored teams: {error:#}");
+                crate::svc_log!("nvim_ade_server: cannot load stored teams: {error:#}");
                 Vec::new()
             });
             let max_team = self
@@ -598,7 +610,7 @@ impl Hub {
             match self.recorder.load_workflows() {
                 Ok(rows) => self.teams.restore_workflows(rows),
                 Err(error) => {
-                    eprintln!("nvim_ade_server: cannot load stored workflows: {error:#}")
+                    crate::svc_log!("nvim_ade_server: cannot load stored workflows: {error:#}")
                 }
             }
             let (stored, expired) = self.teams.restore(
@@ -620,7 +632,7 @@ impl Hub {
                             self.teams
                                 .restore_board(id, board.rev, &board.json, board.history)
                         {
-                            eprintln!(
+                            crate::svc_log!(
                                 "nvim_ade_server: cannot read the board of {id}: {error}; \
                                  keeping its database row and refusing board writes"
                             );
@@ -628,7 +640,7 @@ impl Hub {
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        eprintln!(
+                        crate::svc_log!(
                             "nvim_ade_server: cannot load the board of {id}: {error:#}; \
                              keeping its database row and refusing board writes"
                         );
@@ -898,11 +910,14 @@ impl Hub {
                 control.stop(false, timeouts).await;
                 let patience = timeouts.after_stdin + timeouts.after_term + Duration::from_secs(5);
                 match exited.wait(patience).await {
-                    Some(info) => eprintln!(
+                    Some(info) => crate::svc_log!(
                         "nvim_ade_server: stopped agent instance {id} (code {:?}, signal {:?})",
-                        info.code, info.signal
+                        info.code,
+                        info.signal
                     ),
-                    None => eprintln!("nvim_ade_server: agent instance {id} did not exit in time"),
+                    None => {
+                        crate::svc_log!("nvim_ade_server: agent instance {id} did not exit in time")
+                    }
                 }
             }));
         }
@@ -1575,9 +1590,10 @@ impl Hub {
                     ))
                 }
             };
-            eprintln!(
+            crate::svc_log!(
                 "nvim_ade_server: leasing {} {} for {instance_id}",
-                launch.agent, installed
+                launch.agent,
+                installed
             );
         }
         let spec = SpawnSpec {
@@ -1596,7 +1612,7 @@ impl Hub {
         )
         .map_err(|error| error.to_string())?;
 
-        eprintln!(
+        crate::svc_log!(
             "nvim_ade_server: spawned agent instance {instance_id} (pid {})",
             started.pid
         );
@@ -1695,7 +1711,7 @@ impl Hub {
             {
                 self.by_identity.remove(&identity);
             }
-            eprintln!("nvim_ade_server: stopping agent instance {name}");
+            crate::svc_log!("nvim_ade_server: stopping agent instance {name}");
         }
 
         // The reply is sent after the process exited, so the wait happens off
@@ -1719,7 +1735,7 @@ impl Hub {
                     signal: info.signal,
                 })
                 .await;
-            eprintln!("nvim_ade_server: agent.stop finished for {name}");
+            crate::svc_log!("nvim_ade_server: agent.stop finished for {name}");
         });
     }
 
@@ -1742,7 +1758,7 @@ impl Hub {
         }
         for (instance_id, primary, replay) in moved {
             self.replay_pending(primary, &instance_id, replay);
-            eprintln!(
+            crate::svc_log!(
                 "nvim_ade_server: instance {instance_id} primary is now connection {primary}"
             );
         }
@@ -2011,7 +2027,7 @@ impl Hub {
         // is forwarded instead, before anything is read into memory
         // (PROTOCOL.md 12).
         if self.recorder.bytes(&key) > self.limits.replay_bytes {
-            eprintln!(
+            crate::svc_log!(
                 "nvim_ade_server: log for {instance_id} is too large to replay; forwarding session/load"
             );
             self.forward_load(conn, instance_id, &candidate.frame);
@@ -2047,7 +2063,7 @@ impl Hub {
                     frame: candidate.frame,
                 },
                 Err(error) => {
-                    eprintln!("nvim_ade_server: cannot read the event log: {error}");
+                    crate::svc_log!("nvim_ade_server: cannot read the event log: {error}");
                     LoadResult::Forward {
                         conn,
                         instance: instance_id,
@@ -2155,8 +2171,8 @@ impl Hub {
             // it as soon as it notices.
             outbox.close();
         }
-        eprintln!(
-            "nvim_ade_server: connection {conn} fell behind during a replay buffer; closing it"
+        crate::svc_log!(
+            "nvim_ade_server: connection {conn} closed: replay buffer exceeded its byte limit"
         );
     }
 
@@ -2234,13 +2250,13 @@ impl Hub {
 
     fn agent_line(&mut self, instance_id: &str, text: &str) {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
-            eprintln!(
+            crate::svc_log!(
                 "nvim_ade_server: agent {instance_id} wrote a line that is not JSON; dropped"
             );
             return;
         };
         if !value.is_object() {
-            eprintln!(
+            crate::svc_log!(
                 "nvim_ade_server: agent {instance_id} wrote a JSON value that is not an object; dropped"
             );
             return;
@@ -2409,7 +2425,7 @@ impl Hub {
             }
             Some(AgentAction::Drop) | None => {}
             Some(AgentAction::Invalid) => {
-                eprintln!(
+                crate::svc_log!(
                     "nvim_ade_server: agent {instance_id} wrote a frame that cannot be relayed; dropped"
                 );
             }
@@ -2491,9 +2507,10 @@ impl Hub {
                 }),
             );
         }
-        eprintln!(
+        crate::svc_log!(
             "nvim_ade_server: agent instance {instance_id} exited (code {:?}, signal {:?})",
-            info.code, info.signal
+            info.code,
+            info.signal
         );
         // `agent.stop` replies wait until the instance is gone, so the very next
         // `agent.list` cannot show it (PROTOCOL.md 3.4).
@@ -2562,6 +2579,13 @@ impl Hub {
             if overflowed {
                 // The waiter cannot keep up: close it like an overflowing
                 // outbound queue (PROTOCOL.md 7 and 12) and cancel the replay.
+                if let Some(gate) = self.gates.get(&conn) {
+                    crate::svc_log!(
+                        "nvim_ade_server: connection {conn} replay buffer {} bytes exceeds {}",
+                        gate.bytes,
+                        gate.limit
+                    );
+                }
                 self.close_gated(conn);
             }
             return;
@@ -2898,7 +2922,22 @@ mod tests {
 
     fn outbox(limit: usize) -> (Outbox, OutboxReceiver) {
         let (closer, _watch) = watch::channel(false);
-        Outbox::with_limit(closer, limit)
+        Outbox::with_limit(closer, limit, 0)
+    }
+
+    #[tokio::test]
+    async fn outbox_has_no_frame_count_limit() {
+        let (outbox, mut receiver) = outbox(64 * 1024 * 1024);
+        // A slow reader must see back pressure, never a frame-count close.
+        for index in 0..2000 {
+            assert!(outbox.send(&json!({"i": index, "text": "x".repeat(256)})));
+        }
+        assert!(outbox.queued_bytes() > 2000 * 256);
+        for index in 0..2000 {
+            let frame = receiver.recv().await.expect("frame");
+            let value: Value = serde_json::from_slice(&frame).expect("json");
+            assert_eq!(value["i"], index);
+        }
     }
 
     #[tokio::test]
@@ -2915,7 +2954,7 @@ mod tests {
     #[test]
     fn outbox_closes_the_connection_when_the_limit_is_exceeded() {
         let (closer, watch) = watch::channel(false);
-        let (outbox, _receiver) = Outbox::with_limit(closer, 8);
+        let (outbox, _receiver) = Outbox::with_limit(closer, 8, 0);
         assert!(outbox.send(&json!({"a": 1})));
         // This frame pushes the queue over the 8-byte limit.
         assert!(!outbox.send(&json!({"bb": 2})));

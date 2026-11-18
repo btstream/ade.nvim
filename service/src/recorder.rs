@@ -654,7 +654,7 @@ impl Recorder {
     fn drop_for_backpressure(&self, instance_key: &str) {
         if !self.inner.warned_backpressure.swap(true, Ordering::Relaxed) {
             self.inner.warnings.fetch_add(1, Ordering::Relaxed);
-            eprintln!(
+            crate::svc_log!(
                 "nvim_ade_server: warning: event log queue exceeded {} bytes; \
                  dropping events and marking affected sessions incomplete",
                 self.limits.backpressure_bytes
@@ -1270,7 +1270,7 @@ impl Writer {
             return;
         }
         self.last_warning = Some(now);
-        eprintln!("nvim_ade_server: warning: team persistence failed: {error:#}");
+        crate::svc_log!("nvim_ade_server: warning: team persistence failed: {error:#}");
     }
 
     /// Re-read one instance's stored size from the database (after a prune).
@@ -1320,7 +1320,9 @@ impl Writer {
         if !recent {
             self.last_warning = Some(now);
             self.inner.warnings.fetch_add(1, Ordering::Relaxed);
-            eprintln!("nvim_ade_server: warning: event log write failed for {instance}: {error:#}");
+            crate::svc_log!(
+                "nvim_ade_server: warning: event log write failed for {instance}: {error:#}"
+            );
         }
         // Whatever happened, the instance's log has a hole now. This call may
         // itself fail (the disk is still broken); the failure is what the

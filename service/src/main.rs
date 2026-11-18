@@ -116,6 +116,9 @@ fn print_paths_json(socket: Option<PathBuf>) -> Result<()> {
         socket: paths.socket().display().to_string(),
         token: paths.token_file().display().to_string(),
         lock: paths.lock_file().display().to_string(),
+        log: nvim_ade_server::logging::path(paths.dir())
+            .display()
+            .to_string(),
     })
 }
 
@@ -161,7 +164,7 @@ fn serve(
             }
         }
         Ok(ServeStatus::Exited { socket }) => {
-            eprintln!("nvim_ade_server: stopped, socket {socket} removed");
+            nvim_ade_server::svc_log!("nvim_ade_server: stopped, socket {socket} removed");
             ExitCode::SUCCESS
         }
         Err(error) => fail(&error, true),
@@ -171,13 +174,15 @@ fn serve(
 /// Report a failure: the chain on stderr, then — for `serve`, which promises a
 /// single status line — the JSON error line on stdout. Always exits 1.
 fn fail(error: &anyhow::Error, is_serve: bool) -> ExitCode {
-    eprintln!("nvim_ade_server: {error:#}");
+    nvim_ade_server::svc_log!("nvim_ade_server: {error:#}");
     if is_serve {
         let message = format!("{error:#}");
         // A failure to print the error line is worth a second stderr note but
         // cannot change the exit code.
         if let Err(write_error) = print_line(&ErrorOutput::new(&message)) {
-            eprintln!("nvim_ade_server: cannot write the error line: {write_error}");
+            nvim_ade_server::svc_log!(
+                "nvim_ade_server: cannot write the error line: {write_error}"
+            );
         }
     }
     ExitCode::from(EXIT_FAILURE)

@@ -1308,6 +1308,22 @@ function Team:turn_finished(payload)
   end
 end
 
+---Coalesce live watch frames: reducer.apply is cheap, rendering the whole
+---transcript is not. At most one render is scheduled per window.
+---@param entry table
+function Team:_watch_schedule(entry)
+  if self.watching ~= entry or entry.render_scheduled then
+    return
+  end
+  entry.render_scheduled = true
+  vim.defer_fn(function()
+    entry.render_scheduled = false
+    if self.watching == entry then
+      self:_watch_rendered()
+    end
+  end, 50)
+end
+
 function Team:_watch_rendered()
   if self.watching and self.on_watch then
     pcall(self.on_watch, self.watching.session, self.watching.title)
@@ -1343,7 +1359,7 @@ function Team:watch(team, participant, replay, cb)
     turn_times = {},
   }
   self.watching = entry
-  local function apply(payload)
+  local function apply(payload, schedule)
     if type(payload) ~= "table" or not entry.ready then
       return
     end
@@ -1359,7 +1375,9 @@ function Team:watch(team, participant, replay, cb)
       if block then
         entry.turn_times[block.id] = { started_at = epoch_ms() }
       end
-      self:_watch_rendered()
+      if schedule ~= false then
+        self:_watch_schedule(entry)
+      end
       return
     end
     if message.method == "_ade/turn_finished" then
@@ -1369,7 +1387,9 @@ function Team:watch(team, participant, replay, cb)
         timing.ended_at = epoch_ms()
         entry.turn_times[block.id] = timing
       end
-      self:_watch_rendered()
+      if schedule ~= false then
+        self:_watch_schedule(entry)
+      end
       return
     end
     if message.method == "session/update" and type(message.params) == "table" then
@@ -1377,7 +1397,9 @@ function Team:watch(team, participant, replay, cb)
         return
       end
       if reducer.apply(session, message.params.update or {}) then
-        self:_watch_rendered()
+        if schedule ~= false then
+          self:_watch_schedule(entry)
+        end
       end
     end
   end
@@ -1391,7 +1413,7 @@ function Team:watch(team, participant, replay, cb)
       entry.buffer[#entry.buffer + 1] = payload
       return
     end
-    apply(payload)
+    apply(payload, true)
   end)
   raw:request_tracked(
     "team.watch",
@@ -1418,13 +1440,23 @@ function Team:watch(team, participant, replay, cb)
         end
       end
       entry.ready = true
+      -- Replay is a batch: reduce every frame first, render the final session
+      -- once. Rendering per frame is quadratic on a long transcript.
+      local started = vim.uv.hrtime()
+      local frames = #entry.buffer
       for _, payload in ipairs(entry.buffer) do
-        apply(payload)
+        apply(payload, false)
       end
       entry.buffer = {}
-      if self.on_watch then
-        pcall(self.on_watch, session, entry.title)
-      end
+      local after_apply = vim.uv.hrtime()
+      self:_watch_rendered()
+      local after_render = vim.uv.hrtime()
+      log.debug(
+        "watch replay frames=%d apply_ms=%.1f render_ms=%.1f",
+        frames,
+        (after_apply - started) / 1e6,
+        (after_render - after_apply) / 1e6
+      )
       cb(true, value)
     end
   )
@@ -1436,6 +1468,7 @@ function Team:unwatch(quiet)
   if not entry then
     return
   end
+  entry.render_scheduled = false
   self.watching = nil
   local raw = self:_raw()
   if raw and type(raw.unsubscribe) == "function" then

@@ -458,6 +458,15 @@ function Chat:apply_layout(layout, layout_only, saved_view)
   self:finish_layout(layout, layout_only, saved_view)
 end
 
+---Rows written so far during a chunked commit, or nil when idle.
+---@return {done: integer, total: integer}|nil
+function Chat:commit_status()
+  if not self.commit_job then
+    return nil
+  end
+  return { done = self.commit_done or 0, total = self.commit_total or 0 }
+end
+
 ---A first paint or page swap can be tens of thousands of rows. Write it in
 ---bounded slices instead of freezing the loop for the whole buffer.
 function Chat:commit_layout_async(layout, layout_only, saved_view, chunk_rows, old, full)
@@ -466,6 +475,8 @@ function Chat:commit_layout_async(layout, layout_only, saved_view, chunk_rows, o
   self.layout_epoch = epoch
   local job = { epoch = epoch, version = version }
   self.commit_job = job
+  self.commit_total = #layout.lines
+  self.commit_done = 0
   local win, width, generation, thoughts = self.win, self.width, CodeHL.generation, self.show_thoughts
   local started = metrics.start(self)
   local co = renderer.write_chunked(buf, layout.lines, layout.meta, old or {}, full, chunk_rows)
@@ -493,6 +504,7 @@ function Chat:commit_layout_async(layout, layout_only, saved_view, chunk_rows, o
       vim.bo[buf].modifiable = false
     end)
     self.commit_job = nil
+    self.commit_total, self.commit_done = nil, nil
     -- Half a layout on screen is not a valid base for the incremental writer.
     self.full_rewrite = true
     self.needs_force = true
@@ -511,6 +523,10 @@ function Chat:commit_layout_async(layout, layout_only, saved_view, chunk_rows, o
       return false
     end
     local ok, err = coroutine.resume(co)
+    self.commit_done = math.min(self.commit_total or 0, vim.api.nvim_buf_line_count(buf))
+    if self.on_commit_step then
+      pcall(self.on_commit_step, self)
+    end
     if not ok then
       abandon()
       self.keep_block = nil
@@ -525,6 +541,10 @@ function Chat:commit_layout_async(layout, layout_only, saved_view, chunk_rows, o
       return false
     end
     self.commit_job = nil
+    self.commit_total, self.commit_done = nil, nil
+    if self.on_commit_step then
+      pcall(self.on_commit_step, self)
+    end
     metrics.record(self, "write", started, { rows = #layout.lines, chunked = true })
     self.bg_runs = renderer.sync_backgrounds(buf, nil, layout.meta, true)
     self:finish_layout(layout, layout_only, saved_view)

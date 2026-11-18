@@ -370,7 +370,11 @@ function Watch:watch_config()
   cfg.ui.separator = cfg.ui.separator or {}
   cfg.ui.separator.form = "off"
   cfg.ui.render = cfg.ui.render or {}
-  cfg.ui.render.pagination = vim.tbl_extend("force", cfg.ui.render.pagination or {}, { enabled = false })
+  -- The watch is a replay of a potentially long session: page the old blocks
+  -- so the first paint never lays out hundreds of turns. Scrolling to the top
+  -- loads earlier blocks through the chat's existing pagination.
+  cfg.ui.render.pagination =
+    vim.tbl_extend("force", cfg.ui.render.pagination or {}, { enabled = true, page_blocks = 24 })
   return cfg
 end
 
@@ -382,6 +386,10 @@ function Watch:update_header()
   local task = entry and entry.task or "-"
   local state = entry and entry.state or "?"
   local header = string.format(" %s · %s · %s ", self.participant, tostring(task), tostring(state))
+  local progress = self.chat and self.chat.commit_status and self.chat:commit_status()
+  if progress then
+    header = header .. string.format(" · 载入中 %d/%d ", progress.done, progress.total)
+  end
   pcall(function()
     vim.wo[self.win].winbar = header
   end)
@@ -633,6 +641,9 @@ function Watch:ensure_window()
   local generation = self.generation
   self.closing = false
   self.chat = Chat.new({ config = self:watch_config() })
+  self.chat.on_commit_step = function()
+    self:update_header()
+  end
   self.buf = self.chat.buf
   vim.bo[self.buf].bufhidden = "wipe"
   vim.bo[self.buf].filetype = "ade_team_watch"

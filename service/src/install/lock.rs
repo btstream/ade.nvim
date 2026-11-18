@@ -265,7 +265,7 @@ pub fn acquire(root: &Path, agent: &str, action: &str) -> Result<AgentLock, Stri
                 _ = stop.changed() => return,
                 _ = interval.tick() => {
                     if !ours(&path, &[("acquiredAt", expected_at.as_str())]) {
-                        eprintln!(
+                        crate::svc_log!(
                             "nvim_ade_server: lock {} was reclaimed; heartbeat stopped",
                             lock_dir.display()
                         );
