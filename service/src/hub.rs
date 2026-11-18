@@ -7,7 +7,7 @@
 //! easy to reason about.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -60,6 +60,7 @@ pub struct Outbox {
     frames: mpsc::UnboundedSender<Vec<u8>>,
     queued: Arc<AtomicUsize>,
     closer: watch::Sender<bool>,
+    close_logged: Arc<AtomicBool>,
     limit: usize,
 }
 
@@ -82,6 +83,7 @@ impl Outbox {
                 frames,
                 queued: Arc::clone(&queued),
                 closer,
+                close_logged: Arc::new(AtomicBool::new(false)),
                 limit,
             },
             OutboxReceiver {
@@ -112,6 +114,13 @@ impl Outbox {
     /// Returns false when the connection is being closed: the queue would
     /// exceed its limit, or the writer is gone. The caller treats that as the
     /// connection having ended.
+    fn log_close(&self, reason: std::fmt::Arguments<'_>) {
+        if self.close_logged.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        crate::logging::log(reason);
+    }
+
     pub fn send(&self, value: &Value) -> bool {
         let mut bytes = match serde_json::to_vec(value) {
             Ok(bytes) => bytes,
@@ -122,24 +131,29 @@ impl Outbox {
         };
         bytes.push(b'\n');
 
-        let total = self.queued.fetch_add(bytes.len(), Ordering::AcqRel) + bytes.len();
+        let size = bytes.len();
+        let total = self.queued.fetch_add(size, Ordering::AcqRel) + size;
         if total > self.limit {
-            crate::svc_log!(
+            // The frame was not queued: put the bytes back so is_empty() and
+            // flush_outbox still describe the real queue.
+            self.queued.fetch_sub(size, Ordering::AcqRel);
+            self.log_close(format_args!(
                 "nvim_ade_server: connection {} closed: outbound queue {} bytes exceeds the {} byte limit",
-                self.conn,
-                total,
-                self.limit
-            );
+                self.conn, total, self.limit
+            ));
             let _ = self.closer.send(true);
             return false;
         }
         if self.frames.send(bytes).is_err() {
             // Only the writer task dropping the receiver can fail here; a full
             // queue is back pressure and waits in the unbounded channel.
-            crate::svc_log!(
-                "nvim_ade_server: connection {} closed: writer task is gone",
-                self.conn
-            );
+            self.queued.fetch_sub(size, Ordering::AcqRel);
+            if !*self.closer.borrow() {
+                self.log_close(format_args!(
+                    "nvim_ade_server: connection {} closed: writer task is gone",
+                    self.conn
+                ));
+            }
             let _ = self.closer.send(true);
             return false;
         }
@@ -2149,9 +2163,6 @@ impl Hub {
             // it as soon as it notices.
             outbox.close();
         }
-        crate::svc_log!(
-            "nvim_ade_server: connection {conn} closed: replay buffer exceeded its byte limit"
-        );
     }
 
     /// Whether `conn` is waiting for a replay.
@@ -2901,6 +2912,18 @@ mod tests {
     fn outbox(limit: usize) -> (Outbox, OutboxReceiver) {
         let (closer, _watch) = watch::channel(false);
         Outbox::with_limit(closer, limit, 0)
+    }
+
+    #[test]
+    fn outbox_rejected_frames_are_not_counted() {
+        let (closer, _watch) = watch::channel(false);
+        let (outbox, _receiver) = Outbox::with_limit(closer, 8, 0);
+        assert!(outbox.send(&json!({"a": 1})));
+        let queued = outbox.queued_bytes();
+        // Both the byte-limit and writer-gone paths must subtract a rejected
+        // frame; otherwise is_empty() stays false forever.
+        assert!(!outbox.send(&json!({"b": "this frame is much too large for eight bytes"})));
+        assert_eq!(queued, outbox.queued_bytes());
     }
 
     #[tokio::test]

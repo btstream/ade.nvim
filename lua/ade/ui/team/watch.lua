@@ -696,6 +696,20 @@ function Watch:jump_turn(direction)
     if self.chat then
       self.chat.follow = false
     end
+    return
+  end
+  -- The previous turn lives on an older page: load it and put the cursor on
+  -- the new page's first turn heading once the page has rendered.
+  if direction < 0 and self.chat and self.chat.page and self.chat:load_page(-1) then
+    vim.defer_fn(function()
+      if not (self.win and vim.api.nvim_win_is_valid(self.win)) then
+        return
+      end
+      local turns = self:turn_lines()
+      local line = turns[1] and turns[1].line or 1
+      pcall(vim.api.nvim_win_set_cursor, self.win, { line, 0 })
+      self.chat.follow = false
+    end, 120)
   end
 end
 

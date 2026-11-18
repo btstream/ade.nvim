@@ -1443,7 +1443,10 @@ function Team:watch(team, participant, replay, cb)
       local started = vim.uv.hrtime()
       local frames = #entry.buffer
       for _, payload in ipairs(entry.buffer) do
-        apply(payload, false)
+        local ok, err = pcall(apply, payload, false)
+        if not ok then
+          log.error("dropping a watch replay frame: %s", tostring(err))
+        end
       end
       entry.buffer = {}
       local after_apply = vim.uv.hrtime()

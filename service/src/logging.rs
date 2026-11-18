@@ -13,20 +13,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const LOG_NAME: &str = "nvim_ade_server.log";
 pub const ROTATED_NAME: &str = "nvim_ade_server.log.1";
 pub const MAX_BYTES: u64 = 4 * 1024 * 1024;
-pub const MAX_BYTES_ENV: &str = "NVIM_ADE_SERVER_LOG_MAX_BYTES";
-
-fn max_bytes() -> u64 {
-    std::env::var(MAX_BYTES_ENV)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value >= 256)
-        .unwrap_or(MAX_BYTES)
-}
 
 struct Logger {
     dir: PathBuf,
     file: Option<File>,
     written: u64,
+    limit: u64,
+    rotate_failed: bool,
 }
 
 static LOGGER: OnceLock<Mutex<Option<Logger>>> = OnceLock::new();
@@ -38,35 +31,27 @@ pub fn path(dir: &Path) -> PathBuf {
 
 fn open(dir: &Path) -> io::Result<(File, u64)> {
     let path = path(dir);
-    // Rotate when the current file is full. The old file is replaced, so at
-    // most one previous generation is kept.
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if meta.len() >= max_bytes() {
-            let rotated = dir.join(ROTATED_NAME);
-            let _ = std::fs::remove_file(&rotated);
-            std::fs::rename(&path, &rotated)?;
-        }
-    }
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        // Never follow a symlink planted in a shared socket directory.
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let file = options.open(&path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        // fchmod the opened file: set_permissions(path) would follow a link.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
     let written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
     Ok((file, written))
 }
 
-/// Start writing the service log under `dir`. Safe to call once; later calls
-/// update the destination.
-pub fn init(dir: &Path) -> io::Result<()> {
+/// Start writing the service log under `dir` with a per-file byte cap.
+pub fn init(dir: &Path, limit: u64) -> io::Result<()> {
     let (file, written) = open(dir)?;
     let logger = LOGGER.get_or_init(|| Mutex::new(None));
     let mut slot = logger
@@ -76,34 +61,94 @@ pub fn init(dir: &Path) -> io::Result<()> {
         dir: dir.to_path_buf(),
         file: Some(file),
         written,
+        limit: limit.max(256),
+        rotate_failed: false,
     });
     Ok(())
 }
 
-fn timestamp() -> u128 {
-    SystemTime::now()
+/// Replace the destination (tests).
+#[cfg(test)]
+pub fn reset_for_test() {
+    if let Some(lock) = LOGGER.get() {
+        let mut slot = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = None;
+    }
+}
+
+fn timestamp() -> String {
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_millis())
-        .unwrap_or(0)
+        .unwrap_or_default();
+    let secs = now.as_secs() as i64;
+    let millis = now.subsec_millis();
+    // Civil date from Unix days (Howard Hinnant's algorithm), UTC.
+    let days = secs.div_euclid(86_400);
+    let day_secs = secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        year,
+        month,
+        day,
+        day_secs / 3600,
+        (day_secs % 3600) / 60,
+        day_secs % 60,
+        millis
+    )
+}
+
+fn sanitize(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn rotate(logger: &mut Logger) -> io::Result<()> {
-    logger.file.take();
     let path = path(&logger.dir);
     let rotated = logger.dir.join(ROTATED_NAME);
     let _ = std::fs::remove_file(&rotated);
     if path.exists() {
         std::fs::rename(&path, &rotated)?;
     }
-    let (file, written) = open(&logger.dir)?;
-    logger.file = Some(file);
-    logger.written = written;
-    Ok(())
+    match open(&logger.dir) {
+        Ok((file, written)) => {
+            logger.file = Some(file);
+            logger.written = written;
+            logger.rotate_failed = false;
+            Ok(())
+        }
+        Err(error) => {
+            // Put the old file back so the still-open handle keeps writing to
+            // the expected path.
+            let _ = std::fs::rename(&rotated, &path);
+            Err(error)
+        }
+    }
 }
 
 /// Write one line to stderr and the service log.
 pub fn log(args: std::fmt::Arguments<'_>) {
-    let line = format!("{args}");
+    let line = sanitize(&format!("{args}"));
     eprintln!("{line}");
     let Some(lock) = LOGGER.get() else {
         return;
@@ -112,9 +157,17 @@ pub fn log(args: std::fmt::Arguments<'_>) {
     let Some(logger) = slot.as_mut() else {
         return;
     };
-    let entry = format!("[{:?}] {}\n", timestamp(), line);
-    if logger.written + entry.len() as u64 > max_bytes() {
-        let _ = rotate(logger);
+    let entry = format!("[{}] {}\n", timestamp(), line);
+    if logger.file.is_none() {
+        return;
+    }
+    if logger.written + entry.len() as u64 > logger.limit {
+        if let Err(error) = rotate(logger) {
+            if !logger.rotate_failed {
+                logger.rotate_failed = true;
+                eprintln!("nvim_ade_server: cannot rotate the service log: {error}");
+            }
+        }
     }
     if let Some(file) = logger.file.as_mut() {
         if file.write_all(entry.as_bytes()).is_ok() {
@@ -135,16 +188,23 @@ macro_rules! svc_log {
 mod tests {
     use super::*;
 
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn rotates_at_the_limit_and_keeps_one_old_file() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "ade-log-test-{}-{}",
             std::process::id(),
-            timestamp()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("dir");
-        std::env::set_var(MAX_BYTES_ENV, "1024");
-        init(&dir).expect("init");
+        init(&dir, 1024).expect("init");
         for _ in 0..200 {
             log(format_args!(
                 "nvim_ade_server: a fairly long diagnostic line for rotation"
@@ -155,7 +215,59 @@ mod tests {
         assert!(current.exists(), "current log");
         assert!(rotated.exists(), "rotated log");
         assert!(std::fs::metadata(&current).expect("meta").len() <= 4096);
-        std::env::remove_var(MAX_BYTES_ENV);
+        reset_for_test();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_symlinked_log_file() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "ade-log-link-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "untouched").expect("target");
+        symlink(&target, path(&dir)).expect("symlink");
+        assert!(init(&dir, 1024).is_err(), "a symlink must not be followed");
+        assert_eq!(
+            "untouched",
+            std::fs::read_to_string(&target).expect("target")
+        );
+        reset_for_test();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn escapes_newlines_and_uses_utc_timestamps() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "ade-log-escape-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        init(&dir, 4096).expect("init");
+        log(format_args!("client name\nforged line"));
+        reset_for_test();
+        let text = std::fs::read_to_string(path(&dir)).expect("log");
+        assert!(text.contains("client name\\nforged line"), "{text}");
+        assert!(text.contains("T") && text.contains("Z"), "{text}");
+        assert_eq!(1, text.lines().count(), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

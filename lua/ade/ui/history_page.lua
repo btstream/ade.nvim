@@ -20,6 +20,13 @@ local function edge(blocks, start, direction, cfg)
     end
     stop, bytes = i, bytes + size
   end
+  -- A page starts on a turn heading, never in the middle of a turn: the
+  -- watch must not show a turn whose heading is on the previous page.
+  if direction < 0 then
+    while stop > 1 and blocks[stop].kind ~= "user" do
+      stop = stop - 1
+    end
+  end
   return stop
 end
 
@@ -45,7 +52,13 @@ function Page:sync(session, follow)
   -- The newest block is always materialised: new output must appear without a
   -- manual "load newer" step. Only the older side is paged.
   if follow or not first then
-    first = edge(blocks, n, -1, self.cfg)
+    -- Keep a reader near the old page when the block that owned its first row
+    -- disappeared (e.g. a collapsed turn), rather than jumping to the tail.
+    local start = n
+    if not follow and self.first then
+      start = math.max(1, math.min(self.first, n))
+    end
+    first = edge(blocks, start, -1, self.cfg)
   end
   self:set(blocks, first, n)
   return self.first, self.last
