@@ -961,6 +961,8 @@ function Team:send(team, to, kind, body, extra, cb)
     body = body,
     task = extra.task,
     refs = extra.refs,
+    interrupt = extra.interrupt,
+    cc = extra.cc,
     -- 19.3: the service prefixes the card's summary line and uses `card` as
     -- the task when `task` is absent.
     card = extra.card,

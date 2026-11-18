@@ -1436,6 +1436,147 @@ fn a_human_prompt_cancels_a_running_bus_prompt_first() {
 }
 
 #[test]
+fn an_interrupt_cancels_the_worker_and_delivers_first() {
+    let mut harness = Harness::new(
+        "team-interrupt",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let spawned = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template": "dev", "name": "w1", "task": "do [slow]"}),
+    );
+    assert_eq!(spawned["isError"], false, "{spawned}");
+    harness.wait_participant("w1", |entry| entry["state"] == "working");
+    let queued = harness.send("w1", "notice", "queued message");
+    assert!(queued["result"].is_object(), "{queued}");
+    let interrupted = harness.client.request(
+        91,
+        "team.send",
+        json!({
+            "team": harness.team,
+            "to": "w1",
+            "kind": "notice",
+            "body": "correct it",
+            "interrupt": true,
+            "cc": ["leader"]
+        }),
+    );
+    assert!(interrupted["result"].is_object(), "{interrupted}");
+    wait_for(
+        || {
+            let events = harness.events();
+            let cancel = events.iter().position(|event| event["event"] == "cancel");
+            let prompt = events.iter().position(|event| {
+                event["event"] == "prompt"
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("correct it"))
+            });
+            match (cancel, prompt) {
+                (Some(cancel), Some(prompt)) if cancel < prompt => Some(()),
+                _ => None,
+            }
+        },
+        "the interrupt cancel and prompt",
+    );
+    wait_for(
+        || {
+            let events = harness.events();
+            let first = events.iter().position(|event| {
+                event["event"] == "prompt"
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("correct it"))
+            });
+            let queued = events.iter().position(|event| {
+                event["event"] == "prompt"
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("queued message"))
+            });
+            match (first, queued) {
+                (Some(first), Some(queued)) if first < queued => Some(()),
+                _ => None,
+            }
+        },
+        "the interrupt to be delivered before the queued message",
+    );
+    wait_for(
+        || {
+            let messages = harness.read("leader")["messages"].as_array()?.clone();
+            messages
+                .iter()
+                .any(|message| {
+                    message["kind"] == "notice" && message["body"] == "to w1: correct it"
+                })
+                .then_some(())
+        },
+        "the cc notice",
+    );
+}
+
+#[test]
+fn interrupt_and_cc_are_validated() {
+    let mut harness = Harness::new(
+        "team-interrupt-args",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let spawned = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template": "dev", "name": "w1", "task": "work"}),
+    );
+    assert_eq!(spawned["isError"], false, "{spawned}");
+    let mut bad = |fields: Value| {
+        let mut params = json!({"team": harness.team, "to": "w1", "kind": "notice", "body": "x"});
+        if let Value::Object(map) = fields {
+            for (key, value) in map {
+                params[key] = value;
+            }
+        }
+        harness.client.request(91, "team.send", params)
+    };
+    assert!(!bad(json!({"interrupt": true})).get("error").is_some());
+    assert!(!bad(json!({"cc": ["leader"]})).get("error").is_some());
+    let leader_interrupt = harness.client.request(
+        91,
+        "team.send",
+        json!({"team": harness.team, "to": "leader", "kind": "notice", "body": "x", "interrupt": true}),
+    );
+    assert_eq!(
+        leader_interrupt["error"]["code"], -32060,
+        "{leader_interrupt}"
+    );
+    let wrong_cc = harness.client.request(
+        91,
+        "team.send",
+        json!({"team": harness.team, "to": "w1", "kind": "notice", "body": "x", "cc": ["human"]}),
+    );
+    assert_eq!(wrong_cc["error"]["code"], -32060, "{wrong_cc}");
+    let cc_to_leader = harness.client.request(
+        91,
+        "team.send",
+        json!({"team": harness.team, "to": "leader", "kind": "notice", "body": "x", "cc": ["leader"]}),
+    );
+    assert_eq!(cc_to_leader["error"]["code"], -32060, "{cc_to_leader}");
+    let not_array = harness.client.request(
+        91,
+        "team.send",
+        json!({"team": harness.team, "to": "w1", "kind": "notice", "body": "x", "cc": "leader"}),
+    );
+    assert_eq!(not_array["error"]["code"], -32060, "{not_array}");
+    assert_eq!(
+        harness.team()["participants"].as_array().map(Vec::len),
+        Some(2)
+    );
+}
+
+#[test]
 fn watchers_see_requests_and_cannot_send_requests() {
     let mut harness = Harness::new(
         "team-watch",

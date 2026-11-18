@@ -5,6 +5,9 @@
 -- into turns, renders bus traffic as messages, and keeps the role card
 -- collapsed. The leader uses the existing chat window (no second Chat/input).
 local Chat = require("ade.ui.chat")
+local Input = require("ade.ui.input")
+local layout = require("ade.layout")
+local complete = require("ade.ui.complete")
 local keymaps = require("ade.ui.keymaps")
 
 local M = {}
@@ -209,7 +212,9 @@ local function build_session(source, opts)
       local started = timing and timing.started_at or nil
       local ended = timing and timing.ended_at or nil
       local label
-      if bus then
+      if bus and bus.from == "human" and opts.target then
+        label = string.format("human → %s", tostring(opts.target))
+      elseif bus then
         label = string.format(
           "%s → %s%s",
           bus.from or "?",
@@ -330,6 +335,10 @@ function M.new(opts)
     watch_inflight = false,
     pending_target = nil,
     active_target = nil,
+    input = nil,
+    input_hint = nil,
+    interrupt_armed = false,
+    interrupt_timer = nil,
   }, Watch)
 end
 
@@ -376,6 +385,183 @@ function Watch:update_header()
   pcall(function()
     vim.wo[self.win].winbar = header
   end)
+end
+
+---@return string
+function Watch:cwd()
+  local row = self.team and self.team:team(self.team_id) or nil
+  return row and row.cwd or vim.fn.getcwd()
+end
+
+function Watch:ensure_input()
+  if self.input and vim.api.nvim_buf_is_valid(self.input.buf) then
+    return self.input
+  end
+  local cfg = self:watch_config()
+  self.input = Input.new({
+    config = cfg,
+    on_submit = function(text)
+      self:submit(text, false)
+    end,
+    on_cancel = function()
+      self:clear_interrupt()
+    end,
+  })
+  vim.bo[self.input.buf].filetype = "ade_team_input"
+  vim.bo[self.input.buf].bufhidden = "hide"
+  pcall(vim.api.nvim_buf_set_name, self.input.buf, "ade://watch-input")
+  complete.attach(self.input.buf, function()
+    return { cwd = self:cwd() }
+  end, cfg)
+  self:map_input_keys()
+  return self.input
+end
+
+function Watch:map_input_keys()
+  local buf = self.input.buf
+  local cfg = self:watch_config()
+  local keys = cfg.keymaps.input or {}
+  vim.keymap.set({ "n", "i" }, keys.send or "<C-s>", function()
+    self:submit(self.input:text(), false)
+  end, { buffer = buf, silent = true, desc = "ade: send to worker (queued)" })
+  vim.keymap.set("n", keys.cancel or "<C-c>", function()
+    self:clear_interrupt()
+  end, { buffer = buf, silent = true, desc = "ade: clear interrupt" })
+  local interrupt = ((cfg.teams or {}).dashboard or {}).keys
+  interrupt = interrupt and interrupt.interrupt or "<M-CR>"
+  vim.keymap.set({ "n", "i" }, interrupt, function()
+    self:interrupt()
+  end, { buffer = buf, silent = true, desc = "ade: interrupt the worker" })
+end
+
+function Watch:show_input()
+  if self.leader_active or not self.participant or not self:is_open() then
+    return
+  end
+  local input = self:ensure_input()
+  if not (input.win and vim.api.nvim_win_is_valid(input.win)) then
+    local previous = vim.api.nvim_get_current_win()
+    vim.api.nvim_set_current_win(self.win)
+    vim.cmd("belowright split")
+    local win = vim.api.nvim_get_current_win()
+    input.win = win
+    layout.set_window_buffer(win, input.buf)
+    layout.lock_window(win)
+    local height = self:watch_config().layout.input_height or 6
+    pcall(
+      vim.api.nvim_win_set_height,
+      win,
+      math.max(3, math.min(height, math.max(3, vim.api.nvim_win_get_height(self.win) - 2)))
+    )
+    if previous and vim.api.nvim_win_is_valid(previous) then
+      pcall(vim.api.nvim_set_current_win, previous)
+    end
+  end
+  input:switch_session("watch:" .. tostring(self.team_id) .. ":" .. tostring(self.participant), nil)
+  pcall(input.apply_winbar, input)
+  vim.bo[input.buf].filetype = "ade_team_input"
+end
+
+function Watch:hide_input(keep_window)
+  local input = self.input
+  if not input then
+    self:clear_interrupt()
+    return
+  end
+  pcall(input.save_draft, input)
+  self:clear_interrupt()
+  if not keep_window and input.win and vim.api.nvim_win_is_valid(input.win) then
+    pcall(vim.api.nvim_win_close, input.win, true)
+    input.win = nil
+  end
+end
+
+function Watch:clear_interrupt()
+  self.interrupt_armed = false
+  if self.interrupt_timer then
+    pcall(function()
+      self.interrupt_timer:stop()
+      self.interrupt_timer:close()
+    end)
+    self.interrupt_timer = nil
+  end
+  if self.input_hint and vim.api.nvim_win_is_valid(self.input_hint) then
+    pcall(vim.api.nvim_win_close, self.input_hint, true)
+  end
+  self.input_hint = nil
+end
+
+function Watch:show_interrupt()
+  if not (self.input and self.input.win and vim.api.nvim_win_is_valid(self.input.win)) then
+    return
+  end
+  self:clear_interrupt()
+  local text = "再按一次确认打断 " .. tostring(self.participant) .. " 当前回合"
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile = false
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { " " .. text })
+  local width = math.max(20, vim.api.nvim_strwidth(text) + 2)
+  local ok, win = pcall(vim.api.nvim_open_win, buf, false, {
+    relative = "win",
+    win = self.input.win,
+    row = -1,
+    col = 0,
+    width = width,
+    height = 1,
+    style = "minimal",
+    focusable = false,
+  })
+  if ok then
+    self.input_hint = win
+    self.interrupt_armed = true
+    self.interrupt_timer = vim.uv.new_timer()
+    self.interrupt_timer:start(
+      5000,
+      0,
+      vim.schedule_wrap(function()
+        self:clear_interrupt()
+      end)
+    )
+  end
+end
+
+function Watch:interrupt()
+  if self.interrupt_armed then
+    self:clear_interrupt()
+    self:submit(self.input:text(), true)
+    return
+  end
+  self:show_interrupt()
+end
+
+function Watch:submit(text, interrupt)
+  if not self.participant or self.leader_active or not self.team_id then
+    return
+  end
+  text = tostring(text or "")
+  if text:match("^%s*$") then
+    return
+  end
+  if self.input then
+    pcall(self.input.clear, self.input)
+  end
+  self:clear_interrupt()
+  self.team:send(
+    self.team_id,
+    self.participant,
+    "notice",
+    text,
+    { cc = { "leader" }, interrupt = interrupt == true },
+    function(ok, value)
+      if not ok and self.notify then
+        self.notify(
+          "cannot message " .. tostring(self.participant) .. ": " .. tostring(value and value.message or value)
+        )
+      end
+    end
+  )
 end
 
 function Watch:ensure_window()
@@ -488,7 +674,8 @@ end
 
 ---Close the view without touching the service watch (used when a new watch
 ---replaces this one).
-function Watch:destroy_view()
+function Watch:destroy_view(keep_input)
+  self:hide_input(keep_input)
   self.generation = self.generation + 1
   self.closing = true
   local chat = self.chat
@@ -574,6 +761,7 @@ function Watch:on_watch(session, title)
   end
   self:refresh(first)
   self:update_header()
+  self:show_input()
   if not self.replayed and self.supplement_for ~= session and self.team_id and self.participant then
     self.supplement_for = session
     self.team:read(self.team_id, self.participant, nil, function(ok, value)
@@ -598,6 +786,7 @@ function Watch:refresh(first)
     turn_times = self.turn_times,
     supplement = self.supplement,
     title = self.title or (self.participant and (tostring(self.team_id) .. "/" .. tostring(self.participant))),
+    target = self.participant,
     version = self.display and self.display.version or 0,
     cache = self.turn_cache,
     use_cache = self.turn_cache ~= nil,
@@ -696,6 +885,7 @@ function Watch:focus_leader()
   self.pending_target = nil
   self:destroy_view()
   self.team:unwatch()
+  self:hide_input()
   self.participant, self.team_id, self.title = "leader", nil, nil
   self.leader_active = true
   self:changed()
@@ -777,7 +967,7 @@ function Watch:switch(team, participant)
   else
     self.pending_target = target
   end
-  self:destroy_view()
+  self:destroy_view(true)
   self.participant, self.team_id, self.title = participant, team, nil
   self.replayed = true
   self.supplement, self.supplement_for = nil, nil

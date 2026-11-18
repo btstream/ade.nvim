@@ -520,9 +520,57 @@ impl Hub {
             task = task.or(default_task);
         }
         let refs = team_refs(params)?;
+        let interrupt = optional_bool(params, "interrupt")?.unwrap_or(false);
+        let cc = match params.get("cc") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(items)) => {
+                let mut names = Vec::new();
+                for item in items {
+                    let Some(name) = item.as_str() else {
+                        return Err(TeamError::invalid("cc must contain participant names"));
+                    };
+                    names.push(name.to_string());
+                }
+                names
+            }
+            Some(_) => return Err(TeamError::invalid("cc must be an array")),
+        };
+        let role = self
+            .teams
+            .team(&team)
+            .and_then(|entry| entry.participants.get(&to))
+            .map(|participant| participant.role);
+        if interrupt && role != Some(Role::Worker) {
+            return Err(TeamError::invalid("interrupt is only allowed for a worker"));
+        }
+        for name in &cc {
+            if name != "leader" || role != Some(Role::Worker) {
+                return Err(TeamError::invalid(
+                    "cc only accepts \"leader\" and only when to is a worker",
+                ));
+            }
+        }
         let id =
             self.teams
                 .send_message(&team, "human", &to, kind, &body, task.as_deref(), refs)?;
+        if interrupt && self.teams.bus_turn_running(&team, &to) {
+            self.teams.prioritize_message(&team, &to, id);
+            self.cancel_participant_turn(&team, &to);
+        }
+        for name in cc {
+            if name == "leader" {
+                let notice = format!("to {to}: {body}");
+                self.teams.send_message(
+                    &team,
+                    "human",
+                    "leader",
+                    Kind::Notice,
+                    &notice,
+                    task.as_deref(),
+                    vec![],
+                )?;
+            }
+        }
         if kind == Kind::Control && body == "cancel" {
             self.cancel_participant_turn(&team, &to);
         }

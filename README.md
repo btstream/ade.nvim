@@ -842,7 +842,9 @@ teams = {
 `p`/`r`/`c` 暂停/恢复/取消，`D` 删除已退出 worker 的 worktree，`L` 跳到 leader
 聊天，`s` 按模板启动 worker，`R` 重置回合上限，`x` 结束团队，`<Tab>`/`<S-Tab>`
 切换窗口，`zh`/`zl` 横向滚动看板，`g?` 帮助，`q` 关闭。观察窗口里 worker 是只读的完整回放（工具、diff、plan、回合分组
-都在），leader 显示聊天会话本身并**带输入区**，可以直接对话。
+都在），leader 显示聊天会话本身并**带输入区**，可以直接对话。worker 观察窗口下方也有
+输入区：`<C-s>` 排队发给该 worker 并抄送 leader；`<M-CR>` 连按两次先打断当前回合再
+优先送达（`teams.dashboard.keys.interrupt` 可改）；草稿按 worker 分开保存。
 
 需要你从选项里选时（带选项的提问、spawn 申请、权限、回合上限、agent 自己的权限和
 表单），输入窗口会临时换成选择组件：Tab/Shift-Tab 切题，↑↓ 或 j/k 选择，数字直选，

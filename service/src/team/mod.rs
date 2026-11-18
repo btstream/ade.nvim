@@ -1573,6 +1573,37 @@ impl Teams {
     // -- messages ----------------------------------------------------------
 
     #[allow(clippy::too_many_arguments)]
+    /// Whether `name` currently has a bus prompt in flight (19.14).
+    pub fn bus_turn_running(&self, team_id: &str, name: &str) -> bool {
+        self.teams
+            .get(team_id)
+            .and_then(|team| team.participants.get(name))
+            .is_some_and(|participant| {
+                participant.bus_turn && participant.state == ParticipantState::Working
+            })
+    }
+
+    /// Move the just-queued message to the front of `name`'s mailbox (19.14).
+    pub fn prioritize_message(&mut self, team_id: &str, name: &str, id: u64) {
+        let Some(team) = self.teams.get_mut(team_id) else {
+            return;
+        };
+        let Some(participant) = team.participants.get_mut(name) else {
+            return;
+        };
+        let Some(index) = participant
+            .mailbox
+            .iter()
+            .position(|message| message.id == id)
+        else {
+            return;
+        };
+        let message = participant.mailbox.remove(index).expect("found above");
+        participant.mailbox.push_front(message);
+        self.events.push(TeamEvent::Changed(team_id.to_string()));
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn send_message(
         &mut self,
         team_id: &str,
