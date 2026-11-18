@@ -14,6 +14,7 @@ local Runtime = require("ade.session.runtime")
 local Catalog = require("ade.app.catalog")
 local Permissions = require("ade.app.permissions")
 local Elicitation = require("ade.app.elicitation")
+local Choices = require("ade.app.choices")
 local Interactions = require("ade.app.interactions")
 local Options = require("ade.app.options")
 local Chrome = require("ade.ui.chrome")
@@ -211,6 +212,58 @@ function M.build(ctx, opts, action)
     end,
     notify = notify,
   })
+  -- The inline choice component lives in the composer window; the queue also
+  -- owns team questions/spawn/permission/limit items (draft 8).
+  S.view.choices = Choices.new({
+    team = function()
+      return S.view.team
+    end,
+    interactions = function()
+      return S.view.interactions
+    end,
+    config = function()
+      return S.config or merged
+    end,
+    notify = notify,
+    input_win = function()
+      return S.view.input and S.view.input.win or nil
+    end,
+    chat_win = function()
+      return S.view.chat and S.view.chat.win or nil
+    end,
+    external = function()
+      return (S.config or merged).layout.backend == "external"
+    end,
+    panel_visible = function()
+      return (S.view.panel ~= nil and S.view.panel:is_visible()) or (S.view.team_ui ~= nil and S.view.team_ui:is_open())
+    end,
+    open = function()
+      ctx.open()
+    end,
+    permission_present = function(interaction)
+      return S.view.permissions:present(interaction)
+    end,
+    permission_details = function(interaction)
+      local request = interaction.request or {}
+      local tool = request.toolCall or request.tool_call or {}
+      require("ade.app.presenter").details.open(request, {
+        title = tool.title or "Permission required",
+        cwd = tool.locations and tool.locations[1] and tool.locations[1].path or nil,
+      })
+    end,
+    elicitation_present = function(interaction)
+      return S.view.elicitation:present(interaction)
+    end,
+  })
+  local choice_group = vim.api.nvim_create_augroup("AdeChoices", { clear = true })
+  vim.api.nvim_create_autocmd({ "InsertLeave", "CursorHold" }, {
+    group = choice_group,
+    callback = function()
+      if S.view.choices then
+        S.view.choices:refresh()
+      end
+    end,
+  })
   -- The service-side rule sets (PROTOCOL.md 17). Created before the policy
   -- chain because the chain asks it whether Lua may answer at all; it resolves
   -- the connection lazily, so the order of construction does not matter.
@@ -295,22 +348,27 @@ function M.build(ctx, opts, action)
           if not S.view.permissions.valid(interaction) then
             return false
           end
-          return S.view.permissions:present(interaction)
+          return S.view.choices:present_interaction(interaction)
         end,
         dismiss = function()
-          S.view.permissions:dismiss_presented()
+          S.view.choices:dismiss()
         end,
       },
       elicitation = {
         present = function(interaction)
-          return S.view.elicitation:present(interaction)
+          return S.view.choices:present_interaction(interaction)
         end,
         dismiss = function()
-          S.view.elicitation:dismiss()
+          S.view.choices:dismiss()
         end,
       },
     },
-    on_changed = ctx.refresh_chrome,
+    on_changed = function()
+      if S.view.choices then
+        S.view.choices:refresh()
+      end
+      ctx.refresh_chrome()
+    end,
     notify = notify,
   })
 
@@ -359,6 +417,9 @@ function M.build(ctx, opts, action)
     on_changed = function()
       if S.view.team_ui then
         S.view.team_ui:schedule_refresh()
+      end
+      if S.view.choices then
+        S.view.choices:refresh()
       end
       ctx.refresh_chrome()
     end,

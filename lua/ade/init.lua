@@ -42,6 +42,13 @@ function M.close_team()
   ensure().close_team()
 end
 
+---Show pending choices, or answer a participant's question
+---(`:Ade team answer [name]`).
+---@param name string|nil
+function M.answer_team(name)
+  return ensure().answer_team(name)
+end
+
 ---Open the named workflows window (`:Ade workflows`).
 ---@return boolean
 function M.workflows()
