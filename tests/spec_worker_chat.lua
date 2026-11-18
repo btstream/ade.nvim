@@ -56,20 +56,20 @@ return function(t)
         extra = extra,
       }
       if cb then
-        cb(true, {})
+        cb(not self.fail, self.fail and { message = "failed" } or {})
       end
     end
     return team
   end
 
-  local function setup(t)
+  local function setup(t, over)
     vim.cmd("tabnew")
     local host = vim.api.nvim_get_current_win()
     local team = fake_team()
     local watch = Watch.new({
       team = team,
       config = function()
-        return Config.defaults
+        return over and over.config or Config.defaults
       end,
       notify = function() end,
     })
@@ -85,6 +85,13 @@ return function(t)
     t.eq(true, watch:is_open())
     return watch, team
   end
+
+  t.it("rejects an interrupt key that clashes with the send key", function()
+    local config = vim.deepcopy(Config.defaults)
+    config.teams.dashboard.keys.interrupt = "<C-s>"
+    local ok = pcall(Config.validate, config)
+    t.eq(false, ok)
+  end)
 
   t.describe("worker watch composer", function()
     t.it("queues a notice and copies the leader", function()
@@ -111,6 +118,49 @@ return function(t)
       t.eq(1, #team.sends)
       t.eq(true, team.sends[1].extra.interrupt)
       t.eq(false, watch.interrupt_armed)
+    end)
+
+    t.it("keeps the text and reports a failed send", function()
+      local watch, team = setup(t)
+      team.fail = true
+      vim.api.nvim_buf_set_lines(watch.input.buf, 0, -1, false, { "keep me" })
+      watch:submit("keep me", false)
+      t.eq(1, #team.sends)
+      t.eq("keep me", table.concat(vim.api.nvim_buf_get_lines(watch.input.buf, 0, -1, false), "\n"))
+    end)
+
+    t.it("does not arm an empty interrupt and shows its own winbar", function()
+      local watch, team = setup(t)
+      vim.api.nvim_buf_set_lines(watch.input.buf, 0, -1, false, { "" })
+      watch:interrupt()
+      t.eq(false, watch.interrupt_armed)
+      t.eq(0, #team.sends)
+      watch.input:apply_winbar()
+      local winbar = vim.api.nvim_get_option_value("winbar", { win = watch.input.win })
+      t.match("→ w1", winbar)
+      t.falsy(winbar:find("AdeComposerBar", 1, true))
+    end)
+
+    t.it("expands key list and false send configuration", function()
+      local config = vim.deepcopy(Config.defaults)
+      config.keymaps.input.send = { "<C-s>", "<C-x>" }
+      local watch = setup(t, { config = config })
+      local maps = {}
+      for _, map in ipairs(vim.api.nvim_buf_get_keymap(watch.input.buf, "n")) do
+        maps[map.lhs] = true
+      end
+      t.truthy(maps["<C-S>"] or maps["<C-s>"] or maps["<C-x>"])
+
+      local second = setup(t, {
+        config = (function()
+          local copy = vim.deepcopy(Config.defaults)
+          copy.keymaps.input.send = false
+          return copy
+        end)(),
+      })
+      for _, map in ipairs(vim.api.nvim_buf_get_keymap(second.input.buf, "n")) do
+        t.truthy(map.lhs ~= "<C-s>", "send=false must not bind <C-s>")
+      end
     end)
 
     t.it("keeps a draft per worker and hides the input for the leader", function()

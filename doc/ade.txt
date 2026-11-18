@@ -1405,7 +1405,9 @@ worker 观察窗口下方有输入区：<C-s> 把消息作为 notice 排队发�
 teams.dashboard.keys.interrupt 改，默认 <M-CR>）先在输入区上方提示“再按一次
 确认打断”，再按一次才 cancel 当前
 回合并优先送达。草稿按 worker 分开保存；切到 leader 时仍复用 leader 聊天，
-不显示这个输入区。
+不显示这个输入区。输入区 filetype 是 ade_team_input：blink/cmp 的 per_filetype
+只写了 ade_input 时需要再加上它；粘贴图片和附件在这个输入区不可用。worker
+对被打断后新消息的回答仍会作为 report 抄给 leader。
 
 leader：观察窗口显示 leader 的聊天会话本身（你和它的对话 + 总线回合），
 带输入区：在那里发出去的就是你给 leader 的 prompt（你的 prompt 优先于排队

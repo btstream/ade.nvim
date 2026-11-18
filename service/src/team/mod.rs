@@ -523,6 +523,10 @@ pub struct Participant {
     /// The spawn's display label (19.12).
     #[serde(default)]
     pub label: Option<String>,
+    /// A human interrupt cancelled this turn (19.14): do not count it against
+    /// the turn limits.
+    #[serde(skip)]
+    pub interrupting: bool,
 }
 
 impl Participant {
@@ -559,6 +563,7 @@ impl Participant {
             spawn_role: None,
             agent: None,
             label: None,
+            interrupting: false,
         }
     }
 
@@ -1578,13 +1583,60 @@ impl Teams {
         self.teams
             .get(team_id)
             .and_then(|team| team.participants.get(name))
-            .is_some_and(|participant| {
-                participant.bus_turn && participant.state == ParticipantState::Working
-            })
+            .is_some_and(|participant| participant.bus_turn)
     }
 
     /// Move the just-queued message to the front of `name`'s mailbox (19.14).
-    pub fn prioritize_message(&mut self, team_id: &str, name: &str, id: u64) {
+    /// Mark the running turn as human-interrupted so its end is not counted
+    /// against the limits (19.14).
+    pub fn mark_interrupting(&mut self, team_id: &str, name: &str) {
+        if let Some(participant) = self
+            .teams
+            .get_mut(team_id)
+            .and_then(|team| team.participants.get_mut(name))
+        {
+            participant.interrupting = true;
+        }
+    }
+
+    /// Orphan open questions/permissions/requests from `name` (19.14): the
+    /// cancelled prompt will not answer them.
+    pub fn orphan_open_items(&mut self, team_id: &str, name: &str) -> Vec<InboxItem> {
+        let Some(team) = self.teams.get_mut(team_id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for item in &mut team.inbox {
+            if item.state == ItemState::Open
+                && item.from == name
+                && matches!(
+                    item.kind,
+                    ItemKind::Question | ItemKind::Permission | ItemKind::Request
+                )
+            {
+                item.state = ItemState::Orphaned;
+                out.push(item.clone());
+                self.events
+                    .push(TeamEvent::Inbox(team_id.to_string(), item.id.clone()));
+            }
+        }
+        if !out.is_empty() {
+            self.events.push(TeamEvent::Changed(team_id.to_string()));
+        }
+        out
+    }
+
+    /// Whether `id` is still queued for `name`.
+    pub fn message_queued(&self, team_id: &str, name: &str, id: u64) -> bool {
+        self.teams
+            .get(team_id)
+            .and_then(|team| team.participants.get(name))
+            .is_some_and(|participant| participant.mailbox.iter().any(|message| message.id == id))
+    }
+
+    /// Move the just-queued message in front of the earlier interrupts but
+    /// after everything else already urgent (19.14).
+    pub fn prioritize_message(&mut self, team_id: &str, name: &str, id: u64, after: usize) {
         let Some(team) = self.teams.get_mut(team_id) else {
             return;
         };
@@ -1599,7 +1651,8 @@ impl Teams {
             return;
         };
         let message = participant.mailbox.remove(index).expect("found above");
-        participant.mailbox.push_front(message);
+        let at = after.min(participant.mailbox.len());
+        participant.mailbox.insert(at, message);
         self.events.push(TeamEvent::Changed(team_id.to_string()));
     }
 
@@ -2667,6 +2720,8 @@ impl Teams {
         let reported = participant.reported;
         let was_waiting = participant.state == ParticipantState::WaitingHuman;
         let bus_turn = participant.bus_turn;
+        let interrupted = participant.interrupting;
+        participant.interrupting = false;
         participant.bus_turn = false;
         let turn_text = if text.is_empty() {
             participant.turn_text.clone()
@@ -2674,12 +2729,14 @@ impl Teams {
             text
         };
         participant.finish_turn_activity(&turn_text, bus_turn, now_ms());
-        participant.set_state(if was_waiting {
+        participant.set_state(if was_waiting && !interrupted {
             ParticipantState::WaitingHuman
         } else {
             ParticipantState::Idle
         });
-        participant.turns_total += 1;
+        if !interrupted {
+            participant.turns_total += 1;
+        }
         participant.turn_text.clear();
         participant.turns.push_back(TurnText {
             at: now_ms(),
@@ -2688,11 +2745,13 @@ impl Teams {
         while participant.turns.len() > 3 {
             participant.turns.pop_front();
         }
-        team.total_turns += 1;
-        *team
-            .task_turns
-            .entry((name.clone(), task.clone()))
-            .or_insert(0) += 1;
+        if !interrupted {
+            team.total_turns += 1;
+            *team
+                .task_turns
+                .entry((name.clone(), task.clone()))
+                .or_insert(0) += 1;
+        }
 
         let mut notices: Vec<(String, String, Kind, String, String, Vec<String>)> = Vec::new();
         if !success {
@@ -3117,6 +3176,17 @@ impl Teams {
             ItemKind::Message | ItemKind::Limit => AnswerEffect::Ack,
         };
         team.inbox[position].state = ItemState::Answered;
+        if matches!(kind, ItemKind::Permission | ItemKind::Request) {
+            if let Some(participant) = team.participants.get_mut(&from) {
+                if participant.state == ParticipantState::WaitingHuman {
+                    participant.set_state(if participant.bus_turn {
+                        ParticipantState::Working
+                    } else {
+                        ParticipantState::Idle
+                    });
+                }
+            }
+        }
         team.pending_items.retain(|_, pending| pending != &item_id);
         self.events.push(TeamEvent::Inbox(team_id.clone(), item_id));
         self.events.push(TeamEvent::Changed(team_id.clone()));

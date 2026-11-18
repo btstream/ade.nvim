@@ -1519,6 +1519,57 @@ fn an_interrupt_cancels_the_worker_and_delivers_first() {
 }
 
 #[test]
+fn an_interrupt_times_out_and_frees_the_worker() {
+    let mut harness = Harness::new_with_env(
+        "team-interrupt-timeout",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+        &[("NVIM_ADE_SERVER_HELD_TIMEOUT_MS", "150")],
+    );
+    let spawned = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template": "dev", "name": "w1", "task": "do [slow-ignore-cancel]"}),
+    );
+    assert_eq!(spawned["isError"], false, "{spawned}");
+    harness.wait_participant("w1", |entry| entry["state"] == "working");
+    let interrupted = harness.client.request(
+        91,
+        "team.send",
+        json!({"team": harness.team, "to": "w1", "kind": "notice", "body": "free", "interrupt": true}),
+    );
+    assert!(interrupted["result"].is_object(), "{interrupted}");
+    wait_for(
+        || {
+            let events = harness.events();
+            events
+                .iter()
+                .any(|event| {
+                    event["event"] == "prompt"
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("free"))
+                })
+                .then_some(())
+        },
+        "the timed-out interrupt delivery",
+    );
+    wait_for(
+        || {
+            let messages = harness.read("leader")["messages"].as_array()?.clone();
+            messages
+                .iter()
+                .any(|message| {
+                    message["kind"] == "notice" && message["body"] == "turn ended: cancelled"
+                })
+                .then_some(())
+        },
+        "the cancelled notice",
+    );
+}
+
+#[test]
 fn interrupt_and_cc_are_validated() {
     let mut harness = Harness::new(
         "team-interrupt-args",
@@ -1541,6 +1592,14 @@ fn interrupt_and_cc_are_validated() {
         }
         harness.client.request(91, "team.send", params)
     };
+    let long = "x".repeat(64 * 1024 - 4);
+    let cc_failed = bad(json!({"body": long, "cc": ["leader"]}));
+    assert!(cc_failed["result"]["id"].is_number(), "{cc_failed}");
+    assert!(
+        cc_failed["result"]["cc_failed"].as_str().is_some(),
+        "the main message still succeeds: {cc_failed}"
+    );
+
     assert!(!bad(json!({"interrupt": true})).get("error").is_some());
     assert!(!bad(json!({"cc": ["leader"]})).get("error").is_some());
     let leader_interrupt = harness.client.request(

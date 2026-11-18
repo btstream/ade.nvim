@@ -410,6 +410,24 @@ function Watch:ensure_input()
   vim.bo[self.input.buf].filetype = "ade_team_input"
   vim.bo[self.input.buf].bufhidden = "hide"
   pcall(vim.api.nvim_buf_set_name, self.input.buf, "ade://watch-input")
+  self.input.apply_winbar = function()
+    self:apply_input_winbar()
+    return true
+  end
+  vim.api.nvim_create_autocmd("BufLeave", {
+    buffer = self.input.buf,
+    callback = function()
+      self:clear_interrupt()
+    end,
+  })
+  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+    buffer = self.input.buf,
+    callback = function()
+      if self.interrupt_armed then
+        self:clear_interrupt()
+      end
+    end,
+  })
   complete.attach(self.input.buf, function()
     return { cwd = self:cwd() }
   end, cfg)
@@ -421,17 +439,22 @@ function Watch:map_input_keys()
   local buf = self.input.buf
   local cfg = self:watch_config()
   local keys = cfg.keymaps.input or {}
-  vim.keymap.set({ "n", "i" }, keys.send or "<C-s>", function()
+  local function bind(value, modes, fn, desc)
+    for _, pair in ipairs(keymaps.expand(value, modes)) do
+      vim.keymap.set(pair.mode, pair.lhs, fn, { buffer = buf, silent = true, desc = desc })
+    end
+  end
+  bind(keys.send, { "n", "i" }, function()
     self:submit(self.input:text(), false)
-  end, { buffer = buf, silent = true, desc = "ade: send to worker (queued)" })
-  vim.keymap.set("n", keys.cancel or "<C-c>", function()
+  end, "ade: send to worker (queued)")
+  bind(keys.cancel, { "n" }, function()
     self:clear_interrupt()
-  end, { buffer = buf, silent = true, desc = "ade: clear interrupt" })
+  end, "ade: clear interrupt")
   local interrupt = ((cfg.teams or {}).dashboard or {}).keys
   interrupt = interrupt and interrupt.interrupt or "<M-CR>"
-  vim.keymap.set({ "n", "i" }, interrupt, function()
+  bind(interrupt, { "n", "i" }, function()
     self:interrupt()
-  end, { buffer = buf, silent = true, desc = "ade: interrupt the worker" })
+  end, "ade: interrupt the worker")
 end
 
 function Watch:show_input()
@@ -458,8 +481,30 @@ function Watch:show_input()
     end
   end
   input:switch_session("watch:" .. tostring(self.team_id) .. ":" .. tostring(self.participant), nil)
-  pcall(input.apply_winbar, input)
-  vim.bo[input.buf].filetype = "ade_team_input"
+  self:apply_input_winbar()
+end
+
+function Watch:input_winbar()
+  local cfg = self:watch_config()
+  local keys = cfg.keymaps.input or {}
+  local send = (keymaps.expand(keys.send, { "n" })[1] or {}).lhs or "<C-s>"
+  local interrupt = ((cfg.teams or {}).dashboard or {}).keys
+  interrupt = interrupt and interrupt.interrupt or "<M-CR>"
+  return string.format(" → %s · %s 发送+抄送 leader · %s 打断 ", tostring(self.participant), send, interrupt)
+end
+
+function Watch:apply_input_winbar()
+  if self.input and self.input.win and vim.api.nvim_win_is_valid(self.input.win) then
+    pcall(vim.api.nvim_set_option_value, "winbar", self:input_winbar(), { win = self.input.win })
+  end
+end
+
+function Watch:focus_input()
+  if self.input and self.input.win and vim.api.nvim_win_is_valid(self.input.win) then
+    pcall(vim.api.nvim_set_current_win, self.input.win)
+    return true
+  end
+  return false
 end
 
 function Watch:hide_input(keep_window)
@@ -528,6 +573,12 @@ function Watch:show_interrupt()
 end
 
 function Watch:interrupt()
+  if not self.input or tostring(self.input:text()):match("^%s*$") then
+    if self.notify then
+      self.notify("先输入要发给 " .. tostring(self.participant) .. " 的内容")
+    end
+    return
+  end
   if self.interrupt_armed then
     self:clear_interrupt()
     self:submit(self.input:text(), true)
@@ -544,10 +595,8 @@ function Watch:submit(text, interrupt)
   if text:match("^%s*$") then
     return
   end
-  if self.input then
-    pcall(self.input.clear, self.input)
-  end
   self:clear_interrupt()
+  local input = self.input
   self.team:send(
     self.team_id,
     self.participant,
@@ -555,9 +604,21 @@ function Watch:submit(text, interrupt)
     text,
     { cc = { "leader" }, interrupt = interrupt == true },
     function(ok, value)
-      if not ok and self.notify then
+      if ok then
+        if input then
+          pcall(input.clear, input)
+        end
+        if type(value) == "table" and value.cc_failed and self.notify then
+          self.notify("message sent, but cc leader failed: " .. tostring(value.cc_failed), vim.log.levels.WARN)
+        end
+      elseif self.notify then
+        local extra = type(value) == "table" and value.cc_failed
         self.notify(
-          "cannot message " .. tostring(self.participant) .. ": " .. tostring(value and value.message or value)
+          "cannot message "
+            .. tostring(self.participant)
+            .. ": "
+            .. tostring(value and value.message or value)
+            .. (extra and (" (cc leader failed: " .. tostring(extra) .. ")") or "")
         )
       end
     end
@@ -670,6 +731,9 @@ function Watch:map_keys()
   map("q", function()
     self:close()
   end)
+  map("i", function()
+    self:focus_input()
+  end)
 end
 
 ---Close the view without touching the service watch (used when a new watch
@@ -744,7 +808,7 @@ function Watch:on_watch(session, title)
   self.title = title
   local first = self.source ~= session
   if first then
-    self:destroy_view()
+    self:destroy_view(self.input ~= nil)
     self.source = session
     self.supplement = nil
     self.supplement_for = nil

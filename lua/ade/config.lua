@@ -1355,8 +1355,24 @@ function M.validate(cfg)
     if type(dashboard.keys) ~= "table" then
       fail("teams.dashboard.keys must be a table")
     end
-    if type(dashboard.keys.interrupt) ~= "string" or dashboard.keys.interrupt == "" then
-      fail("teams.dashboard.keys.interrupt must be a key string")
+    local interrupt = dashboard.keys.interrupt
+    if interrupt == nil or (type(interrupt) ~= "string" and type(interrupt) ~= "table" and interrupt ~= false) then
+      fail("teams.dashboard.keys.interrupt must be a key, a list or false")
+    end
+    if type(interrupt) == "string" and interrupt == "" then
+      fail("teams.dashboard.keys.interrupt must not be empty")
+    end
+    local ok, keymaps = pcall(require, "ade.ui.keymaps")
+    if ok then
+      local send = keymaps.expand(cfg.keymaps.input.send, { "n", "i" })
+      local armed = keymaps.expand(interrupt, { "n", "i" })
+      for _, left in ipairs(send) do
+        for _, right in ipairs(armed) do
+          if left.lhs == right.lhs and left.mode == right.mode then
+            fail("teams.dashboard.keys.interrupt clashes with keymaps.input.send: " .. left.lhs)
+          end
+        end
+      end
     end
   end
   if

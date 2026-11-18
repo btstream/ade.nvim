@@ -535,13 +535,26 @@ impl Hub {
             }
             Some(_) => return Err(TeamError::invalid("cc must be an array")),
         };
-        let role = self
-            .teams
-            .team(&team)
-            .and_then(|entry| entry.participants.get(&to))
-            .map(|participant| participant.role);
-        if interrupt && role != Some(Role::Worker) {
-            return Err(TeamError::invalid("interrupt is only allowed for a worker"));
+        let Some(entry) = self.teams.team(&team) else {
+            return Err(TeamError::unknown("unknown team"));
+        };
+        let role = if to == "human" {
+            None
+        } else {
+            match entry.participants.get(&to) {
+                Some(participant) => Some(participant.role),
+                None => return Err(TeamError::unknown("unknown participant")),
+            }
+        };
+        if interrupt {
+            if kind == Kind::Control {
+                return Err(TeamError::invalid(
+                    "interrupt is not allowed for control messages",
+                ));
+            }
+            if role != Some(Role::Worker) {
+                return Err(TeamError::invalid("interrupt is only allowed for a worker"));
+            }
         }
         for name in &cc {
             if name != "leader" || role != Some(Role::Worker) {
@@ -553,14 +566,58 @@ impl Hub {
         let id =
             self.teams
                 .send_message(&team, "human", &to, kind, &body, task.as_deref(), refs)?;
+        let mut cc_failed = None;
         if interrupt && self.teams.bus_turn_running(&team, &to) {
-            self.teams.prioritize_message(&team, &to, id);
+            let queue_key = (team.clone(), to.clone());
+            let mut earlier = self.interrupt_queue.remove(&queue_key).unwrap_or_default();
+            earlier.retain(|queued| self.teams.message_queued(&team, &to, *queued));
+            let after = earlier.len();
+            self.teams.prioritize_message(&team, &to, id, after);
+            earlier.push(id);
+            self.interrupt_queue.insert(queue_key, earlier);
+            self.teams.mark_interrupting(&team, &to);
+            let orphaned = self.teams.orphan_open_items(&team, &to);
+            for item in orphaned {
+                let Some(instance) = item.instance.clone() else {
+                    continue;
+                };
+                let Some(agent_id) = item.agent_id.clone() else {
+                    continue;
+                };
+                let response = if item.kind == ItemKind::Permission {
+                    json!({ "outcome": { "outcome": "cancelled" } })
+                } else {
+                    json!({ "action": "cancel" })
+                };
+                self.answer_pending(&instance, agent_id, response);
+            }
             self.cancel_participant_turn(&team, &to);
+            self.next_interrupt_generation += 1;
+            let generation = self.next_interrupt_generation;
+            self.interrupt_generation
+                .insert((team.clone(), to.clone()), generation);
+            let sender = self.command_sender.clone();
+            let team_for_timer = team.clone();
+            let participant_for_timer = to.clone();
+            let timeout = std::env::var("NVIM_ADE_SERVER_HELD_TIMEOUT_MS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(30_000);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(timeout)).await;
+                let _ = sender
+                    .send(Command::TeamInterruptDeadline {
+                        team: team_for_timer,
+                        participant: participant_for_timer,
+                        generation,
+                    })
+                    .await;
+            });
         }
         for name in cc {
             if name == "leader" {
                 let notice = format!("to {to}: {body}");
-                self.teams.send_message(
+                if let Err(error) = self.teams.send_message(
                     &team,
                     "human",
                     "leader",
@@ -568,13 +625,19 @@ impl Hub {
                     &notice,
                     task.as_deref(),
                     vec![],
-                )?;
+                ) {
+                    cc_failed = Some(error.message);
+                }
             }
         }
         if kind == Kind::Control && body == "cancel" {
             self.cancel_participant_turn(&team, &to);
         }
-        Ok((json!({ "id": id }), true))
+        let mut result = json!({ "id": id });
+        if let Some(message) = cc_failed {
+            result["cc_failed"] = json!(message);
+        }
+        Ok((result, true))
     }
 
     fn team_read(&mut self, params: &Value) -> Result<Value, TeamError> {
@@ -2394,6 +2457,30 @@ impl Hub {
         }
         self.held_timed_out.insert(key);
         self.release_held_prompts(instance, session, true);
+    }
+
+    pub(crate) fn worker_interrupt_deadline(
+        &mut self,
+        team: &str,
+        participant: &str,
+        generation: u64,
+    ) {
+        let key = (team.to_string(), participant.to_string());
+        if self.interrupt_generation.get(&key) != Some(&generation) {
+            return;
+        }
+        if !self.teams.bus_turn_running(team, participant) {
+            return;
+        }
+        let Some(instance) = self.teams.participant_instance(team, participant) else {
+            return;
+        };
+        // The agent ignored session/cancel. End the bus turn as 18.11 does, so
+        // the queued interrupt (front of the mailbox) can be delivered.
+        self.teams
+            .turn_finished(&instance, false, None, String::new());
+        self.drain_team_events();
+        self.team_deliveries();
     }
 
     fn release_held_prompts(&mut self, instance: &str, session: &str, timed_out: bool) {

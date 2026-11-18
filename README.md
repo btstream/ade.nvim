@@ -844,7 +844,9 @@ teams = {
 切换窗口，`zh`/`zl` 横向滚动看板，`g?` 帮助，`q` 关闭。观察窗口里 worker 是只读的完整回放（工具、diff、plan、回合分组
 都在），leader 显示聊天会话本身并**带输入区**，可以直接对话。worker 观察窗口下方也有
 输入区：`<C-s>` 排队发给该 worker 并抄送 leader；`<M-CR>` 连按两次先打断当前回合再
-优先送达（`teams.dashboard.keys.interrupt` 可改）；草稿按 worker 分开保存。
+优先送达（`teams.dashboard.keys.interrupt` 可改）；草稿按 worker 分开保存。输入区
+filetype 是 `ade_team_input`：blink/cmp 的 `per_filetype` 只写了 `ade_input` 时要补上；
+图片/附件不在该输入区提供。
 
 需要你从选项里选时（带选项的提问、spawn 申请、权限、回合上限、agent 自己的权限和
 表单），输入窗口会临时换成选择组件：Tab/Shift-Tab 切题，↑↓ 或 j/k 选择，数字直选，
