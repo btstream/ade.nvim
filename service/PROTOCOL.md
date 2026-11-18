@@ -268,8 +268,10 @@ interpretation. The service only records `session/prompt` requests to count
 
 ## 7. Connection back pressure
 
-Each connection has an outbound queue capped at **64 MiB**. When it would be
-exceeded the service closes that connection (the agent is unaffected and keeps
+Each connection has an outbound queue capped at **64 MiB** (bytes only; the
+number of queued messages is not limited). When it would be
+exceeded the service closes that connection, writing the reason and the queued
+size to its log (the agent is unaffected and keeps
 running; the front end reconnects and re-attaches). Nothing is dropped
 silently within a live connection. (Catching up on what was missed is the job
 of the event log, a later stage.)
