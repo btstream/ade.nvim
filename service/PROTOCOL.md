@@ -1,4 +1,4 @@
-# nvim_ade_server protocol (api_version 6, service 0.7.0)
+# nvim_ade_server protocol (api_version 6, service 0.7.1)
 
 This is the contract between the Neovim front end (`lua/ade/service/`) and the
 service (`service/src/`). Both sides implement it as written; a deviation is a

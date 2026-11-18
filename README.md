@@ -730,7 +730,7 @@ require("ade").setup({
 
 ## 团队、看板与流程（teams，实验性）
 
-服务声明 `teams` 能力（服务 **0.7.0+**，api_version **6**）时，可以把工作交给一个小
+服务声明 `teams` 能力（服务 **0.7.1+**，api_version **6**）时，可以把工作交给一个小
 团队：你正在聊天的会话就是 **leader**，它按需启动 **worker**（独立的 agent 会话，
 可以在各自的 git worktree 里工作），worker 之间通过服务总线（bus）传消息，你通过
 **选择组件**审批和回答问题。团队和看板存在服务的 SQLite 事件日志里，Neovim 退出后
