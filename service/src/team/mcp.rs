@@ -21,7 +21,7 @@ pub fn run() -> ExitCode {
 
 #[cfg(not(unix))]
 pub fn run() -> ExitCode {
-    eprintln!("nvim_ade_server: mcp is only implemented on unix-like systems");
+    crate::svc_log!("nvim_ade_server: mcp is only implemented on unix-like systems");
     ExitCode::from(1)
 }
 

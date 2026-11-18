@@ -26,7 +26,8 @@ below, everything else is there.
 ```
 
 `ready` and `already_running` exit 0; `error` exits 1. Everything else
-(including logs) goes to stderr.
+(including logs) also goes to stderr; the service additionally writes the same
+lines to `<dir>/nvim_ade_server.log` (0600, rotated to `.log.1` at 4 MiB).
 
 ## Where things live
 
@@ -45,6 +46,7 @@ On Windows `<dir>` is `%LOCALAPPDATA%\ade` and the socket is the named pipe
 | `<dir>/nvim_ade_server.sock` | Front-end socket (permission 0600). |
 | `<dir>/nvim_ade_server.token` | Front-end token, one line, permission 0600. Created once and reused while it stays trustworthy. |
 | `<dir>/nvim_ade_server.lock` | Single-instance lock (an OS file lock, so it is released automatically if the process dies). The running instance also writes its socket path here, so a second `serve` can report the live socket. |
+| `<dir>/nvim_ade_server.log` | Service log (0600). Rotated to `nvim_ade_server.log.1` when it reaches 4 MiB; one old file is kept. `:checkhealth ade` and `:Ade service status` print this path. |
 
 `<dir>` itself is 0700.
 

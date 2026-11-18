@@ -1379,7 +1379,7 @@ fn quarantine(path: &Path, detail: &str) -> Result<()> {
             target.display()
         )
     })?;
-    eprintln!(
+    crate::svc_log!(
         "nvim_ade_server: warning: event store {} was corrupted ({detail}); \
          moved it to {} and started a new one",
         path.display(),

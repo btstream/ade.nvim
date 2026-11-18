@@ -321,7 +321,7 @@ async fn write_stdin(mut stdin: ChildStdin, mut commands: mpsc::UnboundedReceive
                 let mut bytes = match serde_json::to_vec(&value) {
                     Ok(bytes) => bytes,
                     Err(error) => {
-                        eprintln!(
+                        crate::svc_log!(
                             "nvim_ade_server: cannot serialize a frame for the agent: {error}"
                         );
                         continue;
@@ -329,11 +329,11 @@ async fn write_stdin(mut stdin: ChildStdin, mut commands: mpsc::UnboundedReceive
                 };
                 bytes.push(b'\n');
                 if let Err(error) = stdin.write_all(&bytes).await {
-                    eprintln!("nvim_ade_server: writing to the agent failed: {error}");
+                    crate::svc_log!("nvim_ade_server: writing to the agent failed: {error}");
                     return;
                 }
                 if let Err(error) = stdin.flush().await {
-                    eprintln!("nvim_ade_server: flushing to the agent failed: {error}");
+                    crate::svc_log!("nvim_ade_server: flushing to the agent failed: {error}");
                     return;
                 }
             }
@@ -373,10 +373,10 @@ async fn read_stdout(
             }
             Ok(Line::Eof) => return,
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                eprintln!("nvim_ade_server: dropping invalid agent stdout line: {error}");
+                crate::svc_log!("nvim_ade_server: dropping invalid agent stdout line: {error}");
             }
             Err(error) => {
-                eprintln!("nvim_ade_server: reading agent stdout failed: {error}");
+                crate::svc_log!("nvim_ade_server: reading agent stdout failed: {error}");
                 return;
             }
         }
@@ -484,7 +484,7 @@ fn terminate(child: &mut Child, force: bool) {
     let Some(target) = group_target(pid) else {
         // Refusing to signal is the safe choice: `kill(0, …)` would signal the
         // service's own process group.
-        eprintln!(
+        crate::svc_log!(
             "nvim_ade_server: refusing to signal agent pid {pid}: not a usable process group id"
         );
         return;
@@ -535,7 +535,7 @@ fn exit_details(status: io::Result<std::process::ExitStatus>) -> (Option<i32>, O
             (status.code(), None)
         }
         Err(error) => {
-            eprintln!("nvim_ade_server: waiting for the agent failed: {error}");
+            crate::svc_log!("nvim_ade_server: waiting for the agent failed: {error}");
             (None, None)
         }
     }

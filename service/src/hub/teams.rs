@@ -1806,7 +1806,7 @@ impl Hub {
                         if self.teams.team(team).is_none() {
                             // The team closed while git ran: the new worktree
                             // belongs to nobody.
-                            eprintln!(
+                            crate::svc_log!(
                                 "nvim_ade_server: discarding worktree {} of closed team {team}",
                                 info.path
                             );

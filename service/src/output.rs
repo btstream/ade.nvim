@@ -43,6 +43,7 @@ pub struct PathsOutput {
     pub socket: String,
     pub token: String,
     pub lock: String,
+    pub log: String,
 }
 
 impl VersionOutput {
