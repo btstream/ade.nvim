@@ -400,6 +400,40 @@ impl Board {
         Ok(self.rev)
     }
 
+    /// Clear `owner` from every card (19.12): a refused or orphaned spawn
+    /// item. One write, attributed to the service. `None` when no card used
+    /// the name (or the board is unavailable).
+    pub fn clear_owner(
+        &mut self,
+        owner: &str,
+        now: u64,
+    ) -> Result<Option<(u64, Vec<String>)>, TeamError> {
+        if self.unavailable {
+            return Ok(None);
+        }
+        let cards: Vec<String> = self
+            .cards
+            .iter()
+            .filter(|card| card.owner.as_deref() == Some(owner))
+            .map(|card| card.id.clone())
+            .collect();
+        if cards.is_empty() {
+            return Ok(None);
+        }
+        let mut next = self.writable_clone();
+        for card in &mut next.cards {
+            if card.owner.as_deref() == Some(owner) {
+                card.owner = None;
+                card.updated_by = "service".to_string();
+                card.updated_at = now;
+            }
+        }
+        next.enforce_limits()?;
+        next.rev += 1;
+        self.adopt(next);
+        Ok(Some((self.rev, cards)))
+    }
+
     /// A clone of only what a write may change. History and the persisted
     /// bookkeeping are not copied (they can hold every card version).
     fn writable_clone(&self) -> Board {
@@ -926,8 +960,19 @@ impl Teams {
         if team.closed {
             return Err(TeamError::unknown("team closed"));
         }
-        let workers: HashSet<String> = team.workers().map(|worker| worker.name.clone()).collect();
-        team.board.apply_leader(params, &workers, now)
+        // 19.12: a card may be assigned to a name awaiting approval, so an
+        // open spawn item's name is a valid owner until it is answered.
+        let mut owners: HashSet<String> =
+            team.workers().map(|worker| worker.name.clone()).collect();
+        owners.extend(
+            team.inbox
+                .iter()
+                .filter(|item| {
+                    item.kind == super::ItemKind::Spawn && item.state == super::ItemState::Open
+                })
+                .filter_map(|item| item.name.clone()),
+        );
+        team.board.apply_leader(params, &owners, now)
     }
 
     /// Step 4 of `team.start` (19.7): write the workflow onto an unnamed board.

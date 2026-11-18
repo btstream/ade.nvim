@@ -296,6 +296,10 @@ impl Mcp {
                         "type": "string",
                         "description": "Extra role text appended to the template's role (max 16 KiB)."
                     },
+                    "label": {
+                        "type": "string",
+                        "description": "A short display label (1..16 characters, one line)."
+                    },
                     "task": { "type": "string" },
                 },
                 "required": ["template"],
@@ -330,14 +334,43 @@ impl Mcp {
         }));
         tools.push(json!({
             "name": "bus_ask_human",
-            "description": "Ask the person a question and wait for an answer.",
+            "description": "Ask the person one question, or up to four questions at once with `questions`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "question": { "type": "string" },
                     "options": { "type": "array", "items": { "type": "string" } },
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "header": {
+                                    "type": "string",
+                                    "description": "Tab label, 1..12 characters, one line."
+                                },
+                                "question": { "type": "string" },
+                                "options": {
+                                    "type": "array",
+                                    "minItems": 2,
+                                    "maxItems": 6,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": { "type": "string" },
+                                            "description": { "type": "string" }
+                                        },
+                                        "required": ["label"]
+                                    }
+                                },
+                                "multi_select": { "type": "boolean" }
+                            },
+                            "required": ["header", "question"]
+                        }
+                    }
                 },
-                "required": ["question"],
             },
         }));
         tools.push(json!({
@@ -552,6 +585,7 @@ impl Mcp {
                     "name": arguments.get("name"),
                     "model": arguments.get("model"),
                     "role": arguments.get("role"),
+                    "label": arguments.get("label"),
                     "task": arguments.get("task"),
                 }),
             ),
@@ -590,6 +624,7 @@ impl Mcp {
                 json!({
                     "question": arguments.get("question"),
                     "options": arguments.get("options"),
+                    "questions": arguments.get("questions"),
                 }),
             ),
             "bus_status" => ("bus.status", json!({})),

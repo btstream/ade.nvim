@@ -82,6 +82,9 @@ pub struct WorkflowMember {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// A short role label for display (19.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
 }
@@ -300,6 +303,17 @@ fn parse_member(
     let template = string_field(object.get("template"), &format!("{prefix}.template"))?;
     let model = optional_string_field(object.get("model"), &format!("{prefix}.model"))?;
     let role = optional_string_field(object.get("role"), &format!("{prefix}.role"))?;
+    let label = optional_string_field(object.get("label"), &format!("{prefix}.label"))?;
+    if label.as_ref().is_some_and(|label| {
+        label.is_empty()
+            || label.chars().count() > 16
+            || label.contains('\n')
+            || label.contains('\r')
+    }) {
+        return Err(TeamError::invalid(format!(
+            "{prefix}.label must be one line of 1..16 characters"
+        )));
+    }
     if role
         .as_ref()
         .is_some_and(|role| role.len() > MAX_ROLE_BYTES)
@@ -341,6 +355,7 @@ fn parse_member(
         template,
         model,
         role,
+        label,
         task,
     })
 }

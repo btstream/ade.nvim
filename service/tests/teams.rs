@@ -3966,6 +3966,213 @@ fn team_start_boundary_and_a_leaderless_team() {
 }
 
 #[test]
+fn members_carry_their_identity_and_label() {
+    let mut harness = Harness::new(
+        "team-member-label",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let spawned = harness.spawn(json!({"name": "w1", "label": "reviewer"}));
+    assert_eq!(spawned["result"]["name"], "w1", "{spawned}");
+    harness.wait_participant("w1", |entry| entry["state"] == "idle");
+    let w1 = harness.participant("w1").expect("w1");
+    assert_eq!(w1["template"], "dev", "{w1}");
+    assert_eq!(w1["agent"], "team-test", "{w1}");
+    assert_eq!(w1["model"], "m2", "{w1}");
+    assert_eq!(w1["label"], "reviewer", "{w1}");
+
+    // Without a label the template name is shown; the leader is "leader".
+    let spawned = harness.spawn(json!({"name": "w2"}));
+    assert_eq!(spawned["result"]["name"], "w2", "{spawned}");
+    harness.wait_participant("w2", |entry| entry["state"] == "idle");
+    let w2 = harness.participant("w2").expect("w2");
+    assert_eq!(w2["label"], "dev", "{w2}");
+    let leader = harness.participant("leader").expect("leader");
+    assert_eq!(leader["template"], Value::Null, "{leader}");
+    assert_eq!(leader["agent"], "team-test", "{leader}");
+    assert_eq!(leader["label"], "leader", "{leader}");
+
+    // A too-long label is refused before anything starts.
+    let refused = harness.spawn(json!({"name": "w9", "label": "12345678901234567"}));
+    assert_eq!(refused["error"]["code"], -32060, "{refused}");
+    assert!(harness.worker_names().len() == 2, "nothing may start");
+}
+
+#[test]
+fn an_owner_awaiting_approval_is_cleared_when_the_spawn_is_refused() {
+    let mut harness = Harness::new(
+        "team-pending-owner",
+        json!({"spawn_confirm": {"auto": []}}),
+        None,
+    );
+    let awaiting = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template": "dev", "name": "w1", "label": "reviewer"}),
+    );
+    assert_eq!(awaiting["isError"], false, "{awaiting}");
+    let request = mcp_json(&awaiting)["request"]
+        .as_str()
+        .expect("spawn request id")
+        .to_string();
+    // The open request's name may own a card (19.12).
+    let written = mcp_call(
+        &harness.server,
+        &harness.token,
+        "board_update",
+        json!({
+            "columns": ["todo"],
+            "upsert": [{"id": "C1", "title": "one", "column": "todo", "owner": "w1"}]
+        }),
+    );
+    assert_eq!(written["isError"], false, "{written}");
+    let before = harness.board()["rev"].as_u64().expect("rev");
+    // Another spawn may not take the reserved name.
+    let duplicate = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template": "dev", "name": "w1"}),
+    );
+    assert_eq!(duplicate["isError"], true, "{duplicate}");
+    assert!(mcp_text(&duplicate).contains("-32060"), "{duplicate}");
+
+    let refused = harness.answer(&request, json!({"allow": false}));
+    assert!(refused["result"].is_object(), "{refused}");
+    wait_for(
+        || {
+            let board = harness.board();
+            (board["cards"][0]["owner"] == Value::Null).then_some(())
+        },
+        "the cleared card owner",
+    );
+    let board = harness.board();
+    assert!(board["rev"].as_u64().unwrap() > before, "{board}");
+    assert_eq!(board["cards"][0]["updated_by"], "service", "{board}");
+    assert_eq!(
+        harness.next_board_changed(Duration::from_secs(10)),
+        Some(board["rev"].as_u64().unwrap()),
+        "the service write is announced"
+    );
+    wait_for(
+        || {
+            let read = harness.read("leader");
+            let found = read["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["kind"] == "notice"
+                        && message["body"]
+                            .as_str()
+                            .is_some_and(|body| body.contains("owner cleared on C1"))
+                })
+            });
+            found.then_some(())
+        },
+        "the owner-cleared notice",
+    );
+}
+
+#[test]
+fn several_questions_are_one_item_and_answer_body_lists_them() {
+    let mut harness = Harness::new(
+        "team-questions",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let asked = mcp_call(
+        &harness.server,
+        &harness.token,
+        "bus_ask_human",
+        json!({
+            "questions": [
+                {
+                    "header": "范围",
+                    "question": "保留旧 API 吗？",
+                    "options": [
+                        {"label": "保留", "description": "对调用方没有影响"},
+                        {"label": "删除"}
+                    ]
+                },
+                {
+                    "header": "测试",
+                    "question": "跑哪些？",
+                    "options": [{"label": "单元"}, {"label": "集成"}],
+                    "multi_select": true
+                }
+            ]
+        }),
+    );
+    assert_eq!(asked["isError"], false, "{asked}");
+    let request = mcp_json(&asked)["request"]
+        .as_str()
+        .expect("question request")
+        .to_string();
+    let inbox = harness.team()["inbox"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let item = inbox
+        .iter()
+        .find(|item| item["id"] == request)
+        .expect("question item");
+    assert_eq!(
+        item["questions"].as_array().map(Vec::len),
+        Some(2),
+        "{item}"
+    );
+    assert_eq!(item["questions"][1]["multi_select"], true, "{item}");
+
+    let answered = harness.answer(
+        &request,
+        json!({"answers": [
+            {"selected": ["保留"]},
+            {"selected": ["单元", "集成"], "text": "再加 e2e"}
+        ]}),
+    );
+    assert!(answered["result"].is_object(), "{answered}");
+    wait_for(
+        || {
+            let read = harness.read("leader");
+            let found = read["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["kind"] == "answer"
+                        && message["body"]
+                            .as_str()
+                            .is_some_and(|body| body.contains("范围"))
+                })
+            });
+            found.then_some(())
+        },
+        "the multi-question answer",
+    );
+    let read = harness.read("leader");
+    let body = read["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| {
+            message["kind"] == "answer"
+                && message["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("范围"))
+        })
+        .and_then(|message| message["body"].as_str())
+        .unwrap()
+        .to_string();
+    assert_eq!(body, "范围: 保留\n测试: 单元, 集成\n再加 e2e");
+
+    // Bad shapes are refused before an item appears.
+    let bad = mcp_call(
+        &harness.server,
+        &harness.token,
+        "bus_ask_human",
+        json!({"questions": [{"header": "h", "question": "q", "options": [{"label": "one"}]}]}),
+    );
+    assert_eq!(bad["isError"], true, "{bad}");
+    assert!(mcp_text(&bad).contains("-32060"), "{bad}");
+}
+
+#[test]
 fn team_start_writes_the_workflow_onto_an_empty_board() {
     let mut harness = Harness::new(
         "team-start-board",
