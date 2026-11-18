@@ -127,9 +127,6 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
     validate_event_log_max_mb(options.event_log_max_mb)?;
 
     prepare_dir(&paths)?;
-    if let Err(error) = crate::logging::init(paths.dir()) {
-        eprintln!("nvim_ade_server: cannot open the service log: {error}");
-    }
     let lock = match acquire_lock(&paths)? {
         Some(lock) => lock,
         None => {
@@ -139,6 +136,11 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
             return Ok(ServeStatus::AlreadyRunning { socket });
         }
     };
+    // Only the instance holding the lock owns the log file: a second `serve`
+    // must not rotate the running service's log before exiting.
+    if let Err(error) = crate::logging::init(paths.dir(), crate::logging::MAX_BYTES) {
+        eprintln!("nvim_ade_server: cannot open the service log: {error}");
+    }
     // The lock file records our socket, so a second `serve` (possibly started
     // with a different `--socket`) can report the real one. This happens after
     // the lock is held, so nobody else writes here.
@@ -620,6 +622,8 @@ fn contains_only_service_files(dir: &std::path::Path) -> bool {
         crate::paths::TOKEN_FILE_NAME,
         crate::paths::LOCK_FILE_NAME,
         "nvim_ade_server.token.tmp",
+        crate::logging::LOG_NAME,
+        crate::logging::ROTATED_NAME,
     ];
     entries.filter_map(Result::ok).all(|entry| {
         let name = entry.file_name();

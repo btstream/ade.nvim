@@ -477,9 +477,10 @@ function Chat:commit_layout_async(layout, layout_only, saved_view, chunk_rows, o
   self.commit_job = job
   self.commit_total = #layout.lines
   self.commit_done = 0
+  local progress = { done = 0 }
   local win, width, generation, thoughts = self.win, self.width, CodeHL.generation, self.show_thoughts
   local started = metrics.start(self)
-  local co = renderer.write_chunked(buf, layout.lines, layout.meta, old or {}, full, chunk_rows)
+  local co = renderer.write_chunked(buf, layout.lines, layout.meta, old or {}, full, chunk_rows, progress)
   local function current()
     return not self.destroyed
       and self.layout_epoch == epoch
@@ -505,6 +506,9 @@ function Chat:commit_layout_async(layout, layout_only, saved_view, chunk_rows, o
     end)
     self.commit_job = nil
     self.commit_total, self.commit_done = nil, nil
+    if self.on_commit_step then
+      pcall(self.on_commit_step, self)
+    end
     -- Half a layout on screen is not a valid base for the incremental writer.
     self.full_rewrite = true
     self.needs_force = true
@@ -523,7 +527,7 @@ function Chat:commit_layout_async(layout, layout_only, saved_view, chunk_rows, o
       return false
     end
     local ok, err = coroutine.resume(co)
-    self.commit_done = math.min(self.commit_total or 0, vim.api.nvim_buf_line_count(buf))
+    self.commit_done = math.min(self.commit_total or 0, progress.done or 0)
     if self.on_commit_step then
       pcall(self.on_commit_step, self)
     end

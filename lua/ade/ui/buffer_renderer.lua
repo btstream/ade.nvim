@@ -197,7 +197,7 @@ function M.write(buf, lines, meta, old, full)
   return changed
 end
 
-function M.write_sliced(buf, lines, meta, old, full, chunk_rows)
+function M.write_sliced(buf, lines, meta, old, full, chunk_rows, progress)
   return coroutine.create(function()
     -- Buffer writes can be refused while text is locked (for example a scheduled
     -- slice that happens to run during a redraw). Retry on the next slice
@@ -240,11 +240,18 @@ function M.write_sliced(buf, lines, meta, old, full, chunk_rows)
     guarded(function()
       set_lines(buf, prefix, end_line, vim.list_slice(lines, first, stop))
     end)
+    if progress then
+      progress.done = stop
+    end
     coroutine.yield()
     for start = stop + 1, last, chunk_rows do
+      local finish = math.min(last, start + chunk_rows - 1)
       guarded(function()
-        set_lines(buf, start - 1, start - 1, vim.list_slice(lines, start, math.min(last, start + chunk_rows - 1)))
+        set_lines(buf, start - 1, start - 1, vim.list_slice(lines, start, finish))
       end)
+      if progress then
+        progress.done = finish
+      end
       coroutine.yield()
     end
     guarded(function()
@@ -269,8 +276,8 @@ end
 
 ---Write a layout with an explicit row budget between yields.
 ---@return coroutine
-function M.write_chunked(buf, lines, meta, old, full, chunk_rows)
-  return M.write_sliced(buf, lines, meta, old, full, math.max(1, chunk_rows or 500))
+function M.write_chunked(buf, lines, meta, old, full, chunk_rows, progress)
+  return M.write_sliced(buf, lines, meta, old, full, math.max(1, chunk_rows or 500), progress)
 end
 
 ---Repaint backgrounds if their geometry changed.
