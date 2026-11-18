@@ -209,12 +209,34 @@ function M.build(ctx, opts, action)
       return (S.view.choices ~= nil and S.view.choices.replacing == true)
         or (S.view.panel ~= nil and S.view.panel.showing == true)
     end,
+    focus_ok = function()
+      local win = vim.api.nvim_get_current_win()
+      if not win or not vim.api.nvim_win_is_valid(win) then
+        return false
+      end
+      local buf = vim.api.nvim_win_get_buf(win)
+      local ft = vim.bo[buf].filetype
+      return ft == "ade_chat"
+        or ft == "ade_input"
+        or vim.b[buf].ade_picker == true
+        or (S.view.input ~= nil and S.view.input.win == win)
+        or (S.view.chat ~= nil and S.view.chat.win == win)
+    end,
   })
   S.view.elicitation = Elicitation.new({
     answer = function(interaction, response)
       S.view.interactions:answer(interaction.id, response)
     end,
     notify = notify,
+    focus_ok = function()
+      local win = vim.api.nvim_get_current_win()
+      if not win or not vim.api.nvim_win_is_valid(win) then
+        return false
+      end
+      local buf = vim.api.nvim_win_get_buf(win)
+      local ft = vim.bo[buf].filetype
+      return ft == "ade_chat" or ft == "ade_input" or vim.b[buf].ade_picker == true
+    end,
   })
   -- The inline choice component lives in the composer window; the queue also
   -- owns team questions/spawn/permission/limit items (draft 8).

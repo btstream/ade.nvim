@@ -10,9 +10,10 @@ local current
 -- A picker or input box opened from a form is part of the form's surface; the
 -- form must be able to close it when the request is withdrawn.
 local active_picker
+local pick_focus = true
 
 local function pick(opts)
-  opts = vim.tbl_extend("force", { dismiss_on_leave = false }, opts)
+  opts = vim.tbl_extend("force", { dismiss_on_leave = false, focus = pick_focus }, opts)
   active_picker = picker.select(opts)
   return active_picker
 end
@@ -165,6 +166,7 @@ end
 ---  notify: fun(message: string, level: integer|nil)}
 ---@return boolean opened
 function M.open(request, opts)
+  pick_focus = opts.focus ~= false
   local parsed = schema_parser.parse(request.requestedSchema)
   if not parsed then
     opts.notify("unsupported elicitation schema", vim.log.levels.WARN)
@@ -220,7 +222,7 @@ function M.open(request, opts)
   local message = request.message or (request.requestedSchema and request.requestedSchema.title) or "Agent question"
   local message_lines = vim.split(message, "\n", { plain = true })
   local height = math.min(20, #message_lines + #fields + 3)
-  local win = vim.api.nvim_open_win(buf, true, {
+  local win = vim.api.nvim_open_win(buf, pick_focus, {
     relative = "editor",
     style = "minimal",
     border = "rounded",

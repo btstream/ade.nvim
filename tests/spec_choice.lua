@@ -126,6 +126,23 @@ return function(t)
       close_window()
     end)
 
+    t.it("renders the live pending count from status_fn", function()
+      local win = window()
+      local view = Choice.new({ notify = function() end })
+      view:show({
+        title = "count",
+        status_fn = function()
+          return "还有 2 个待处理"
+        end,
+        questions = { { header = "Q", question = "q", options = { { label = "A" } } } },
+        on_cancel = function() end,
+      }, { win = win, external = false, max_height = 8 })
+      local text = table.concat(vim.api.nvim_buf_get_lines(view.buf, 0, -1, false), "\n")
+      t.match("还有 2 个待处理", text)
+      view:close()
+      close_window()
+    end)
+
     t.it("does not resize under edgy and restores the native height", function()
       local win = window()
       local view = Choice.new({ notify = function() end })
@@ -550,6 +567,27 @@ return function(t)
       t.falsy(interactions.showed, "show_next is not called again")
       t.match("选择框", table.concat(notices, "\n"))
       close_window()
+    end)
+
+    t.it("stamps team on row-fallback inbox items", function()
+      local item = { id = "i1", kind = "question", state = "open", from = "w1", body = "q" }
+      local team = {
+        list_rows = function()
+          return { { id = "t1", cwd = "/tmp", state = "active", inbox = { item } } }
+        end,
+      }
+      local choices = Choices.new({
+        team = function()
+          return team
+        end,
+        interactions = function()
+          return nil
+        end,
+        notify = function() end,
+      })
+      local items = choices:items(team)
+      t.eq(1, #items)
+      t.eq("t1", items[1].team)
     end)
 
     t.it("answers a question without options through vim.ui.input", function()

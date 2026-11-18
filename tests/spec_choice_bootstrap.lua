@@ -26,6 +26,14 @@ return function(t)
     return S
   end
 
+  local function form_win()
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      if vim.b[vim.api.nvim_win_get_buf(win)].ade_form then
+        return win
+      end
+    end
+  end
+
   local function picker_win()
     for _, win in ipairs(vim.api.nvim_list_wins()) do
       if vim.b[vim.api.nvim_win_get_buf(win)].ade_picker then
@@ -346,6 +354,13 @@ return function(t)
       t.eq(nil, responded, "leaving the picker must not answer it")
       t.eq(1, #S.view.interactions:pending())
       t.eq(picker, picker_win(), "the picker stays on screen")
+      local floats = 0
+      for _, win in ipairs(vim.api.nvim_list_wins()) do
+        if vim.api.nvim_win_get_config(win).relative ~= "" then
+          floats = floats + 1
+        end
+      end
+      t.truthy(floats >= 2, "the picker and its details float stay")
       controller.open()
       wait(function()
         return choices.view:is_open()
@@ -554,6 +569,61 @@ return function(t)
       t.eq(editor, vim.api.nvim_get_current_win(), "an editor window keeps focus")
       t.match("需要你的选择", table.concat(notices, "\n"))
       pcall(vim.api.nvim_win_close, editor, true)
+    end)
+
+    t.it("keeps a hidden-panel elicitation form after focus leaves", function()
+      local S = setup({ ui = { picker = "internal" } })
+      cleanup(S)
+      S.view.interactions:open("elicitation", {
+        sessionId = "s1",
+        message = "Pick",
+        requestedSchema = {
+          type = "object",
+          properties = {
+            db = { type = "string", enum = { "Postgres", "Redis" } },
+            note = { type = "string" },
+          },
+          required = { "db" },
+        },
+      }, function() end, 17)
+      local choices = S.view.choices
+      wait(function()
+        return choices.view:is_open()
+      end, 5000, "the form component")
+      controller.hide()
+      wait(function()
+        return not choices.view:is_open() and form_win() ~= nil
+      end, 5000, "the hidden form")
+      vim.cmd("wincmd p")
+      vim.wait(120)
+      t.truthy(form_win(), "the form stays after focus leaves")
+    end)
+
+    t.it("mounts the component in the leader-mount input window", function()
+      local S = setup({ teams = { dashboard = { wide = 40 } } })
+      cleanup(S)
+      t.eq(true, controller.open_team())
+      local ui = S.view.team_ui
+      wait(function()
+        return ui and ui.tab and ui.tab:is_open()
+      end, 5000, "the dashboard tab")
+      local before = S.view.input.win
+      ui:mount_leader()
+      wait(function()
+        return S.view.input.win and S.view.input.win ~= before
+      end, 5000, "the mounted input")
+      S.view.interactions:open("permission", {
+        sessionId = "s1",
+        toolCall = { title = "Run", kind = "execute" },
+        options = { { optionId = "a", name = "Allow", kind = "allow_once" } },
+      }, function() end, 18)
+      local choices = S.view.choices
+      wait(function()
+        return choices.view:is_open()
+      end, 5000, "the component in the mounted input")
+      t.eq(S.view.input.win, vim.api.nvim_get_current_win())
+      choices:dismiss()
+      ui:unmount_leader()
     end)
 
     t.it("stops insert mode before mounting the component", function()

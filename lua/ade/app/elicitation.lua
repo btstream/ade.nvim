@@ -4,9 +4,10 @@ local presenter = require("ade.app.presenter")
 local Elicitation = {}
 Elicitation.__index = Elicitation
 
----@param opts {answer: fun(interaction: table, response: table), notify: fun(message: string, level: integer|nil)}
+---@param opts {answer: fun(interaction: table, response: table), notify: fun(message: string, level: integer|nil),
+---  focus_ok: (fun(): boolean)|nil}
 function Elicitation.new(opts)
-  return setmetatable({ answer = opts.answer, notify = opts.notify }, Elicitation)
+  return setmetatable({ answer = opts.answer, notify = opts.notify, focus_ok = opts.focus_ok }, Elicitation)
 end
 
 ---@param interaction table
@@ -20,6 +21,7 @@ function Elicitation:present(interaction)
     presenter.select({
       title = "Agent needs a browser",
       items = items,
+      focus = self.focus_ok == nil or self.focus_ok(),
       on_choice = function()
         if url and vim.ui.open then
           vim.ui.open(url)
@@ -33,6 +35,7 @@ function Elicitation:present(interaction)
     return true
   end
   return presenter.form.open(request, {
+    focus = self.focus_ok == nil or self.focus_ok(),
     on_submit = function(content)
       self.answer(interaction, { action = "accept", content = content })
     end,
