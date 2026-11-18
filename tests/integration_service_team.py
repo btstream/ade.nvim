@@ -775,7 +775,7 @@ class Editor:
             end
             if not pick then return false end
             view:select(pick)
-            if view.tab > #view.model.questions then
+            if view:is_open() and view.tab > #view.model.questions then
               view:submit()
             end
             return true

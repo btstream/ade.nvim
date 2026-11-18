@@ -26,6 +26,26 @@ return function(t)
     return S
   end
 
+  local function picker_win()
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      if vim.b[vim.api.nvim_win_get_buf(win)].ade_picker then
+        return win
+      end
+    end
+  end
+
+  local function focus_float()
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      local config = vim.api.nvim_win_get_config(win)
+      if config.relative ~= "" then
+        local ok = pcall(vim.api.nvim_set_current_win, win)
+        if ok and vim.api.nvim_get_current_win() == win then
+          return win
+        end
+      end
+    end
+  end
+
   local function cleanup(S)
     t.cleanup(function()
       if S and S.view and S.view.interactions then
@@ -281,8 +301,9 @@ return function(t)
       end, 5000, "the internal fallback")
       -- A real user leaves the pointer on the internal picker; the panel
       -- switch must not turn that focus change into a rejection.
-      local picker_win = vim.api.nvim_get_current_win()
-      t.truthy(picker_win ~= nil)
+      local picker_win = focus_float()
+      t.truthy(picker_win, "the internal picker float is focusable")
+      t.eq(picker_win, vim.api.nvim_get_current_win(), "the picker is the current window")
       controller.open()
       wait(function()
         return choices.view:is_open()
@@ -293,6 +314,46 @@ return function(t)
         return responded ~= nil
       end, 5000, "the internal answer")
       t.eq("selected", responded.outcome.outcome)
+      t.eq("a", responded.outcome.optionId)
+    end)
+
+    t.it("keeps a hidden-panel permission picker visible after focus leaves", function()
+      local S = setup({ ui = { picker = "internal" } })
+      cleanup(S)
+      local responded
+      S.view.interactions:open("permission", {
+        sessionId = "s1",
+        toolCall = { title = "Run", kind = "execute" },
+        options = { { optionId = "a", name = "Allow", kind = "allow_once" } },
+      }, function(response)
+        responded = response
+      end, 13)
+      local choices = S.view.choices
+      wait(function()
+        return choices.view:is_open()
+      end, 5000, "the component before hide")
+      controller.hide()
+      wait(function()
+        return not choices.view:is_open() and #S.view.interactions:pending() == 1 and picker_win() ~= nil
+      end, 5000, "the hidden picker")
+      local picker = picker_win()
+      t.truthy(picker, "the hidden picker exists")
+      local ok = pcall(vim.api.nvim_set_current_win, picker)
+      t.truthy(ok)
+      t.eq(picker, vim.api.nvim_get_current_win())
+      vim.cmd("wincmd p")
+      vim.wait(150)
+      t.eq(nil, responded, "leaving the picker must not answer it")
+      t.eq(1, #S.view.interactions:pending())
+      t.eq(picker, picker_win(), "the picker stays on screen")
+      controller.open()
+      wait(function()
+        return choices.view:is_open()
+      end, 5000, "the component after the picker leave")
+      choices.view:select(1)
+      wait(function()
+        return responded ~= nil
+      end, 5000, "the hidden-picker answer")
       t.eq("a", responded.outcome.optionId)
     end)
 
@@ -452,6 +513,47 @@ return function(t)
         return responded ~= nil
       end, 5000, "the zero-option answer")
       t.eq("cancelled", responded.outcome.outcome)
+    end)
+
+    t.it("takes focus from the panel but not from an editor window", function()
+      local S = setup()
+      cleanup(S)
+      local choices = S.view.choices
+      S.view.interactions:open("permission", {
+        sessionId = "s1",
+        toolCall = { title = "Run", kind = "execute" },
+        options = { { optionId = "a", name = "Allow", kind = "allow_once" } },
+      }, function() end, 15)
+      wait(function()
+        return choices.view:is_open()
+      end, 5000, "the first focus component")
+      t.eq(S.input.win, vim.api.nvim_get_current_win(), "the composer takes focus")
+      choices.view:close()
+      S.view.interactions:answer(S.view.interactions.order[1].id, {
+        outcome = { outcome = "selected", optionId = "a" },
+      })
+
+      vim.cmd("vsplit")
+      local editor = vim.api.nvim_get_current_win()
+      local notices = {}
+      local original_notify = vim.notify
+      vim.notify = function(message)
+        notices[#notices + 1] = tostring(message)
+      end
+      t.cleanup(function()
+        vim.notify = original_notify
+      end)
+      S.view.interactions:open("permission", {
+        sessionId = "s1",
+        toolCall = { title = "Run 2", kind = "execute" },
+        options = { { optionId = "a", name = "Allow", kind = "allow_once" } },
+      }, function() end, 16)
+      wait(function()
+        return choices.view:is_open()
+      end, 5000, "the editor-focus component")
+      t.eq(editor, vim.api.nvim_get_current_win(), "an editor window keeps focus")
+      t.match("需要你的选择", table.concat(notices, "\n"))
+      pcall(vim.api.nvim_win_close, editor, true)
     end)
 
     t.it("stops insert mode before mounting the component", function()

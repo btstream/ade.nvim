@@ -122,6 +122,7 @@ local function internal_select(opts)
   vim.bo[buf].buftype = "nofile"
   vim.bo[buf].bufhidden = "wipe"
   vim.bo[buf].swapfile = false
+  vim.b[buf].ade_picker = true
 
   local format = opts.format or function(item)
     return item.label
@@ -350,13 +351,13 @@ local function internal_select(opts)
     once = true,
     callback = function()
       if opts.dismiss_on_leave == false then
-        -- A panel switch may move focus through this float. Close it without
-        -- settling the request; the queue re-presents it (component or
-        -- fallback). Only an explicit choice or Esc/q answers it.
-        close()
-      else
-        cancel()
+        -- Permission and form pickers stay on screen when focus moves away
+        -- (a panel switch, `:wincmd p` or a click). Only an explicit choice
+        -- or Esc/q answers the request; closing on BufLeave would leave the
+        -- blocked agent with no surface at all.
+        return
       end
+      cancel()
     end,
   })
   return { close = cancel }

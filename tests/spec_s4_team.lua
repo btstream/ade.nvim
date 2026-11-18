@@ -1316,7 +1316,6 @@ return function(t)
       end, 5000, "the choice component")
       local view = state().view.choices.view
       view:select(1)
-      view:submit()
       wait(function()
         return #service.team_answers == 1
       end, 5000, "the permission answer")
@@ -1356,7 +1355,6 @@ return function(t)
       local second = state().view.choices.view
       local second_options = second:options(second.model.questions[1])
       second:select(#second_options)
-      second:submit()
       wait(function()
         return #service.team_answers == 2
       end, 5000, "the cancelled answer")

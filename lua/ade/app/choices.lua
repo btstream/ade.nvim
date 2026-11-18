@@ -69,6 +69,7 @@ function Choices:items(team, team_id)
     for _, row in ipairs(team:list_rows()) do
       if not team_id or row.id == team_id then
         for _, item in ipairs(row.inbox or {}) do
+          item.team = item.team or row.id
           out[#out + 1] = item
         end
       end
@@ -123,6 +124,7 @@ function Choices:mount()
   end
   return {
     win = win,
+    chat_win = chat,
     external = self.deps.external and self.deps.external() or false,
     max_height = max_height,
   }
@@ -289,6 +291,7 @@ function Choices:team_permission_model(team, item, pending)
   return {
     title = "worker " .. tostring(item.from or "?") .. " 请求权限 · team " .. tostring(item.team),
     status_fn = self:status_fn(item.team),
+    submit_single = true,
     questions = { { header = "Permission", question = item.body or "Permission required", options = options } },
     on_cancel = function()
       -- Esc is "later" for team items, including a worker permission.

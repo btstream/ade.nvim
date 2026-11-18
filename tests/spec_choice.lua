@@ -108,6 +108,24 @@ return function(t)
       close_window()
     end)
 
+    t.it("anchors attachments at the draft end while the choice buffer shows", function()
+      local win = window()
+      local Input = require("ade.ui.input")
+      local input = Input.new({
+        config = { ui = { toolbar = { placement = "off" } } },
+        on_submit = function() end,
+        on_cancel = function() end,
+      })
+      vim.api.nvim_buf_set_lines(input.buf, 0, -1, false, { "abc", "de" })
+      local choice_buf = vim.api.nvim_create_buf(false, true)
+      vim.b[choice_buf].ade_choice = true
+      vim.api.nvim_win_set_buf(win, choice_buf)
+      input.win = win
+      t.eq({ 1, 2 }, input:cursor_position(), "append to the end of the draft")
+      input:destroy()
+      close_window()
+    end)
+
     t.it("does not resize under edgy and restores the native height", function()
       local win = window()
       local view = Choice.new({ notify = function() end })
@@ -482,6 +500,55 @@ return function(t)
       choices:show_pending("t1")
       vim.wait(20)
       t.eq(2, #calls, "`:Ade team answer` retries it")
+      close_window()
+    end)
+
+    t.it("does not stack the component over an unclosable fallback", function()
+      local win = window()
+      local interactions = {
+        shown = "p1",
+        order = { { id = "p1", state = "pending", type = "permission" } },
+        pending = function(self)
+          return self.order
+        end,
+        show_next = function(self)
+          self.showed = true
+        end,
+        unshow = function(self)
+          self.shown = nil
+        end,
+      }
+      local notices = {}
+      local choices = Choices.new({
+        team = function()
+          return nil
+        end,
+        interactions = function()
+          return interactions
+        end,
+        config = function()
+          return { ui = { picker = "vim" }, permissions = { prompt = "select" } }
+        end,
+        notify = function(message)
+          notices[#notices + 1] = message
+        end,
+        input_win = function()
+          return win
+        end,
+        chat_win = function()
+          return win
+        end,
+        external = function()
+          return false
+        end,
+        panel_visible = function()
+          return true
+        end,
+      })
+      choices:show_pending(nil)
+      t.eq(false, choices.view:is_open(), "no component on top of vim.ui.select")
+      t.falsy(interactions.showed, "show_next is not called again")
+      t.match("选择框", table.concat(notices, "\n"))
       close_window()
     end)
 

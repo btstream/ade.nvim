@@ -1380,7 +1380,8 @@ agent 自己的权限请求和表单），聊天输入窗口会临时换成选�
 附件和撤销历史留在原输入缓冲区。
 
 - Tab / Shift-Tab（也接受左右、h/l）切换问题，↑↓/jk 选择，1-9 直接选，
-  Space 多选，Enter 确认，Esc 稍后（agent 的权限/表单是取消）。
+  Space 多选，Enter 确认，Esc 稍后（团队权限也是稍后；只有 agent 自己的
+  权限请求和表单是取消）。
 - 没有选项的提问不占组件：只提示，用 :Ade team answer 或在成员上按 a
   回答。
 - 面板隐藏时只提示；:Ade open 或 :Ade team answer 后显示。
