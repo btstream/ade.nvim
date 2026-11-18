@@ -548,6 +548,20 @@ return function(t)
           and vim.api.nvim_win_get_buf(input.win) == input.buf
       end, 5000, "the leader chat in the right column")
       t.eq(vim.api.nvim_get_current_tabpage(), UI.tab.tab)
+      local function widths()
+        local out = {}
+        for _, win in ipairs(vim.api.nvim_tabpage_list_wins(UI.tab.tab)) do
+          out[#out + 1] = vim.api.nvim_win_get_width(win)
+        end
+        return table.concat(out, ",")
+      end
+      local before = widths()
+      for _ = 1, 3 do
+        UI:refresh()
+      end
+      t.eq(before, widths(), "a refresh must not squeeze the mounted leader")
+      t.eq(true, vim.api.nvim_win_get_width(chat.win) >= 16, "the chat keeps a usable width")
+      t.eq(true, vim.api.nvim_win_get_width(input.win) >= 16, "the input keeps a usable width")
       local original_tab = UI._impl.leader_mounted and UI._impl.leader_mounted.original_tab or nil
       vim.api.nvim_set_current_win(UI.tab.panels.members)
       vim.api.nvim_feedkeys("q", "x", false)
@@ -718,14 +732,6 @@ return function(t)
       controller.connect()
       wait_ready()
       controller.state().config.teams.dashboard.members_width = 40
-      local choices = require("ade.app.choices")
-      local old_counts = choices.pending_counts
-      choices.pending_counts = function()
-        return { question = 2, approval = 1 }
-      end
-      t.cleanup(function()
-        choices.pending_counts = old_counts
-      end)
       service:team_changed(base_team(dir))
       wait(function()
         return team():team("t1") ~= nil
@@ -735,14 +741,56 @@ return function(t)
       wait(function()
         return UI.tab.panels.members ~= nil
       end, 5000, "the tab")
+      local queue = UI:choices()
+      local old_counts = queue.pending_counts
+      queue.pending_counts = function()
+        return { question = 2, approval = 1 }
+      end
+      t.cleanup(function()
+        queue.pending_counts = old_counts
+      end)
+      UI:update_tabline()
       t.match("team t1", vim.o.tabline)
       t.match("? 待回答 2", vim.o.tabline)
       t.match("⚑ 待批准 1", vim.o.tabline)
       t.eq(40, vim.api.nvim_win_get_width(UI.tab.panels.members))
       t.eq(true, vim.api.nvim_get_option_value("winfixwidth", { win = UI.tab.panels.members }))
+      t.eq(2, vim.o.showtabline)
+      vim.wait(250)
       vim.api.nvim_win_set_width(UI.tab.panels.members, 48)
+      -- Headless nvim does not deliver WinResized for API resizes; a real drag
+      -- does, and the test emits it before any scheduled refresh can run.
+      vim.cmd("doautocmd WinResized")
+      vim.wait(50)
       vim.cmd("doautocmd VimResized")
       t.eq(48, vim.api.nvim_win_get_width(UI.tab.panels.members))
+      -- Opening and closing the right column must not ratchet the width (M1).
+      for _ = 1, 5 do
+        UI.tab:open_watch_host()
+        vim.wait(30)
+        vim.cmd("doautocmd WinResized")
+        UI.tab:close_watch_host()
+        vim.wait(30)
+        vim.cmd("doautocmd WinResized")
+        UI:refresh()
+        t.eq(48, vim.api.nvim_win_get_width(UI.tab.panels.members))
+      end
+      -- The watch column keeps a user width too (M2).
+      local host = UI.tab:open_watch_host()
+      vim.wait(250)
+      vim.api.nvim_win_set_width(host, 40)
+      vim.cmd("doautocmd WinResized")
+      UI:refresh()
+      t.eq(40, vim.api.nvim_win_get_width(host))
+      UI.tab:close_watch_host()
+      vim.wait(250)
+
+      -- Manual resizes are not clamped to the config range (m1).
+      vim.wait(250)
+      vim.api.nvim_win_set_width(UI.tab.panels.members, 10)
+      vim.cmd("doautocmd WinResized")
+      UI:refresh()
+      t.eq(10, vim.api.nvim_win_get_width(UI.tab.panels.members))
     end)
 
     t.it("member roles and board frames use the v2 style", function()
@@ -850,20 +898,20 @@ return function(t)
       end, 5000, "the team")
       t.eq(true, controller.open_team())
       local UI = ui()
-      local choices = require("ade.app.choices")
-      local old_answer, old_show = choices.answer_participant, choices.show_pending
+      local queue = UI:choices()
+      local old_answer, old_show = queue.answer_participant, queue.show_pending
       local answered, shown
-      choices.answer_participant = function(_, name)
+      queue.answer_participant = function(_, team_id, name)
         answered = name
         return true
       end
-      choices.show_pending = function(team_id)
+      queue.show_pending = function(_, team_id)
         shown = team_id
         return true
       end
       t.cleanup(function()
-        choices.answer_participant = old_answer
-        choices.show_pending = old_show
+        queue.answer_participant = old_answer
+        queue.show_pending = old_show
       end)
       local line
       for index, id in pairs(UI.tab.ids.members or {}) do
@@ -878,6 +926,332 @@ return function(t)
       t.eq("w1", answered)
       vim.api.nvim_feedkeys("!", "x", false)
       t.eq("t1", shown)
+    end)
+
+    t.it("board extmarks and hit tests use bytes and every row aligns", function()
+      wide(t)
+      local service, dir = start_service(t, "v2-bytes", { team_board = sample_board() })
+      setup(t, "v2-bytes", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      local tab = UI.tab
+      wait(function()
+        return #vim.api.nvim_buf_get_lines(tab.buffers.board, 0, -1, false) > 3
+      end, 5000, "the board")
+      local lines = vim.api.nvim_buf_get_lines(tab.buffers.board, 0, -1, false)
+
+      local widths, separators = {}, {}
+      for line, info in pairs(tab.meta.board) do
+        if info.kind == "board_header" or info.kind == "board_row" or info.kind == "board_gap" then
+          local text = lines[line]
+          widths[#widths + 1] = vim.fn.strdisplaywidth(text)
+          local seen = {}
+          local pos = 1
+          while true do
+            local at = text:find("┃", pos, true)
+            if not at then
+              break
+            end
+            seen[#seen + 1] = vim.fn.strdisplaywidth(text:sub(1, at - 1))
+            pos = at + 1
+          end
+          separators[#separators + 1] = table.concat(seen, ",")
+        end
+      end
+      t.truthy(#widths > 3)
+      for _, width in ipairs(widths) do
+        t.eq(widths[1], width, "every board row has one width")
+      end
+      for _, cells in ipairs(separators) do
+        t.eq(separators[1], cells, "every board row puts ┃ in the same cells")
+      end
+
+      vim.api.nvim_set_current_win(tab.panels.board)
+      local hits = 0
+      for line, info in pairs(tab.meta.board) do
+        if info.kind == "board_row" then
+          for _, cell in ipairs(info.cells or {}) do
+            if cell.card then
+              vim.api.nvim_win_set_cursor(tab.panels.board, { line, cell.start })
+              local kind, _, card = tab:current()
+              t.eq("card", kind)
+              t.eq(cell.card.id, card.id)
+              hits = hits + 1
+            end
+          end
+        end
+      end
+      t.truthy(hits > 0)
+
+      -- The bold span covers the card id itself, not a border byte.
+      local ids = {}
+      for _, info in pairs(tab.meta.board) do
+        for _, cell in ipairs(info.cells or {}) do
+          if cell.card then
+            ids[cell.card.id] = true
+          end
+        end
+      end
+      local bold = 0
+      for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(tab.buffers.board, tab.mark_ns, 0, -1, { details = true })) do
+        if mark[4].hl_group == "AdeBold" then
+          local text = vim.api.nvim_buf_get_text(tab.buffers.board, mark[2], mark[3], mark[2], mark[4].end_col, {})[1]
+          t.truthy(ids[text], text)
+          bold = bold + 1
+        end
+      end
+      t.truthy(bold > 0)
+      local header_text = {}
+      for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(tab.buffers.board, tab.mark_ns, 0, -1, { details = true })) do
+        if mark[4].hl_group == "AdeBoardColumn1" then
+          header_text[#header_text + 1] =
+            vim.api.nvim_buf_get_text(tab.buffers.board, mark[2], mark[3], mark[2], mark[4].end_col, {})[1]
+        end
+      end
+      t.match("待开发", table.concat(header_text, ""))
+    end)
+
+    t.it("member rows keep the label, agent and model at 32 and 48 cells", function()
+      local Members = require("ade.ui.team.members")
+      local now = os.time() * 1000
+      local members = {
+        id = "t1",
+        participants = {
+          { name = "leader", agent = "claude", model = "opus", state = "idle", state_since = now - 5000, task = "_" },
+          {
+            name = "w1",
+            label = "coder",
+            agent = "opencode",
+            model = "deepseek/ds-flash",
+            state = "working",
+            state_since = now - 190000,
+            task = "C1",
+          },
+          {
+            name = "r1",
+            label = "reviewer",
+            agent = "pi",
+            model = "gpt",
+            state = "idle",
+            paused = true,
+            state_since = now - 3700000,
+            task = "C2",
+          },
+        },
+      }
+      local wide_lines = Members.lines(members, 48, { messages = { r1 = 1 } })
+      local wide_text = table.concat(wide_lines, "\n")
+      t.match("★ leader claude/opus", wide_text)
+      t.falsy(wide_text:find("leader  leader", 1, true))
+      t.match("coder opencode/ds%-flash", wide_text)
+      t.match("reviewer pi/gpt", wide_text)
+
+      local narrow_lines = Members.lines(members, 32, { messages = { r1 = 1 } })
+      local narrow = table.concat(narrow_lines, "\n")
+      t.match("coder", narrow, narrow)
+      t.falsy(narrow:find("leader  leader", 1, true))
+      -- The model moves to its own line when the first one is full.
+      t.match("opencode/ds%-flash", narrow)
+      t.match("paused", narrow)
+    end)
+
+    t.it("tool summaries reject lookalikes and show failures and progress", function()
+      local Tools = require("ade.ui.team.tools")
+      for _, block in ipairs({
+        { kind = "tool", title = "Read lua/ade/ui/team/board_update.lua", raw_input = { path = "x" } },
+        { kind = "tool", title = "bash: grep -r bus_status .", raw_input = { command = "grep" } },
+        { kind = "tool", tool_name = "mcp__other__bus_send", raw_input = { to = "x", kind = "task" } },
+      }) do
+        t.eq(nil, Tools.describe(block), vim.inspect(block))
+      end
+      t.truthy(
+        Tools.describe({ kind = "tool", tool_name = "ade-team_bus_send", raw_input = { to = "w1", kind = "task" } })
+      )
+      t.truthy(
+        Tools.describe({ kind = "tool", title = "ade-team_team_spawn", raw_input = { name = "w1", template = "coder" } })
+      )
+
+      local blocks = require("ade.ui.blocks")
+      local ctx = { icons = blocks.icon_set("unicode"), width = 40, config = { ui = {} } }
+      local function render(block)
+        local lines = blocks.render_block(block, ctx)
+        return table.concat(
+          vim.tbl_map(function(line)
+            return line.text or ""
+          end, lines),
+          "\n"
+        ),
+          lines
+      end
+      local failed, failed_lines = render({
+        kind = "tool",
+        tool_name = "mcp__ade-team__board_update",
+        status = "failed",
+        raw_input = { upsert = { { id = "C1" } } },
+      })
+      t.match("失败", failed)
+      local red = false
+      for _, segment in ipairs(failed_lines[1].segments or {}) do
+        if segment.group == "AdeToolError" then
+          red = true
+        end
+      end
+      t.truthy(red)
+      local pending = render({
+        kind = "tool",
+        tool_name = "ade-team_team_spawn",
+        status = "in_progress",
+        raw_input = { name = "w1", template = "coder" },
+      })
+      t.match("…", pending)
+      ctx.width = 12
+      ctx.icons = blocks.icon_set("ascii")
+      local short = render({
+        kind = "tool",
+        tool_name = "ade-team_board_update",
+        status = "completed",
+        raw_input = { upsert = { { id = "C1" }, { id = "C2" } } },
+      })
+      t.truthy(vim.fn.strdisplaywidth(short:gsub("\n.*", "")) <= 12, short)
+    end)
+
+    t.it("card detail focuses the popup and closes with q", function()
+      wide(t)
+      local service, dir = start_service(t, "v2-popup", { team_board = sample_board() })
+      setup(t, "v2-popup", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      local tab = UI.tab
+      wait(function()
+        for _, info in pairs(tab.meta.board or {}) do
+          for _, cell in ipairs(info.cells or {}) do
+            if cell.card and cell.card.id == "T1" then
+              return true
+            end
+          end
+        end
+        return false
+      end, 5000, "the T1 card cell")
+      local line, col
+      for lnum, info in pairs(tab.meta.board or {}) do
+        for _, cell in ipairs(info.cells or {}) do
+          if cell.card and cell.card.id == "T1" then
+            line, col = lnum, cell.start
+          end
+        end
+      end
+      t.truthy(line)
+      vim.api.nvim_set_current_win(tab.panels.board)
+      vim.api.nvim_win_set_cursor(tab.panels.board, { line, col })
+      tab.dashboard:handle_key("cr")
+      local detail_win, detail_buf
+      wait(function()
+        for _, win in ipairs(vim.api.nvim_list_wins()) do
+          local buf = vim.api.nvim_win_get_buf(win)
+          if vim.bo[buf].filetype == "ade_team_detail" then
+            detail_win, detail_buf = win, buf
+            return true
+          end
+        end
+        return false
+      end, 5000, "the card popup")
+      t.eq(detail_win, vim.api.nvim_get_current_win(), "focus moves into the popup")
+      vim.api.nvim_feedkeys("q", "x", false)
+      wait(function()
+        return not vim.api.nvim_buf_is_valid(detail_buf) or #vim.api.nvim_buf_get_lines(detail_buf, 0, -1, false) == 0
+      end, 5000, "the popup to close")
+      t.eq(false, vim.api.nvim_win_is_valid(detail_win))
+    end)
+
+    t.it("the narrow float shows roles, marks and reachable cards", function()
+      local service, dir = start_service(t, "v2-float", { team_board = sample_board() })
+      setup(t, "v2-float", service, dir)
+      controller.state().config.teams.dashboard.wide = 300
+      controller.connect()
+      wait_ready()
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local UI = ui()
+      wait(function()
+        return UI.win ~= nil and vim.api.nvim_win_is_valid(UI.win)
+      end, 5000, "the float")
+      t.eq(nil, UI.tab)
+      local width = vim.api.nvim_win_get_width(UI.win)
+      wait(function()
+        local text = table.concat(vim.api.nvim_buf_get_lines(UI.buf, 0, -1, false), "\n")
+        return text:find("┃", 1, true) ~= nil
+      end, 5000, "the float board")
+      -- Move to the column that has the card (one column is visible).
+      vim.api.nvim_set_current_win(UI.win)
+      for lnum, id in pairs(UI.ids or {}) do
+        if id == "t1|w1" then
+          vim.api.nvim_win_set_cursor(UI.win, { lnum, 0 })
+        end
+      end
+      local pressed = false
+      for _, map in ipairs(vim.api.nvim_buf_get_keymap(UI.buf, "n")) do
+        if map.lhs == "zl" then
+          map.callback()
+          pressed = true
+          break
+        end
+      end
+      t.truthy(pressed)
+      wait(function()
+        local text = table.concat(vim.api.nvim_buf_get_lines(UI.buf, 0, -1, false), "\n")
+        return text:find("T1", 1, true) ~= nil
+      end, 5000, "the card column")
+      local text = table.concat(vim.api.nvim_buf_get_lines(UI.buf, 0, -1, false), "\n")
+      t.match("★", text)
+      t.match("◆", text)
+      t.match("┃", text)
+      t.match("╭", text)
+      for _, line in ipairs(vim.api.nvim_buf_get_lines(UI.buf, 0, -1, false)) do
+        t.truthy(vim.fn.strdisplaywidth(line) <= width, line)
+      end
+      t.truthy(#vim.api.nvim_buf_get_extmarks(UI.buf, -1, 0, -1, {}) > 0)
+      local card_line
+      for lnum, id in pairs(UI.ids or {}) do
+        if id == "card:t1|T1" then
+          card_line = lnum
+        end
+      end
+      t.truthy(card_line)
+      vim.api.nvim_set_current_win(UI.win)
+      vim.api.nvim_win_set_cursor(UI.win, { card_line, 0 })
+      local kind, team_id, card = UI:current()
+      t.eq("card", kind)
+      t.eq("t1", team_id)
+      t.eq("T1", card)
+    end)
+
+    t.it("ascii borders keep alignment under ambiwidth=double", function()
+      local old = vim.o.ambiwidth
+      t.cleanup(function()
+        vim.o.ambiwidth = old
+      end)
+      vim.o.ambiwidth = "double"
+      local lines = Board.lines(sample_board(), {}, { width = 80 })
+      local text = table.concat(lines, "\n")
+      t.falsy(text:find("┃", 1, true))
+      t.falsy(text:find("╭", 1, true))
+      t.match("%|", text)
+      t.match("%+", text)
     end)
 
     t.it("coalesces frequent dashboard refreshes", function()

@@ -353,29 +353,23 @@ def scenario_board_cards(case):
 
 
 def scenario_group_approve(case):
-    """3. Two spawns in one turn collapse into one inbox row; A approves both."""
+    """3. Two spawns in one turn form a group; `!` approves both through the UI."""
     editor = make_editor(case, "a", templates=base.template(), spawn_confirm_auto=[])
     editor.connect()
     editor.submit("[spawn-two]")
-    grouped = wait_until(
+    wait_until(
         lambda: (lambda value: value if value and value.get("n", 0) >= 2 and value.get("group") else None)(spawn_group(editor)),
         "the spawn group",
     )
-    group = grouped["group"]
-    editor.lua(
-        """
-        local group = ...
-        local st = require("ade.controller").state()
-        st.view.team:answer_group(group, true, function() end)
-        return true
-        """,
-        group,
-    )
-    editor.wait_participant("w1", lambda entry: entry["sessionId"] is not None, "w1 after A")
-    editor.wait_participant("w2", lambda entry: entry["sessionId"] is not None, "w2 after A")
+    editor.open_panel()
+    editor.panel_press("!")
+    wait_until(editor.choice_open, "the choice component")
+    editor.choice_pick("allow")
+    editor.wait_participant("w1", lambda entry: entry["sessionId"] is not None, "w1 after allow")
+    editor.wait_participant("w2", lambda entry: entry["sessionId"] is not None, "w2 after allow")
     approvals = sum((event.get("text") or "").count("approved:") for event in case.agent_events())
     assert approvals >= 2, approvals
-    return "the spawn group was answered together and started both workers"
+    return "the spawn group was approved together through the choice queue"
 
 
 def scenario_activity(case):

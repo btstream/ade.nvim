@@ -1264,19 +1264,96 @@ return function(t)
       end, 5000, "the team")
       t.eq(true, controller.open_team())
       local ui = state().view.team_ui
-      local choices = require("ade.app.choices")
-      local old_show = choices.show_pending
+      local queue = state().view.choices
+      local old_show = queue.show_pending
       local shown
-      choices.show_pending = function(team_id)
+      queue.show_pending = function(_, team_id)
         shown = team_id
         return true
       end
       t.cleanup(function()
-        choices.show_pending = old_show
+        queue.show_pending = old_show
       end)
       vim.api.nvim_set_current_win(ui.win)
       vim.api.nvim_feedkeys("!", "x", false)
       t.eq("t1", shown)
+      ui:close()
+    end)
+
+    t.it("the panel's permission answer sends the option id, or none on cancel", function()
+      local service, dir = start_service(t, "panel-permission")
+      setup(t, "panel-permission", service, dir)
+      controller.connect()
+      wait_ready()
+      controller.open()
+      service:team_changed({
+        id = "t1",
+        cwd = dir,
+        state = "active",
+        participants = { { name = "w1", state = "idle", task = "_", queued = 0, turns = {} } },
+        inbox = {},
+        limits = {},
+      })
+      service:team_inbox({
+        id = "i1",
+        team = "t1",
+        kind = "permission",
+        from = "w1",
+        body = "",
+        options = { { kind = "allow_once", optionId = "allow", name = "Allow" } },
+        state = "open",
+      })
+      wait(function()
+        return team():team("t1") ~= nil and team():item("i1") ~= nil
+      end, 5000, "the permission item")
+      t.eq(true, controller.open_team())
+      local ui = state().view.team_ui
+      vim.api.nvim_set_current_win(ui.win)
+      vim.api.nvim_feedkeys("!", "x", false)
+      wait(function()
+        local queue = state().view.choices
+        return queue and queue:is_open()
+      end, 5000, "the choice component")
+      local view = state().view.choices.view
+      view:select(1)
+      view:submit()
+      wait(function()
+        return #service.team_answers == 1
+      end, 5000, "the permission answer")
+      t.eq("allow", service.team_answers[1].option)
+
+      service:team_inbox({
+        id = "i1",
+        team = "t1",
+        kind = "permission",
+        from = "w1",
+        body = "",
+        options = { { kind = "allow_once", optionId = "allow", name = "Allow" } },
+        state = "answered",
+      })
+      service:team_inbox({
+        id = "i2",
+        team = "t1",
+        kind = "permission",
+        from = "w1",
+        body = "",
+        options = { { kind = "allow_once", optionId = "allow", name = "Allow" } },
+        state = "open",
+      })
+      wait(function()
+        return team():item("i2") ~= nil and team():item("i1") == nil
+      end, 5000, "the second item")
+      vim.api.nvim_set_current_win(ui.win)
+      vim.api.nvim_feedkeys("!", "x", false)
+      wait(function()
+        local queue = state().view.choices
+        return queue and queue:is_open()
+      end, 5000, "the second choice component")
+      state().view.choices.view:cancel()
+      wait(function()
+        return #service.team_answers == 2
+      end, 5000, "the cancelled answer")
+      t.eq(nil, service.team_answers[2].option)
       ui:close()
     end)
 
@@ -1789,7 +1866,8 @@ return function(t)
         return body:find("── turn 2", 1, true)
           and body:find("leader → task T5", 1, true)
           and body:find("补 reconnect 的回归测试", 1, true)
-          and body:find("→ leader report T4：tests pass", 1, true)
+          and body:find("→ leader report T4", 1, true)
+          and body:find("tests pass", 1, true)
       end, 5000, "the second turn, plan and bus message")
 
       -- The diff is rendered by the normal tool card, not flattened text.
@@ -1944,7 +2022,7 @@ return function(t)
           unwatches = unwatches + 1
         end
       end
-      t.truthy(unwatches <= 1, "a stale A response never unwinds the current A watch")
+      t.eq(0, unwatches, "A stays current, so B is skipped and A is never unwatched")
       ui.watcher:close()
     end)
 
@@ -2567,15 +2645,15 @@ return function(t)
       t.eq("notice", service.team_sends[1].kind)
       t.eq("queued while suspended", service.team_sends[1].body)
 
-      local choices = require("ade.app.choices")
-      local old_answer = choices.answer_participant
+      local queue = state().view.choices
+      local old_answer = queue.answer_participant
       local answered
-      choices.answer_participant = function(_, name)
+      queue.answer_participant = function(_, _, name)
         answered = name
         return true
       end
       t.cleanup(function()
-        choices.answer_participant = old_answer
+        queue.answer_participant = old_answer
       end)
       vim.api.nvim_win_set_cursor(ui.win, { line_of("t1|w1"), 0 })
       vim.api.nvim_feedkeys("a", "x", false)
