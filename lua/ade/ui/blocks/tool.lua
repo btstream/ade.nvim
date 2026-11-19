@@ -233,7 +233,7 @@ function M.render_tool(block, ctx)
       elseif block.status == "in_progress" or block.status == "pending" then
         group, suffix = "AdeToolRunning", " · …"
       end
-      local caret = (ctx.icons and ctx.icons.chevron_right) or "›"
+      local caret = (ctx.icons and ctx.icons.chevron_right) or require("ade.ui.icons").glyph("tool_caret")
       local Text = require("ade.ui.team.text")
       local width = ctx.width or 80
       -- Reserve the suffix so a failure marker is never the part that gets

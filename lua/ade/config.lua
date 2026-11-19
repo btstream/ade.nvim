@@ -228,6 +228,7 @@ M.defaults = {
   ui = {
     -- Use Nerd Font icons. Set to false for a plain ASCII interface.
     icons = true,
+    icon_overrides = {},
     -- Show agent thoughts expanded. Off by default, matching Zed's clean
     -- transcript; a collapsed header is still drawn so they can be opened.
     -- Kept for compatibility: `thoughts.default_expanded` supersedes it.
@@ -294,6 +295,35 @@ M.defaults = {
       -- Refresh animation for the running indicator.
       animate = true,
       animation_interval = 120,
+      component_separator = " · ",
+      right_padding = 1,
+      sections = {
+        left = {
+          -- Keep these gaps on the bar background, outside the colored badges.
+          { "mode", separator = { text = " ", hl = "AdeToolbar" } },
+          { "attachments", separator = { text = " ", hl = "AdeToolbar" } },
+          "model",
+          {
+            "thinking",
+            fmt = function(text)
+              return require("ade.ui.toolbar").truncate(text, 12)
+            end,
+          },
+          {
+            "context",
+            cond = function(ctx)
+              return ctx.show_usage
+            end,
+          },
+          {
+            "cost",
+            cond = function(ctx)
+              return ctx.show_usage
+            end,
+          },
+        },
+        right = { "status", "queue" },
+      },
     },
 
     -- Divider drawn between conversation turns.
@@ -353,6 +383,7 @@ M.defaults = {
       -- not be used: in a terminal it is the same key as <CR>.
       pick_model = { n = "M", i = "<M-m>" },
       pick_mode = { n = "m", i = "<M-b>" },
+      pick_thinking = { n = "gT", i = "<M-e>" },
       pick_session = "L",
       -- Moves the cursor into the pending question/permission card that floats
       -- over the bottom of the chat window.
@@ -373,6 +404,7 @@ M.defaults = {
       add_diagnostics = "R",
       pick_model = "M",
       pick_mode = "m",
+      pick_thinking = "gT",
       new_session = "<C-n>",
       pick_session = "L",
       scroll_bottom = "G",
@@ -641,6 +673,141 @@ function M.effective()
   return M.current or M.validate(M.merge(M.defaults, {}))
 end
 
+local function check_hl(value, path)
+  if type(value) ~= "string" or not value:match("^@?[%w_.]+$") then
+    fail("%s must be a highlight group name", path)
+  end
+end
+
+local function check_separator(value, path, allow_edges)
+  if value == false or type(value) == "string" then
+    return
+  end
+  if type(value) ~= "table" then
+    fail("%s must be a string, false or a separator table", path)
+  end
+  if value.text ~= nil then
+    if type(value.text) ~= "string" or value.left ~= nil or value.right ~= nil then
+      fail("%s must specify text (with optional hl) or left/right", path)
+    end
+    if value.hl ~= nil then
+      check_hl(value.hl, path .. ".hl")
+    end
+  elseif allow_edges and (value.left ~= nil or value.right ~= nil) and value.hl == nil then
+    for _, side in ipairs({ "left", "right" }) do
+      if value[side] ~= nil then
+        check_separator(value[side], path .. "." .. side, false)
+      end
+    end
+  else
+    fail("%s must specify separator text", path)
+  end
+end
+
+local function validate_toolbar(toolbar)
+  check_number(toolbar.right_padding, 0, 10000, "ui.toolbar.right_padding")
+  if toolbar.right_padding % 1 ~= 0 then
+    fail("ui.toolbar.right_padding must be an integer")
+  end
+  if toolbar.component_separator ~= nil then
+    check_separator(toolbar.component_separator, "ui.toolbar.component_separator", false)
+  end
+  if toolbar.sections == nil then
+    return
+  end
+  if type(toolbar.sections) ~= "table" then
+    fail("ui.toolbar.sections must be a table")
+  end
+  local components = require("ade.ui.toolbar_sections").components
+  for side, list in pairs(toolbar.sections) do
+    if side ~= "left" and side ~= "right" then
+      fail("ui.toolbar.sections only accepts left and right")
+    end
+    if type(list) ~= "table" or not vim.islist(list) then
+      fail("ui.toolbar.sections.%s must be a list", side)
+    end
+    for i, entry in ipairs(list) do
+      local path = string.format("ui.toolbar.sections.%s[%d]", side, i)
+      local spec = type(entry) == "table" and entry or { entry }
+      local key = spec[1]
+      if type(key) ~= "function" and (type(key) ~= "string" or not components[key]) then
+        fail("%s must name a built-in component or provide a function", path)
+      end
+      if spec.separator ~= nil then
+        check_separator(spec.separator, path .. ".separator", true)
+      end
+      if spec.color ~= nil then
+        check_hl(spec.color, path .. ".color")
+      end
+      for _, field in ipairs({ "cond", "fmt" }) do
+        if spec[field] ~= nil and type(spec[field]) ~= "function" then
+          fail("%s.%s must be a function", path, field)
+        end
+      end
+      local function check_padding(value, suffix)
+        check_number(value, 0, 10000, path .. suffix)
+        if value % 1 ~= 0 then
+          fail("%s%s must be an integer", path, suffix)
+        end
+      end
+      if type(spec.padding) == "table" then
+        for k, v in pairs(spec.padding) do
+          if k ~= "left" and k ~= "right" then
+            fail("%s.padding only accepts left and right", path)
+          end
+          check_padding(v, ".padding." .. k)
+        end
+      elseif spec.padding ~= nil then
+        check_padding(spec.padding, ".padding")
+      end
+      if spec.priority ~= nil then
+        check_number(spec.priority, -10000, 10000, path .. ".priority")
+      end
+    end
+  end
+end
+
+local function validate_icons(overrides)
+  if type(overrides) ~= "table" then
+    fail("ui.icon_overrides must be a table")
+  end
+  local function check_icon(value, path)
+    if value ~= false and (type(value) ~= "string" or value:find("%c")) then
+      fail("%s must be a single-line string or false", path)
+    end
+  end
+  for key, value in pairs(overrides) do
+    local path = "ui.icon_overrides." .. tostring(key)
+    if key == "modes" then
+      if type(value) ~= "table" then
+        fail("%s must be a table", path)
+      end
+      for agent, modes in pairs(value) do
+        if type(agent) ~= "string" or type(modes) ~= "table" then
+          fail("%s must map agent names to tables of mode IDs", path)
+        end
+        for id, icon in pairs(modes) do
+          if type(id) ~= "string" then
+            fail("%s.%s must use string mode IDs", path, agent)
+          end
+          check_icon(icon, path .. "." .. agent .. "." .. id)
+        end
+      end
+    elseif key == "spinner_frames" and value ~= false then
+      if type(value) ~= "table" or not vim.islist(value) or #value == 0 then
+        fail("%s must be false or a non-empty list of frames", path)
+      end
+      for _, frame in ipairs(value) do
+        if type(frame) ~= "string" or frame == "" or frame:find("%c") then
+          fail("%s must contain non-empty single-line strings", path)
+        end
+      end
+    else
+      check_icon(value, path)
+    end
+  end
+end
+
 function M.validate(cfg)
   M.normalize_keymaps(cfg)
   check_enum(cfg.backend, { "direct", "service", "auto" }, "backend")
@@ -752,6 +919,8 @@ function M.validate(cfg)
   check_enum(cfg.ui.session_picker, { "snacks", "internal" }, "ui.session_picker")
   check_enum(cfg.ui.title.placement, { "auto", "winbar", "off" }, "ui.title.placement")
   check_enum(cfg.ui.toolbar.placement, { "auto", "winbar", "off" }, "ui.toolbar.placement")
+  validate_toolbar(cfg.ui.toolbar)
+  validate_icons(cfg.ui.icon_overrides)
   check_enum(cfg.ui.separator.form, { "dot", "turn", "off" }, "ui.separator.form")
   if type(cfg.ui.diff) ~= "table" then
     fail("ui.diff must be a table")
@@ -1497,14 +1666,16 @@ local function check_keymap_value(value, path)
     if not vim.tbl_contains({ "n", "i", "v", "x", "t", "c" }, mode) then
       fail("%s has an unknown mode %q", path, mode)
     end
-    if type(keys) == "string" then
+    if keys == false then
+      -- Match keymaps.expand: false disables just this mode.
+    elseif type(keys) == "string" then
       key(keys, "." .. mode)
     elseif type(keys) == "table" and vim.islist(keys) then
       for i, lhs in ipairs(keys) do
         key(lhs, "." .. mode .. "[" .. i .. "]")
       end
     else
-      fail("%s.%s must be a string or a list of strings", path, mode)
+      fail("%s.%s must be a string, a list of strings or false", path, mode)
     end
   end
 end

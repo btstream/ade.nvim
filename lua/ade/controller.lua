@@ -561,12 +561,10 @@ end
 
 -- Thin forwards: the options service owns the pickers and the choice logic.
 
-function M.pick_model()
-  S.view.options:pick_model()
-end
-
-function M.pick_mode()
-  S.view.options:pick_mode()
+for _, name in ipairs({ "pick_model", "pick_mode", "pick_thinking" }) do
+  M[name] = function()
+    S.view.options[name](S.view.options)
+  end
 end
 
 ---Every session control in one picker, including boolean switches.
@@ -689,12 +687,10 @@ function _G.AdeTranscriptBar()
 end
 
 ---Winbar click handlers. These must be plain globals so `%@v:lua.Name@` works.
-function _G.AdePickModel()
-  M.pick_model()
-end
-
-function _G.AdePickMode()
-  M.pick_mode()
+for suffix, method in pairs({ Model = "pick_model", Mode = "pick_mode", Thinking = "pick_thinking" }) do
+  _G["AdePick" .. suffix] = function()
+    M[method]()
+  end
 end
 
 return M

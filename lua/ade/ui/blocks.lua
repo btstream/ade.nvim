@@ -59,7 +59,8 @@ function M.render_separator(ctx, opts)
   if opts.form == "turn" and ic.history then
     label = string.format(" %s Turn %d ", ic.history, opts.turn or 1)
   else
-    label = " ● "
+    local dot = Icons.glyph("turn_dot")
+    label = dot ~= "" and (" " .. dot .. " ") or ""
   end
   local label_w = vim.api.nvim_strwidth(label)
   local rule_w = width - label_w

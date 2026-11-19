@@ -44,6 +44,7 @@ M.actions = {
     { action = "add_selection", desc = "add selection", modes = { "n" }, handler = "on_add_selection" },
     { action = "pick_model", desc = "pick model", modes = { "n", "i" }, handler = "on_pick_model" },
     { action = "pick_mode", desc = "pick mode", modes = { "n", "i" }, handler = "on_pick_mode" },
+    { action = "pick_thinking", desc = "pick thinking level", modes = { "n", "i" }, handler = "on_pick_thinking" },
     { action = "pick_file", desc = "insert file mention", modes = { "n", "i" }, handler = "on_pick_file" },
     { action = "paste_image", desc = "paste image from clipboard", modes = { "n", "i" }, handler = "on_paste_image" },
     { action = "pick_session", desc = "sessions", modes = { "n" }, handler = "on_pick_session" },
@@ -68,6 +69,7 @@ M.actions = {
     { action = "add_diagnostics", desc = "add diagnostics", modes = { "n" }, handler = "on_add_diagnostics" },
     { action = "pick_model", desc = "pick model", modes = { "n" }, handler = "on_pick_model" },
     { action = "pick_mode", desc = "pick mode", modes = { "n" }, handler = "on_pick_mode" },
+    { action = "pick_thinking", desc = "pick thinking level", modes = { "n" }, handler = "on_pick_thinking" },
     { action = "new_session", desc = "new session", modes = { "n" }, handler = "on_new_session" },
     { action = "pick_session", desc = "sessions", modes = { "n" }, handler = "on_pick_session" },
     { action = "scroll_bottom", desc = "jump to latest", modes = { "n" }, handler = "on_scroll_bottom" },
@@ -198,7 +200,7 @@ function M.help_entries(view, keymaps)
 end
 
 ---@param opts {keymaps: table, on_send: fun(), on_cancel: fun(), on_hide: fun(),
----  on_add_selection: fun(), on_pick_model: fun(), on_pick_mode: fun(),
+---  on_add_selection: fun(), on_pick_model: fun(), on_pick_mode: fun(), on_pick_thinking: fun(),
 ---  on_pick_session: fun(), on_pick_file: fun(), on_paste_image: fun(), get_session: fun()}
 function M.attach_input(buf, opts)
   M.attach("input", buf, opts.keymaps, opts)
@@ -221,7 +223,7 @@ end
 ---  on_toggle_block: fun(), on_prev_block: fun(), on_next_block: fun(),
 ---  on_open_location: fun(), on_help: fun(), on_add_selection: fun(),
 ---  on_add_file: fun(), on_add_diagnostics: fun(), on_pick_model: fun(),
----  on_pick_mode: fun(), on_new_session: fun(), on_pick_session: fun(),
+---  on_pick_mode: fun(), on_pick_thinking: fun(), on_new_session: fun(), on_pick_session: fun(),
 ---  on_scroll_bottom: fun(), on_scroll_top: fun()}
 function M.attach_chat(buf, opts)
   M.attach("chat", buf, opts.keymaps, opts)

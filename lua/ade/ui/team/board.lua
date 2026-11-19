@@ -222,7 +222,14 @@ function M.lines(board, states, opts)
       local first, last = scroll + 1, scroll + #visible
       local position = first == last and string.format("列 %d/%d · %s", first, #columns, columns[first])
         or string.format("列 %d-%d/%d", first, last, #columns)
-      add(Text.new_line():add(string.format("‹ %s · zh/zl ›", position)), { kind = "board_hint" })
+      local glyph = require("ade.ui.icons").glyph
+      add(
+        Text.new_line()
+          :add(string.format("%s %s · zh/zl %s", glyph("team_hint_left"), position, glyph("team_hint_right"))),
+        {
+          kind = "board_hint",
+        }
+      )
     end
 
     local header = Text.new_line()
@@ -306,8 +313,14 @@ function M.lines(board, states, opts)
       local title = stage ~= "" and stage or "无阶段"
       local collapsed = not (opts.expanded and opts.expanded[stage])
       add(
-        Text.new_line()
-          :add(string.format("%s · 已提交 · %d 张%s", title, #stages[stage], collapsed and "" or " ▾")),
+        Text.new_line():add(
+          string.format(
+            "%s · 已提交 · %d 张%s",
+            title,
+            #stages[stage],
+            collapsed and "" or (" " .. require("ade.ui.icons").glyph("team_collapse"))
+          )
+        ),
         { kind = "archived_stage", stage = stage }
       )
       if not collapsed then

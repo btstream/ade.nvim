@@ -11,7 +11,16 @@
 local M = {}
 
 local NS = vim.api.nvim_create_namespace("ade_agent_manager")
-local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+local Icons = require("ade.ui.icons")
+
+local function frames()
+  return Icons.frames(true) or { "" }
+end
+
+local function marker(key)
+  local icon = Icons.glyph(key)
+  return icon ~= "" and (icon .. " ") or ""
+end
 local LIVE_LOG_LINES = 6
 local DETAIL_LOG_LINES = 20
 
@@ -124,13 +133,14 @@ local function add_row(b, row, opts)
   if section == "running" then
     chunks[#chunks + 1] = { opts.spinner .. " ", "AdeAgentsPending" }
   elseif row.status == "broken" or (outcome and outcome.phase == "failed") then
-    chunks[#chunks + 1] = { "✗ ", "AdeAgentsError" }
+    chunks[#chunks + 1] = { marker("agent_error"), "AdeAgentsError" }
   elseif section == "installed" then
-    chunks[#chunks + 1] = { "✓ ", "AdeAgentsInstalled" }
+    chunks[#chunks + 1] = { marker("agent_installed"), "AdeAgentsInstalled" }
   elseif section == "external" then
-    chunks[#chunks + 1] = { "● ", executable(row.command) and "AdeAgentsInstalled" or "AdeAgentsMuted" }
+    chunks[#chunks + 1] =
+      { marker("agent_system"), executable(row.command) and "AdeAgentsInstalled" or "AdeAgentsMuted" }
   else
-    chunks[#chunks + 1] = { "○ ", "AdeAgentsMuted" }
+    chunks[#chunks + 1] = { marker("agent_missing"), "AdeAgentsMuted" }
   end
   chunks[#chunks + 1] = { row.id, "AdeAgentsName" }
 
@@ -152,7 +162,7 @@ local function add_row(b, row, opts)
     if row.status == "broken" then
       chunks[#chunks + 1] = { " broken — press i to reinstall", "AdeAgentsError" }
     elseif row.outdated then
-      chunks[#chunks + 1] = { " → " .. row.latest, "AdeAgentsUpdate" }
+      chunks[#chunks + 1] = { " " .. marker("agent_update") .. row.latest, "AdeAgentsUpdate" }
       chunks[#chunks + 1] = { " (press u to update)", "AdeAgentsMuted" }
     end
   elseif section == "available" then
@@ -245,7 +255,7 @@ local HELP = {
 function M.render(rows, opts)
   opts = opts or {}
   opts.expanded = opts.expanded or {}
-  opts.spinner = opts.spinner or SPINNER[1]
+  opts.spinner = opts.spinner or frames()[1]
   local b = builder()
   b.add({ { " ade.nvim", "AdeAgentsHeader" }, { " · agents", "AdeAgentsMuted" } })
   b.add({
@@ -271,7 +281,7 @@ function M.render(rows, opts)
     b.add({ { " " .. opts.spinner .. " checking for newer versions…", "AdeAgentsPending" } })
   end
   if opts.toolchain then
-    b.add({ { " ⚠ " .. opts.toolchain, "AdeAgentsError" } })
+    b.add({ { " " .. marker("agent_warning") .. opts.toolchain, "AdeAgentsError" } })
   end
   b.blank()
 
@@ -347,7 +357,7 @@ function M:sync_timer()
           self:stop_timer()
           return
         end
-        self.frame = self.frame % #SPINNER + 1
+        self.frame = self.frame % #frames() + 1
         self:refresh()
       end)
     )
@@ -400,7 +410,7 @@ function M:refresh()
 
   local rendered = M.render(manager:list(), {
     expanded = self.expanded,
-    spinner = SPINNER[self.frame],
+    spinner = frames()[self.frame],
     help = self.help,
     checking = manager.is_checking and manager:is_checking() or false,
     toolchain = self.toolchain_problem,

@@ -194,7 +194,13 @@ function M.describe(block)
   if name == "bus_send" then
     local task = a.task and a.task ~= "_" and (" " .. tostring(a.task)) or ""
     return {
-      title = string.format("→ %s %s%s", tostring(a.to), tostring(a.kind or "message"), task),
+      title = string.format(
+        "%s %s %s%s",
+        require("ade.ui.icons").glyph("team_send"),
+        tostring(a.to),
+        tostring(a.kind or "message"),
+        task
+      ),
       text = first(a.body),
     }
   end

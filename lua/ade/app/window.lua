@@ -156,6 +156,7 @@ function M:install_input_keymaps()
     on_add_selection = actions.add_selection,
     on_pick_model = actions.pick_model,
     on_pick_mode = actions.pick_mode,
+    on_pick_thinking = actions.pick_thinking,
     on_pick_file = actions.pick_file,
     on_paste_image = actions.paste_image,
     on_paste_image_path = actions.add_image,
@@ -249,6 +250,7 @@ function M:install_chat_keymaps()
     on_add_diagnostics = actions.add_diagnostics,
     on_pick_model = actions.pick_model,
     on_pick_mode = actions.pick_mode,
+    on_pick_thinking = actions.pick_thinking,
     on_new_session = actions.new_session,
     on_pick_session = actions.pick_session,
     on_scroll_bottom = function()

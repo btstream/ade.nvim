@@ -1,15 +1,16 @@
 -- Member rows for the unified team dashboard: roles, fixed width and bytes.
 local Roles = require("ade.ui.team.roles")
 local Text = require("ade.ui.team.text")
+local glyph = require("ade.ui.icons").glyph
 local one_line = Text.one_line
 
 local M = {}
 
 local ICONS = {
-  working = "●",
-  idle = "○",
-  waiting_human = "?",
-  exited = "✕",
+  working = "team_working",
+  idle = "team_idle",
+  waiting_human = "team_waiting",
+  exited = "team_exited",
 }
 
 local LABELS = {
@@ -37,9 +38,9 @@ end
 ---@param entry table
 ---@return string
 function M.state_icon(entry)
-  local icon = ICONS[entry.state] or "○"
+  local icon = glyph(ICONS[entry.state] or "team_idle")
   if entry.paused and entry.state ~= "exited" then
-    icon = "⏸"
+    icon = glyph("team_paused")
   end
   return icon
 end
@@ -165,7 +166,7 @@ function M.row(entry, width, messages, palette)
   line:add(" ")
 
   local task = entry.task and entry.task ~= "_" and one_line(entry.task) or ""
-  local mail = (tonumber(messages) or 0) > 0 and ("✉ " .. tostring(messages)) or ""
+  local mail = (tonumber(messages) or 0) > 0 and (glyph("team_mail") .. " " .. tostring(messages)) or ""
   local state = state_text(entry)
   local role_min = 6
   local available = width - line.cells - 1 - role_min
@@ -206,7 +207,7 @@ function M.row(entry, width, messages, palette)
   end
   local activity = entry.activity and entry.activity.text
   if type(activity) == "string" and activity ~= "" then
-    details[#details + 1] = "↳ " .. one_line(activity)
+    details[#details + 1] = glyph("team_activity") .. " " .. one_line(activity)
   end
   local worktree = entry.worktree
   if type(worktree) == "table" and worktree.branch then

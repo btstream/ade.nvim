@@ -84,6 +84,19 @@ return function(t)
       t.eq("S", km.chat.add_selection)
       t.eq({ n = "M", i = "<M-m>" }, km.input.pick_model)
       t.eq("M", km.chat.pick_model)
+      t.eq({ n = "gT", i = "<M-e>" }, km.input.pick_thinking)
+      t.eq("gT", km.chat.pick_thinking)
+    end)
+
+    t.it("allows rebinding and disabling the thinking picker per view", function()
+      local km = cfg({
+        keymaps = { input = { pick_thinking = { n = "T", i = false } }, chat = { pick_thinking = false } },
+      }).keymaps
+      local input = installed(attach("input", km.input))
+      local chat = installed(attach("chat", km.chat))
+      t.eq("ade: pick thinking level", input["n T"])
+      t.eq(nil, input["i " .. key_of("<M-e>")])
+      t.eq(nil, chat["n gT"])
     end)
 
     t.it("accepts a single key, a list and a per-mode map", function()

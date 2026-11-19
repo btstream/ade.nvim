@@ -108,7 +108,9 @@ local function pick_multi(field, values, on_done, alive)
   local items = {}
   for _, option in ipairs(field.options) do
     items[#items + 1] = {
-      label = (selected[option.value] and "[x] " or "[ ] ") .. option.label,
+      label = require("ade.ui.icons").glyph(
+        selected[option.value] and "choice_text_checked" or "choice_text_unchecked"
+      ) .. " " .. option.label,
       description = option.description,
       value = option.value,
     }

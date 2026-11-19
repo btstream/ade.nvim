@@ -103,6 +103,8 @@ q              隐藏面板（普通模式）
                keymaps.input.pick_model
 <M-b> / m      切换模式（输入 / 普通模式）
                keymaps.input.pick_mode
+<M-e> / gT     选择 Thinking Level（输入 / 普通模式）
+               keymaps.input.pick_thinking
 L              历史会话（普通模式）
                keymaps.input.pick_session
 <M-a>          进入待回答的选择卡片（输入 / 普通模式）
@@ -111,7 +113,8 @@ L              历史会话（普通模式）
 @path/to/file  发送时自动展开为附件
 
 winbar 左侧显示模式徽标、模型名与可选用量；右侧显示状态图标/动画与队列数量。
-模型名不显示 provider 前缀，选择器仍保留完整名称。模式徽标和模型名可以点击。
+模型名不显示 provider 前缀，选择器仍保留完整名称。模式、模型和 Thinking Level
+可以点击。自定义布局见 |ade-toolbar|。
 普通选择器默认调用 vim.ui.select；过滤能力取决于用户接管它的 UI。
 
 每个会话有独立的草稿和附件。面板隐藏后草稿仍保留。
@@ -139,6 +142,8 @@ R              附加诊断
                keymaps.chat.add_diagnostics
 M / m          选择模型 / 模式
                keymaps.chat.pick_model / keymaps.chat.pick_mode
+gT             选择 Thinking Level
+               keymaps.chat.pick_thinking
 <C-n>          新建会话
                keymaps.chat.new_session
 L              历史会话
@@ -256,6 +261,7 @@ picker、会话浏览器等自绘浮窗内部的按键不在 keymaps 管辖范�
           add_selection = "<C-]>",
           pick_model = { n = "M", i = "<M-m>" },
           pick_mode = { n = "m", i = "<M-b>" },
+          pick_thinking = { n = "gT", i = "<M-e>" },
           pick_session = "L",
           focus_choice = "<M-a>",
         },
@@ -272,6 +278,7 @@ picker、会话浏览器等自绘浮窗内部的按键不在 keymaps 管辖范�
           add_diagnostics = "R",
           pick_model = "M",
           pick_mode = "m",
+          pick_thinking = "gT",
           new_session = "<C-n>",
           pick_session = "L",
           scroll_bottom = "G",
@@ -755,7 +762,37 @@ AdeUserIcon；助手的两组均链接到 Keyword。想区分时
 工具栏在 Neovim 0.12+ 使用继承背景的高亮语法；0.10/0.11 使用兼容语法，外部布局
 插件重映射 WinBar 时颜色可能有所不同。
 
-ui.icons = false 会改用 ASCII 图标。
+ui.icons = false 为主要图标选择 ASCII 默认集；ui.icon_overrides 可逐项覆盖。
+
+输入区 Winbar                                                *ade-toolbar*
+
+ui.toolbar.sections.left / right 配置组件顺序；空列表清空该分区。不配置时
+沿用原布局。内置组件为 mode、model、thinking、attachments、context、
+cost、status、queue。比如： >lua
+    require("ade").setup({
+      ui = {
+        toolbar = {
+          component_separator = { text = " · ", hl = "Comment" },
+          sections = {
+            left = { "mode", { "model", separator = { text = " │ ", hl = "NonText" } }, "thinking" },
+            right = { "status", "queue" },
+          },
+        },
+        icon_overrides = {
+          status_idle = "○",
+          modes = { claude = { acceptEdits = "E", plan = "P" } },
+        },
+      },
+    })
+<
+组件支持 color、padding、cond(ctx)、fmt(text, ctx) 和 priority。也可直接使用
+function(ctx) 返回文字。分隔符可写成字符串、{ text, hl }、false，或用
+{ left = ..., right = ... } 为组件两边分别配置。未指定 hl 时继承所属组件的高亮；
+全局分隔符默认继承前一个可见组件的高亮。显式 hl 优先，不影响组件文字。
+
+模式图标按 agent 名、profile 名和 ACP mode ID 匹配。其他图标及 spinner_frames
+同样通过 ui.icon_overrides 设置；设为 false 可关闭单项。
+require("ade").pick_thinking() 可用于自定义键位，只列出当前 agent 提供的档位。
 
 ==============================================================================
 19. 健康检查                                                 *ade-health*

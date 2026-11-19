@@ -119,6 +119,7 @@ end
 ---characters two cells wide, so use plain ASCII there and keep alignment.
 ---@return table
 function M.glyphs()
+  local glyph = require("ade.ui.icons").glyph
   if vim.o.ambiwidth == "double" then
     return {
       sep = "|",
@@ -129,9 +130,9 @@ function M.glyphs()
       horizontal = "-",
       vertical = ":",
       bar = "|",
-      leader = "*",
-      worker = "o",
-      waiting = "?",
+      leader = glyph("team_leader", "*"),
+      worker = glyph("team_worker", "o"),
+      waiting = glyph("team_pending", "?"),
     }
   end
   return {
@@ -143,9 +144,9 @@ function M.glyphs()
     horizontal = "─",
     vertical = "│",
     bar = "▌",
-    leader = "★",
-    worker = "◆",
-    waiting = "◇",
+    leader = glyph("team_leader"),
+    worker = glyph("team_worker"),
+    waiting = glyph("team_pending"),
   }
 end
 

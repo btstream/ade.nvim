@@ -4,6 +4,79 @@
 -- the Nerd Fonts Nerd Fonts-patched range, so no extra plugin is required.
 local M = {}
 
+-- These surfaces already used Unicode even with the ASCII icon set. Keep
+-- their existing defaults while making the glyphs individually replaceable.
+local glyphs = {
+  agent_error = "✗",
+  agent_installed = "✓",
+  agent_system = "●",
+  agent_missing = "○",
+  agent_update = "→",
+  agent_warning = "⚠",
+  team_working = "●",
+  team_idle = "○",
+  team_waiting = "?",
+  team_exited = "✕",
+  team_paused = "⏸",
+  team_mail = "✉",
+  team_activity = "↳",
+  team_send = "→",
+  team_leader = "★",
+  team_worker = "◆",
+  team_pending = "◇",
+  team_approval = "⚑",
+  choice_checked = "☒",
+  choice_unchecked = "☐",
+  choice_cursor = "❯",
+  review_accepted = "✓",
+  review_rejected = "✗",
+  review_pending = "▎",
+  review_result = "→",
+  turn_dot = "●",
+  history_load = "↑",
+  team_collapse = "▾",
+  team_hint_left = "‹",
+  team_hint_right = "›",
+  choice_text_checked = "[x]",
+  choice_text_unchecked = "[ ]",
+  team_question = "?",
+  review_original = "A",
+  review_proposal = "B",
+  tool_caret = "›",
+}
+
+local spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+local spinner_ascii = { "|", "/", "-", "\\" }
+
+local function configured()
+  local cfg = require("ade.config").current
+  return cfg and cfg.ui.icon_overrides
+end
+
+function M.override(overrides, key)
+  overrides = overrides or configured()
+  if type(overrides) == "table" then
+    return overrides[key]
+  end
+end
+
+function M.glyph(key, fallback)
+  local overrides = configured()
+  local value = overrides and overrides[key]
+  if value == false then
+    return ""
+  end
+  return value or fallback or glyphs[key]
+end
+
+function M.frames(use_icons, overrides)
+  local frames = M.override(overrides, "spinner_frames")
+  if frames ~= nil then
+    return frames
+  end
+  return use_icons == false and spinner_ascii or spinner
+end
+
 ---Nerd Font glyphs (default).
 ---@return table<string, string>
 function M.nerd()
@@ -97,17 +170,56 @@ end
 -- fresh 30-key table each time is pure churn.
 local nerd_set = nil
 local ascii_set = nil
+local resolved = setmetatable({}, { __mode = "k" })
 
 ---Resolve the active icon set.
 ---@param use_icons boolean|nil
 ---@return table<string, string>
-function M.get(use_icons)
+function M.get(use_icons, overrides)
+  local base
   if use_icons == false then
     ascii_set = ascii_set or M.ascii()
-    return ascii_set
+    base = ascii_set
+  else
+    nerd_set = nerd_set or M.nerd()
+    base = nerd_set
   end
-  nerd_set = nerd_set or M.nerd()
-  return nerd_set
+  overrides = overrides or configured()
+  if not overrides or next(overrides) == nil then
+    return base
+  end
+  local cache = resolved[overrides] or {}
+  resolved[overrides] = cache
+  if not cache[base] then
+    local set = {}
+    for key, default in pairs(base) do
+      local value = overrides[key]
+      set[key] = value == false and "" or (value or default)
+    end
+    cache[base] = set
+  end
+  return cache[base]
+end
+
+---The protocol value is case-sensitive; never use the display label as a custom key.
+---Return nil if there is no icon, so callers can fall back to the mode name.
+function M.mode_icon(label, id, icons, overrides, agent, profile)
+  local modes = M.override(overrides, "modes")
+  local by_agent = modes and modes[agent]
+  local by_profile = modes and modes[profile]
+  local value = by_agent and by_agent[id]
+  if value == nil then
+    value = by_profile and by_profile[id]
+  end
+  if value == nil then
+    local function builtin(key)
+      key = type(key) == "string" and key:lower() or nil
+      return key == "plan" and "mode_plan" or key == "build" and "mode_build" or nil
+    end
+    local key = builtin(id) or builtin(label)
+    value = key and icons[key]
+  end
+  return type(value) == "string" and value ~= "" and value or nil
 end
 
 return M

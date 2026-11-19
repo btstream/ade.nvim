@@ -153,12 +153,13 @@ JSON 解码、单块排版或 Treesitter 解析很重时仍可能暂停，恢复
 | `<C-]>`（普通模式） | `add_selection` | 附加当前选区 |
 | `M` / `<M-m>` | `pick_model` | 普通模式 / 输入时选择模型 |
 | `m` / `<M-b>` | `pick_mode` | 普通模式 / 输入时选择模式 |
+| `gT` / `<M-e>` | `pick_thinking` | 普通模式 / 输入时选择 Thinking Level |
 | `L`（普通模式） | `pick_session` | 历史会话 |
 | `<M-a>` | `focus_choice` | 进入待回答的选择卡片（提问 / 权限） |
 | `<C-x><C-u>` | — | 补全 `/命令` 或 `@文件`（Vim 内置触发，不受 `keymaps` 控制） |
 | `<leader>ai`（任意 buffer） | `keymaps.inline` | 在光标/选区上开始内联编辑 |
 | `@path/to/file` | — | 发送时自动作为附件 |
-| 点击 winbar 的模型 / 模式 | — | 打开选择器（鼠标区域，不是键位） |
+| 点击 winbar 的模型 / 模式 / Thinking Level | — | 打开选择器（鼠标区域，不是键位） |
 
 ### 转录区
 
@@ -175,6 +176,7 @@ JSON 解码、单块排版或 Treesitter 解析很重时仍可能暂停，恢复
 | `F` | `add_file` | 附加当前文件 |
 | `R` | `add_diagnostics` | 附加诊断 |
 | `M` / `m` | `pick_model` / `pick_mode` | 选择模型 / 模式 |
+| `gT` | `pick_thinking` | 选择 Thinking Level |
 | `<C-n>` | `new_session` | 新建会话 |
 | `L` | `pick_session` | 历史会话 |
 | `<M-a>` | `focus_choice` | 进入待回答的选择卡片（提问 / 权限） |
@@ -1103,6 +1105,7 @@ require("ade").setup({
       add_selection = "<C-]>",
       pick_model = { n = "M", i = "<M-m>" },
       pick_mode = { n = "m", i = "<M-b>" },
+      pick_thinking = { n = "gT", i = "<M-e>" },
       pick_session = "L",
     },
     chat = {
@@ -1118,6 +1121,7 @@ require("ade").setup({
       add_diagnostics = "R",
       pick_model = "M",
       pick_mode = "m",
+      pick_thinking = "gT",
       new_session = "<C-n>",
       pick_session = "L",
       scroll_bottom = "G",
@@ -1420,7 +1424,47 @@ Neovim 0.12+ 的工具栏区域继承背景；旧版本使用兼容语法，外�
 
 snacks 后端只接管行内容：它的窗口沿用你已有的 snacks 主题，不套用上面三组。
 
-`ui.icons = false` 会把所有图标换成 ASCII，适用于不支持的终端。
+`ui.icons = false` 为主要图标选择 ASCII 默认集，仍可用 `ui.icon_overrides` 覆盖。
+
+### 自定义输入区 Winbar
+
+```lua
+require("ade").setup({
+  ui = {
+    toolbar = {
+      component_separator = { text = " · ", hl = "Comment" },
+      sections = {
+        left = {
+          { "mode", separator = { left = { text = "", hl = "MyModeLeft" }, right = " " } },
+          { "attachments", separator = " " },
+          { "model", separator = { text = " │ ", hl = "NonText" } },
+          "thinking",
+        },
+        right = { "status", "queue" },
+      },
+    },
+    icon_overrides = {
+      status_idle = "○",
+      spinner_frames = { "◐", "◓", "◑", "◒" },
+      modes = {
+        opencode = { build = "B", plan = "P" },
+        claude = { default = "D", acceptEdits = "E", plan = "P", auto = "A", bypassPermissions = "!" },
+      },
+    },
+  },
+  keymaps = {
+    input = { pick_thinking = { n = "gT", i = "<M-e>" } },
+    chat = { pick_thinking = "gT" }, -- false 可禁用
+  },
+})
+```
+
+- 默认布局和分隔符定义在 [`lua/ade/config.lua`](lua/ade/config.lua) 的 `ui.toolbar` 中。可分别替换 `left` 和 `right`，用 `{}` 清空一侧。内置组件有 `mode`、`model`、`thinking`、`attachments`、`context`、`cost`、`status`、`queue`。显式列出 `context` 或 `cost` 时，有数据即显示；`show_usage` 控制的是默认布局。
+- `ui.toolbar.right_padding` 默认在右侧留一格，设为 `0` 可贴边；空间不足时优先显示组件。
+- 组件可写成名字、`function(ctx) ... end` 或 `{ 名字或函数, ... }`。可选字段：`color`（高亮组）、`padding`（数值或 `{left, right}`）、`cond(ctx)`、`fmt(text, ctx)`、`priority`（越高越晚裁剪）。`ctx` 提供 `agent`、`profile`、`mode`、`model`、`thinking` 等当前显示数据；回调在重绘时运行，应快速且无副作用。
+- 分隔符支持字符串、`{ text = "...", hl = "高亮组名" }` 或 `false`。组件可用 `separator = { left = ..., right = ... }` 分别指定两边，并可在分区边缘显示端帽。同一分区内，从前一个可见组件的 `right`、后一个可见组件的 `left`、全局默认值依次查找；`false` 停止查找且不画。未指定 `hl` 时，分隔符继承所属组件的高亮；全局分隔符默认跟随前一个可见组件。显式 `hl` 优先，可通过 `vim.api.nvim_set_hl()` 定义。
+- 点击 Thinking Level，或调用 `require("ade").pick_thinking()`，可选择当前 agent 提供的档位；没有上报档位时不会显示该组件。
+- `icon_overrides.modes` 使用 **agent 配置名 / profile 名 → ACP mode ID**，如 `acceptEdits`；精确的 agent 配置优先于 profile。图标不改变模式权限。单项设为 `false` 可隐藏图标，模式徽标则显示文字。`spinner_frames = false` 禁用帧动画；可用 `status_running` 覆盖静态运行图标。其他图标键名见 [`lua/ade/ui/icons.lua`](lua/ade/ui/icons.lua)。
 
 ## 权限与安全
 

@@ -342,7 +342,9 @@ function Dashboard:tabline_text()
   local Text = require("ade.ui.team.text")
   local full_cwd = vim.fn.fnamemodify(tostring(team.cwd), ":~")
   local head = head_for(full_cwd)
-  local count_text = string.format("? 待回答 %d  ⚑ 待批准 %d ", q, a)
+  local glyph = require("ade.ui.icons").glyph
+  local count_text =
+    string.format("%s 待回答 %d  %s 待批准 %d ", glyph("team_question"), q, glyph("team_approval"), a)
   local narrow = vim.o.columns < 140
   if narrow then
     -- Measure what is actually left after the counts and the fixed parts of

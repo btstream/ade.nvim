@@ -124,9 +124,6 @@ local function clickable(text, hl_group, action)
   return body
 end
 
----Modes that get a dedicated glyph. Anything else falls back to its own text.
-local MODE_GLYPHS = { plan = "mode_plan", build = "mode_build" }
-
 ---Candidate strings to test, most specific first.
 ---@param mode string|nil
 ---@param key string|nil
@@ -144,20 +141,13 @@ end
 
 ---Text for the mode region: a glyph for known modes, the raw label otherwise.
 ---
----With `ui.icons = false` the label is kept, because a single ASCII letter would
----not tell the user which mode is active.
+---Use the mode name when no icon is defined or an override disables it.
 ---@param mode string display label
 ---@param ic table<string, string>
 ---@param key string|nil value id, preferred for the glyph decision
 ---@return string
-function M.mode_text(mode, ic, key)
-  for _, candidate in ipairs(mode_candidates(mode, key)) do
-    local glyph = MODE_GLYPHS[candidate:lower()]
-    if glyph and ic[glyph] then
-      return ic[glyph]
-    end
-  end
-  return mode
+function M.mode_text(mode, ic, key, overrides, agent, profile)
+  return Icons.mode_icon(mode, key, ic, overrides, agent, profile) or mode
 end
 
 ---Highlight group for the mode region, so plan and build read differently.
@@ -188,9 +178,13 @@ end
 ---@param ic table<string, string>
 ---@param spinner string|nil
 ---@return string
-function M.status_text(status, ic, spinner)
+function M.status_text(status, ic, spinner, overrides)
   if status == "running" then
-    return spinner or ic.tool_run
+    local static = Icons.override(overrides, "status_running")
+    if static == false then
+      return ""
+    end
+    return spinner or static or ic.tool_run
   end
   local key = "status_" .. status
   return ic[key] or ic.tool_pending
@@ -201,176 +195,18 @@ end
 ---@param width integer available cells (the whole window width)
 ---@return string
 function M.render(info, width)
-  local ic = Icons.get(info.icons)
-  local width_ok = math.max(1, width - 1)
-
-  -- The mode is a badge pinned to the very start of the bar: no leading space,
-  -- and the highlight covers the padding around the glyph so it reads as a
-  -- solid block rather than a floating icon.
-  --
-  -- `%#AdeToolbar#` opens the bar explicitly; everything after it uses
-  -- `%$...$`, which inherits that background. Relying on the window's `WinBar`
-  -- mapping instead would let a layout manager (edgy) remap it and turn every
-  -- foreground-only region into a differently coloured block.
-  local badge = "%#AdeToolbar#"
-  local badge_width = 0
-  if info.mode and info.mode ~= "" then
-    local glyph = M.mode_text(info.mode, ic, info.mode_key)
-    local group = M.mode_hl(info.mode, info.mode_key, info.mode_plan)
-    badge = badge .. clickable(" " .. glyph .. " ", group, "AdePickMode")
-    badge_width = dw(glyph) + 2
-  end
-
-  -- Attachment chips follow the badge rather than preceding it: they are
-  -- variable-width and would otherwise push the mode off the left edge and be
-  -- truncated from the front on a narrow composer. Each label is clipped so a
-  -- long filename cannot swallow the model name.
-  local chip_text, chip_width = "", 0
-  local chip_labels = {}
-  for _, label in ipairs(info.chips or {}) do
-    if label ~= "" then
-      chip_labels[#chip_labels + 1] = "[" .. label .. "]"
-    end
-  end
-  if #chip_labels > 0 then
-    -- Leave room for the badge and for at least the status glyph on the right.
-    local budget = math.max(4, width_ok - badge_width - 6)
-    local rendered, used = {}, 0
-    for _, label in ipairs(chip_labels) do
-      if used >= budget then
-        -- Signal the rest without spending cells on them.
-        rendered[#rendered + 1] = "…"
-        used = used + 1
-        break
-      end
-      local per_label = math.max(3, budget - used - (#rendered > 0 and 1 or 0))
-      local piece = M.truncate(label, per_label)
-      if piece ~= "" then
-        rendered[#rendered + 1] = piece
-        used = used + dw(piece) + (#rendered > 1 and 1 or 0)
-      end
-      if dw(piece) < dw(label) then
-        break
-      end
-    end
-    if #rendered > 0 then
-      local plain = table.concat(rendered, " ")
-      chip_text = M.highlight("AdeUserChip") .. M.escape(plain) .. M.highlight("AdeToolbar") .. " "
-      chip_width = dw(plain) + 1
-    end
-  end
-
-  -- The rest of the left side is kept as structured segments so truncation can
-  -- shrink the text while keeping every clickable region intact.
-  local left = {}
-  ---@param text string
-  ---@param hl_group string|nil
-  ---@param action string|nil
-  local function push_left(text, hl_group, action)
-    if #left > 0 then
-      left[#left + 1] = { text = " · " }
-    end
-    left[#left + 1] = { text = text, hl = hl_group, action = action }
-  end
-
-  if info.model and info.model ~= "" then
-    push_left(info.model, "AdeToolbarAccent", "AdePickModel")
-  end
-  -- Thinking level is orthogonal to the work mode, so it gets its own small
-  -- marker instead of sharing the mode badge.
-  if info.thinking and info.thinking ~= "" then
-    push_left(M.truncate(info.thinking, 12), "AdeMuted")
-  end
-  if info.show_usage and info.usage and info.usage.size and info.usage.size > 0 then
-    local pct = math.floor((info.usage.used or 0) / info.usage.size * 100 + 0.5)
-    push_left("Context" .. " " .. pct .. "%", "AdeMuted")
-  end
-  -- Some agents report the monetary cost of the turn; it is small and useful,
-  -- so it follows the context marker rather than needing its own command.
-  if info.show_usage and info.usage and type(info.usage.cost) == "table" then
-    local amount = info.usage.cost.amount
-    local currency = info.usage.cost.currency or ""
-    if type(amount) == "number" and amount > 0 then
-      -- Four decimals reads well for cents but rounds a sub-cent turn to
-      -- "0.0000", which looks like "free". Fall back to significant digits.
-      local text = amount < 0.0001 and string.format("%.2e", amount) or string.format("%.4f", amount)
-      if currency ~= "" then
-        text = text .. " " .. currency
-      end
-      push_left(text, "AdeMuted")
-    end
-  end
-
-  local right_plain = {}
-  local right_parts = {}
-  local function push_right(text, hl_group)
-    if #right_parts > 0 then
-      right_plain[#right_plain + 1] = " · "
-      right_parts[#right_parts + 1] = " · "
-    end
-    right_plain[#right_plain + 1] = text
-    right_parts[#right_parts + 1] = hl(text, hl_group)
-  end
-
-  -- Status is a glyph: a spinner while running, an alert while a permission is
-  -- pending, a cross while cancelling, an outline when idle.
-  if info.waiting then
-    push_right(M.status_text("waiting", ic, info.spinner), "AdeToolbarWaiting")
-  elseif info.status == "running" then
-    push_right(M.status_text("running", ic, info.spinner), "AdeToolbarRunning")
-  elseif info.status == "cancelling" then
-    push_right(M.status_text("cancelling", ic, info.spinner), "AdeToolbarCancelling")
-  else
-    push_right(M.status_text("idle", ic, info.spinner), "AdeToolbarIdle")
-  end
-  if info.queued and info.queued > 0 then
-    push_right(string.format("+%d %s", info.queued, "queued"), "AdeMuted")
-  end
-
-  local left_text = {}
-  for i, seg in ipairs(left) do
-    left_text[i] = seg.text
-  end
-  left_text = table.concat(left_text)
-  local right_text = table.concat(right_plain)
-  local right_w = dw(right_text)
-
-  -- The status side always wins: drop the left side entirely when needed.
-  if right_w + badge_width + chip_width >= width_ok then
-    return "%#AdeToolbar#" .. hl(M.truncate(right_text, math.max(1, width)), nil)
-  end
-
-  local budget = width_ok - right_w - badge_width - chip_width - 2
-  local body
-  if budget <= 0 or left_text == "" then
-    body = table.concat(right_parts)
-  else
-    -- Truncate segment by segment so every region stays clickable even when
-    -- the text has to be shortened.
-    local rendered = {}
-    local used = 0
-    for _, seg in ipairs(left) do
-      if used >= budget then
-        break
-      end
-      local piece = M.truncate(seg.text, budget - used)
-      local piece_w = dw(piece)
-      if piece ~= "" then
-        rendered[#rendered + 1] = clickable(piece, seg.hl, seg.action)
-        used = used + piece_w
-      end
-      if piece_w < dw(seg.text) then
-        break
-      end
-    end
-    local left_rendered = table.concat(rendered)
-    body = left_rendered ~= "" and (left_rendered .. "%=" .. table.concat(right_parts)) or table.concat(right_parts)
-  end
-
-  -- The badge is emitted with no surrounding spaces of its own, so its
-  -- background starts at column 0 of the window. Chips sit between the badge
-  -- and the model so a narrow composer truncates the labels, not the badge.
-  return badge .. "%#AdeToolbar# " .. chip_text .. body .. " "
+  local ic = Icons.get(info.icons, info.icon_overrides)
+  local defaults = require("ade.config").defaults.ui.toolbar
+  return require("ade.ui.toolbar_sections").render(
+    M,
+    info,
+    width,
+    ic,
+    info.toolbar or defaults,
+    defaults,
+    clickable,
+    hl
+  )
 end
 
 ---Build the transcript window title.
@@ -382,7 +218,7 @@ function M.chat_title(opts, width)
   if not title or title == "" then
     title = "No session"
   end
-  local suffix = opts.pending_new and ("  " .. Icons.get(opts.icons).arrow_down .. " new") or ""
+  local suffix = opts.pending_new and ("  " .. Icons.get(opts.icons, opts.icon_overrides).arrow_down .. " new") or ""
   local available = math.max(10, width - dw(opts.agent) - dw(suffix) - 6)
   -- The title bar sits on the transcript's own background, not the statusline
   -- colour: it is the transcript's header, not a separate strip. `AdeNormal`

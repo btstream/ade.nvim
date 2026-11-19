@@ -165,7 +165,8 @@ function M.statuscolumn()
   end
   local row = vim.v.lnum
   local bar = data.bars[row]
-  local cell = bar and ("%#" .. bar.group .. "#" .. bar.glyph .. "%*") or " "
+  local icon = bar and bar.glyph ~= "" and require("ade.ui.toolbar").escape(bar.glyph) or " "
+  local cell = bar and ("%#" .. bar.group .. "#" .. icon .. "%*") or " "
   if vim.v.virtnum ~= 0 then
     return cell .. string.rep(" ", data.width + 1)
   end

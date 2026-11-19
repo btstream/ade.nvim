@@ -9,8 +9,8 @@ return function(t)
   local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
   local mock = root .. "tests/mock_agent.py"
 
-  local function setup(profile)
-    ade.setup({
+  local function setup(profile, extra)
+    ade.setup(vim.tbl_deep_extend("force", {
       agent = profile,
       agents = {
         [profile] = {
@@ -21,7 +21,7 @@ return function(t)
         },
       },
       permissions = { prompt = "native" },
-    })
+    }, extra or {}))
     controller.open()
     local S = controller.state()
     vim.wait(8000, function()
@@ -115,15 +115,38 @@ return function(t)
         sent[#sent + 1] = { id = config_id, value = value }
         return true, {}
       end
-      local captured = capture(function()
-        controller.pick_model()
-      end)
-      t.truthy(captured, "no model picker")
-      captured.on_choice(captured.items[1].value)
+      local captured = capture(ade.pick_thinking)
+      t.truthy(captured, "no thinking picker")
+      local clicked = capture(_G.AdePickThinking)
+      t.eq(captured.items, clicked.items)
+      local map
+      for _, candidate in ipairs(vim.api.nvim_buf_get_keymap(S.view.input.buf, "n")) do
+        if candidate.lhs == "gT" then
+          map = candidate.callback
+        end
+      end
+      t.truthy(map, "no buffer-local thinking binding")
+      t.eq(captured.items, capture(map).items)
+      local choice = captured.items[#captured.items].value
+      captured.on_choice(choice)
       vim.wait(500)
-      t.eq("model", sent[1].id)
+      t.eq("thinking", sent[1].id)
+      t.eq(choice, S.sess.current.controls.thinking.current)
       S.conn.client.set_config_option = original
       controller.hide()
+    end)
+
+    t.it("uses the configured Claude mode icon without replacing its picker label", function()
+      setup("claude", { ui = { icon_overrides = { modes = { claude = { acceptEdits = "EDIT" } } } } })
+      local captured = capture(ade.pick_mode)
+      for _, item in ipairs(captured.items) do
+        if item.value == "acceptEdits" then
+          t.match("EDIT Accept edits", item.label)
+          controller.hide()
+          return
+        end
+      end
+      error("Claude's acceptEdits mode was missing")
     end)
 
     t.it("refuses a work-mode picker when the agent has no work mode", function()

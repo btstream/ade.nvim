@@ -166,7 +166,7 @@ function M.full(session, view, opts)
     end
   end
   if first > 1 then
-    lines[#lines + 1] = "↑ Load earlier messages (<CR>)"
+    lines[#lines + 1] = require("ade.ui.icons").glyph("history_load") .. " Load earlier messages (<CR>)"
     meta[#meta + 1] = { kind = "page", page = -1, segments = { { s = 0, e = -1, group = "AdeLink" } } }
   end
   if view.page and view.page.continuation then

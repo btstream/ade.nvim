@@ -15,7 +15,8 @@ local function marker(hunk)
   if not hunk.decided then
     return "  "
   end
-  return hunk.accepted and "✓ " or "✗ "
+  local icon = require("ade.ui.icons").glyph(hunk.accepted and "review_accepted" or "review_rejected")
+  return icon ~= "" and (icon .. " ") or ""
 end
 
 ---Header for a hunk in the fallback view.

@@ -6,6 +6,7 @@
 -- `session/set_config_option` for config options.
 local presenter = require("ade.app.presenter")
 local controls_mod = require("ade.session.controls")
+local Icons = require("ade.ui.icons")
 
 local Options = {}
 Options.__index = Options
@@ -115,12 +116,25 @@ end
 ---@param generation integer
 ---@param session table
 function Options:pick_control(control, title, client, generation, session)
-  local ic = presenter.icons(self.config().ui.icons)
+  local cfg = self.config()
+  local ic = Icons.get(cfg.ui.icons, cfg.ui.icon_overrides)
   local items = {}
   for _, entry in ipairs(control.options or {}) do
-    local marked = entry.value == control.current and (ic.check_circle .. " ") or (ic.tool_pending .. " ")
+    local marked = entry.value == control.current and ic.check_circle or ic.tool_pending
+    local name = entry.name or tostring(entry.value)
+    local mode_icon
+    if session.controls and control == session.controls.mode then
+      mode_icon = Icons.mode_icon(
+        name,
+        entry.value,
+        ic,
+        cfg.ui.icon_overrides,
+        session.agent_name or cfg.agent,
+        session.profile and session.profile.name
+      )
+    end
     items[#items + 1] = {
-      label = marked .. (entry.name or tostring(entry.value)),
+      label = (marked ~= "" and marked .. " " or "") .. (mode_icon and mode_icon .. " " or "") .. name,
       description = entry.description,
       value = entry.value,
     }

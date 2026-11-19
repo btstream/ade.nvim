@@ -94,9 +94,11 @@ end
 
 ---Glyph in the state bar: the first row of a decided hunk says how it was
 ---decided, every other row is a plain bar.
+local glyph = require("ade.ui.icons").glyph
+local escape = require("ade.ui.toolbar").escape
 local STATE_GLYPH = {
-  Accepted = "✓",
-  Rejected = "✗",
+  Accepted = "review_accepted",
+  Rejected = "review_rejected",
 }
 
 -- Filler hatch. Wider than any window; the overlay is clipped at the edge.
@@ -120,7 +122,7 @@ function Session:place_decorations()
     for row = first, last do
       bars[row] = {
         group = "AdeReviewState" .. state,
-        glyph = (row == first and STATE_GLYPH[state]) or "▎",
+        glyph = glyph((row == first and STATE_GLYPH[state]) or "review_pending"),
       }
     end
   end
@@ -196,18 +198,18 @@ Session.place_signs = Session.place_decorations
 local function pane_winbar(pane, status)
   local badge, badge_group, label
   if pane == "original" then
-    badge, badge_group, label = " A ", "AdeReviewBadgeOriginal", "before"
+    badge, badge_group, label = glyph("review_original"), "AdeReviewBadgeOriginal", "before"
   elseif pane == "proposal" then
-    badge, badge_group, label = " B ", "AdeReviewBadgeProposal", "proposal"
+    badge, badge_group, label = glyph("review_proposal"), "AdeReviewBadgeProposal", "proposal"
   else
-    badge, badge_group, label = " → ", "AdeReviewBadgeResult", "result"
+    badge, badge_group, label = glyph("review_result"), "AdeReviewBadgeResult", "result"
   end
   local parts = {
-    "%#" .. badge_group .. "#" .. badge .. "%*",
+    badge ~= "" and ("%#" .. badge_group .. "# " .. escape(badge) .. " %*") or "",
     "%#AdeReviewPath# " .. label .. " %*",
   }
   if status then
-    parts[#parts + 1] = "%=%#AdeReviewVersion#" .. status .. " %*"
+    parts[#parts + 1] = "%=%#AdeReviewVersion#" .. escape(status) .. " %*"
   end
   return table.concat(parts)
 end
@@ -229,9 +231,11 @@ function Session:update_winbar()
   end
   local index = self.decorated_current
   local status = string.format(
-    "%s✓%d ✗%d · %d pending",
+    "%s%s%d %s%d · %d pending",
     index and string.format("hunk %d/%d · ", index, #self.hunks) or "",
+    glyph("review_accepted"),
     accepted,
+    glyph("review_rejected"),
     rejected,
     pending
   )
@@ -259,14 +263,16 @@ function Session:update_title()
   end
   local index = self:selected()
   local text = string.format(
-    " ADE Inline · %s · ✓%d ✗%d · %d pending · ga/gr · ]c/[c · q discard ",
+    " ADE Inline · %s · %s%d %s%d · %d pending · ga/gr · ]c/[c · q discard ",
     index and string.format("hunk %d/%d", index, total) or (pending_count(self.hunks) > 0 and "select a hunk" or "done"),
+    glyph("review_accepted"),
     accepted,
+    glyph("review_rejected"),
     rejected,
     pending_count(self.hunks)
   )
   if self.container == "buffer" then
-    pcall(vim.api.nvim_set_option_value, "winbar", text, { win = self.win })
+    pcall(vim.api.nvim_set_option_value, "winbar", escape(text), { win = self.win })
   else
     pcall(vim.api.nvim_win_set_config, self.win, {
       title = text,

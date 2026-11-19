@@ -144,8 +144,9 @@ local function build_session(source, opts)
     for index, message in ipairs(type(supplement.messages) == "table" and supplement.messages or {}) do
       local task = message.task
       local title = string.format(
-        "%s → %s%s",
+        "%s %s %s%s",
         tostring(message.from or "?"),
+        require("ade.ui.icons").glyph("team_send"),
         tostring(message.kind or "message"),
         task and task ~= "_" and (" " .. task) or ""
       )
@@ -213,11 +214,12 @@ local function build_session(source, opts)
       local ended = timing and timing.ended_at or nil
       local label
       if bus and bus.from == "human" and opts.target then
-        label = string.format("human → %s", tostring(opts.target))
+        label = string.format("human %s %s", require("ade.ui.icons").glyph("team_send"), tostring(opts.target))
       elseif bus then
         label = string.format(
-          "%s → %s%s",
+          "%s %s %s%s",
           bus.from or "?",
+          require("ade.ui.icons").glyph("team_send"),
           bus.kind or "message",
           bus.task and bus.task ~= "" and (" " .. bus.task) or ""
         )
@@ -509,7 +511,13 @@ function Watch:input_winbar()
   local send = (keymaps.expand(keys.send, { "n" })[1] or {}).lhs or "<C-s>"
   local interrupt = ((cfg.teams or {}).dashboard or {}).keys
   interrupt = interrupt and interrupt.interrupt or "<M-CR>"
-  return string.format(" → %s · %s 发送+抄送 leader · %s 打断 ", tostring(self.participant), send, interrupt)
+  return string.format(
+    " %s %s · %s 发送+抄送 leader · %s 打断 ",
+    require("ade.ui.icons").glyph("team_send"),
+    tostring(self.participant),
+    send,
+    interrupt
+  )
 end
 
 function Watch:apply_input_winbar()

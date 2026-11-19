@@ -7,8 +7,7 @@ local toolbar = require("ade.ui.toolbar")
 local presenter = require("ade.ui.presenter")
 local Log = require("ade.log")
 
-local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
-local SPINNER_ASCII = { "|", "/", "-", "\\" }
+local Icons = require("ade.ui.icons")
 
 local Chrome = {}
 Chrome.__index = Chrome
@@ -145,6 +144,10 @@ function Chrome:composer_bar(win)
 
   return toolbar.render({
     icons = cfg.ui.icons,
+    icon_overrides = cfg.ui.icon_overrides,
+    toolbar = cfg.ui.toolbar,
+    agent = session and session.agent_name or cfg.agent,
+    profile = session and session.profile and session.profile.name,
     mode = mode,
     mode_key = mode_key,
     mode_plan = mode_plan,
@@ -221,6 +224,7 @@ function Chrome:chat_bar(win)
   local chat = self.get_chat()
   return toolbar.chat_title({
     icons = cfg.ui.icons,
+    icon_overrides = cfg.ui.icon_overrides,
     agent = cfg.agent,
     title = self.session_label(session),
     pending_new = chat and chat.pending_new or false,
@@ -314,7 +318,7 @@ function Chrome:tick(requested)
     return
   end
   -- Skip missed frames rather than replaying a backlog after a busy main loop.
-  local frames = self.icons and SPINNER or SPINNER_ASCII
+  local frames = self.frames
   self.index = math.floor((now - self.started_at) / (self.interval * 1e6)) % #frames + 1
   if self.frame ~= frames[self.index] then
     self.stats.frame_changes = self.stats.frame_changes + 1
@@ -334,17 +338,20 @@ function Chrome:sync_animation(running)
     return
   end
   local cfg = self.config()
-  self.animation_enabled = cfg.ui.toolbar.animate
-  if not cfg.ui.toolbar.animate then
+  local overrides = cfg.ui.icon_overrides
+  local frames = Icons.frames(cfg.ui.icons, overrides)
+  local static = Icons.override(overrides, "status_running")
+  self.animation_enabled = cfg.ui.toolbar.animate and frames ~= false and static ~= false
+  if not self.animation_enabled then
     self:stop_animation()
     self.requested_running = true
     self.index = 1
-    self.frame = cfg.ui.icons and SPINNER[1] or SPINNER_ASCII[1]
+    self.frame = static or (frames and frames[1]) or nil
     return
   end
   local interval = cfg.ui.toolbar.animation_interval or 120
   self.requested_running = true
-  if timer_active(self.timer) and self.interval == interval and self.icons == cfg.ui.icons then
+  if timer_active(self.timer) and self.interval == interval and self.frames == frames then
     return
   end
   if self.timer then
@@ -352,8 +359,7 @@ function Chrome:sync_animation(running)
   end
   self:stop_animation()
   self.requested_running = true
-  local frames = cfg.ui.icons and SPINNER or SPINNER_ASCII
-  self.interval, self.icons = interval, cfg.ui.icons
+  self.interval, self.frames = interval, frames
   self.started_at = self.clock()
   self.last_tick_at = self.started_at
   self.index = 1

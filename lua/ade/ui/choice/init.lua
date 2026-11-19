@@ -73,7 +73,7 @@ function View:line_list()
   local tabs = {}
   for index, question in ipairs(model.questions or {}) do
     local header = tostring(question.header or ("Q" .. index))
-    local marker = self:answered(index) and "☒" or "☐"
+    local marker = require("ade.ui.icons").glyph(self:answered(index) and "choice_checked" or "choice_unchecked")
     if self.tab == index then
       tabs[#tabs + 1] = "[" .. marker .. " " .. header .. "]"
     else
@@ -98,7 +98,7 @@ function View:line_list()
     local options = self:options(question)
     local answer = self:answer(self.tab)
     for index, option in ipairs(options) do
-      local marker = self.cursor == index and "❯" or " "
+      local marker = self.cursor == index and require("ade.ui.icons").glyph("choice_cursor") or " "
       local selected
       if question.multi_select then
         local picked = false
@@ -108,7 +108,7 @@ function View:line_list()
             break
           end
         end
-        selected = picked and "☒" or "☐"
+        selected = require("ade.ui.icons").glyph(picked and "choice_checked" or "choice_unchecked")
       else
         selected = ""
       end

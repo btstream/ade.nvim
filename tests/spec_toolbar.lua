@@ -11,6 +11,150 @@ return function(t)
   end
 
   t.describe("toolbar", function()
+    t.it("uses config defaults and replaces only the section the user configures", function()
+      local config = require("ade.config")
+      local cfg = config.validate(config.merge(config.defaults, {
+        ui = { toolbar = { sections = { right = {} } } },
+      }))
+      t.eq({}, cfg.ui.toolbar.sections.right)
+      t.eq(config.defaults.ui.toolbar.sections.left, cfg.ui.toolbar.sections.left)
+      local info = {
+        mode = "build",
+        model = "Model",
+        thinking = "Default",
+        status = "idle",
+        icons = false,
+        usage = { used = 50, size = 100 },
+        toolbar = cfg.ui.toolbar,
+      }
+      t.eq(" B  Model · Default", visible(toolbar.render(info, 80)))
+      info.show_usage = true
+      t.eq(" B  Model · Default · Context 50%%", visible(toolbar.render(info, 80)))
+    end)
+
+    t.it("inherits separator highlights from their owning component", function()
+      local text = toolbar.render({
+        model = "Model",
+        thinking = "Default",
+        toolbar = {
+          component_separator = { text = " | " },
+          sections = {
+            left = {
+              { "model", color = "ModelColor", separator = { left = "<" } },
+              { "thinking", color = "ThinkingColor", separator = { left = ":", right = { text = ">" } } },
+              {
+                function()
+                  return "last"
+                end,
+                color = "LastColor",
+              },
+              function()
+                return "end"
+              end,
+            },
+            right = {},
+          },
+        },
+      }, 80)
+      for _, pair in ipairs({
+        { "ModelColor", "<" },
+        { "ThinkingColor", ":" },
+        { "ThinkingColor", ">" },
+        { "LastColor", " | " },
+      }) do
+        t.truthy(text:find(toolbar.highlight(pair[1]) .. pair[2] .. toolbar.highlight("AdeToolbar"), 1, true))
+      end
+      t.eq("<Model:Default>last | end", vim.api.nvim_eval_statusline(text, { use_winbar = true }).str)
+    end)
+
+    t.it("uses the preceding component's highlight in the default layout", function()
+      local text = toolbar.render({ model = "Model", thinking = "Default", status = "idle", queued = 2 }, 80)
+      for _, group in ipairs({ "AdeToolbarAccent", "AdeToolbarIdle" }) do
+        t.truthy(text:find(toolbar.highlight(group) .. " · " .. toolbar.highlight("AdeToolbar"), 1, true))
+      end
+    end)
+
+    t.it("keeps the default badge gap on the bar and leaves an inset after status", function()
+      local raw = toolbar.render({ mode = "build", model = "Model", status = "idle", icons = false }, 30)
+      local base = toolbar.highlight("AdeToolbar")
+      t.truthy(raw:find("%T" .. base .. " " .. base, 1, true))
+      local result = vim.api.nvim_eval_statusline(raw, { use_winbar = true, maxwidth = 30 })
+      t.eq(" B  Model" .. string.rep(" ", 19) .. "o ", result.str)
+    end)
+
+    t.it("styles both separator edges and only joins visible components", function()
+      local text = toolbar.render({
+        mode = "Accept edits",
+        mode_key = "acceptEdits",
+        agent = "work",
+        profile = "claude",
+        model = "50%",
+        thinking = "Default",
+        icon_overrides = { modes = { claude = { acceptEdits = "E" } } },
+        toolbar = {
+          component_separator = { text = " · ", hl = "Comment" },
+          sections = {
+            left = {
+              {
+                "mode",
+                separator = { left = { text = "<", hl = "ModeLeft" }, right = { text = ">", hl = "ModeRight" } },
+              },
+              { "context", separator = "BAD" },
+              "model",
+              { "thinking", separator = { text = " │ ", hl = "NonText" } },
+            },
+            right = {},
+          },
+        },
+      }, 80)
+      t.eq("< E >50% · Default", vim.api.nvim_eval_statusline(text, { use_winbar = true }).str)
+      for _, group in ipairs({ "ModeLeft", "ModeRight", "Comment" }) do
+        t.truthy(text:find(toolbar.highlight(group), 1, true))
+      end
+      t.truthy(text:find("%@v:lua.AdePickThinking@", 1, true))
+    end)
+
+    t.it("fits re-ordered sections without leaving a separator behind", function()
+      local info = {
+        model = "宽模型",
+        thinking = "Very Long",
+        icons = false,
+        icon_overrides = { status_idle = "○" },
+        toolbar = {
+          sections = {
+            left = {
+              "thinking",
+              { "model", separator = false },
+              function()
+                return "100%"
+              end,
+            },
+            right = { "status" },
+          },
+        },
+      }
+      local full = toolbar.render(info, 40)
+      t.truthy(vim.api.nvim_eval_statusline(full, { use_winbar = true }).str:find("宽模型100%", 1, true))
+      for width = 1, 16 do
+        local text = toolbar.render(info, width)
+        local eval = vim.api.nvim_eval_statusline(text, { use_winbar = true, maxwidth = width })
+        t.truthy(eval.width <= width)
+        t.truthy(eval.str:find("○", 1, true))
+        t.falsy(eval.str:find("^%s*·"))
+        t.falsy(eval.str:find("·%s*○$"))
+      end
+    end)
+
+    t.it("uses exact agent overrides ahead of profile defaults and supports a label fallback", function()
+      local icons = require("ade.ui.icons")
+      local overrides = { modes = { claude = { acceptEdits = "E", plan = "P" }, work = { acceptEdits = false } } }
+      local ic = icons.get(false, overrides)
+      t.eq("Accept edits", toolbar.mode_text("Accept edits", ic, "acceptEdits", overrides, "work", "claude"))
+      t.eq("E", toolbar.mode_text("Accept edits", ic, "acceptEdits", overrides, "other", "claude"))
+      t.eq("Ask", toolbar.mode_text("Ask", ic, "acceptedits", overrides, "claude"))
+      t.eq("", icons.get(false, { user = false }).user)
+    end)
+
     t.it("places attachment chips after the mode badge, not before it", function()
       -- The badges are pinned to the left edge. Prepending chips pushed the mode
       -- off the bar and let a narrow composer truncate the chip from the front,
