@@ -16,6 +16,89 @@ return function(t)
   end
 
   t.describe("inline choice component", function()
+    t.it("colors the question, focus, selected answer and custom prompt independently", function()
+      local win = window()
+      local view = Choice.new({})
+      t.cleanup(function()
+        view:close()
+      end)
+      t.truthy(view:show({
+        title = "Questions",
+        questions = {
+          {
+            header = "范围",
+            question = "选哪一项？",
+            multi_select = true,
+            allow_custom = true,
+            options = { { label = "范围 A", description = "说明" }, { label = "范围 B" } },
+          },
+        },
+      }, { win = win, focus_wins = { win } }))
+      local ns = vim.api.nvim_get_namespaces().ade_choice
+      local function spans()
+        local out, focus = {}, nil
+        local lines = vim.api.nvim_buf_get_lines(view.buf, 0, -1, false)
+        for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(view.buf, ns, 0, -1, { details = true })) do
+          local row, col, spec = mark[2], mark[3], mark[4]
+          if spec.line_hl_group == "AdeChoiceFocus" then
+            focus = row + 1
+          else
+            local text = lines[row + 1]:sub(col + 1, spec.end_col)
+            out[vim.trim(text)] = spec.hl_group
+          end
+        end
+        return out, focus
+      end
+      local styled, focus = spans()
+      t.eq("AdeChoiceQuestion", styled["选哪一项？"])
+      t.eq("AdeChoiceTabActive", styled["范围]"])
+      t.eq("AdeChoiceOptionActive", styled["范围 A"])
+      t.eq("AdeChoiceMuted", styled["说明"])
+      t.eq("AdeChoiceHint", styled.Tab)
+      t.eq(1, view.maps.options[focus])
+
+      view:select(1)
+      view.cursor = 2
+      view:render()
+      styled, focus = spans()
+      t.eq("AdeChoiceSelected", styled["范围 A"])
+      t.eq(2, view.maps.options[focus])
+
+      view:select(3)
+      styled, focus = spans()
+      t.eq("AdeChoiceCustom", styled["其他:"])
+      t.falsy(styled["其他（自己输入）…"], "do not leave the old option highlight on the editable line")
+      t.eq(nil, focus, "direct selection clears the previous option's focus background")
+      t.eq(nil, styled[require("ade.ui.icons").glyph("choice_cursor")], "the previous option loses its focus arrow")
+      view:close()
+      close_window()
+    end)
+
+    t.it("marks only the chosen index when two choices have the same label", function()
+      local win = window()
+      local view = Choice.new({})
+      t.cleanup(function()
+        view:close()
+      end)
+      t.truthy(view:show({
+        questions = {
+          { question = "范围？", multi_select = true, options = { { label = "同名" }, { label = "同名" } } },
+        },
+      }, { win = win }))
+      view:select(2)
+      local selected = {}
+      local ns = vim.api.nvim_get_namespaces().ade_choice
+      for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(view.buf, ns, 0, -1, { details = true })) do
+        local index = view.maps.options[mark[2] + 1]
+        if index and mark[4].hl_group == "AdeChoiceSelected" then
+          selected[index] = true
+        end
+      end
+      t.eq({ [2] = true }, selected)
+      view:close()
+      close_window()
+    end)
+
     t.it("floats a card over the bottom of the chat window and leaves it untouched", function()
       local win, original = window()
       vim.api.nvim_win_set_height(win, 20)

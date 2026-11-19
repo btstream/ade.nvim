@@ -241,6 +241,20 @@ M.groups = {
   -- Footer hints and transient status ("deleting...", "deleted").
   AdePickerFooter = { link = "Comment" },
 
+  -- Question and permission cards use their own theme roles.
+  AdeChoiceNormal = { link = "NormalFloat" },
+  AdeChoiceBorder = { link = "FloatBorder" },
+  AdeChoiceTitle = { link = "DiagnosticInfo" },
+  AdeChoiceTab = { link = "Comment" },
+  AdeChoiceTabActive = { link = "DiagnosticInfo" },
+  AdeChoiceQuestion = { link = "Title" },
+  AdeChoiceOptionActive = { link = "DiagnosticInfo" },
+  AdeChoiceFocus = { link = "CursorLine" },
+  AdeChoiceSelected = { link = "DiagnosticOk" },
+  AdeChoiceMuted = { link = "Comment" },
+  AdeChoiceCustom = { link = "DiagnosticInfo" },
+  AdeChoiceHint = { link = "Special" },
+
   -- Generic selection groups. The pickers link to these by default; the
   -- transcript and panels use them directly.
   AdeSelection = { link = "Visual" },

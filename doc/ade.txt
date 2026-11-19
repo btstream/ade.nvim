@@ -768,6 +768,10 @@ AdeUserIcon；助手的两组均链接到 Keyword。想区分时
 工具栏在 Neovim 0.12+ 使用继承背景的高亮语法；0.10/0.11 使用兼容语法，外部布局
 插件重映射 WinBar 时颜色可能有所不同。
 
+提问卡片默认随主题配色。可在 ui.highlights 中覆盖 AdeChoiceTabActive（当前标签）、
+AdeChoiceOptionActive（焦点选项文字）、AdeChoiceFocus（焦点行背景）、
+AdeChoiceSelected（已选标记）、AdeChoiceMuted（说明）和 AdeChoiceHint（快捷键）。
+
 ui.icons = false 为主要图标选择 ASCII 默认集；ui.icon_overrides 可逐项覆盖。
 
 输入区 Winbar                                                *ade-toolbar*

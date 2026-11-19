@@ -7,6 +7,8 @@
 -- chat transcript reserves the same number of rows below its last line, so the
 -- card never hides the latest output. `b:ade_choice` marks the card buffer.
 local M = {}
+local Icons = require("ade.ui.icons")
+local ns = vim.api.nvim_create_namespace("ade_choice")
 local View = {}
 View.__index = View
 
@@ -29,6 +31,16 @@ end
 ---@return string[]
 local function split_lines(text)
   return vim.split(tostring(text or ""), "\n", { plain = true })
+end
+
+local function paint(buf, row, first, last, group)
+  if last > first then
+    vim.api.nvim_buf_set_extmark(buf, ns, row, first, {
+      end_col = last,
+      hl_group = group,
+      end_right_gravity = false,
+    })
+  end
 end
 
 function View:notify_message(message, level)
@@ -63,27 +75,53 @@ function View:line_list()
   local model = self.model
   local lines = {}
   local maps = { options = {} }
+  local marks = {}
+  local function add(parts)
+    local row, col, text = #lines, 0, {}
+    for i, part in ipairs(parts) do
+      local piece = tostring(part[1]):gsub("[\r\n]", " ")
+      text[i] = piece
+      if part[2] then
+        marks[#marks + 1] = { row, col, col + #piece, part[2] }
+      end
+      col = col + #piece
+    end
+    lines[row + 1] = table.concat(text)
+  end
+  local function hint(keys)
+    local parts = { { " " } }
+    for i, pair in ipairs(keys) do
+      parts[#parts + 1] = { i == 1 and "" or " · ", "AdeChoiceMuted" }
+      parts[#parts + 1] = { pair[1], "AdeChoiceHint" }
+      parts[#parts + 1] = { " " .. pair[2], "AdeChoiceMuted" }
+    end
+    add(parts)
+  end
   local title = tostring(model.title or "需要选择")
   local status = model.status_fn and model.status_fn() or model.status
-  if status and status ~= "" then
-    title = title .. "    " .. tostring(status)
-  end
-  title = title .. string.format("    %d/%d", self.tab, #(model.questions or {}) + 1)
-  lines[#lines + 1] = " " .. title
-  local tabs = {}
+  local count = #(model.questions or {})
+  add({
+    { " " .. title, "AdeChoiceTitle" },
+    { status and status ~= "" and ("    " .. tostring(status)) or "", "AdeChoiceMuted" },
+    { string.format("    %d/%d", self.tab, count + 1), "AdeChoiceMuted" },
+  })
+  local tabs = { { " " } }
   for index, question in ipairs(model.questions or {}) do
     local header = tostring(question.header or ("Q" .. index))
-    local marker = require("ade.ui.icons").glyph(self:answered(index) and "choice_checked" or "choice_unchecked")
-    if self.tab == index then
-      tabs[#tabs + 1] = "[" .. marker .. " " .. header .. "]"
-    else
-      tabs[#tabs + 1] = " " .. marker .. " " .. header .. " "
-    end
+    local active, answered = self.tab == index, self:answered(index)
+    local group = active and "AdeChoiceTabActive" or "AdeChoiceTab"
+    tabs[#tabs + 1] = { active and "[" or " ", group }
+    tabs[#tabs + 1] = {
+      Icons.glyph(answered and "choice_checked" or "choice_unchecked"),
+      answered and "AdeChoiceSelected" or group,
+    }
+    tabs[#tabs + 1] = { " " .. header .. (active and "]" or " "), group }
+    tabs[#tabs + 1] = { "  " }
   end
-  tabs[#tabs + 1] = self.tab == #(model.questions or {}) + 1 and "[提交]" or " 提交 "
-  lines[#lines + 1] = " " .. table.concat(tabs, "  ")
+  local submit = self.tab == count + 1
+  tabs[#tabs + 1] = { submit and "[提交]" or " 提交 ", submit and "AdeChoiceTabActive" or "AdeChoiceTab" }
+  add(tabs)
   lines[#lines + 1] = ""
-  local count = #(model.questions or {})
   if self.tab <= count then
     local question = model.questions[self.tab]
     local question_lines = split_lines(question.question)
@@ -92,38 +130,43 @@ function View:line_list()
       question_lines[#question_lines + 1] = " …（K 展开）"
     end
     for _, line in ipairs(question_lines) do
-      lines[#lines + 1] = " " .. line
+      add({ { " " .. line, "AdeChoiceQuestion" } })
     end
     lines[#lines + 1] = ""
     local options = self:options(question)
     local answer = self:answer(self.tab)
     for index, option in ipairs(options) do
-      local marker = self.cursor == index and require("ade.ui.icons").glyph("choice_cursor") or " "
-      local selected
-      if question.multi_select then
-        local picked = false
-        for _, label in ipairs(answer.selected) do
-          if label == option.label then
-            picked = true
-            break
-          end
-        end
-        selected = require("ade.ui.icons").glyph(picked and "choice_checked" or "choice_unchecked")
-      else
-        selected = ""
-      end
+      local active = not self.custom and self.cursor == index
+      local marker = active and Icons.glyph("choice_cursor") or " "
+      local picked = not answer.skipped and vim.tbl_contains(answer.selected_index or {}, index)
+      local selected = question.multi_select and Icons.glyph(picked and "choice_checked" or "choice_unchecked") or ""
       local description = option.description and ("    " .. tostring(option.description)) or ""
-      local line = string.format(" %s %s %d. %s%s", marker, selected, index, tostring(option.label), description)
-      lines[#lines + 1] = line
+      add({
+        { " " .. marker, "AdeChoiceOptionActive" },
+        { " " .. selected, picked and "AdeChoiceSelected" or "AdeChoiceMuted" },
+        { string.format(" %d. ", index), active and "AdeChoiceOptionActive" or "AdeChoiceMuted" },
+        { tostring(option.label), active and "AdeChoiceOptionActive" or (picked and "AdeChoiceSelected" or nil) },
+        { description, "AdeChoiceMuted" },
+      })
       maps.options[#lines] = index
+      if active then
+        maps.focus_line = #lines
+      end
     end
     if self.custom then
       maps.custom_line = self.custom_line
     end
     lines[#lines + 1] = ""
-    lines[#lines + 1] = " Tab 切换 · ↑↓/jk 选择 · 1-9 直接选 · Space 多选 · Enter 确认 · Esc 稍后"
+    hint({
+      { "Tab", "切换" },
+      { "↑↓/jk", "选择" },
+      { "1-9", "直接选" },
+      { "Space", "多选" },
+      { "Enter", "确认" },
+      { "Esc", "稍后" },
+    })
   else
-    lines[#lines + 1] = " 提交前确认："
+    add({ { " 提交前确认：", "AdeChoiceQuestion" } })
     lines[#lines + 1] = ""
     for index, question in ipairs(model.questions or {}) do
       local answer = self:answer(index)
@@ -140,22 +183,32 @@ function View:line_list()
       else
         text = "（未答）"
       end
-      lines[#lines + 1] = string.format(" %d. %s: %s", index, tostring(question.header or "Q"), text)
+      add({
+        { string.format(" %d. %s: ", index, tostring(question.header or "Q")), "AdeChoiceQuestion" },
+        { text, not answer.skipped and self:answered(index) and "AdeChoiceSelected" or "AdeChoiceMuted" },
+      })
     end
     lines[#lines + 1] = ""
-    lines[#lines + 1] = " Enter 提交 · Tab 返回 · Esc 稍后"
+    hint({ { "Enter", "提交" }, { "Tab", "返回" }, { "Esc", "稍后" } })
   end
-  return lines, maps
+  return lines, maps, marks
 end
 
 function View:render()
   if not self.buf or not vim.api.nvim_buf_is_valid(self.buf) then
     return
   end
-  local lines, maps = self:line_list()
+  local lines, maps, marks = self:line_list()
   self.maps = maps
   vim.bo[self.buf].modifiable = true
   vim.api.nvim_buf_set_lines(self.buf, 0, -1, false, lines)
+  vim.api.nvim_buf_clear_namespace(self.buf, ns, 0, -1)
+  if maps.focus_line then
+    vim.api.nvim_buf_set_extmark(self.buf, ns, maps.focus_line - 1, 0, { line_hl_group = "AdeChoiceFocus" })
+  end
+  for _, mark in ipairs(marks) do
+    paint(self.buf, unpack(mark))
+  end
   vim.bo[self.buf].modifiable = false
   if self.win and vim.api.nvim_win_is_valid(self.win) then
     local line = 1
@@ -196,9 +249,15 @@ function View:begin_custom(line)
   end
   self.custom = true
   self.custom_line = line
+  -- Repaint before replacing the editable row so a direct numeric selection
+  -- cannot leave an arrow or focus background on another option.
+  self:render()
   vim.bo[self.buf].modifiable = true
-  vim.api.nvim_buf_set_lines(self.buf, line - 1, line, false, { " 其他: " })
-  vim.api.nvim_win_set_cursor(self.win, { line, #" 其他: " })
+  local prompt = " 其他: "
+  vim.api.nvim_buf_clear_namespace(self.buf, ns, line - 1, line)
+  vim.api.nvim_buf_set_lines(self.buf, line - 1, line, false, { prompt })
+  paint(self.buf, line - 1, 0, #prompt, "AdeChoiceCustom")
+  vim.api.nvim_win_set_cursor(self.win, { line, #prompt })
   vim.cmd("startinsert!")
   vim.keymap.set("i", "<CR>", function()
     local text = vim.api.nvim_get_current_line():gsub("^%s*其他:%s*", "")
@@ -578,7 +637,8 @@ function View:show(model, mount)
   self.win = win
   vim.wo[win].wrap = true
   vim.wo[win].linebreak = true
-  vim.wo[win].winhighlight = "Normal:AdePickerNormal,FloatBorder:AdePickerBorder,FloatTitle:AdePickerTitle"
+  vim.wo[win].winhighlight =
+    "Normal:AdeChoiceNormal,NormalNC:AdeChoiceNormal,FloatBorder:AdeChoiceBorder,FloatTitle:AdeChoiceTitle"
   self:keys()
   if not enter then
     local now = vim.uv.now()

@@ -915,7 +915,7 @@ function Choices:elicitation_model(interaction)
     local default = field.default
     if default ~= nil then
       if field.kind == "boolean" then
-        initial[index] = { selected = { default and "是" or "否" } }
+        initial[index] = { selected = { default and "是" or "否" }, selected_index = { default and 1 or 2 } }
       elseif field.kind == "multi" then
         local labels = {}
         local indexes = {}
