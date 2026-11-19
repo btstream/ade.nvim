@@ -14,19 +14,20 @@ local M = {}
 
 ---Flatten grouped select options.
 ---@param option table
----@return table[]
+---@return table[], table<table, table>
 local function values_of(option)
-  local out = {}
+  local out, groups = {}, {}
   for _, entry in ipairs(option.options or {}) do
     if entry.group then
       for _, child in ipairs(entry.options or {}) do
         out[#out + 1] = child
+        groups[child] = entry
       end
     else
       out[#out + 1] = entry
     end
   end
-  return out
+  return out, groups
 end
 
 ---@param option table
@@ -43,7 +44,7 @@ local function from_config(option, profile)
     option = option,
   }
   if control.kind == "select" then
-    control.options = values_of(option)
+    control.options, control.option_groups = values_of(option)
   end
   control.plan = false
   control.unsafe = false

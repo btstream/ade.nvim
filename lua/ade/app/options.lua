@@ -26,6 +26,7 @@ function Options.new(opts)
     run = opts.run,
     on_changed = opts.on_changed,
     notify = opts.notify,
+    changes = setmetatable({}, { __mode = "k" }),
   }, Options)
 end
 
@@ -38,17 +39,78 @@ function Options:still_current(client, generation, session)
   return self.ui_current(client, generation, session) and self.current() == session
 end
 
----Apply one control value.
----@param control table
----@param value any
----@param client table|nil
----@param generation integer
----@param session table
-function Options:apply(control, value, client, generation, session)
-  if not self:still_current(client, generation, session) then
+-- ACP replies can replace all configOptions; serialize writes per session so
+-- an older snapshot can never arrive after a newer write.
+function Options:apply(control, value, client, generation, session, cycling)
+  if not client or not self:still_current(client, generation, session) then
     return
   end
-  self.run("control:" .. session.id .. ":" .. control.id, client, session, function(task)
+  local queue = self.changes[session]
+  if not queue then
+    queue = { pending = {} }
+    self.changes[session] = queue
+  end
+  if cycling and queue.cycling then
+    return
+  end
+  if cycling then
+    queue.cycling = true
+  end
+  queue.pending[#queue.pending + 1] = {
+    id = control.id,
+    value = value,
+    client = client,
+    generation = generation,
+    cycling = cycling,
+  }
+  self:drain(session, queue)
+end
+
+function Options:drain(session, queue)
+  if queue.active then
+    return
+  end
+  while #queue.pending > 0 do
+    local change = table.remove(queue.pending, 1)
+    local control = self:still_current(change.client, change.generation, session)
+      and session.controls
+      and controls_mod.by_id(session.controls, change.id)
+    local value
+    if control then
+      value = change.value
+      if type(value) == "function" then
+        value = value(control)
+      end
+      -- A prior change (e.g. model) may have removed this option.
+      if
+        control.kind == "select"
+        and not vim.iter(control.options or {}):any(function(entry)
+          return entry.value == value
+        end)
+      then
+        value = nil
+      end
+    end
+    if control and value ~= nil then
+      queue.active = true
+      self:write(control, value, change, session, function()
+        queue.active = false
+        if change.cycling then
+          queue.cycling = nil
+        end
+        self:drain(session, queue)
+      end)
+      return
+    end
+    if change.cycling then
+      queue.cycling = nil
+    end
+  end
+  self.changes[session] = nil
+end
+
+function Options:write(control, value, change, session, on_finally)
+  self.run("control:" .. session.id, change.client, session, function(task)
     local ok, result
     if control.source == "modes" then
       ok, result = task:call("set_mode", session.id, value)
@@ -80,7 +142,7 @@ function Options:apply(control, value, client, generation, session)
     self.on_changed()
   end, function(err)
     self.notify("unable to change " .. (control.name or control.id) .. ": " .. tostring(err), vim.log.levels.ERROR)
-  end)
+  end, on_finally)
 end
 
 ---Toggle a boolean control.
@@ -89,12 +151,13 @@ end
 ---@param generation integer
 ---@param session table
 function Options:toggle(control, client, generation, session)
-  local next_value = not control.current
   if control.source == "modes" then
     -- A boolean never comes from `modes`; guard anyway.
     return
   end
-  self:apply(control, next_value, client, generation, session)
+  self:apply(control, function(latest)
+    return not latest.current
+  end, client, generation, session)
 end
 
 ---Picker title for a control: avoid repeating the same name twice.
@@ -109,6 +172,19 @@ local function picker_title(control, title)
   return title .. " · " .. name
 end
 
+local function model_group(control, entry)
+  local name = entry.name or tostring(entry.value)
+  local prefix, short = name:match("^([^/]+)/(.+)$")
+  local group = control.option_groups and control.option_groups[entry]
+  local id = group and group.group or (type(entry.value) == "string" and entry.value:match("^([^/]+)/.+$")) or prefix
+  local display = group and group.name or nil
+  local label = display or (prefix and id and prefix:lower() == id:lower() and prefix) or id
+  if prefix and id and (prefix:lower() == id:lower() or (display and prefix:lower() == display:lower())) then
+    name = short
+  end
+  return id, label, name, display ~= nil
+end
+
 ---Picker for a select control.
 ---@param control table
 ---@param title string|nil
@@ -119,6 +195,8 @@ function Options:pick_control(control, title, client, generation, session)
   local cfg = self.config()
   local ic = Icons.get(cfg.ui.icons, cfg.ui.icon_overrides)
   local items = {}
+  local is_model = session.controls and control == session.controls.model
+  local groups, order, ungrouped = {}, {}, {}
   for _, entry in ipairs(control.options or {}) do
     local marked = entry.value == control.current and ic.check_circle or ic.tool_pending
     local name = entry.name or tostring(entry.value)
@@ -133,11 +211,43 @@ function Options:pick_control(control, title, client, generation, session)
         session.profile and session.profile.name
       )
     end
-    items[#items + 1] = {
+    local bucket = items
+    if is_model then
+      local id, label, explicit
+      id, label, name, explicit = model_group(control, entry)
+      if id then
+        local key = id:lower()
+        if not groups[key] then
+          groups[key] = { name = label, items = {} }
+          order[#order + 1] = groups[key]
+        end
+        if explicit then
+          groups[key].name = label
+        end
+        bucket = groups[key].items
+      else
+        bucket = ungrouped
+      end
+    end
+    bucket[#bucket + 1] = {
       label = (marked ~= "" and marked .. " " or "") .. (mode_icon and mode_icon .. " " or "") .. name,
       description = entry.description,
       value = entry.value,
     }
+  end
+  if is_model then
+    for _, group in ipairs(order) do
+      for _, item in ipairs(group.items) do
+        item.label = group.name .. " / " .. item.label
+        items[#items + 1] = item
+      end
+    end
+    for _, item in ipairs(ungrouped) do
+      if #order > 0 then
+        item.label = "Other / " .. item.label
+      end
+      items[#items + 1] = item
+    end
   end
   if #items == 0 then
     self.notify("this option has no values", vim.log.levels.INFO)
@@ -185,6 +295,40 @@ end
 
 function Options:pick_mode()
   self:pick("mode", "Mode")
+end
+
+function Options:cycle_mode()
+  local session, client = self.current(), self.get_client()
+  if not session or not client then
+    return
+  end
+  if not session.controls then
+    session:refresh_controls()
+  end
+  local mode = session.controls.mode
+  if not mode or mode.kind ~= "select" then
+    return
+  end
+  self:apply(mode, function(latest)
+    local values = latest.options or {}
+    if #values < 2 then
+      return
+    end
+    local index = 0
+    for i, entry in ipairs(values) do
+      if entry.value == latest.current then
+        index = i
+        break
+      end
+    end
+    for step = 1, #values do
+      local entry = values[(index + step - 1) % #values + 1]
+      local full_access = type(entry._meta) == "table" and entry._meta.kind == "full_access"
+      if entry.value ~= latest.current and entry.value ~= "bypassPermissions" and not full_access then
+        return entry.value
+      end
+    end
+  end, client, self.generation(), session, true)
 end
 
 function Options:pick_thinking()

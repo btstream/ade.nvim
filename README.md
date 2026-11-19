@@ -153,6 +153,7 @@ JSON 解码、单块排版或 Treesitter 解析很重时仍可能暂停，恢复
 | `<C-]>`（普通模式） | `add_selection` | 附加当前选区 |
 | `M` / `<M-m>` | `pick_model` | 普通模式 / 输入时选择模型 |
 | `m` / `<M-b>` | `pick_mode` | 普通模式 / 输入时选择模式 |
+| `<S-Tab>` | `cycle_mode` | 普通模式 / 输入时直接切到下一个模式 |
 | `gT` / `<M-e>` | `pick_thinking` | 普通模式 / 输入时选择 Thinking Level |
 | `L`（普通模式） | `pick_session` | 历史会话 |
 | `<M-a>` | `focus_choice` | 进入待回答的选择卡片（提问 / 权限） |
@@ -176,6 +177,7 @@ JSON 解码、单块排版或 Treesitter 解析很重时仍可能暂停，恢复
 | `F` | `add_file` | 附加当前文件 |
 | `R` | `add_diagnostics` | 附加诊断 |
 | `M` / `m` | `pick_model` / `pick_mode` | 选择模型 / 模式 |
+| `<S-Tab>` | `cycle_mode` | 直接切到下一个模式 |
 | `gT` | `pick_thinking` | 选择 Thinking Level |
 | `<C-n>` | `new_session` | 新建会话 |
 | `L` | `pick_session` | 历史会话 |
@@ -189,6 +191,11 @@ JSON 解码、单块排版或 Treesitter 解析很重时仍可能暂停，恢复
 业务映射优先于这些兜底映射。
 
 所有按键都是 buffer-local，不会污染全局映射。
+
+`<S-Tab>` 按 agent 上报的工作模式顺序循环，不切换 Thinking Level。可通过
+`keymaps.input.cycle_mode`、`keymaps.chat.cycle_mode` 改键或设为 `false`。
+快捷键跳过 `bypassPermissions` 和 agent 标记为 `full_access` 的模式；仍可在模式选择器中手动选择。
+模型选择器按供应商 ID 归组，优先显示 agent 提供的供应商名称。
 
 ### 输入区补全：blink.cmp / nvim-cmp / 原生菜单
 
@@ -1472,6 +1479,7 @@ require("ade").setup({
 - 分隔符支持字符串、`{ text = "...", hl = "高亮组名" }` 或 `false`。组件可用 `separator = { left = ..., right = ... }` 分别指定两边，并可在分区边缘显示端帽。同一分区内，从前一个可见组件的 `right`、后一个可见组件的 `left`、全局默认值依次查找；`false` 停止查找且不画。未指定 `hl` 时，分隔符继承所属组件的高亮；全局分隔符默认跟随前一个可见组件。显式 `hl` 优先，可通过 `vim.api.nvim_set_hl()` 定义。
 - 点击 Thinking Level，或调用 `require("ade").pick_thinking()`，可选择当前 agent 提供的档位；没有上报档位时不会显示该组件。
 - `icon_overrides.modes` 使用 **agent 配置名 / profile 名 → ACP mode ID**，如 `acceptEdits`；精确的 agent 配置优先于 profile。图标不改变模式权限。单项设为 `false` 可隐藏图标，模式徽标则显示文字。`spinner_frames = false` 禁用帧动画；可用 `status_running` 覆盖静态运行图标。其他图标键名见 [`lua/ade/ui/icons.lua`](lua/ade/ui/icons.lua)。
+- Claude 的 `default`、`acceptEdits`、`plan`、`auto`、`bypassPermissions` 自带图标和独立的 Winbar 高亮组。用 `ui.toolbar.mode_highlights = { claude = { acceptEdits = "MyEditBadge" } }` 可指定高亮组；同样优先匹配 agent 配置名，再匹配 profile。也可用 `ui.highlights` 修改 `AdeToolbarModeClaudeAcceptEdits` 等内置组。不带显式 `hl` 的分隔符会继承模式徽标的高亮。
 
 ## 权限与安全
 

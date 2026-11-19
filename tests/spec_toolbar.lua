@@ -11,6 +11,49 @@ return function(t)
   end
 
   t.describe("toolbar", function()
+    t.it("renders and colors the built-in Claude modes by exact protocol ID", function()
+      local highlights = require("ade.ui.highlights")
+      local cases = {
+        default = { "D", "Default" },
+        acceptEdits = { "E", "AcceptEdits" },
+        plan = { "P", "Plan" },
+        auto = { "A", "Auto" },
+        bypassPermissions = { "!", "BypassPermissions" },
+      }
+      for id, spec in pairs(cases) do
+        local group = "AdeToolbarModeClaude" .. spec[2]
+        t.truthy(highlights.groups[group])
+        local raw = toolbar.render({
+          mode = "Agent label",
+          mode_key = id,
+          agent = "work",
+          profile = "claude",
+          icons = false,
+        }, 60)
+        t.truthy(raw:find(toolbar.highlight(group) .. "▊", 1, true))
+        t.truthy(visible(raw):find(" " .. spec[1] .. " ", 1, true))
+      end
+    end)
+
+    t.it("lets the exact agent override the profile's mode highlight", function()
+      local config = require("ade.config")
+      local cfg = config.validate(config.merge(config.defaults, {
+        ui = { toolbar = { mode_highlights = { work = { acceptEdits = "CustomEdit" } } } },
+      }))
+      local info = {
+        mode = "Accept edits",
+        mode_key = "acceptEdits",
+        agent = "work",
+        profile = "claude",
+        toolbar = cfg.ui.toolbar,
+      }
+      t.truthy(toolbar.render(info, 60):find(toolbar.highlight("CustomEdit"), 1, true))
+      info.agent = "other"
+      t.truthy(toolbar.render(info, 60):find(toolbar.highlight("AdeToolbarModeClaudeAcceptEdits"), 1, true))
+      info.mode_key = "acceptedits"
+      t.truthy(toolbar.render(info, 60):find(toolbar.highlight("AdeToolbarAccent"), 1, true))
+    end)
+
     t.it("uses config defaults and replaces only the section the user configures", function()
       local config = require("ade.config")
       local cfg = config.validate(config.merge(config.defaults, {
@@ -27,9 +70,9 @@ return function(t)
         usage = { used = 50, size = 100 },
         toolbar = cfg.ui.toolbar,
       }
-      t.eq(" B  Model · Default", visible(toolbar.render(info, 80)))
+      t.eq("▊ B  Model · Default", visible(toolbar.render(info, 80)))
       info.show_usage = true
-      t.eq(" B  Model · Default · Context 50%%", visible(toolbar.render(info, 80)))
+      t.eq("▊ B  Model · Default · Context 50%%", visible(toolbar.render(info, 80)))
     end)
 
     t.it("inherits separator highlights from their owning component", function()
@@ -79,7 +122,7 @@ return function(t)
       local base = toolbar.highlight("AdeToolbar")
       t.truthy(raw:find("%T" .. base .. " " .. base, 1, true))
       local result = vim.api.nvim_eval_statusline(raw, { use_winbar = true, maxwidth = 30 })
-      t.eq(" B  Model" .. string.rep(" ", 19) .. "o ", result.str)
+      t.eq("▊ B  Model" .. string.rep(" ", 18) .. "o ", result.str)
     end)
 
     t.it("styles both separator edges and only joins visible components", function()
@@ -233,10 +276,10 @@ return function(t)
     t.it("pins the mode badge to the left edge", function()
       local ic = require("ade.ui.icons").get(true)
       local raw = toolbar.render({ mode = "build", model = "Sonnet", status = "idle", icons = true }, 80)
-      -- The bar opens with its own background, then the badge starts at column
-      -- 0: no leading space or separator before it.
-      t.truthy(raw:find("^%%#AdeToolbar#%%@v:lua%.AdePickMode@", 1), "the mode region should start the bar: " .. raw)
-      local group = raw:match("^%%#AdeToolbar#%%@v:lua%.AdePickMode@%%[$]([%w_]+)[$]")
+      -- The cap starts at column 0 and uses the same highlight as the badge.
+      local build, base = toolbar.highlight("AdeToolbarModeBuild"), toolbar.highlight("AdeToolbar")
+      t.eq(1, raw:find("%#AdeToolbar#" .. build .. "▊" .. base .. "%@v:lua.AdePickMode@", 1, true))
+      local group = raw:match("%%@v:lua%.AdePickMode@%%[$]([%w_]+)[$]")
       t.eq("AdeToolbarModeBuild", group)
       -- The clickable region must still open on the badge and close after it.
       t.truthy(raw:find("%T", 1, true) ~= nil, "the mode region must be terminated so clicks stop")
@@ -245,7 +288,7 @@ return function(t)
     t.it("pads the badge glyph by one cell on each side", function()
       local ic = require("ade.ui.icons").get(true)
       local raw = toolbar.render({ mode = "build", status = "idle", icons = true }, 80)
-      local body = raw:match("%%[$]AdeToolbarModeBuild[$](.-)%%[$]AdeToolbar[$]")
+      local body = raw:match("%%@v:lua%.AdePickMode@%%[$]AdeToolbarModeBuild[$](.-)%%[$]AdeToolbar[$]")
       t.eq(" " .. ic.mode_build .. " ", body, "the badge should be ' glyph ', not the bare glyph")
     end)
 
@@ -348,12 +391,9 @@ return function(t)
       local function fg(name)
         return vim.api.nvim_get_hl(0, { name = name }).fg
       end
-      local function bg(name)
-        return vim.api.nvim_get_hl(0, { name = name }).bg
-      end
       t.truthy(
-        bg("AdeToolbarModePlan") ~= bg("AdeToolbarModeBuild"),
-        "modes should be told apart by their badge background"
+        fg("AdeToolbarModePlan") ~= fg("AdeToolbarModeBuild"),
+        "modes should be told apart by their badge foreground"
       )
       local statuses = {
         fg("AdeToolbarIdle"),

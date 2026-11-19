@@ -562,7 +562,7 @@ end
 
 -- Thin forwards: the options service owns the pickers and the choice logic.
 
-for _, name in ipairs({ "pick_model", "pick_mode", "pick_thinking" }) do
+for _, name in ipairs({ "pick_model", "pick_mode", "pick_thinking", "cycle_mode" }) do
   M[name] = function()
     S.view.options[name](S.view.options)
   end

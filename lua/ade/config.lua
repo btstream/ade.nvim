@@ -229,6 +229,7 @@ M.defaults = {
   ui = {
     -- Use Nerd Font icons. Set to false for a plain ASCII interface.
     icons = true,
+    -- Per-mode overrides: modes = { claude = { acceptEdits = "E" } }.
     icon_overrides = {},
     -- Show agent thoughts expanded. Off by default, matching Zed's clean
     -- transcript; a collapsed header is still drawn so they can be opened.
@@ -298,6 +299,16 @@ M.defaults = {
       animation_interval = 120,
       component_separator = " · ",
       right_padding = 1,
+      -- Agent configuration name or profile -> exact ACP mode ID -> highlight.
+      mode_highlights = {
+        claude = {
+          default = "AdeToolbarModeClaudeDefault",
+          acceptEdits = "AdeToolbarModeClaudeAcceptEdits",
+          plan = "AdeToolbarModeClaudePlan",
+          auto = "AdeToolbarModeClaudeAuto",
+          bypassPermissions = "AdeToolbarModeClaudeBypassPermissions",
+        },
+      },
       sections = {
         left = {
           -- Keep these gaps on the bar background, outside the colored badges.
@@ -379,6 +390,7 @@ M.defaults = {
       -- not be used: in a terminal it is the same key as <CR>.
       pick_model = { n = "M", i = "<M-m>" },
       pick_mode = { n = "m", i = "<M-b>" },
+      cycle_mode = "<S-Tab>",
       pick_thinking = { n = "gT", i = "<M-e>" },
       pick_session = "L",
       -- Moves the cursor into the pending question/permission card that floats
@@ -400,6 +412,7 @@ M.defaults = {
       add_diagnostics = "R",
       pick_model = "M",
       pick_mode = "m",
+      cycle_mode = "<S-Tab>",
       pick_thinking = "gT",
       new_session = "<C-n>",
       pick_session = "L",
@@ -707,6 +720,21 @@ local function validate_toolbar(toolbar)
   end
   if toolbar.component_separator ~= nil then
     check_separator(toolbar.component_separator, "ui.toolbar.component_separator", false)
+  end
+  local mode_highlights = toolbar.mode_highlights
+  if type(mode_highlights) ~= "table" then
+    fail("ui.toolbar.mode_highlights must be a table")
+  end
+  for agent, modes in pairs(mode_highlights) do
+    if type(agent) ~= "string" or type(modes) ~= "table" then
+      fail("ui.toolbar.mode_highlights must map agent names to tables of mode IDs")
+    end
+    for id, group in pairs(modes) do
+      if type(id) ~= "string" then
+        fail("ui.toolbar.mode_highlights.%s must use string mode IDs", agent)
+      end
+      check_hl(group, "ui.toolbar.mode_highlights." .. agent .. "." .. id)
+    end
   end
   if toolbar.sections == nil then
     return

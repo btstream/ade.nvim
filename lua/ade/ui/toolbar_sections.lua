@@ -3,10 +3,10 @@ local M = {}
 local dw = vim.api.nvim_strwidth
 
 local components = {
-  mode = function(t, info, ic)
+  mode = function(t, info, ic, mode_highlights)
     if info.mode and info.mode ~= "" then
       return t.mode_text(info.mode, ic, info.mode_key, info.icon_overrides, info.agent, info.profile),
-        t.mode_hl(info.mode, info.mode_key, info.mode_plan),
+        t.mode_hl(info.mode, info.mode_key, info.mode_plan, mode_highlights, info.agent, info.profile),
         "AdePickMode"
     end
   end,
@@ -68,7 +68,7 @@ local function call(fn, ...)
   end
 end
 
-local function prepare(section, toolbar, info, ic)
+local function prepare(section, toolbar, info, ic, mode_highlights)
   local out = {}
   for _, entry in ipairs(section) do
     local spec = type(entry) == "table" and entry or { entry }
@@ -78,7 +78,7 @@ local function prepare(section, toolbar, info, ic)
       if type(key) == "function" then
         text = call(key, info)
       else
-        text, color, action = components[key](toolbar, info, ic)
+        text, color, action = components[key](toolbar, info, ic, mode_highlights)
       end
       if spec.fmt and plain(text) ~= "" then
         text = call(spec.fmt, text, info)
@@ -145,8 +145,9 @@ function M.render(toolbar, info, width, ic, config, defaults, clickable, hl)
   if sep == nil then
     sep = defaults.component_separator
   end
-  local left = prepare(layout.left or defaults.sections.left, toolbar, info, ic)
-  local right = prepare(layout.right or defaults.sections.right, toolbar, info, ic)
+  local mode_highlights = config.mode_highlights or defaults.mode_highlights
+  local left = prepare(layout.left or defaults.sections.left, toolbar, info, ic, mode_highlights)
+  local right = prepare(layout.right or defaults.sections.right, toolbar, info, ic, mode_highlights)
   local right_padding = config.right_padding or 0
   local function measure(section)
     local cells = 0

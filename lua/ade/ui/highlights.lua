@@ -51,9 +51,15 @@ M.groups = {
   -- Only a foreground: the background is inherited from `AdeToolbar` via the
   -- `%$...$` markup, so there is nothing to set here.
   AdeToolbarAccent = { fg = "fg" },
-  -- Modes are badges, told apart by their background.
+  -- Modes are badges with a distinct foreground on a dark background.
   AdeToolbarModePlan = { bg = "#212121", fg = "#ffcb6b" },
   AdeToolbarModeBuild = { bg = "#212121", fg = "#c792ea" },
+  -- Claude mode badges: independent defaults for each ACP mode.
+  AdeToolbarModeClaudeDefault = { bg = "#212121", fg = "#82aaff" },
+  AdeToolbarModeClaudeAcceptEdits = { bg = "#212121", fg = "#c3e88d" },
+  AdeToolbarModeClaudePlan = { bg = "#212121", fg = "#ffcb6b" },
+  AdeToolbarModeClaudeAuto = { bg = "#212121", fg = "#c792ea" },
+  AdeToolbarModeClaudeBypassPermissions = { bg = "#212121", fg = "#ff5370" },
   -- Statuses are plain glyphs. Idle is just the bar's own text colour: no
   -- emphasis means no special colour, and it is readable by construction.
   -- (`Comment` would be tempting but is tuned for prose on `Normal`.) The other

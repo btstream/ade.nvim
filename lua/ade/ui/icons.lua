@@ -113,8 +113,14 @@ function M.nerd()
     history = "󰋚", -- history
     arrow_right = "󰁔", -- arrow-right
     -- Toolbar: mode and status are shown as glyphs rather than words.
-    mode_plan = "󰫽", -- format-list-bulleted (same family as `plan`)
-    mode_build = "󰫯", -- cog
+    mode_plan = "P", -- format-list-bulleted (same family as `plan`)
+    mode_build = "B", -- cog
+    -- Claude's defaults are independent of the generic mode icons.
+    mode_claude_default = "D", -- account
+    mode_claude_accept_edits = "E", -- pencil
+    mode_claude_plan = "P", -- format-list
+    mode_claude_auto = "A", -- robot
+    mode_claude_bypass_permissions = "！", -- alert
     status_idle = "󰝦", -- circle-outline
     status_waiting = "󰀪", -- alert
     status_cancelling = "󰅖", -- close
@@ -159,6 +165,11 @@ function M.ascii()
     -- Toolbar fallbacks: short letters, since ASCII has no glyphs for these.
     mode_plan = "P",
     mode_build = "B",
+    mode_claude_default = "D",
+    mode_claude_accept_edits = "E",
+    mode_claude_plan = "P",
+    mode_claude_auto = "A",
+    mode_claude_bypass_permissions = "!",
     status_idle = "o",
     status_waiting = "!",
     status_cancelling = "x",
@@ -201,6 +212,16 @@ function M.get(use_icons, overrides)
   return cache[base]
 end
 
+local profile_mode_icons = {
+  claude = {
+    default = "mode_claude_default",
+    acceptEdits = "mode_claude_accept_edits",
+    plan = "mode_claude_plan",
+    auto = "mode_claude_auto",
+    bypassPermissions = "mode_claude_bypass_permissions",
+  },
+}
+
 ---The protocol value is case-sensitive; never use the display label as a custom key.
 ---Return nil if there is no icon, so callers can fall back to the mode name.
 function M.mode_icon(label, id, icons, overrides, agent, profile)
@@ -212,11 +233,12 @@ function M.mode_icon(label, id, icons, overrides, agent, profile)
     value = by_profile and by_profile[id]
   end
   if value == nil then
+    local defaults = profile_mode_icons[profile or agent]
     local function builtin(key)
       key = type(key) == "string" and key:lower() or nil
       return key == "plan" and "mode_plan" or key == "build" and "mode_build" or nil
     end
-    local key = builtin(id) or builtin(label)
+    local key = (defaults and defaults[id]) or builtin(id) or builtin(label)
     value = key and icons[key]
   end
   return type(value) == "string" and value ~= "" and value or nil

@@ -426,8 +426,8 @@ function M.build(ctx, opts, action)
       return ctx.Operations.generation
     end,
     ui_current = ctx.ui_current,
-    run = function(key, client, session, fn, on_error)
-      return ctx.Operations:run(key, client, session, fn, on_error)
+    run = function(key, client, session, fn, on_error, on_finally)
+      return ctx.Operations:run(key, client, session, fn, on_error, on_finally)
     end,
     on_changed = ctx.refresh_chrome,
     notify = notify,

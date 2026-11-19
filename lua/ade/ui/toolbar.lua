@@ -155,7 +155,14 @@ end
 ---@param key string|nil value id, preferred for the style decision
 ---@param plan boolean|nil the agent's own semantic kind, when it reported one
 ---@return string
-function M.mode_hl(mode, key, plan)
+function M.mode_hl(mode, key, plan, mode_highlights, agent, profile)
+  if mode_highlights and key then
+    local by_agent, by_profile = mode_highlights[agent], mode_highlights[profile]
+    local group = (by_agent and by_agent[key]) or (by_profile and by_profile[key])
+    if group then
+      return group
+    end
+  end
   if plan then
     return "AdeToolbarModePlan"
   end

@@ -181,6 +181,10 @@ function M.pick_mode()
   ensure().pick_mode()
 end
 
+function M.cycle_mode()
+  ensure().cycle_mode()
+end
+
 function M.pick_thinking()
   ensure().pick_thinking()
 end

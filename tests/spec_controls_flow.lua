@@ -86,7 +86,7 @@ return function(t)
       ui_current = function()
         return true
       end,
-      run = function(key, client_arg, s, fn)
+      run = function(key, client_arg, s, fn, _, finally)
         local task = {
           check = function() end,
           call = function(_, method, ...)
@@ -95,6 +95,9 @@ return function(t)
           status = "running",
         }
         fn(task)
+        if finally then
+          finally()
+        end
         return task
       end,
       on_changed = function() end,
@@ -103,6 +106,165 @@ return function(t)
   end
 
   t.describe("controller session controls", function()
+    t.it("serializes mode and model writes with the newest control snapshot", function()
+      local session, calls = state.new("s", "/tmp"), {}
+      local function payload(mode, model)
+        return {
+          configOptions = {
+            {
+              id = "mode",
+              category = "mode",
+              type = "select",
+              currentValue = mode,
+              options = { { value = "plan" }, { value = "build" } },
+            },
+            {
+              id = "model",
+              category = "model",
+              type = "select",
+              currentValue = model,
+              options = { { value = "one" }, { value = "two" } },
+            },
+          },
+        }
+      end
+      session:configure(payload("plan", "one"))
+      local options = stub_options(session, {})
+      options.run = function(_, _, _, fn, _, finally)
+        calls[#calls + 1] = function(response)
+          fn({
+            call = function()
+              return true, response
+            end,
+          })
+          finally()
+        end
+      end
+      options:cycle_mode()
+      local old_model = session.controls.model
+      options:apply(old_model, "two", options.get_client(), options.generation(), session)
+      t.eq(1, #calls)
+      calls[1](payload("build", "one"))
+      t.eq(2, #calls)
+      t.truthy(old_model ~= session.controls.model)
+      calls[2]() -- an acknowledgement without a snapshot updates the fresh control
+      t.eq("build", session.controls.mode.current)
+      t.eq("two", session.controls.model.current)
+    end)
+
+    t.it("skips bypass and full-access modes when cycling but leaves them in the picker", function()
+      local session = modes_only_session()
+      table.insert(session.modes.availableModes, 2, { id = "bypassPermissions" })
+      table.insert(session.modes.availableModes, 3, { id = "unrestricted", _meta = { kind = "full_access" } })
+      session:refresh_controls()
+      local calls = {}
+      local options = stub_options(session, calls)
+      options:cycle_mode()
+      t.eq("code", session.controls.mode.current)
+
+      local picker = capture(function()
+        options:pick_mode()
+      end)
+      t.eq("bypassPermissions", picker.items[2].value)
+      t.eq("unrestricted", picker.items[3].value)
+      picker.on_choice(picker.items[2].value)
+      t.eq("bypassPermissions", session.controls.mode.current)
+
+      table.remove(session.modes.availableModes, 4) -- only one safe mode remains
+      session:refresh_controls()
+      options:cycle_mode()
+      t.eq("ask", session.controls.mode.current)
+      options:cycle_mode()
+      t.eq(3, #calls, "do not resend the current mode")
+    end)
+
+    t.it("binds Shift-Tab to change the current Claude mode without a picker", function()
+      local S = setup("claude")
+      local session = S.sess.current
+      local sent = {}
+      S.conn.client.set_config_option = function(_, session_id, config_id, value)
+        sent[#sent + 1] = { session_id, config_id, value }
+        local payload = vim.deepcopy(session.config_options)
+        for _, option in ipairs(payload) do
+          if option.id == config_id then
+            option.currentValue = value
+          end
+        end
+        return true, { configOptions = payload }
+      end
+      for _, mode in ipairs({ "n", "i" }) do
+        local found
+        for _, map in ipairs(vim.api.nvim_buf_get_keymap(S.view.input.buf, mode)) do
+          if map.desc == "ade: cycle mode" then
+            found = map
+            break
+          end
+        end
+        t.truthy(found)
+        t.eq(vim.keycode("<S-Tab>"), vim.keycode(found.lhs))
+        local expected = mode == "n" and "acceptEdits" or "plan"
+        t.eq(nil, capture(found.callback))
+        t.truthy(vim.wait(3000, function()
+          return session.controls.mode.current == expected
+        end))
+      end
+      t.eq({ { session.id, "mode", "acceptEdits" }, { session.id, "mode", "plan" } }, sent)
+      controller.hide()
+    end)
+
+    t.it("cycles through work modes in agent order and wraps without opening a picker", function()
+      local session, calls = modes_only_session(), {}
+      local options = stub_options(session, calls)
+      t.eq(
+        nil,
+        capture(function()
+          options:cycle_mode()
+        end)
+      )
+      t.eq("code", session.controls.mode.current)
+      options:cycle_mode()
+      t.eq("ask", session.controls.mode.current)
+      t.eq({
+        { method = "set_mode", session_id = "s", value = "code" },
+        { method = "set_mode", session_id = "s", value = "ask" },
+      }, calls)
+    end)
+
+    t.it("groups models using ACP groups or model prefixes and retains their original IDs", function()
+      local session, calls = state.new("s", "/tmp"), {}
+      session:configure({
+        configOptions = {
+          {
+            id = "model",
+            category = "model",
+            type = "select",
+            currentValue = "one",
+            options = {
+              { value = "one", name = "github-copilot/One" },
+              { group = "anthropic", name = "Anthropic", options = { { value = "two", name = "Two" } } },
+              { value = "github-copilot/three", name = "Three" },
+              { group = "github-copilot", name = "GitHub Copilot", options = { { value = "four", name = "Four" } } },
+              { value = "unknown", name = "Unknown" },
+            },
+          },
+        },
+      })
+      local options = stub_options(session, calls)
+      local picker = capture(function()
+        options:pick_model()
+      end)
+      local ids = {}
+      for i, item in ipairs(picker.items) do
+        ids[i] = item.value
+      end
+      t.eq({ "one", "github-copilot/three", "four", "two", "unknown" }, ids)
+      for i, label in ipairs({ "GitHub Copilot /", "GitHub Copilot /", "GitHub Copilot /", "Anthropic /", "Other /" }) do
+        t.truthy(picker.items[i].label:find(label, 1, true))
+      end
+      picker.on_choice(picker.items[2].value)
+      t.eq("github-copilot/three", calls[1].value)
+    end)
+
     t.it("switches pi thinking levels through set_config_option", function()
       local S = setup("pi")
       t.truthy(S.sess.current.controls.model)

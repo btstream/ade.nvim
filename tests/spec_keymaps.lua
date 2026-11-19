@@ -86,6 +86,8 @@ return function(t)
       t.eq("M", km.chat.pick_model)
       t.eq({ n = "gT", i = "<M-e>" }, km.input.pick_thinking)
       t.eq("gT", km.chat.pick_thinking)
+      t.eq("<S-Tab>", km.input.cycle_mode)
+      t.eq("<S-Tab>", km.chat.cycle_mode)
     end)
 
     t.it("allows rebinding and disabling the thinking picker per view", function()
