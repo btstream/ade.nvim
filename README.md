@@ -154,6 +154,7 @@ JSON 解码、单块排版或 Treesitter 解析很重时仍可能暂停，恢复
 | `M` / `<M-m>` | `pick_model` | 普通模式 / 输入时选择模型 |
 | `m` / `<M-b>` | `pick_mode` | 普通模式 / 输入时选择模式 |
 | `L`（普通模式） | `pick_session` | 历史会话 |
+| `<M-a>` | `focus_choice` | 进入待回答的选择卡片（提问 / 权限） |
 | `<C-x><C-u>` | — | 补全 `/命令` 或 `@文件`（Vim 内置触发，不受 `keymaps` 控制） |
 | `<leader>ai`（任意 buffer） | `keymaps.inline` | 在光标/选区上开始内联编辑 |
 | `@path/to/file` | — | 发送时自动作为附件 |
@@ -176,6 +177,7 @@ JSON 解码、单块排版或 Treesitter 解析很重时仍可能暂停，恢复
 | `M` / `m` | `pick_model` / `pick_mode` | 选择模型 / 模式 |
 | `<C-n>` | `new_session` | 新建会话 |
 | `L` | `pick_session` | 历史会话 |
+| `<M-a>` | `focus_choice` | 进入待回答的选择卡片（提问 / 权限） |
 | `g?` | `help` | 帮助（列表按当前配置生成） |
 | `q` | `close_panel` | 隐藏面板 |
 
@@ -849,10 +851,12 @@ filetype 是 `ade_team_input`：blink/cmp 的 `per_filetype` 只写了 `ade_inpu
 图片/附件不在该输入区提供。
 
 需要你从选项里选时（带选项的提问、spawn 申请、权限、回合上限、agent 自己的权限和
-表单），输入窗口会临时换成选择组件：Tab/Shift-Tab 切题，↑↓ 或 j/k 选择，数字直选，
-Space 多选，Enter 确认，Esc 稍后（团队权限也是稍后；只有 agent 自己的权限/表单是取消）。组件用独立缓冲区
-（仍是 `ade_input`，带 `b:ade_choice`），你的草稿和附件不受影响；补全、提交和
-附件逻辑在组件里不生效。没有选项的提问只提示，用 `:Ade team answer [名字]` 回答。
+表单），聊天窗口底部会浮出一张选择卡片：Tab/Shift-Tab 切题，↑↓ 或 j/k 选择，数字直选，
+Space 多选，Enter 确认，Esc 稍后（团队权限也是稍后；只有 agent 自己的权限/表单是取消）。卡片高度随内容
+自动调整（最多占聊天窗口约 60%，超出时在卡片内滚动），转录区底部会留出等高的空白，最新输出不会被挡住。
+卡片用独立缓冲区（filetype `ade_choice`，带 `b:ade_choice`），输入框和草稿保持可见、不受影响。
+光标在聊天或输入窗口时卡片会直接获得焦点；否则只提示，回到面板后按 `<M-a>`（`keymaps.chat.focus_choice` /
+`keymaps.input.focus_choice`）进入卡片。没有选项的提问只提示，用 `:Ade team answer [名字]` 回答。
 
 **持久化**：团队、参与者、排队消息和每个团队最近 200 条消息正文、看板、卡片历史、
 命名流程写入服务的事件日志数据库（权限 0600）；看板与卡片历史随团队删除，命名流程

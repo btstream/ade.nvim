@@ -102,11 +102,8 @@ function Panel:show()
     local ready = self:ensure()
     local cfg = self.config()
     if ready and cfg.layout.focus_input_on_open and self.input and self.input:is_visible() then
-      local buf = vim.api.nvim_win_get_buf(self.input.win)
-      if not vim.b[buf].ade_choice then
-        vim.api.nvim_set_current_win(self.input.win)
-        vim.cmd("startinsert")
-      end
+      vim.api.nvim_set_current_win(self.input.win)
+      vim.cmd("startinsert")
     end
     if self.on_visibility then
       pcall(self.on_visibility, true)

@@ -354,6 +354,9 @@ M.defaults = {
       pick_model = { n = "M", i = "<M-m>" },
       pick_mode = { n = "m", i = "<M-b>" },
       pick_session = "L",
+      -- Moves the cursor into the pending question/permission card that floats
+      -- over the bottom of the chat window.
+      focus_choice = "<M-a>",
     },
     chat = {
       close_panel = "q",
@@ -374,6 +377,7 @@ M.defaults = {
       pick_session = "L",
       scroll_bottom = "G",
       scroll_top = "gg",
+      focus_choice = "<M-a>",
     },
     -- Inline editing. `visual` applies to the captured selection, `normal`
     -- inserts at the cursor.

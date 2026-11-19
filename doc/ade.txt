@@ -105,6 +105,8 @@ q              隐藏面板（普通模式）
                keymaps.input.pick_mode
 L              历史会话（普通模式）
                keymaps.input.pick_session
+<M-a>          进入待回答的选择卡片（输入 / 普通模式）
+               keymaps.input.focus_choice
 <C-x><C-u>     补全 /命令 与 @文件（Vim 内置触发，不可配）
 @path/to/file  发送时自动展开为附件
 
@@ -141,6 +143,8 @@ M / m          选择模型 / 模式
                keymaps.chat.new_session
 L              历史会话
                keymaps.chat.pick_session
+<M-a>          进入待回答的选择卡片
+               keymaps.chat.focus_choice
 g?             帮助（内容按当前配置生成）
                keymaps.chat.help
 q              隐藏面板
@@ -253,6 +257,7 @@ picker、会话浏览器等自绘浮窗内部的按键不在 keymaps 管辖范�
           pick_model = { n = "M", i = "<M-m>" },
           pick_mode = { n = "m", i = "<M-b>" },
           pick_session = "L",
+          focus_choice = "<M-a>",
         },
         chat = {
           close_panel = "q",
@@ -271,6 +276,7 @@ picker、会话浏览器等自绘浮窗内部的按键不在 keymaps 管辖范�
           pick_session = "L",
           scroll_bottom = "G",
           scroll_top = "gg",
+          focus_choice = "<M-a>",
         },
       },
       permissions = { prompt = "select", show_details = true },
@@ -1376,18 +1382,21 @@ spawn 组：leader 在同一个回合里发出的多个 spawn 申请带同一个
 需要选择时 ~
                                                      *ade-teams-choice*
 需要你从选项里选时（带选项的提问、spawn 申请、worker 权限、回合上限、
-agent 自己的权限请求和表单），聊天输入窗口会临时换成选择组件；草稿、
-附件和撤销历史留在原输入缓冲区。
+agent 自己的权限请求和表单），聊天窗口底部会浮出一张选择卡片；输入框、
+草稿和附件保持可见、不受影响。卡片高度随内容自动调整（切题、展开、输入
+“其他”时都会重算，最多约占聊天窗口的 60%，超出在卡片内滚动）；转录区底部
+留出等高空白，最新输出不会被遮住。
 
 - Tab / Shift-Tab（也接受左右、h/l）切换问题，↑↓/jk 选择，1-9 直接选，
   Space 多选，Enter 确认，Esc 稍后（团队权限也是稍后；只有 agent 自己的
   权限请求和表单是取消）。
 - 没有选项的提问不占组件：只提示，用 :Ade team answer 或在成员上按 a
   回答。
-- 面板隐藏时只提示；:Ade open 或 :Ade team answer 后显示。
-- 组件缓冲区也是 ade_input（edgy 需要），并设置 b:ade_choice：ade 自己
-  的补全、提交、附件、图片和草稿逻辑不生效。你自己的 FileType ade_input
-  按键会作用到组件，同名时组件优先。
+- 光标在聊天或输入窗口时卡片直接获得焦点；否则只提示，回到面板后按
+  <M-a>（keymaps.chat.focus_choice / keymaps.input.focus_choice）进入。
+  回答或 Esc 后光标回到输入窗口。
+- 面板隐藏时卡片随之关闭，只提示；:Ade open 或 :Ade team answer 后显示。
+- 卡片缓冲区的 filetype 是 ade_choice，并设置 b:ade_choice。
 
 观察窗口 ~
                                                              *ade-teams-watch*

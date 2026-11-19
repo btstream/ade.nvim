@@ -238,7 +238,7 @@ function M.build(ctx, opts, action)
       return ft == "ade_chat" or ft == "ade_input" or vim.b[buf].ade_picker == true
     end,
   })
-  -- The inline choice component lives in the composer window; the queue also
+  -- The choice card floats over the bottom of the chat window; the queue also
   -- owns team questions/spawn/permission/limit items (draft 8).
   S.view.choices = Choices.new({
     team = function()
@@ -257,8 +257,14 @@ function M.build(ctx, opts, action)
     chat_win = function()
       return S.view.chat and S.view.chat.win or nil
     end,
-    external = function()
-      return (S.config or merged).layout.backend == "external"
+    reserve = function(rows)
+      if S.view.chat then
+        S.view.chat:set_bottom_reserve(rows)
+      end
+    end,
+    focus_hint = function()
+      local keys = require("ade.ui.keymaps").expand(((S.config or merged).keymaps.chat or {}).focus_choice, { "n" })
+      return keys[1] and keys[1].lhs or nil
     end,
     panel_visible = function()
       return (S.view.panel ~= nil and S.view.panel:is_visible()) or (S.view.team_ui ~= nil and S.view.team_ui:is_open())

@@ -47,6 +47,7 @@ M.actions = {
     { action = "pick_file", desc = "insert file mention", modes = { "n", "i" }, handler = "on_pick_file" },
     { action = "paste_image", desc = "paste image from clipboard", modes = { "n", "i" }, handler = "on_paste_image" },
     { action = "pick_session", desc = "sessions", modes = { "n" }, handler = "on_pick_session" },
+    { action = "focus_choice", desc = "answer pending choice", modes = { "n", "i" }, handler = "on_focus_choice" },
   },
   -- Not a composer/transcript view: these are global maps installed once, but
   -- they use the same validation table so unknown actions cannot be configured.
@@ -71,6 +72,7 @@ M.actions = {
     { action = "pick_session", desc = "sessions", modes = { "n" }, handler = "on_pick_session" },
     { action = "scroll_bottom", desc = "jump to latest", modes = { "n" }, handler = "on_scroll_bottom" },
     { action = "scroll_top", desc = "jump to start", modes = { "n" }, handler = "on_scroll_top" },
+    { action = "focus_choice", desc = "answer pending choice", modes = { "n" }, handler = "on_focus_choice" },
   },
 }
 

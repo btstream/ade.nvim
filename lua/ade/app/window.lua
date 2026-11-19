@@ -160,6 +160,11 @@ function M:install_input_keymaps()
     on_paste_image = actions.paste_image,
     on_paste_image_path = actions.add_image,
     on_pick_session = actions.pick_session,
+    on_focus_choice = function()
+      if S.view.choices then
+        S.view.choices:focus()
+      end
+    end,
   })
 end
 
@@ -253,6 +258,11 @@ function M:install_chat_keymaps()
     on_scroll_top = function()
       S.view.chat:scroll_to_top()
       update_title()
+    end,
+    on_focus_choice = function()
+      if S.view.choices then
+        S.view.choices:focus()
+      end
     end,
   })
 end

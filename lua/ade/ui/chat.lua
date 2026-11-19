@@ -887,6 +887,24 @@ function Chat:scroll_to_bottom()
   end
 end
 
+---Keep `rows` blank rows below the transcript for the choice card that floats
+---over the bottom of the window; a following view stays on the latest output.
+---@param rows integer
+function Chat:set_bottom_reserve(rows)
+  rows = math.max(0, rows or 0)
+  if rows == (self.bottom_reserve or 0) then
+    return
+  end
+  self.bottom_reserve = rows > 0 and rows or nil
+  if not self.buf or not vim.api.nvim_buf_is_valid(self.buf) then
+    return
+  end
+  renderer.set_reserve(self.buf, rows)
+  if self.follow and not self.layout_job and not self.commit_job and not self.page then
+    self:scroll_to_bottom()
+  end
+end
+
 function Chat:scroll_to_top()
   local win = self.win
   if not win or not vim.api.nvim_win_is_valid(win) then
@@ -1069,6 +1087,9 @@ function Chat:destroy()
   if self.augroup then
     pcall(vim.api.nvim_del_augroup_by_id, self.augroup)
     self.augroup = nil
+  end
+  if self.buf then
+    renderer.set_reserve(self.buf, 0)
   end
   if self.buf and vim.api.nvim_buf_is_valid(self.buf) then
     pcall(vim.api.nvim_buf_delete, self.buf, { force = true })

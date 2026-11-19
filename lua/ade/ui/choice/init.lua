@@ -1,11 +1,11 @@
 -- The inline choice component (W0 v2, draft 8).
 --
--- It borrows the chat composer window with its own buffer, so the person's
--- draft, undo history, attachments and images stay untouched. The buffer keeps
--- filetype `ade_input` for edgy; `b:ade_choice` tells ade.nvim's composer,
--- completion, submit and attachment code to stay out of the way.
-local layout = require("ade.layout")
-
+-- A card floating over the bottom of the chat window, with its own buffer: the
+-- composer and its draft stay untouched and visible. The card is as tall as its
+-- wrapped content (capped to part of the chat window) and follows every
+-- re-render, so switching questions or typing a custom answer resizes it. The
+-- chat transcript reserves the same number of rows below its last line, so the
+-- card never hides the latest output. `b:ade_choice` marks the card buffer.
 local M = {}
 local View = {}
 View.__index = View
@@ -87,8 +87,9 @@ function View:line_list()
   if self.tab <= count then
     local question = model.questions[self.tab]
     local question_lines = split_lines(question.question)
-    if self.external and not self.expanded and #question_lines > 2 then
-      question_lines = { question_lines[1], question_lines[2], " …（K 展开）" }
+    if not self.expanded and #question_lines > 8 then
+      question_lines = vim.list_slice(question_lines, 1, 6)
+      question_lines[#question_lines + 1] = " …（K 展开）"
     end
     for _, line in ipairs(question_lines) do
       lines[#lines + 1] = " " .. line
@@ -168,6 +169,7 @@ function View:render()
     end
     pcall(vim.api.nvim_win_set_cursor, self.win, { math.max(1, line), 0 })
   end
+  self:resize()
 end
 
 function View:advance()
@@ -454,13 +456,67 @@ function View:keys()
   end)
 end
 
+local function valid_win(win)
+  return win ~= nil and vim.api.nvim_win_is_valid(win)
+end
+
+---Fit the card to its content: full chat width, bottom-aligned, as tall as the
+---wrapped text up to `max_ratio` of the chat window. Scrolls past that.
+function View:resize()
+  local host, win = self.host, self.win
+  if not valid_win(host) or not valid_win(win) then
+    return
+  end
+  local host_height = vim.api.nvim_win_get_height(host)
+  local function place(height)
+    pcall(vim.api.nvim_win_set_config, win, {
+      relative = "win",
+      win = host,
+      anchor = "SW",
+      row = host_height,
+      col = 0,
+      width = math.max(10, vim.api.nvim_win_get_width(host) - 2),
+      height = height,
+    })
+  end
+  -- Width first: the wrapped height depends on it.
+  place(vim.api.nvim_win_get_height(win))
+  local height = vim.api.nvim_buf_line_count(self.buf)
+  local ok, info = pcall(vim.api.nvim_win_text_height, win, { start_row = 0, end_row = -1 })
+  if ok and type(info) == "table" and type(info.all) == "number" then
+    height = info.all
+  end
+  -- Two rows of border; keep a few transcript rows visible above.
+  local max = math.max(1, math.min(math.floor(host_height * self.max_ratio) - 2, host_height - 3))
+  height = math.max(1, math.min(height, max))
+  place(height)
+  if self.reserve then
+    pcall(self.reserve, math.min(height + 2, host_height))
+  end
+end
+
+---Move the cursor into the card.
+---@return boolean focused
+function View:focus()
+  if not valid_win(self.win) then
+    return false
+  end
+  if vim.api.nvim_get_mode().mode:sub(1, 1) == "i" then
+    pcall(vim.cmd, "stopinsert")
+  end
+  return pcall(vim.api.nvim_set_current_win, self.win)
+end
+
 ---@param model table
----@param mount {win: integer, external: boolean|nil, max_height: integer|nil}
+---@param mount {win: integer, focus_wins: integer[]|nil, return_win: (fun(): integer|nil)|nil,
+---  reserve: fun(rows: integer)|nil, max_ratio: number|nil, focus_hint: string|nil,
+---  on_detach: fun()|nil} `on_detach` runs when the card goes without an answer
+---  because its chat window closed or someone closed the card itself.
 ---@return boolean shown
 function View:show(model, mount)
   self:close()
-  local win = mount and mount.win
-  if not win or not vim.api.nvim_win_is_valid(win) then
+  local host = mount and mount.win
+  if not valid_win(host) then
     return false
   end
   self.model = model
@@ -478,45 +534,64 @@ function View:show(model, mount)
   self.cursor = 1
   self.custom = false
   self.expanded = false
-  self.win = win
-  self.original_buf = vim.api.nvim_win_get_buf(win)
-  self.saved_winbar = vim.api.nvim_get_option_value("winbar", { win = win })
-  self.saved_wrap = vim.api.nvim_get_option_value("wrap", { win = win })
-  self.saved_height = vim.api.nvim_win_get_height(win)
-  self.external = mount.external == true
-  if vim.api.nvim_get_mode().mode:sub(1, 1) == "i" then
+  self.host = host
+  self.reserve = mount.reserve
+  self.return_win = mount.return_win
+  self.on_detach = mount.on_detach
+  self.max_ratio = mount.max_ratio or 0.6
+  local current = vim.api.nvim_get_current_win()
+  local enter = current == host
+  for _, focus_win in ipairs(mount.focus_wins or {}) do
+    if focus_win == current then
+      enter = true
+    end
+  end
+  if enter and vim.api.nvim_get_mode().mode:sub(1, 1) == "i" then
     pcall(vim.cmd, "stopinsert")
   end
   self.buf = vim.api.nvim_create_buf(false, true)
   vim.bo[self.buf].buftype = "nofile"
   vim.bo[self.buf].bufhidden = "wipe"
   vim.bo[self.buf].swapfile = false
-  vim.bo[self.buf].filetype = "ade_input"
+  vim.bo[self.buf].filetype = "ade_choice"
   vim.bo[self.buf].buflisted = false
   vim.bo[self.buf].modifiable = false
   vim.b[self.buf].ade_choice = true
   vim.b[self.buf].completion = false
   dispose_cmp(self.buf)
-  pcall(vim.api.nvim_set_option_value, "winbar", "", { win = win })
-  local ok = layout.set_window_buffer(win, self.buf)
+  local ok, win = pcall(vim.api.nvim_open_win, self.buf, enter, {
+    relative = "win",
+    win = host,
+    anchor = "SW",
+    row = vim.api.nvim_win_get_height(host),
+    col = 0,
+    width = math.max(10, vim.api.nvim_win_get_width(host) - 2),
+    height = 1,
+    style = "minimal",
+    border = "rounded",
+    zindex = 45,
+  })
   if not ok then
     self:close()
     return false
   end
-  pcall(vim.api.nvim_set_option_value, "wrap", true, { win = win })
+  self.win = win
+  vim.wo[win].wrap = true
+  vim.wo[win].linebreak = true
+  vim.wo[win].winhighlight = "Normal:AdePickerNormal,FloatBorder:AdePickerBorder,FloatTitle:AdePickerTitle"
   self:keys()
-  local current = vim.api.nvim_get_current_win()
-  local in_panel = current == win or (mount.chat_win and current == mount.chat_win)
-  if in_panel then
-    pcall(vim.api.nvim_set_current_win, win)
-  else
+  if not enter then
     local now = vim.uv.now()
     if not self.focus_notice_at or now - self.focus_notice_at > 5000 then
       self.focus_notice_at = now
-      self:notify_message("需要你的选择：切到聊天输入窗口或 :Ade team answer", vim.log.levels.INFO)
+      local hint = mount.focus_hint and ("在聊天窗口按 " .. mount.focus_hint .. " 进入，") or ""
+      self:notify_message("需要你的选择：" .. hint .. "或 :Ade team answer", vim.log.levels.INFO)
     end
   end
+  local group = vim.api.nvim_create_augroup("AdeChoiceCard" .. self.buf, { clear = true })
+  self.augroup = group
   vim.api.nvim_create_autocmd("InsertLeave", {
+    group = group,
     buffer = self.buf,
     callback = function()
       if self.custom then
@@ -534,47 +609,70 @@ function View:show(model, mount)
       end
     end,
   })
+  vim.api.nvim_create_autocmd({ "WinResized", "VimResized" }, {
+    group = group,
+    callback = function()
+      vim.schedule(function()
+        self:resize()
+      end)
+    end,
+  })
+  -- The card has no life of its own: when the chat window goes (panel hidden)
+  -- or someone closes the card with :q, drop it without answering. The queue
+  -- notices on its next refresh and shows the item again later.
+  vim.api.nvim_create_autocmd("WinClosed", {
+    group = group,
+    callback = function(args)
+      local closed = tonumber(args.match)
+      if closed == self.host or closed == self.win then
+        vim.schedule(function()
+          if self.host == host then
+            local on_detach = self.on_detach
+            self:close()
+            if on_detach then
+              pcall(on_detach)
+            end
+          end
+        end)
+      end
+    end,
+  })
   self:render()
-  local lines = vim.api.nvim_buf_line_count(self.buf)
-  if not self.external then
-    local max = mount.max_height or math.max(4, math.floor((vim.o.lines - 2) / 2))
-    local height = lines
-    local ok, info = pcall(vim.api.nvim_win_text_height, win, { start_row = 0, end_row = -1 })
-    if ok and type(info) == "table" and type(info.height) == "number" then
-      height = info.height
-    end
-    pcall(vim.api.nvim_win_set_height, win, math.max(3, math.min(height, max)))
-  end
   return true
 end
 
 function View:close()
-  local win = self.win
-  local buf = self.buf
-  self.win, self.buf = nil, nil
+  local win, buf, group = self.win, self.buf, self.augroup
+  local had_focus = valid_win(win) and vim.api.nvim_get_current_win() == win
+  local reserve, return_win = self.reserve, self.return_win
+  self.win, self.buf, self.augroup, self.host = nil, nil, nil, nil
   self.model, self.answers, self.custom = nil, nil, false
-  if win and vim.api.nvim_win_is_valid(win) then
-    if self.original_buf and vim.api.nvim_buf_is_valid(self.original_buf) then
-      layout.set_window_buffer(win, self.original_buf)
-    end
-    if self.saved_winbar ~= nil then
-      pcall(vim.api.nvim_set_option_value, "winbar", self.saved_winbar, { win = win })
-    end
-    if self.saved_wrap ~= nil then
-      pcall(vim.api.nvim_set_option_value, "wrap", self.saved_wrap, { win = win })
-    end
-    if not self.external and self.saved_height then
-      pcall(vim.api.nvim_win_set_height, win, self.saved_height)
-    end
+  self.reserve, self.return_win, self.on_detach = nil, nil, nil
+  if group then
+    pcall(vim.api.nvim_del_augroup_by_id, group)
+  end
+  if had_focus and vim.api.nvim_get_mode().mode:sub(1, 1) == "i" then
+    pcall(vim.cmd, "stopinsert")
+  end
+  if valid_win(win) then
+    pcall(vim.api.nvim_win_close, win, true)
   end
   if buf and vim.api.nvim_buf_is_valid(buf) then
     pcall(vim.api.nvim_buf_delete, buf, { force = true })
   end
-  self.original_buf, self.saved_winbar, self.saved_height = nil, nil, nil
+  if reserve then
+    pcall(reserve, 0)
+  end
+  if had_focus and return_win then
+    local target = return_win()
+    if valid_win(target) then
+      pcall(vim.api.nvim_set_current_win, target)
+    end
+  end
 end
 
 function View:is_open()
-  return self.win ~= nil and vim.api.nvim_win_is_valid(self.win)
+  return valid_win(self.win)
 end
 
 M.View = View

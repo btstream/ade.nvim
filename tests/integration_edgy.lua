@@ -185,36 +185,32 @@ check("idle transcript follows edgy width changes without a session update", fun
   end, 2000, "edgy width restore")
 end)
 
--- The inline choice component borrows the composer without leaving the
--- edgebar or changing the managed size.
-check("the choice component keeps the composer in the edgebar", function()
+-- The choice card floats over the chat window: edgy's windows, buffers and
+-- sizes stay as they were, and the float is not adopted as an edgy view.
+check("the choice card floats over the chat window inside the edgebar", function()
   local Choice = require("ade.ui.choice")
-  local original = vim.api.nvim_win_get_buf(st.input.win)
-  local width = vim.api.nvim_win_get_width(st.input.win)
+  local input_buf = vim.api.nvim_win_get_buf(st.input.win)
+  local chat_buf = vim.api.nvim_win_get_buf(st.chat.win)
+  local width = vim.api.nvim_win_get_width(st.chat.win)
   local view = Choice.new({ notify = function() end })
   assert(
     view:show({
       title = "choice",
       questions = { { header = "Q", question = "pick", options = { { label = "A" }, { label = "B" } } } },
       on_cancel = function() end,
-    }, { win = st.input.win, external = true }),
-    "the component did not mount"
+    }, { win = st.chat.win }),
+    "the card did not mount"
   )
-  local buf = vim.api.nvim_win_get_buf(st.input.win)
-  assert(vim.bo[buf].filetype == "ade_input", "edgy needs the ade_input filetype")
-  assert(vim.b[buf].ade_choice == true, "the composer marker is missing")
-  assert(vim.api.nvim_win_get_width(st.input.win) == width, "edgy's size changed")
   require("edgy.layout").update()
   vim.wait(100)
-  assert(vim.api.nvim_win_is_valid(st.input.win), "the composer left the edgebar")
-  local shown_width = vim.api.nvim_win_get_width(st.input.win)
+  assert(view:is_open(), "edgy closed the card")
+  assert(vim.api.nvim_win_get_config(view.win).relative == "win", "the card is not a float over the chat")
+  assert(vim.api.nvim_win_get_buf(st.input.win) == input_buf, "the composer buffer changed")
+  assert(vim.api.nvim_win_get_buf(st.chat.win) == chat_buf, "the chat buffer changed")
+  assert(vim.api.nvim_win_get_width(st.chat.win) == width, "edgy's size changed")
   view:close()
-  assert(vim.api.nvim_win_get_buf(st.input.win) == original, "the draft buffer was not restored")
   vim.wait(100)
-  assert(
-    vim.api.nvim_win_get_width(st.input.win) == shown_width,
-    "the width changed after close: " .. vim.api.nvim_win_get_width(st.input.win) .. " vs " .. shown_width
-  )
+  assert(vim.api.nvim_win_get_width(st.chat.win) == width, "the width changed after close")
 end)
 
 check("the worker watch input filetype is not an edgy view", function()

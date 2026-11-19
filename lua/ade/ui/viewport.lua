@@ -40,7 +40,7 @@ local function align_tail(chat)
     local view = vim.fn.winsaveview()
     local info = vim.fn.getwininfo(win)[1]
     local height = vim.api.nvim_win_text_height(win, { start_row = view.topline - 1, end_row = count - 1 }).all
-    local skip = math.max(0, height - info.height)
+    local skip = math.max(0, height - (info.height - (chat.bottom_reserve or 0)))
     if skip > 0 then
       view.skipcol = skip * math.max(1, info.width - info.textoff)
       vim.fn.winrestview(view)
@@ -95,9 +95,12 @@ function M.clamp_tail(chat)
       return false
     end
     local info = vim.fn.getwininfo(chat.win)[1]
-    if count <= info.height and vim.api.nvim_win_text_height then
+    -- Rows reserved below the last line for the choice card count as text.
+    local reserve = chat.bottom_reserve or 0
+    local visible = info.height - reserve
+    if count <= visible and vim.api.nvim_win_text_height then
       local height = vim.api.nvim_win_text_height(chat.win, { start_row = 0, end_row = count - 1 }).all
-      if height <= info.height then
+      if height <= visible then
         local saved = vim.fn.winsaveview()
         local beyond = saved.topline ~= 1 or saved.skipcol ~= 0 or saved.topfill ~= 0
         if beyond then
@@ -112,7 +115,7 @@ function M.clamp_tail(chat)
     -- Do not disturb a correctly aligned view. In particular, zb's wrapped-line
     -- skipcol is resolved during redraw; saving/restoring it prematurely can
     -- discard that pending adjustment and hide EOF again.
-    if row == 0 or row >= info.winrow + info.winbar + info.height - 1 then
+    if row == 0 or row >= info.winrow + info.winbar + visible - 1 then
       return false
     end
     local saved = vim.fn.winsaveview()
@@ -123,7 +126,7 @@ function M.clamp_tail(chat)
     if saved.topline == bottom.topline and saved.skipcol == bottom.skipcol and saved.topfill == bottom.topfill then
       -- Some wrapped/status-column combinations round zb one screen row too
       -- far. Correct the measured screen gap with native smooth scrolling.
-      local gap = info.winrow + info.winbar + info.height - 1 - row
+      local gap = info.winrow + info.winbar + visible - 1 - row
       vim.cmd("normal! " .. gap .. string.char(25)) -- <C-y>: scroll up by screen rows
       bottom = vim.fn.winsaveview()
     end

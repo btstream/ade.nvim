@@ -113,21 +113,37 @@ function Choices:notify(message, level)
 end
 
 function Choices:mount()
-  local win = self.deps.input_win and self.deps.input_win() or nil
-  if not win or not vim.api.nvim_win_is_valid(win) then
+  local chat = self.deps.chat_win and self.deps.chat_win() or nil
+  if not chat or not vim.api.nvim_win_is_valid(chat) then
     return nil
   end
-  local chat = self.deps.chat_win and self.deps.chat_win() or nil
-  local max_height
-  if chat and vim.api.nvim_win_is_valid(chat) then
-    max_height = math.max(4, math.floor(vim.api.nvim_win_get_height(chat) / 2))
-  end
+  local input_win = self.deps.input_win
+  local input = input_win and input_win() or nil
   return {
-    win = win,
-    chat_win = chat,
-    external = self.deps.external and self.deps.external() or false,
-    max_height = max_height,
+    win = chat,
+    focus_wins = { chat, input },
+    return_win = function()
+      local target = input_win and input_win() or nil
+      if target and vim.api.nvim_win_is_valid(target) then
+        return target
+      end
+      return chat
+    end,
+    reserve = self.deps.reserve,
+    focus_hint = self.deps.focus_hint and self.deps.focus_hint() or nil,
+    on_detach = function()
+      self:refresh()
+    end,
   }
+end
+
+---Move the cursor into the card, showing the next pending item first when
+---nothing is on screen.
+function Choices:focus()
+  if not self.view:is_open() then
+    self:show_pending(nil)
+  end
+  return self.view:focus()
 end
 
 function Choices:visible()
@@ -572,6 +588,21 @@ function Choices:fallback_closable()
   return (config.ui or {}).picker == "internal"
 end
 
+---Take the card off screen without answering (the panel went away). An ACP
+---request it was showing goes back to the queue so the fallback can show it.
+---@param interactions table|nil
+function Choices:drop_current(interactions)
+  if not self.view:is_open() then
+    return
+  end
+  local current = self.current
+  self.view:close()
+  self.current = nil
+  if current and current.kind == "acp" and interactions then
+    interactions:unshow(current.interaction and current.interaction.id or nil)
+  end
+end
+
 ---Recompute the queue and show the next item when possible.
 function Choices:refresh()
   local open = self:team_entries(nil)
@@ -657,11 +688,8 @@ function Choices:refresh()
         return
       end
     else
-      if self.view:is_open() then
-        self.view:close()
-        self.current = nil
-      end
-      -- No composer: keep the old picker/form so the agent is not blocked.
+      self:drop_current(interactions)
+      -- No chat window: keep the old picker/form so the agent is not blocked.
       -- Never call show_next again while it is already on screen: its floats
       -- fire WinNew/BufWinEnter and would make refresh loop.
       if not interactions.shown then
@@ -671,10 +699,7 @@ function Choices:refresh()
     end
   end
   if not visible then
-    if self.view:is_open() then
-      self.view:close()
-      self.current = nil
-    end
+    self:drop_current(interactions)
     return
   end
   if self.current and self.view:is_open() then
@@ -993,7 +1018,7 @@ function Choices:present_interaction(interaction)
     return false
   end
   if not self:visible() or not mount then
-    -- No composer to borrow (panel hidden or no window). ACP requests are
+    -- No chat window to float over (panel hidden). ACP requests are
     -- blocking, so keep the old picker/form as the single-agent fallback.
     if interaction.type == "permission" and self.deps.permission_present then
       return self.deps.permission_present(interaction)

@@ -16,9 +16,10 @@ return function(t)
   end
 
   t.describe("inline choice component", function()
-    t.it("borrows the composer window and restores the original buffer", function()
+    t.it("floats a card over the bottom of the chat window and leaves it untouched", function()
       local win, original = window()
-      local submitted
+      vim.api.nvim_win_set_height(win, 20)
+      local submitted, reserved
       local view = Choice.new({ notify = function() end })
       local model = {
         title = "r1 提问",
@@ -33,16 +34,93 @@ return function(t)
           submitted = answers
         end,
       }
-      t.eq(true, view:show(model, { win = win, external = false, max_height = 5 }))
-      local buf = vim.api.nvim_win_get_buf(win)
-      t.eq("ade_input", vim.bo[buf].filetype)
-      t.eq(true, vim.b[buf].ade_choice)
-      t.eq(false, vim.bo[buf].modifiable)
-      t.truthy(vim.api.nvim_win_get_height(win) <= 5)
+      t.eq(
+        true,
+        view:show(model, {
+          win = win,
+          focus_wins = { win },
+          reserve = function(rows)
+            reserved = rows
+          end,
+        })
+      )
+      t.eq(original, vim.api.nvim_win_get_buf(win), "the chat window keeps its buffer")
+      local config = vim.api.nvim_win_get_config(view.win)
+      t.eq("win", config.relative)
+      t.eq(win, config.win)
+      t.eq("SW", config.anchor)
+      t.eq(view.win, vim.api.nvim_get_current_win(), "focused from the chat window")
+      t.eq("ade_choice", vim.bo[view.buf].filetype)
+      t.eq(true, vim.b[view.buf].ade_choice)
+      t.eq(false, vim.bo[view.buf].modifiable)
+      t.eq(config.height + 2, reserved, "the transcript reserves the card's rows")
       view:select(2)
       view:submit()
       t.eq("B", submitted[1].selected[1])
-      t.eq(original, vim.api.nvim_win_get_buf(win), "the composer buffer comes back")
+      t.eq(false, view:is_open())
+      t.eq(0, reserved, "the reserve is released")
+      close_window()
+    end)
+
+    t.it("fits its height to each question's content and caps it", function()
+      local win = window()
+      vim.api.nvim_win_set_height(win, 30)
+      local view = Choice.new({ notify = function() end })
+      local options = {}
+      for i = 1, 9 do
+        options[i] = { label = "option " .. i }
+      end
+      view:show({
+        title = "fit",
+        questions = {
+          { header = "Short", question = "one?", options = { { label = "A" } } },
+          { header = "Long", question = "many?", options = options },
+          { header = "Huge", question = string.rep("word ", 2000), options = options },
+        },
+        on_cancel = function() end,
+      }, { win = win })
+      local short = vim.api.nvim_win_get_height(view.win)
+      view.tab = 2
+      view:render()
+      local long = vim.api.nvim_win_get_height(view.win)
+      t.truthy(long > short, "more options make a taller card")
+      view.expanded = true
+      view.tab = 3
+      view:render()
+      local huge = vim.api.nvim_win_get_height(view.win)
+      t.truthy(huge + 2 <= math.floor(30 * 0.6), "the card is capped to part of the chat window")
+      view.tab = 1
+      view:render()
+      t.eq(short, vim.api.nvim_win_get_height(view.win), "and shrinks back")
+      view:close()
+      close_window()
+    end)
+
+    t.it("does not take focus from other windows and closes with the chat window", function()
+      local win = window()
+      vim.api.nvim_win_set_height(win, 20)
+      vim.cmd("split")
+      local other = vim.api.nvim_get_current_win()
+      local notices = {}
+      local view = Choice.new({
+        notify = function(message)
+          notices[#notices + 1] = message
+        end,
+      })
+      view:show({
+        title = "away",
+        questions = { { header = "Q", question = "q", options = { { label = "A" } } } },
+        on_cancel = function() end,
+      }, { win = win, focus_wins = { win }, focus_hint = "<M-a>" })
+      t.eq(other, vim.api.nvim_get_current_win())
+      t.match("<M%-a>", notices[1] or "")
+      t.eq(true, view:focus())
+      t.eq(view.win, vim.api.nvim_get_current_win())
+      vim.api.nvim_win_close(win, true)
+      vim.wait(50, function()
+        return not view:is_open()
+      end)
+      t.eq(false, view:is_open(), "the card goes with its chat window")
       close_window()
     end)
 
@@ -68,7 +146,7 @@ return function(t)
         on_submit = function(answers)
           submitted = answers
         end,
-      }, { win = win, external = false, max_height = 8 })
+      }, { win = win })
       view:select(1)
       view:toggle()
       view.cursor = 2
@@ -94,7 +172,7 @@ return function(t)
           },
         },
         on_submit = function() end,
-      }, { win = win, external = false, max_height = 8 })
+      }, { win = win })
       view:select(3) -- Other
       t.eq(true, view.custom)
       t.eq(0, #view.answers[1].selected, "Other clears the single selection")
@@ -108,24 +186,6 @@ return function(t)
       close_window()
     end)
 
-    t.it("anchors attachments at the draft end while the choice buffer shows", function()
-      local win = window()
-      local Input = require("ade.ui.input")
-      local input = Input.new({
-        config = { ui = { toolbar = { placement = "off" } } },
-        on_submit = function() end,
-        on_cancel = function() end,
-      })
-      vim.api.nvim_buf_set_lines(input.buf, 0, -1, false, { "abc", "de" })
-      local choice_buf = vim.api.nvim_create_buf(false, true)
-      vim.b[choice_buf].ade_choice = true
-      vim.api.nvim_win_set_buf(win, choice_buf)
-      input.win = win
-      t.eq({ 1, 2 }, input:cursor_position(), "append to the end of the draft")
-      input:destroy()
-      close_window()
-    end)
-
     t.it("renders the live pending count from status_fn", function()
       local win = window()
       local view = Choice.new({ notify = function() end })
@@ -136,33 +196,10 @@ return function(t)
         end,
         questions = { { header = "Q", question = "q", options = { { label = "A" } } } },
         on_cancel = function() end,
-      }, { win = win, external = false, max_height = 8 })
+      }, { win = win })
       local text = table.concat(vim.api.nvim_buf_get_lines(view.buf, 0, -1, false), "\n")
       t.match("还有 2 个待处理", text)
       view:close()
-      close_window()
-    end)
-
-    t.it("does not resize under edgy and restores the native height", function()
-      local win = window()
-      local view = Choice.new({ notify = function() end })
-      local before = vim.api.nvim_win_get_height(win)
-      view:show({
-        title = "external",
-        questions = { { header = "Q", question = "q", options = { { label = "A" } } } },
-        on_cancel = function() end,
-      }, { win = win, external = true })
-      t.eq(before, vim.api.nvim_win_get_height(win), "edgy owns the size")
-      view:close()
-
-      local view2 = Choice.new({ notify = function() end })
-      view2:show({
-        title = "native",
-        questions = { { header = "Q", question = "q", options = { { label = "A" } } } },
-      }, { win = win, external = false, max_height = 3 })
-      t.truthy(vim.api.nvim_win_get_height(win) <= 3)
-      view2:close()
-      t.eq(before, vim.api.nvim_win_get_height(win), "native height is restored")
       close_window()
     end)
   end)
@@ -247,9 +284,6 @@ return function(t)
         end,
         chat_win = function()
           return win
-        end,
-        external = function()
-          return false
         end,
         panel_visible = function()
           return true
@@ -337,9 +371,6 @@ return function(t)
         chat_win = function()
           return win
         end,
-        external = function()
-          return false
-        end,
         panel_visible = function()
           return true
         end,
@@ -390,9 +421,6 @@ return function(t)
         chat_win = function()
           return win
         end,
-        external = function()
-          return false
-        end,
         panel_visible = function()
           return true
         end,
@@ -431,9 +459,6 @@ return function(t)
         end,
         chat_win = function()
           return win
-        end,
-        external = function()
-          return false
         end,
         panel_visible = function()
           return true
@@ -498,9 +523,6 @@ return function(t)
         chat_win = function()
           return win
         end,
-        external = function()
-          return false
-        end,
         panel_visible = function()
           return true
         end,
@@ -554,9 +576,6 @@ return function(t)
         end,
         chat_win = function()
           return win
-        end,
-        external = function()
-          return false
         end,
         panel_visible = function()
           return true
@@ -651,9 +670,6 @@ return function(t)
         end,
         chat_win = function()
           return win
-        end,
-        external = function()
-          return false
         end,
         panel_visible = function()
           return true
