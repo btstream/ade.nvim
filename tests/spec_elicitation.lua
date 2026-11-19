@@ -63,6 +63,37 @@ return function(t)
       end)
     end)
 
+    t.it("dismissing a single-choice picker does not cancel the request", function()
+      local cancel
+      with_picker(function(opts)
+        cancel = opts.on_cancel
+        return {
+          close = function()
+            opts.on_cancel()
+          end,
+        }
+      end, function()
+        local cancelled = false
+        form.open({
+          message = "Pick",
+          requestedSchema = {
+            type = "object",
+            properties = { db = { type = "string", enum = { "a", "b" } } },
+          },
+        }, {
+          on_submit = function() end,
+          on_cancel = function()
+            cancelled = true
+          end,
+          on_decline = function() end,
+          notify = function() end,
+        })
+        form.dismiss()
+        t.eq(false, cancelled, "a dismissal is not the person cancelling")
+        t.truthy(cancel)
+      end)
+    end)
+
     t.it("declines an unsupported schema", function()
       local declined = false
       local opened = form.open(

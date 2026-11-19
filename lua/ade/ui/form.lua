@@ -18,6 +18,9 @@ local function pick(opts)
   return active_picker
 end
 
+-- True while `M.dismiss` closes the single-choice picker.
+local dismissing = false
+
 local function close_picker()
   local handle = active_picker
   active_picker = nil
@@ -26,14 +29,16 @@ local function close_picker()
   end
 end
 
----Close the open form, if any.
+---Close the open form, if any, without answering it.
 function M.dismiss()
   local handle = current
   current = nil
+  dismissing = true
   if handle then
-    handle.close()
+    pcall(handle.close)
   end
-  close_picker()
+  pcall(close_picker)
+  dismissing = false
 end
 
 local function label_for(field, values)
@@ -200,6 +205,13 @@ function M.open(request, opts)
         opts.on_submit({ [only.key] = value })
       end,
       on_cancel = function()
+        -- The picker's close is its cancel. Closing it from `M.dismiss` takes
+        -- the form off screen (replaced by the choice card, or the request
+        -- settled elsewhere); that is not the person cancelling, so the
+        -- request must stay pending.
+        if dismissing then
+          return
+        end
         if current == handle then
           current = nil
         end
