@@ -212,7 +212,7 @@ M.defaults = {
     ---@type "right"|"left"
     position = "right",
     -- Width as a fraction of the editor columns (0 < width <= 1) or an absolute cell count (> 1).
-    width = 0.38,
+    width = 65,
     min_width = 42,
     max_width = 120,
     input_height = 8,
