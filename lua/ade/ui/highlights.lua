@@ -75,8 +75,8 @@ M.groups = {
 
   -- Inline editing. The prompt is a modal-looking float; pending hunks take the
   -- warning colour and the current one the info colour.
-  AdeInlinePrompt = { link = "NormalFloat" },
-  AdeInlineBorder = { link = "FloatBorder" },
+  AdeInlinePrompt = { link = "InputUIFloatWinNormal" },
+  AdeInlineBorder = { link = "InputUIFloatBorder" },
   AdeInlineTitle = { link = "FloatTitle" },
   AdeInlineBanner = { link = "Comment" },
   -- Shared diff roles. Card rows paint these as a background; the review links

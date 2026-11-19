@@ -510,7 +510,7 @@ M.defaults = {
       -- "solid", "shadow", or an 8-element table of characters.
       border = "rounded",
       -- "left" | "center" | "right"
-      title_pos = "left",
+      title_pos = "center",
       -- "minimal" hides the number/sign columns; "default" keeps window options.
       style = "minimal",
       highlights = {
