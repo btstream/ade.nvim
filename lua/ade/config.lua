@@ -301,7 +301,7 @@ M.defaults = {
       sections = {
         left = {
           -- Keep these gaps on the bar background, outside the colored badges.
-          { "mode", separator = { text = " ", hl = "AdeToolbar" } },
+          { "mode", separator = { left = { text = "▊" }, right = { text = " ", hl = "AdeToolbar" } } },
           { "attachments", separator = { text = " ", hl = "AdeToolbar" } },
           "model",
           { "thinking", max_width = 12 },

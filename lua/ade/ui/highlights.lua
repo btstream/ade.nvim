@@ -47,18 +47,18 @@ M.groups = {
   -- Toolbar. The panel maps `WinBar` to `AdeToolbar`, so a region that only
   -- sets a foreground still paints the bar's background: the bar reads as one
   -- strip, and only the glyph colour changes between states.
-  AdeToolbar = { link = "StatusLine" },
+  AdeToolbar = { link = "Normal" },
   -- Only a foreground: the background is inherited from `AdeToolbar` via the
   -- `%$...$` markup, so there is nothing to set here.
   AdeToolbarAccent = { fg = "fg" },
   -- Modes are badges, told apart by their background.
-  AdeToolbarModePlan = { fg = "#212121", bg = "#ffcb6b" },
-  AdeToolbarModeBuild = { fg = "#212121", bg = "#c792ea" },
+  AdeToolbarModePlan = { bg = "#212121", fg = "#ffcb6b" },
+  AdeToolbarModeBuild = { bg = "#212121", fg = "#c792ea" },
   -- Statuses are plain glyphs. Idle is just the bar's own text colour: no
   -- emphasis means no special colour, and it is readable by construction.
   -- (`Comment` would be tempting but is tuned for prose on `Normal`.) The other
   -- states take their theme diagnostic colour.
-  AdeToolbarIdle = { link = "StatusLine" },
+  AdeToolbarIdle = { link = "Normal" },
   AdeToolbarRunning = { link = "DiagnosticInfo" },
   AdeToolbarWaiting = { link = "DiagnosticWarn" },
   AdeToolbarCancelling = { link = "DiagnosticError" },
