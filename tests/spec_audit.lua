@@ -198,9 +198,12 @@ return function(t)
       t.eq(nil, result.str:find("50%%", 1, true))
     end)
 
-    t.it("drops an oversized mode badge instead of overflowing", function()
+    t.it("fits an oversized mode badge without overflowing", function()
       local bar = toolbar.render({ mode = string.rep("custom", 20), status = "idle" }, 8)
-      local result = vim.api.nvim_eval_statusline(bar, { maxwidth = 1000, use_winbar = true })
+      -- Remove Neovim's alignment fill, then evaluate with a larger width so
+      -- Neovim itself cannot clip overflowing component text for the renderer.
+      local content = (bar:gsub("%%=", ""))
+      local result = vim.api.nvim_eval_statusline(content, { maxwidth = 1000, use_winbar = true })
       t.truthy(result.width <= 8)
     end)
 

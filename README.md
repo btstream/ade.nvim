@@ -939,6 +939,7 @@ require("ade").setup({
     event_log = true,                      -- 记录事件日志，供下次打开时重放
     event_log_max_mb = 256,                -- 每个实例的日志上限（16-4096 MiB）
     restore = true,                        -- 打开时恢复上次在这个目录里的会话
+    restore_on_restart = true,             -- 服务/agent 停止后也尝试恢复（默认）
     reconnect_attempts = 8,                -- 意外断线后的自动重连次数（0 关闭）
   },
   backend = "auto",                        -- "direct" | "service" | "auto"（默认 auto）
@@ -960,6 +961,12 @@ require("ade").setup({
 `restore = true`（默认）时，附着到一个**已经在运行**的实例后，如果服务报告这个工作目录下有
 会话，就自动重新打开**最近有活动**的那个，而不是新建空会话；没有匹配的、agent 不支持
 `session/load`、或加载失败时回退到新建，并提示一次原因。
+
+`restore_on_restart = true`（默认）时，ADE 会按 agent 配置名和工作目录记住最后选中的会话。
+下一次打开 ADE 如果启动了新的服务端 agent 实例，就尝试加载该会话。两种自动恢复可以
+分别开关；显式新建不会触发自动恢复。仅支持 `session/resume` 的 agent 可以接续上下文，
+但不会回放历史。会话已不存在时会清除指针并新建；临时错误保留指针，再次打开可重试。
+本地 `stdpath("state")/ade/last_sessions/` 只保存会话 ID 和定位信息，不保存历史、队列或凭据。
 
 **自动重连**：服务后端下，连接**意外**断开（不是 `:Ade service stop`、`:Ade disconnect`、
 关闭编辑器）时会自动重连，退避 0.5s、1s、2s、4s、8s，之后每 15s，最多

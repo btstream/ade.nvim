@@ -339,14 +339,62 @@ return function(t)
       t.eq({ "s9" }, record.loaded)
     end)
 
-    t.it("does nothing for a newly created instance", function()
-      local instance, record = harness()
+    t.it("does nothing for a newly created instance when restart restore is disabled", function()
+      local cwd = vim.fn.tempname()
+      local store = require("ade.storage.last_sessions")
+      store.set("opencode", cwd, "saved")
+      t.cleanup(function()
+        store.forget("opencode", cwd, "saved")
+      end)
+      local instance, record = harness({
+        cwd = cwd,
+        config = config_with({ agent = "opencode", service = { restore_on_restart = false } }),
+      })
       local restored = instance:after_ready({
         created = true,
         sessions = { { sessionId = "s9", cwd = "/proj", updated_at = 10 } },
       })
       t.falsy(restored)
       t.eq({}, record.loaded)
+    end)
+
+    t.it("uses the stored agent and directory on restart, independently of live restore", function()
+      local store = require("ade.storage.last_sessions")
+      local cwd = vim.fn.tempname()
+      store.set("opencode", cwd, "saved")
+      store.set("claude", cwd, "another-agent")
+      t.cleanup(function()
+        store.forget("opencode", cwd, "saved")
+        store.forget("claude", cwd, "another-agent")
+      end)
+      local instance, record = harness({
+        cwd = cwd,
+        config = config_with({ agent = "opencode", service = { restore = false, restore_on_restart = true } }),
+      })
+      t.truthy(instance:after_ready({ created = true, sessions = {} }))
+      t.eq({ "saved" }, record.loaded)
+      t.eq(cwd, record.load_opts.cwd)
+      t.truthy(record.load_opts.cold_restore)
+      t.falsy(record.load_opts.on_failed("connection closed"))
+      t.eq("saved", store.get("opencode", cwd))
+      t.truthy(record.load_opts.on_failed("unknown session"))
+      t.eq(nil, store.get("opencode", cwd))
+      t.eq("another-agent", store.get("claude", cwd))
+    end)
+
+    t.it("only forgets sessions on an unambiguous missing-session error", function()
+      local id = "session-123"
+      for _, message in ipairs({
+        "session storage temporarily not found",
+        "session database does not exist",
+        "permission to load session: credentials not found",
+        "session another-id not found",
+      }) do
+        t.falsy(Restore.session_missing({ message = message }, id), message)
+      end
+      for _, message in ipairs({ "Unknown session.", "No such session: session-123", "Session 'session-123' not found" }) do
+        t.truthy(Restore.session_missing({ message = message }, id), message)
+      end
     end)
 
     t.it("honours service.restore = false", function()

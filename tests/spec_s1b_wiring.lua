@@ -180,6 +180,112 @@ return function(t)
   end
 
   t.describe("S1b wiring through ade.setup", function()
+    t.it("keeps the previous session on a transient reload failure in the same editor", function()
+      local cwd = tmpdir("cold-retry-project")
+      local service, dir = start_service("cold-retry")
+      local store = require("ade.storage.last_sessions")
+      t.cleanup(function()
+        service:close()
+        store.forget("opencode", cwd, "sess_mock")
+      end)
+      setup("cold-retry", service, dir, { cwd = cwd, service = { restore_on_restart = true, reconnect_attempts = 0 } })
+      ade.open()
+      wait_ready()
+      local S = state()
+      local previous = S.sess.current
+      local _, instance = next(service.instances)
+      service:stop_instance(instance, "agent stopped")
+      wait(function()
+        return S.conn.phase ~= "ready"
+      end, 5000, "the old instance has stopped")
+      t.truthy(previous.needs_load)
+
+      local spawn, attempts = service.spawn_agent, 0
+      service.spawn_agent = function(next_instance)
+        local started = spawn(next_instance)
+        local handler = next_instance.handler
+        next_instance.handler = function(message)
+          if message.method == "session/load" then
+            attempts = attempts + 1
+            if attempts == 1 then
+              service:deliver(next_instance, {
+                jsonrpc = "2.0",
+                id = message.id,
+                error = { code = -32603, message = "session storage temporarily not found" },
+              })
+              return
+            end
+          end
+          handler(message)
+        end
+        return started
+      end
+      ade.open()
+      wait(function()
+        return attempts == 1 and not S.conn.replaying and S.conn.phase == "ready"
+      end, 5000, "the transient load failure")
+      t.eq(previous, S.sess.current)
+      t.eq(previous.id, store.get("opencode", cwd))
+
+      ade.open()
+      wait(function()
+        return attempts == 2 and S.sess.current and not S.sess.current.needs_load
+      end, 5000, "the retry to restore the previous session")
+      t.eq(previous.id, S.sess.current.id)
+      local creations = 0
+      for _, frame in ipairs(service.sent) do
+        if (frame.message or {}).method == "session/new" then
+          creations = creations + 1
+        end
+      end
+      t.eq(1, creations, "only the original session should have been created")
+      controller.hide()
+    end)
+
+    t.it("reopens the selected session on a new service and agent instance", function()
+      local cwd = tmpdir("cold-project")
+      local opts = { cwd = cwd, service = { restore_on_restart = true, reconnect_attempts = 0 } }
+      local first, dir = start_service("cold-before")
+      t.cleanup(function()
+        first:close()
+        require("ade.storage.last_sessions").forget_session("opencode", "sess_mock")
+      end)
+      setup("cold-before", first, dir, opts)
+      ade.open()
+      wait_ready()
+      local id = state().sess.current.id
+      t.eq(id, require("ade.storage.last_sessions").get("opencode", cwd))
+      first:close()
+      wait(function()
+        return state().conn.phase ~= "ready"
+      end, 5000, "the old service has stopped")
+
+      local second, next_dir = start_service("cold-after")
+      t.cleanup(function()
+        second:close()
+      end)
+      setup("cold-after", second, next_dir, opts)
+      ade.open()
+      wait_ready()
+      t.eq(true, state().conn.client.created)
+      t.eq(id, state().sess.current.id)
+      local loaded, created
+      for _, frame in ipairs(second.sent) do
+        local message = frame.message or {}
+        if message.method == "session/load" then
+          loaded = message.params
+        elseif message.method == "session/new" then
+          created = true
+        end
+      end
+      t.truthy(loaded, "the fresh instance should receive session/load")
+      t.eq(id, loaded.sessionId)
+      t.eq(cwd, loaded.cwd)
+      t.falsy(created, "an empty session must not race the restore")
+      t.match("old answer", state().view.chat:transcript())
+      controller.hide()
+    end)
+
     t.it("reconnects automatically when the service connection drops", function()
       local service, dir = start_service("reconnect")
       local connection = setup("reconnect", service, dir)

@@ -48,6 +48,7 @@ M.defaults = {
     -- agent kept running), reopen the most recent session for this cwd instead
     -- of starting an empty one.
     restore = true,
+    restore_on_restart = true,
     -- Automatic reconnection attempts after an unexpected connection loss.
     -- 0 disables it; the backoff is 0.5s, 1s, 2s, 4s, 8s, then 15s each.
     reconnect_attempts = 8,
@@ -303,12 +304,7 @@ M.defaults = {
           { "mode", separator = { text = " ", hl = "AdeToolbar" } },
           { "attachments", separator = { text = " ", hl = "AdeToolbar" } },
           "model",
-          {
-            "thinking",
-            fmt = function(text)
-              return require("ade.ui.toolbar").truncate(text, 12)
-            end,
-          },
+          { "thinking", max_width = 12 },
           {
             "context",
             cond = function(ctx)
@@ -760,6 +756,9 @@ local function validate_toolbar(toolbar)
       elseif spec.padding ~= nil then
         check_padding(spec.padding, ".padding")
       end
+      if spec.max_width ~= nil then
+        check_padding(spec.max_width, ".max_width")
+      end
       if spec.priority ~= nil then
         check_number(spec.priority, -10000, 10000, path .. ".priority")
       end
@@ -848,6 +847,9 @@ function M.validate(cfg)
   end
   if type(service.restore) ~= "boolean" then
     fail("service.restore must be a boolean")
+  end
+  if type(service.restore_on_restart) ~= "boolean" then
+    fail("service.restore_on_restart must be a boolean")
   end
   check_number(service.reconnect_attempts, 0, 50, "service.reconnect_attempts")
   if service.reconnect_attempts % 1 ~= 0 then

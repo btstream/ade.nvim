@@ -6,6 +6,7 @@
 local presenter = require("ade.app.presenter")
 local capabilities = require("ade.protocol.capabilities")
 local log = require("ade.log")
+local last_sessions = require("ade.storage.last_sessions")
 
 local Sessions = {}
 Sessions.__index = Sessions
@@ -169,6 +170,14 @@ end
 
 ---Resume `session_id` without replaying its history.
 ---
+-- The callback distinguishes a missing conversation from a retryable error.
+-- Never create a replacement after a newer selection already won.
+function Sessions:cold_restore_failed(opts, runtime, intent, message, err)
+  if runtime.selection == intent and opts.on_failed and opts.on_failed(message, err) then
+    self:create()
+  end
+end
+
 ---The fallback when the agent supports `session/resume` but not `session/load`:
 ---the agent-side context comes back, the transcript does not. The user is told,
 ---because an empty transcript after "open session" otherwise looks like a bug.
@@ -182,9 +191,10 @@ function Sessions:resume(session_id, opts)
     return
   end
   local runtime = self.get_runtime()
-  local cwd = self.catalog:session_cwd(session_id, self.resolve_cwd())
+  local cwd = opts.cwd or self.catalog:session_cwd(session_id, self.resolve_cwd())
   local entry = runtime:stage(session_id, cwd)
-  local intent = runtime:intend()
+  local intent = opts.intent or runtime:intend()
+  opts.intent = intent
   -- Hold the same replay lock as `replay`: a second load while this request is
   -- in flight would stage a second projection for the same session id.
   self.replaying = true
@@ -200,13 +210,19 @@ function Sessions:resume(session_id, opts)
         auth
         and auth:require(result, {
           retry = function()
-            self:resume(session_id, opts)
+            if not opts.cold_restore or runtime.selection == intent then
+              self:resume(session_id, opts)
+            end
           end,
         })
       then
         return
       end
       local message = type(result) == "table" and (result.message or vim.inspect(result)) or tostring(result)
+      if opts.cold_restore then
+        self:cold_restore_failed(opts, runtime, intent, message, result)
+        return
+      end
       if opts.kind == "restore" and tostring(message):lower():match("shutdown") then
         -- Expected during teardown; do not alarm the user.
         self:create()
@@ -245,11 +261,15 @@ function Sessions:resume(session_id, opts)
     self.on_changed()
     self.notify("Session resumed (history is not replayed)")
     self.catalog:refresh_title(entry)
-    if opts.on_restored then
+    if opts.on_restored and (not opts.cold_restore or runtime.selection == intent) then
       pcall(opts.on_restored)
     end
   end, function(err)
     runtime:rollback(entry)
+    if opts.cold_restore then
+      self:cold_restore_failed(opts, runtime, intent, tostring(err), err)
+      return
+    end
     self.notify("unable to resume the session: " .. tostring(err), vim.log.levels.ERROR)
     if opts.on_failed then
       pcall(opts.on_failed, tostring(err))
@@ -275,9 +295,10 @@ end
 ---@param opts {kind: string|nil, intent: integer|nil}
 function Sessions:replay(session_id, opts)
   local runtime = self.get_runtime()
-  local cwd = self.catalog:session_cwd(session_id, self.resolve_cwd())
+  local cwd = opts.cwd or self.catalog:session_cwd(session_id, self.resolve_cwd())
   local entry = runtime:stage(session_id, cwd)
   local intent = opts.intent or runtime:intend()
+  opts.intent = intent
   local client = self.get_client()
   -- Identifies this attempt so a cancelled/superseded replay's cleanup does not
   -- clear the flag of a newer one.
@@ -297,13 +318,19 @@ function Sessions:replay(session_id, opts)
         auth
         and auth:require(result, {
           retry = function()
-            self:replay(session_id, opts)
+            if not opts.cold_restore or runtime.selection == intent then
+              self:replay(session_id, opts)
+            end
           end,
         })
       then
         return
       end
       local message = type(result) == "table" and (result.message or vim.inspect(result)) or tostring(result)
+      if opts.cold_restore then
+        self:cold_restore_failed(opts, runtime, intent, message, result)
+        return
+      end
       if opts.kind == "restore" and tostring(message):lower():match("shutdown") then
         -- Expected during teardown; do not alarm the user.
         self:create()
@@ -357,11 +384,15 @@ function Sessions:replay(session_id, opts)
     self.prune()
     self.on_changed()
     self.catalog:refresh_title(entry)
-    if opts.on_restored then
+    if opts.on_restored and (not opts.cold_restore or runtime.selection == intent) then
       pcall(opts.on_restored)
     end
   end, function(err)
     -- `on_finally` owns the rollback and the pending cleanup for every ending.
+    if opts.cold_restore then
+      self:cold_restore_failed(opts, runtime, intent, tostring(err), err)
+      return
+    end
     self.notify("unable to load the session: " .. tostring(err), vim.log.levels.ERROR)
     if opts.on_failed then
       pcall(opts.on_failed, tostring(err))
@@ -452,7 +483,7 @@ function Sessions:load(session_id, opts)
     -- Resuming restores the agent-side context without replaying history; it is
     -- the closest this agent can get to "open that session".
     if capabilities.supports(capabilities.agent(client), "sessionCapabilities.resume") then
-      self:resume(session_id, { kind = opts.kind, on_failed = opts.on_failed, on_restored = opts.on_restored })
+      self:resume(session_id, opts)
       return
     end
     self.notify("This agent cannot load sessions; starting a new one", vim.log.levels.WARN)
@@ -463,7 +494,8 @@ function Sessions:load(session_id, opts)
   -- Agents reject session/load when the cwd does not match the session.
   -- Loading replays authoritative history, even for a cached session; appending
   -- to the cached object would duplicate every message on subsequent visits.
-  self:replay(session_id, { kind = opts.kind or "load", on_failed = opts.on_failed, on_restored = opts.on_restored })
+  opts.kind = opts.kind or "load"
+  self:replay(session_id, opts)
 end
 
 ---Whether the client can be asked to close a session.
@@ -566,6 +598,7 @@ function Sessions:delete(session_id, done)
     return
   end
   local runtime = self.get_runtime()
+  local agent = self.config().agent
   local settled = false
   local function finish(ok)
     if settled then
@@ -592,6 +625,9 @@ function Sessions:delete(session_id, done)
     runtime:remove(session_id)
     self.cancel_session(session or { id = session_id }, task)
     self.catalog:forget(session_id)
+    if agent then
+      last_sessions.forget_session(agent, session_id)
+    end
     local current = self.current()
     if current and current.id == session_id then
       -- The active conversation is gone; start a fresh one.

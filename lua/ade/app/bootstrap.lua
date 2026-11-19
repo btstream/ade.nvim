@@ -151,6 +151,7 @@ function M.build(ctx, opts, action)
     S.conn.client = nil
   end
   S.sess.current = nil
+  S.conn.skip_auto_restore = nil
   S.sess.all = {}
   S.sess.runtime = Runtime.new(
     merged.memory,
@@ -689,16 +690,21 @@ function M.build(ctx, opts, action)
         pcall(S.conn.policy.reconcile, S.conn.policy, true)
       end
       local reload_id = S.conn.service:take_pending_reload()
+      local skip_restore = S.conn.skip_auto_restore
+      S.conn.skip_auto_restore = nil
+      local client, current = S.conn.client, S.sess.current
+      reload_id = reload_id or (current and current.needs_load and current.id)
       if reload_id then
-        ctx.reload_session(reload_id)
-      elseif S.sess.current and S.sess.current.needs_load then
-        ctx.reload_session(S.sess.current.id)
-      elseif not S.sess.current then
+        local session = S.sess.all[reload_id] or (current and current.id == reload_id and current)
+        if not (client and client.created == true and session and S.conn.restore:after_restart(session)) then
+          ctx.reload_session(reload_id)
+        end
+      elseif not S.sess.current and (skip_restore or not S.conn.auth_after_ready) then
         -- Reopening a Neovim whose agent kept running: the service reports the
         -- sessions it holds and, when one belongs to this cwd, that session is
         -- loaded instead of starting an empty one (PROTOCOL.md 3.2).
-        local client = S.conn.client
-        local restored = S.conn.restore
+        local restored = not skip_restore
+          and S.conn.restore
           and S.conn.restore:after_ready({
             created = client and client.created,
             sessions = client and client.sessions,
@@ -942,14 +948,14 @@ function M.build(ctx, opts, action)
     cwd = function()
       return S.conn.service and S.conn.service.cwd_hint and S.conn.service.cwd_hint() or ctx.resolve_cwd()
     end,
-    supported = function()
+    supported = function(allow_resume)
       local client = S.conn.client
       if not client then
         return false
       end
       local supports = require("ade.protocol.capabilities").supports
       local agent = require("ade.protocol.capabilities").agent(client)
-      return supports(agent, "loadSession")
+      return supports(agent, "loadSession") or (allow_resume and supports(agent, "sessionCapabilities.resume"))
     end,
     -- The outcome callbacks travel through `Sessions:load`: without them
     -- `restore.lua` cannot tell the user "restored session X" or why it fell

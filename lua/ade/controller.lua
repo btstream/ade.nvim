@@ -419,6 +419,7 @@ end
 function M.new_session()
   if S.sess.service then
     S.sess.service:create(function()
+      S.conn.skip_auto_restore = true
       M.connect()
     end)
   end

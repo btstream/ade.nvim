@@ -5,6 +5,7 @@
 -- controller's already-largest function.
 local keymaps = require("ade.ui.keymaps")
 local drafts = require("ade.storage.drafts")
+local last_sessions = require("ade.storage.last_sessions")
 local inline = require("ade.inline")
 
 local M = {}
@@ -33,6 +34,12 @@ function M:select_session(session)
   local previous = S.sess.current
   S.sess.current = session
   S.sess.runtime:select(session)
+  if session and not session.needs_load and S.conn.client and S.conn.client.created ~= nil then
+    local cfg = self.deps.config()
+    if cfg.service and cfg.service.restore_on_restart then
+      last_sessions.set(cfg.agent, session.cwd, session.id)
+    end
+  end
   if
     previous
     and previous ~= session
@@ -64,8 +71,13 @@ function M:open()
   end
   self.deps.sync_spinner()
   if S.conn.phase == "ready" then
-    if not S.sess.current then
-      self.deps.actions.new_session()
+    local current = S.sess.current
+    if (not current or current.needs_load) and not S.conn.replaying and not S.conn.creating_session then
+      local client, restore = S.conn.client, S.conn.restore
+      local restoring = client and client.created == true and restore and restore:after_restart(current)
+      if not restoring and not current then
+        self.deps.actions.new_session()
+      end
     end
     return
   end

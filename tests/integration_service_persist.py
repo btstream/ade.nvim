@@ -1627,6 +1627,33 @@ Editor.wait_until_permission = _wait_until_permission
 # ---------------------------------------------------------------------------
 
 
+def scenario_restore_after_stop(case):
+    """A new editor can find the old id without a surviving service event log."""
+    options = {"restore_on_restart": True, "restore": False}
+    shared_state = os.path.join(case.dir, "state")
+    first = case.editor("before")
+    first.start(service=options)
+    first.lua("vim.env.XDG_STATE_HOME = ...", shared_state)
+    first.connect()
+    session_id = first.state()["session"]["id"]
+    service_pid = case.service_pid()
+    assert_true(service_pid is not None, "the first editor did not start a service")
+    first.run_command("Ade service stop")
+    wait_gone(service_pid, WAIT, "the stopped service")
+    first.quit()
+
+    second = case.editor("after")
+    second.start(service=options)
+    second.lua("vim.env.XDG_STATE_HOME = ...", shared_state)
+    second.connect()
+    assert_true(second.attach_info().get("created") is True, "the agent instance must be new")
+    assert_true(second.state()["session"]["id"] == session_id, "the saved session id was not restored")
+    assert_true(
+        any(block["text"] == "old answer" for block in second.transcript()),
+        "the agent's session/load replay did not reach the new editor",
+    )
+
+
 def scenario_reopen_restores(case):
     """10. Opening a new editor shows the conversation the log holds.
 
@@ -2566,6 +2593,7 @@ SCENARIOS = [
     ("8 two front ends", scenario_two_frontends),
     ("9 commands", scenario_commands),
     ("10 reopen restores the conversation", scenario_reopen_restores),
+    ("10b reopen after service stop", scenario_restore_after_stop),
     ("11 adopt a running turn", scenario_adopt_running_turn),
     ("12 log disabled", scenario_log_disabled),
     ("13 pruned log falls back to the agent load", scenario_pruned_log_falls_back),

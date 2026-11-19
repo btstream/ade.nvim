@@ -13,6 +13,7 @@
 -- Loading itself is `Sessions:load`, unchanged: replay locking, the replay
 -- marker and the "needs load" bookkeeping all stay in one place.
 local log = require("ade.log")
+local last_sessions = require("ade.storage.last_sessions")
 
 local M = {}
 
@@ -70,6 +71,78 @@ function M.new(deps)
   return setmetatable({ deps = deps, reported = false }, Restore)
 end
 
+-- ACP agents do not share a standardized "session missing" error code. Do
+-- not treat generic server errors, transport failures or auth as deletion.
+function M.session_missing(err, id)
+  local text = type(err) == "table" and err.message or err
+  if type(text) ~= "string" then
+    return false
+  end
+  text = vim.trim(text):lower():gsub("[.!]$", "")
+  local subjects = { "session" }
+  if type(id) == "string" and id ~= "" then
+    id = id:lower()
+    for _, value in ipairs({ id, "'" .. id .. "'", '"' .. id .. '"' }) do
+      for _, prefix in ipairs({ "session ", "session id ", "session with id " }) do
+        subjects[#subjects + 1] = prefix .. value
+      end
+      for _, prefix in ipairs({ "unknown session ", "unknown session: ", "no such session ", "no such session: " }) do
+        if text == prefix .. value then
+          return true
+        end
+      end
+    end
+  end
+  if text == "unknown session" or text == "no such session" then
+    return true
+  end
+  for _, subject in ipairs(subjects) do
+    if text == subject .. " not found" or text == subject .. " does not exist" then
+      return true
+    end
+  end
+  return false
+end
+
+function Restore:after_restart(session)
+  local cfg = self.deps.config()
+  if not (cfg.service and cfg.service.restore_on_restart) then
+    return false
+  end
+  local cwd = session and session.cwd or self.deps.cwd()
+  if type(cwd) ~= "string" or cwd == "" or type(cfg.agent) ~= "string" then
+    return false
+  end
+  local id = session and session.id or last_sessions.get(cfg.agent, cwd)
+  if not id then
+    return false
+  end
+  if not self.deps.supported(true) then
+    self:report("the agent cannot load or resume the last session", vim.log.levels.WARN)
+    return false
+  end
+  self.deps.load(id, {
+    kind = "restore",
+    cold_restore = true,
+    cwd = cwd,
+    on_failed = function(message, err)
+      if M.session_missing(err or message, id) then
+        last_sessions.forget(cfg.agent, cwd, id)
+        self:report("last session " .. id .. " no longer exists", vim.log.levels.WARN)
+        return true -- request a new session, but only while this intent is current
+      end
+      self.deps.notify(
+        "could not reopen the last session: " .. message .. "; open ADE again to retry",
+        vim.log.levels.WARN
+      )
+    end,
+    on_restored = function()
+      self.deps.notify("restored session " .. id .. " after service restart", vim.log.levels.INFO)
+    end,
+  })
+  return true
+end
+
 ---Reopen a session after a ready event, or start a new one.
 ---
 ---`attach` is the transport's attach result (`created`, `sessions`), or nil for
@@ -79,12 +152,14 @@ end
 function Restore:after_ready(attach)
   local cfg = self.deps.config() or {}
   local service = type(cfg.service) == "table" and cfg.service or {}
+  if type(attach) == "table" and attach.created == true then
+    return self:after_restart()
+  end
   if service.restore == false then
     return false
   end
   if type(attach) ~= "table" or attach.created ~= false then
-    -- A brand-new instance has nothing to restore: whatever sessions it reports
-    -- (none) belong to nobody.
+    -- Direct connections never participate in service restore.
     return false
   end
   local session, reason = M.pick(attach.sessions, self.deps.cwd())

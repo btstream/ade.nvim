@@ -84,6 +84,9 @@ local function prepare(section, toolbar, info, ic)
         text = call(spec.fmt, text, info)
       end
       text = plain(text)
+      if spec.max_width then
+        text = toolbar.truncate(text, spec.max_width)
+      end
       if text ~= "" then
         local sep = spec.separator
         local edges = type(sep) == "table" and sep.text == nil

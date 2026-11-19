@@ -1568,6 +1568,7 @@ service/rust-toolchain.toml 锁定日期的 nightly 工具链，**建议安装 r
       event_log = true,               -- 记录事件日志，供下次打开时重放
       event_log_max_mb = 256,         -- 每个实例的日志上限（16-4096 MiB）
       restore = true,                 -- 打开时恢复上次在这个目录里的会话
+      restore_on_restart = true,      -- 新启动 agent 实例时也尝试恢复（默认）
       reconnect_attempts = 8,         -- 意外断线后的自动重连次数（0 关闭）
     },
     backend = "auto",                 -- "direct" | "service" | "auto"（默认 auto）
@@ -1581,6 +1582,9 @@ event_log = false 关闭记录后，重新打开看不到离开期间的内容�
 删除或切换会话才发。keep_alive = false 与直连后端照常关闭。
 restore = true 时，附着到已在运行的实例后会自动重新打开该工作目录下最近有活动的会话，
 而不是新建空会话；没有匹配、agent 不支持 session/load 或加载失败时回退新建并提示一次。
+restore_on_restart = true 时，ADE 按 agent 和工作目录保存上次选中的会话 ID；
+新启动 agent 实例后也会尝试恢复。仅支持 session/resume 时不回放历史。会话不存在则
+新建，临时错误保留记录，重新打开可重试。不保存历史、队列或凭据。
 
 服务模式下意外断线会自动重连：0.5s、1s、2s、4s、8s，之后每 15s，最多
 reconnect_attempts 次（默认 8）。状态栏显示 reconnecting (n/8)，成功后提示一次；

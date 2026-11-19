@@ -32,6 +32,11 @@ local t = require("tests.harness")
 local controller = require("ade.controller")
 local drafts = require("ade.storage.drafts")
 local drafts_path = drafts.path
+local last_sessions = require("ade.storage.last_sessions")
+local last_sessions_dir, case_index = last_sessions.dir(), 1
+last_sessions.dir = function()
+  return last_sessions_dir .. "/" .. case_index
+end
 local setup_calls, torn_down = 0, 0
 local raw_setup = controller.setup
 controller.setup = function(...)
@@ -56,6 +61,7 @@ t.after_each(function()
   end
   drafts.clear()
   drafts.path = drafts_path
+  case_index = case_index + 1
   vim.wait(1)
 end)
 
