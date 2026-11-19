@@ -219,6 +219,33 @@ local function hidden_lines(block)
 end
 
 function M.render_tool(block, ctx)
+  if not block.expanded then
+    local message = require("ade.ui.team.tools").describe(block)
+    if message then
+      local header = one_line(message.title)
+      local body = one_line(message.text)
+      local line = body ~= "" and (header .. "：" .. body) or header
+      local group, suffix = "AdeNotice", ""
+      if block.status == "failed" then
+        group, suffix = "AdeToolError", " · 失败"
+      elseif block.status == "cancelled" then
+        group, suffix = "AdeToolCancelled", " · 已取消"
+      elseif block.status == "in_progress" or block.status == "pending" then
+        group, suffix = "AdeToolRunning", " · …"
+      end
+      local caret = (ctx.icons and ctx.icons.chevron_right) or "›"
+      local Text = require("ade.ui.team.text")
+      local width = ctx.width or 80
+      -- Reserve the suffix so a failure marker is never the part that gets
+      -- cut off on a narrow window (N3).
+      local main = Text.ellipsis(caret .. " " .. line, math.max(0, width - Text.width(suffix)))
+      line = Text.ellipsis(main .. suffix, width)
+      return {
+        { text = line, segments = { { s = 0, e = -1, group = group } } },
+        { text = "", segments = nil },
+      }
+    end
+  end
   local ic = ctx.icons
   local glyph, glyph_hl = tool_icon(block, ic)
   local caret = block.expanded and ic.chevron_down or ic.chevron_right

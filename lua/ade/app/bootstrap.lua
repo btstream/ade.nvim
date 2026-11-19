@@ -14,6 +14,7 @@ local Runtime = require("ade.session.runtime")
 local Catalog = require("ade.app.catalog")
 local Permissions = require("ade.app.permissions")
 local Elicitation = require("ade.app.elicitation")
+local Choices = require("ade.app.choices")
 local Interactions = require("ade.app.interactions")
 local Options = require("ade.app.options")
 local Chrome = require("ade.ui.chrome")
@@ -26,6 +27,7 @@ local Prompts = require("ade.app.prompts")
 local PermissionPolicy = require("ade.service.policy")
 local Team = require("ade.app.team")
 local TeamUI = require("ade.ui.team")
+local TeamCommands = require("ade.app.team_commands")
 local Auth = require("ade.app.auth")
 local Connection = require("ade.app.connection")
 local Panel = require("ade.ui.panel")
@@ -203,12 +205,107 @@ function M.build(ctx, opts, action)
     session = function()
       return S.sess.current
     end,
+    replacing = function()
+      return (S.view.choices ~= nil and S.view.choices.replacing == true)
+        or (S.view.panel ~= nil and S.view.panel.showing == true)
+    end,
+    focus_ok = function()
+      local win = vim.api.nvim_get_current_win()
+      if not win or not vim.api.nvim_win_is_valid(win) then
+        return false
+      end
+      local buf = vim.api.nvim_win_get_buf(win)
+      local ft = vim.bo[buf].filetype
+      return ft == "ade_chat"
+        or ft == "ade_input"
+        or vim.b[buf].ade_picker == true
+        or (S.view.input ~= nil and S.view.input.win == win)
+        or (S.view.chat ~= nil and S.view.chat.win == win)
+    end,
   })
   S.view.elicitation = Elicitation.new({
     answer = function(interaction, response)
       S.view.interactions:answer(interaction.id, response)
     end,
     notify = notify,
+    focus_ok = function()
+      local win = vim.api.nvim_get_current_win()
+      if not win or not vim.api.nvim_win_is_valid(win) then
+        return false
+      end
+      local buf = vim.api.nvim_win_get_buf(win)
+      local ft = vim.bo[buf].filetype
+      return ft == "ade_chat" or ft == "ade_input" or vim.b[buf].ade_picker == true
+    end,
+  })
+  -- The choice card floats over the bottom of the chat window; the queue also
+  -- owns team questions/spawn/permission/limit items (draft 8).
+  S.view.choices = Choices.new({
+    team = function()
+      return S.view.team
+    end,
+    interactions = function()
+      return S.view.interactions
+    end,
+    config = function()
+      return S.config or merged
+    end,
+    notify = notify,
+    input_win = function()
+      return S.view.input and S.view.input.win or nil
+    end,
+    chat_win = function()
+      return S.view.chat and S.view.chat.win or nil
+    end,
+    reserve = function(rows)
+      if S.view.chat then
+        S.view.chat:set_bottom_reserve(rows)
+      end
+    end,
+    focus_hint = function()
+      local keys = require("ade.ui.keymaps").expand(((S.config or merged).keymaps.chat or {}).focus_choice, { "n" })
+      return keys[1] and keys[1].lhs or nil
+    end,
+    panel_visible = function()
+      return (S.view.panel ~= nil and S.view.panel:is_visible()) or (S.view.team_ui ~= nil and S.view.team_ui:is_open())
+    end,
+    open = function()
+      ctx.open()
+    end,
+    permission_present = function(interaction)
+      if not S.view.permissions.valid(interaction) then
+        return false
+      end
+      return S.view.permissions:present(interaction)
+    end,
+    permission_dismiss = function()
+      S.view.permissions:dismiss_presented()
+    end,
+    elicitation_dismiss = function()
+      S.view.elicitation:dismiss()
+    end,
+    permission_details = function(interaction)
+      local request = interaction.request or {}
+      local tool = request.toolCall or request.tool_call or {}
+      require("ade.app.presenter").details.open(request, {
+        title = tool.title or "Permission required",
+        cwd = tool.locations and tool.locations[1] and tool.locations[1].path or nil,
+      })
+    end,
+    elicitation_present = function(interaction)
+      return S.view.elicitation:present(interaction)
+    end,
+  })
+  local choice_group = vim.api.nvim_create_augroup("AdeChoices", { clear = true })
+  vim.api.nvim_create_autocmd({ "InsertLeave", "CursorHold", "WinClosed", "WinNew", "BufWinEnter", "TabEnter" }, {
+    group = choice_group,
+    callback = function()
+      vim.schedule(function()
+        if S.view.choices then
+          S.view.choices:refresh()
+        end
+      end)
+    end,
   })
   -- The service-side rule sets (PROTOCOL.md 17). Created before the policy
   -- chain because the chain asks it whether Lua may answer at all; it resolves
@@ -294,22 +391,27 @@ function M.build(ctx, opts, action)
           if not S.view.permissions.valid(interaction) then
             return false
           end
-          return S.view.permissions:present(interaction)
+          return S.view.choices:present_interaction(interaction)
         end,
         dismiss = function()
-          S.view.permissions:dismiss_presented()
+          S.view.choices:dismiss()
         end,
       },
       elicitation = {
         present = function(interaction)
-          return S.view.elicitation:present(interaction)
+          return S.view.choices:present_interaction(interaction)
         end,
         dismiss = function()
-          S.view.elicitation:dismiss()
+          S.view.choices:dismiss()
         end,
       },
     },
-    on_changed = ctx.refresh_chrome,
+    on_changed = function()
+      if S.view.choices then
+        S.view.choices:refresh()
+      end
+      ctx.refresh_chrome()
+    end,
     notify = notify,
   })
 
@@ -357,7 +459,10 @@ function M.build(ctx, opts, action)
     notify = notify,
     on_changed = function()
       if S.view.team_ui then
-        S.view.team_ui:refresh()
+        S.view.team_ui:schedule_refresh()
+      end
+      if S.view.choices then
+        S.view.choices:refresh()
       end
       ctx.refresh_chrome()
     end,
@@ -367,6 +472,16 @@ function M.build(ctx, opts, action)
       vim.schedule(function()
         if S.view.team_ui then
           S.view.team_ui:watch(session, title)
+        end
+      end)
+    end,
+    on_closed = function(team_id)
+      vim.schedule(function()
+        if S.view.team_ui then
+          pcall(S.view.team_ui.team_closed, S.view.team_ui, team_id)
+        end
+        if S.view.choices then
+          S.view.choices:refresh()
         end
       end)
     end,
@@ -856,11 +971,72 @@ function M.build(ctx, opts, action)
       ctx.update_chat_title()
       ctx.refresh_chrome()
     end,
+    on_visibility = function()
+      if S.view.choices then
+        vim.schedule(function()
+          S.view.choices:refresh()
+        end)
+      end
+    end,
   })
 
+  if S.view.team_ui then
+    pcall(S.view.team_ui.close, S.view.team_ui)
+  end
   S.view.team_ui = TeamUI.new({
     team = S.view.team,
     config = cfg,
+    notify = notify,
+    panel = function()
+      return S.view.panel
+    end,
+    -- The watch view reuses the leader's existing chat; it never creates a
+    -- second Chat or a second input area.
+    leader_chat = function()
+      return S.view.chat
+    end,
+    leader_input = function()
+      return S.view.input
+    end,
+    start_team = function(workflow)
+      if S.view.team_commands then
+        S.view.team_commands:start(workflow)
+      end
+    end,
+  })
+
+  S.view.team_commands = TeamCommands.new({
+    state = function()
+      return S
+    end,
+    config = cfg,
+    notify = notify,
+    resolve_cwd = ctx.resolve_cwd,
+    open = function()
+      ctx.open()
+    end,
+    new_session = function()
+      ctx.new_session()
+    end,
+    connect = function()
+      ctx.connect()
+    end,
+    pick_agent = function(name)
+      ctx.pick_agent(name)
+    end,
+    options = function()
+      return S.view.options
+    end,
+    client = function()
+      return S.conn.client
+    end,
+    generation = function()
+      return ctx.Operations.generation
+    end,
+    report_error = Team.error_text,
+    open_team = function()
+      return ctx.open_team()
+    end,
   })
 
   S.view.chat = Chat.new({ config = merged })

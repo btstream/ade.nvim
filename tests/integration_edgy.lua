@@ -185,6 +185,49 @@ check("idle transcript follows edgy width changes without a session update", fun
   end, 2000, "edgy width restore")
 end)
 
+-- The choice card floats over the chat window: edgy's windows, buffers and
+-- sizes stay as they were, and the float is not adopted as an edgy view.
+check("the choice card floats over the chat window inside the edgebar", function()
+  local Choice = require("ade.ui.choice")
+  local input_buf = vim.api.nvim_win_get_buf(st.input.win)
+  local chat_buf = vim.api.nvim_win_get_buf(st.chat.win)
+  local width = vim.api.nvim_win_get_width(st.chat.win)
+  local view = Choice.new({ notify = function() end })
+  assert(
+    view:show({
+      title = "choice",
+      questions = { { header = "Q", question = "pick", options = { { label = "A" }, { label = "B" } } } },
+      on_cancel = function() end,
+    }, { win = st.chat.win }),
+    "the card did not mount"
+  )
+  require("edgy.layout").update()
+  vim.wait(100)
+  assert(view:is_open(), "edgy closed the card")
+  assert(vim.api.nvim_win_get_config(view.win).relative == "win", "the card is not a float over the chat")
+  assert(vim.api.nvim_win_get_buf(st.input.win) == input_buf, "the composer buffer changed")
+  assert(vim.api.nvim_win_get_buf(st.chat.win) == chat_buf, "the chat buffer changed")
+  assert(vim.api.nvim_win_get_width(st.chat.win) == width, "edgy's size changed")
+  view:close()
+  vim.wait(100)
+  assert(vim.api.nvim_win_get_width(st.chat.win) == width, "the width changed after close")
+end)
+
+check("the worker watch input filetype is not an edgy view", function()
+  local before = #vim.api.nvim_list_wins()
+  vim.cmd("vsplit")
+  local win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].filetype = "ade_team_input"
+  vim.api.nvim_win_set_buf(win, buf)
+  require("edgy.layout").update()
+  vim.wait(100)
+  assert(vim.api.nvim_win_is_valid(win), "edgy closed the watch input")
+  assert(#vim.api.nvim_list_wins() == before + 1, "edgy moved another window")
+  assert(st.chat:is_visible() and st.input:is_visible(), "the chat views changed")
+  vim.api.nvim_win_close(win, true)
+end)
+
 -- Closing only the composer must not be re-created by ade.
 vim.api.nvim_win_close(st.input.win, true)
 vim.wait(200)

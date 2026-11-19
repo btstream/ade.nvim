@@ -103,6 +103,29 @@ enum Job {
         bytes: usize,
     },
     TeamDelete(String),
+    /// One board write plus the history changes it caused (19.11).
+    BoardSave {
+        team_id: String,
+        rev: u64,
+        json: String,
+        history: Vec<(String, String, i64, i64)>,
+        cleared: Vec<String>,
+        bytes: usize,
+    },
+    /// Persist one named workflow (19.11).
+    WorkflowSave {
+        scope: String,
+        project: String,
+        name: String,
+        json: String,
+        updated_ms: u64,
+        bytes: usize,
+    },
+    WorkflowDelete {
+        scope: String,
+        project: String,
+        name: String,
+    },
     /// Complete the receiver once every earlier job is written.
     Barrier(oneshot::Sender<()>),
 }
@@ -445,6 +468,46 @@ impl Recorder {
         self.send(Job::TeamDelete(id.to_string()));
     }
 
+    /// Queue one board write. Every write is kept (not coalesced): each one
+    /// carries the card history versions it turned into current state.
+    pub fn save_board(
+        &self,
+        team_id: &str,
+        rev: u64,
+        json: String,
+        history: Vec<(String, String, i64, i64)>,
+        cleared: Vec<String>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let bytes = team_id.len()
+            + json.len()
+            + history
+                .iter()
+                .map(|(_, json, _, _)| json.len())
+                .sum::<usize>();
+        self.inner.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if !self.send(Job::BoardSave {
+            team_id: team_id.to_string(),
+            rev,
+            json,
+            history,
+            cleared,
+            bytes,
+        }) {
+            self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Read one stored board. Startup only: blocks on the database.
+    pub fn load_board(&self, team_id: &str) -> Result<Option<crate::store::StoredBoard>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        self.inner.store.load_board(team_id)
+    }
+
     /// Read the stored teams. Startup only: blocks on the database.
     pub fn load_teams(&self) -> Result<Vec<(String, String)>> {
         if !self.enabled {
@@ -479,6 +542,53 @@ impl Recorder {
             return Ok(None);
         }
         self.inner.store.load_team_meta(key)
+    }
+
+    // -- workflows (PROTOCOL.md 19.11) -------------------------------------
+
+    /// Queue a named workflow write. Never blocks; the writer owns the store.
+    pub fn save_workflow(
+        &self,
+        scope: &str,
+        project: &str,
+        name: &str,
+        json: String,
+        updated_ms: u64,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let bytes = scope.len() + project.len() + name.len() + json.len();
+        self.inner.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if !self.send(Job::WorkflowSave {
+            scope: scope.to_string(),
+            project: project.to_string(),
+            name: name.to_string(),
+            json,
+            updated_ms,
+            bytes,
+        }) {
+            self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub fn delete_workflow(&self, scope: &str, project: &str, name: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.send(Job::WorkflowDelete {
+            scope: scope.to_string(),
+            project: project.to_string(),
+            name: name.to_string(),
+        });
+    }
+
+    /// Read the stored workflows. Startup only: blocks on the database.
+    pub fn load_workflows(&self) -> Result<Vec<(String, String, String, String)>> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        self.inner.store.load_workflows()
     }
 
     // -- internals ----------------------------------------------------------
@@ -544,7 +654,7 @@ impl Recorder {
     fn drop_for_backpressure(&self, instance_key: &str) {
         if !self.inner.warned_backpressure.swap(true, Ordering::Relaxed) {
             self.inner.warnings.fetch_add(1, Ordering::Relaxed);
-            eprintln!(
+            crate::svc_log!(
                 "nvim_ade_server: warning: event log queue exceeded {} bytes; \
                  dropping events and marking affected sessions incomplete",
                 self.limits.backpressure_bytes
@@ -698,6 +808,34 @@ impl Writer {
                         self.flush_team_saves();
                         self.delete_team(&id);
                     }
+                    Job::BoardSave {
+                        team_id,
+                        rev,
+                        json,
+                        history,
+                        cleared,
+                        bytes,
+                    } => {
+                        self.save_board(&team_id, rev, &json, &history, &cleared, bytes);
+                    }
+                    Job::WorkflowSave {
+                        scope,
+                        project,
+                        name,
+                        json,
+                        updated_ms,
+                        bytes,
+                    } => {
+                        self.write(&mut batch);
+                        self.save_workflow(&scope, &project, &name, &json, updated_ms, bytes);
+                    }
+                    Job::WorkflowDelete {
+                        scope,
+                        project,
+                        name,
+                    } => {
+                        self.delete_workflow(&scope, &project, &name);
+                    }
                     Job::Barrier(sender) => {
                         self.write(&mut batch);
                         self.flush_team_saves();
@@ -747,6 +885,34 @@ impl Writer {
                 Job::TeamDelete(id) => {
                     self.flush_team_saves();
                     self.delete_team(&id);
+                }
+                Job::BoardSave {
+                    team_id,
+                    rev,
+                    json,
+                    history,
+                    cleared,
+                    bytes,
+                } => {
+                    self.save_board(&team_id, rev, &json, &history, &cleared, bytes);
+                }
+                Job::WorkflowSave {
+                    scope,
+                    project,
+                    name,
+                    json,
+                    updated_ms,
+                    bytes,
+                } => {
+                    self.write(&mut batch);
+                    self.save_workflow(&scope, &project, &name, &json, updated_ms, bytes);
+                }
+                Job::WorkflowDelete {
+                    scope,
+                    project,
+                    name,
+                } => {
+                    self.delete_workflow(&scope, &project, &name);
                 }
                 Job::Barrier(sender) => {
                     self.write(&mut batch);
@@ -1027,6 +1193,22 @@ impl Writer {
         self.flush_team_saves();
     }
 
+    fn save_board(
+        &mut self,
+        team_id: &str,
+        rev: u64,
+        json: &str,
+        history: &[(String, String, i64, i64)],
+        cleared: &[String],
+        bytes: usize,
+    ) {
+        let result = self.store.save_board(team_id, rev, json, history, cleared);
+        self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        if let Err(error) = result {
+            self.report_team_failure(&error);
+        }
+    }
+
     fn delete_team(&mut self, id: &str) {
         // A delete wins over any snapshot queued before/after it: the team is
         // gone, so an old snapshot must never resurrect it on a retry.
@@ -1049,6 +1231,30 @@ impl Writer {
         }
     }
 
+    fn save_workflow(
+        &mut self,
+        scope: &str,
+        project: &str,
+        name: &str,
+        json: &str,
+        updated_ms: u64,
+        bytes: usize,
+    ) {
+        self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        if let Err(error) = self
+            .store
+            .save_workflow(scope, project, name, json, updated_ms)
+        {
+            self.report_team_failure(&error);
+        }
+    }
+
+    fn delete_workflow(&mut self, scope: &str, project: &str, name: &str) {
+        if let Err(error) = self.store.delete_workflow(scope, project, name) {
+            self.report_team_failure(&error);
+        }
+    }
+
     fn mark_incomplete(&mut self, instance: &str) {
         if let Err(error) = self.store.mark_instance_incomplete(instance) {
             self.report_failure(instance, &error);
@@ -1064,7 +1270,7 @@ impl Writer {
             return;
         }
         self.last_warning = Some(now);
-        eprintln!("nvim_ade_server: warning: team persistence failed: {error:#}");
+        crate::svc_log!("nvim_ade_server: warning: team persistence failed: {error:#}");
     }
 
     /// Re-read one instance's stored size from the database (after a prune).
@@ -1114,7 +1320,9 @@ impl Writer {
         if !recent {
             self.last_warning = Some(now);
             self.inner.warnings.fetch_add(1, Ordering::Relaxed);
-            eprintln!("nvim_ade_server: warning: event log write failed for {instance}: {error:#}");
+            crate::svc_log!(
+                "nvim_ade_server: warning: event log write failed for {instance}: {error:#}"
+            );
         }
         // Whatever happened, the instance's log has a hole now. This call may
         // itself fail (the disk is still broken); the failure is what the

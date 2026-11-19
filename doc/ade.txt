@@ -44,6 +44,9 @@ ade.nvim 是一个 Neovim 原生的 Agent Client Protocol 客户端。
     files        从项目索引选择文件，插入 @引用，不打开文件或发送消息
     image        读取剪贴板图像并附加；带路径时附加该文件
     diagnostics  把当前 buffer 的诊断附加到输入区
+    team         团队面板；:Ade team start [流程] / :Ade team close
+                 （见 |ade-teams|）
+    workflows    列出、查看、删除命名流程
 
 :AdeLog                                                      *:AdeLog*
     打开日志文件。
@@ -102,6 +105,8 @@ q              隐藏面板（普通模式）
                keymaps.input.pick_mode
 L              历史会话（普通模式）
                keymaps.input.pick_session
+<M-a>          进入待回答的选择卡片（输入 / 普通模式）
+               keymaps.input.focus_choice
 <C-x><C-u>     补全 /命令 与 @文件（Vim 内置触发，不可配）
 @path/to/file  发送时自动展开为附件
 
@@ -138,6 +143,8 @@ M / m          选择模型 / 模式
                keymaps.chat.new_session
 L              历史会话
                keymaps.chat.pick_session
+<M-a>          进入待回答的选择卡片
+               keymaps.chat.focus_choice
 g?             帮助（内容按当前配置生成）
                keymaps.chat.help
 q              隐藏面板
@@ -250,6 +257,7 @@ picker、会话浏览器等自绘浮窗内部的按键不在 keymaps 管辖范�
           pick_model = { n = "M", i = "<M-m>" },
           pick_mode = { n = "m", i = "<M-b>" },
           pick_session = "L",
+          focus_choice = "<M-a>",
         },
         chat = {
           close_panel = "q",
@@ -268,6 +276,7 @@ picker、会话浏览器等自绘浮窗内部的按键不在 keymaps 管辖范�
           pick_session = "L",
           scroll_bottom = "G",
           scroll_top = "gg",
+          focus_choice = "<M-a>",
         },
       },
       permissions = { prompt = "select", show_details = true },
@@ -1011,74 +1020,475 @@ follow_cursor = false 让输入框停在打开时的位置。审查内容随窗�
 审查按结果到达时的 filetype 解析，<C-d> 切换本次模式；同一时间只运行一个请求。
 
 ==============================================================================
-23b. 团队（teams，实验性）                                *ade-teams*
+23b. 团队、看板与流程（teams，实验性）                             *ade-teams*
 
-服务声明 teams 能力（0.6.0+）时，主 agent 可以在聊天里用 team_spawn 组建小团队：
-worker 通过服务总线传消息，人在收件箱里审批/回答。团队运行在服务里，Neovim 退出后继续；
-服务重启后所有团队结束（本阶段不做恢复）。
+服务声明 teams 能力（服务 0.7.1+，api_version 6）。你正在聊天的会话就是
+leader，它可以按需启动 worker（各自是一个独立的 agent 会话，可以在自己的
+git worktree 里工作），worker 之间通过服务总线（bus）传消息；团队和看板
+保存在服务里，Neovim 退出后继续运行。
 
+服务里没有流程状态机：流程只是一段 leader 遵循的约定，服务只负责校验、
+保存、转发和提取。看板同理：服务保存结构，不解释列名或字段的含义。
+
+概念 ~
+                                                          *ade-teams-concepts*
+leader      你正在聊天的会话。一个工作目录只有一个 leader；换 leader 要先
+            结束团队。leader 的 agent 和模型就是那个会话本身的。
+worker      服务按模板启动的参与者，名字形如 w1、reviewer（匹配
+            [a-z0-9][a-z0-9_-]*，最多 32 字符，不能叫 leader 或 human）。
+            它用总线工具（bus_send、bus_ask_human、bus_status、
+            card_update）和 leader 通信。
+模板        描述“用哪个 agent、怎么启动”：agent 必填；model 是默认模型，
+            spawn 不带 model 时用它；models 是允许 leader 指定的模型列表
+            （不写 = 不限，指定时必须在此列表里）；role 可选（写死的角色
+            说明）；worktree = true 时在独立 worktree 里运行。
+命名流程    一份“流程说明 + 团队组成”，可以内置、写在配置里，或由 leader
+            按你的要求保存到服务数据库（项目级或用户级）。见
+            |ade-teams-workflows|。
+看板        每个团队一块：列、卡片、负责人、阶段。leader 管结构（列、
+            建卡/删卡、挪列、指派负责人），worker 只写自己负责卡片的正文
+            和键值。卡片是给你看的，不是 agent 之间的信息通道：agent 没
+            有读取卡片内容的工具。
+阶段        默认流程把工作分成阶段；一个阶段的卡片都完成后，leader 汇总一
+            次请你确认提交，不按卡片逐个问。确认后 worker（或 leader）
+            归档卡片。
+
+看板限制：最多 16 列、200 张未归档卡片、500 张已归档卡片（超出时丢弃最旧
+的），整块看板最多 256 KiB；卡片正文最多 8 KiB，fields 最多 12 个键、每个
+值最多 120 字符。超出时服务拒绝这次写入，看板保持不变。
+
+默认流程 ~
+                                                      *ade-teams-default-flow*
+不指定流程时，leader 按内置的 default 流程工作：
+
+1. 你提出需求；leader 做设计，把工作分成若干阶段，每个阶段拆成任务并在看
+   板上建卡（卡片的 stage 写阶段名）。默认列：待开发 / 进行中 / 审查中 /
+   等你决定；等你决定只放需要你拍板的问题，不放“等提交”的卡片。
+2. leader 按需 team_spawn worker，每张卡片指定负责人，发 task 消息。
+   worker 在自己的 worktree 里开发，进度写在卡片上。
+3. worker 做完后 report；leader 审查改动、跑测试。不通过就发 review 打
+   回，卡片回到进行中。
+4. 单张卡片通过后不问人：leader 把这名 worker 的分支合并到本阶段的集成分
+   支（例如 ade/<team>/<stage>，在单独的 worktree 里合并，不改动主工作区
+   的 HEAD），再给 worker 发完成确认；worker 归档卡片。worker 已经退出时
+   由 leader 归档。
+5. 阶段完成后一次性问你：本阶段的卡片都归档后，leader 汇总这一阶段做了什
+   么（每张卡片的标题和结论、集成分支上的测试结果、需要你注意的地方），
+   请你确认提交。
+6. 你确认后，leader 把集成分支合并进主分支、清理本阶段的 worktree 和
+   worker 分支；你不同意时，按你的意见在下一轮修改，或放弃整个集成分支。
+7. 你也可以事先授权“阶段完成后直接提交”，那第 5 步只汇报、不等确认。
+
+默认流程的正文可以整体替换：在配置里写 teams.workflows.default（见
+|ade-teams-config|）。
+
+对话定制流程 ~
+                                                       *ade-teams-custom-flow*
+准备组队时，leader 先把计划复述给你确认：团队组成、每个人用什么 agent 和
+模型、看板列、每一步谁做什么；你同意后再组队，并把流程写进看板的
+workflow 字段。
+
+例如你说：
+
+    做 xxx 工作，你来做主要设计和任务分解，生成两个 opencode 的 worker
+    写代码，opencode 的 worker 使用的模型是 xxx，然后用一个 pi 的
+    reviewer 来审核代码，reviewer 使用 gpt6.1sol 模型。
+
+leader 会这样组队（每次启动 worker 默认都要你在选择组件里确认；一键批准
+见 |ade-teams-panel|）：
+
+    team_spawn {template="opencode", name="w1", model="xxx",
+                role="写代码…"}
+    team_spawn {template="opencode", name="w2", model="xxx",
+                role="写代码…"}
+    team_spawn {template="pi", name="reviewer", model="gpt6.1sol",
+                role="审查…"}
+
+流程中途也可以改：你说“以后测试也交给 reviewer 跑”，leader 更新看板上的
+流程并照做。
+
+命名流程 ~
+                                                         *ade-teams-workflows*
+一个命名流程：
+
+    {
+      name    = "review_by_pi",      -- [a-z0-9][a-z0-9_-]{0,31}
+      summary = "opencode 写代码，pi 审查",  -- 一行，最多 120 字符
+      text    = "……",                -- 全文，最多 4 KiB；省略 = 默认正文
+      leader  = { agent?, model?, role? },  -- 只有明确要求时才有
+      team    = { { name, template, model?, role?, task? }, ... },
+                                        -- 0..8 个 worker
+      columns = { "待开发", "进行中", "审查中", "等你决定" },
+                                        -- 1..16 列
+    }
+
+team 只列 worker，永远不含 leader；成员名字不能重复，也不能是 leader 或
+human；template 必须是已配置的模板，成员的 model 必须在模板的 models 列表
+里（有列表时）；成员 role 最多 16 KiB，task 最多 64 KiB；列标题每项 1..40
+字符且不能重复。summary 和 text 至少要写一个；只写 text 时 summary 取正文
+第一行。leader 里写了 agent 时，它必须是已配置的 agent；leader.role 最多
+4 KiB。
+
+流程成员数不能超过 teams.max_workers（默认 3，范围 1..8）：配置校验会拒绝
+超过的流程；运行中剩余成员会超过 max_workers 个活 worker 时，team.start
+整体拒绝，一个都不启动。
+
+来源与解析顺序（同名取靠前的）：config > project > user > builtin。
+
+    config    配置里的 teams.workflows，只读，leader 不能改
+    project   leader 保存到服务数据库、只在这个仓库可用
+    user      保存到服务数据库、所有项目可用
+    builtin   内置的 default（空团队 + 四个默认列 + 默认正文）
+
+项目级流程按团队 cwd 所在 git 仓库的公共目录（git rev-parse
+--git-common-dir 的规范路径）区分，所以同一个仓库的各个 worktree 共用；不在
+git 仓库里时按 cwd。
+
+用法：
+
+- 保存：你说“把这个流程存成 review_by_pi”，leader 调 workflow_save。同名
+  的已存流程会被拒绝（返回错误），leader 问你是否覆盖；你同意后带
+  replace = true 再存。与配置里的流程同名也会被拒绝——配置的同名流程会
+  遮住它。每个范围（项目或用户）最多保存 100 个流程，超出返回 -32061
+  “too many workflows”。保存不弹额外确认：保存的只是文字和组队计划，
+  真正启动 worker 时仍走 spawn 确认。
+- 使用：你说“用 review_by_pi 流程做 xxx”，leader 先读全文、复述计划，你
+  确认后按 team 组队、按 columns 建看板，把 text 写进看板并在看板上记下
+  流程名。
+- 查看和删除：:Ade workflows 列出所有命名流程（名字、范围、一行说明、成
+  员），<CR> 看全文，d 删除对话保存的流程（config/builtin 只提示不能
+  删）。也可以在对话里让 leader 删除。
+- 省 token：leader 平时只在 bus.status 里看到名字、一行说明和范围；全文
+  只在用到时用 workflow_get 读取。
+
+流程里的 leader ~
+                                                   *ade-teams-workflow-leader*
+leader 默认就是你正在对话的那个会话，流程不改变它。只有你明确要求时，流程
+里才写 leader：
+
+- role：追加在 leader 的团队说明后面（只出现一次）。
+- model：当前 leader 的 agent 提供这个模型时，前端会切换过去并告诉你；
+  不提供时只提示，不切换。
+- agent：和当前 leader 的 agent 不同时不会自动换 leader。:Ade team start
+  会问你是“另开该 agent 的会话作为 leader（有团队时先结束）”还是“忽略，
+  用当前 leader”。
+
+leader 保存流程时，只有你在对话里明确提到 leader 的 agent、模型或角色，才
+写 leader 字段。
+
+配置 ~
+                                                            *ade-teams-config*
     teams = {
-      enabled = false,               -- true: 新建团队时按 default 定义启动 worker
-      default = "dev",
-      definitions = {
+      enabled = false,         -- true: 建团队后按 default 流程自动组队
+      default = "dev",         -- 默认流程名（或 "default"）
+      workflows = {            -- 命名流程；同名时覆盖内置的 default
         dev = {
-          workers = {
-            { name = "w1", template = "coder", task = "T1" },
-            { name = "w2", template = "reviewer" },
+          summary = "两个 opencode 写代码，leader 审查",
+          text = "……",          -- 省略时用默认流程正文
+          columns = { "待开发", "进行中", "审查中", "等你决定" },
+          team = {
+            { name = "w1", template = "opencode", model = "xxx",
+              task = "T1" },
+            { name = "w2", template = "opencode", model = "xxx" },
+          },
+        },
+        review_by_pi = {
+          summary = "opencode 写代码，pi 审查",
+          leader = {
+            agent = "claude",
+            role = "只做设计和审查，不亲自改代码",
+          },
+          team = {
+            { name = "w1", template = "opencode" },
+            { name = "reviewer", template = "pi" },
           },
         },
       },
-      spawn_from_chat = true,        -- 允许主 agent 从聊天里组建团队
-      max_workers = 3,               -- 每个 leader 最多 3 个 worker（1..8）
+      spawn_from_chat = true,  -- 允许 leader 从聊天里组队
+      max_workers = 3,         -- 每个团队最多 3 个 worker（1..8）
       spawn_confirm = { auto = {} }, -- 列出的模板无需人工确认
       limits = { max_turns_per_task = 30, max_turns_total = 200 },
       templates = {
-        coder = {
-          agent = "claude",          -- 必须是已配置的 agent
-          role = "Implement the task and report with bus_send(kind=\"report\").",
-          worktree = true,           -- 独立 git worktree（默认 false）
+        opencode = {
+          agent = "opencode",  -- 必须是已配置的 agent
+          model = "xxx",       -- 默认模型；spawn 不带 model 时用它
+          models = { "xxx", "yyy" }, -- 允许指定的模型；省略 = 不限
+          worktree = true,     -- 独立 git worktree（默认 false）
         },
-        reviewer = {
-          agent = "claude",
-          role = "Review the diff and report with bus_send(kind=\"report\").",
+        pi = {
+          agent = "pi",
+          role = "按 leader 分配的卡片审查代码。", -- 可选
         },
       },
+      dashboard = { wide = 160 },  -- 面板宽度阈值（40..10000）
     }
 
-每次 team_spawn 默认需要确认；加入 spawn_confirm.auto 才自动放行。worker 的问题、
-spawn、权限请求、一般 request、消息和回合上限都会进入收件箱（team.inbox 通知一次）。
+注意：旧的 teams.definitions 和 teams.workflow 已删除，配置里出现时 setup
+直接报错（错误里给出新写法），不做迁移。流程必须有 summary 或 text 之一：
+只写 text 时 summary 取正文第一行；只列成员、两者都不写会报错。每个流程的
+team 人数不能超过 max_workers，否则 setup 报错（写明流程名和两个数字）。
 
-worktree = true 的模板由服务在 stdpath("data")/ade/worktrees/ 下创建独立 worktree
-和 ade/<team>-<stamp>/<name> 分支。worktree 只含已提交内容：团队目录有未提交改动时
-提示 dirty_tree，worker 从最后一次提交开始。worker 退出或团队关闭后 worktree 与分支
-都保留；面板 D 删除（可 force），未合并的分支会保留。
+迁移示例：
 
-enabled = true 时，leader 新建团队后按 default 定义调用 team.spawn，只启动 team.list
-里还没有的名字，重连、恢复或第二个前端不会重复启动。
+    旧：
+        teams = {
+          definitions = {
+            dev = { workers = {
+              { name = "w1", template = "opencode", task = "T1" },
+            } },
+          },
+        }
 
-服务重启后未关闭的团队变为挂起（suspended）：面板照常显示，标注挂起时间和“等待
-leader 会话恢复”。恢复 leader 的会话后团队自动继续，worker 按存储的 session/worktree
-恢复，恢复 notice 作为 bus 回合显示在 leader 聊天里。挂起期间 m 可发消息（排队）、
-可回答 question/message/limit、R 重置回合上限、D 删除已退出 worker 的 worktree、
-x 关闭团队；
-w/s/p/r/c 提示团队已挂起。leader 注入不会被挂起团队阻塞；恢复出的会话不是存储的
-leader 时团队保持挂起，并提示按 x 关闭。
+    新：
+        teams = {
+          workflows = {
+            dev = {
+              summary = "一个 opencode worker",
+              team = {
+                { name = "w1", template = "opencode", task = "T1" },
+              },
+            },
+          },
+        }
 
-消息正文、队列和最近 200 条消息写入服务事件日志数据库（0600）；挂起超过 7 天的团队
-在服务启动或每小时检查时删除，worktree 与分支保留。
+替换默认流程正文：teams.workflows = { default = { text = "……" } }。
 
-服务版本与插件不同且服务里还有团队时不自动重启（挂起的团队除外），只提示稍后重启；
-需要时用 :Ade service stop 手动重启。
+启动团队 ~
+                                                             *ade-teams-start*
+三种方式：
 
-    :Ade team      团队面板；没有团队时不显示
+对话          直接对 leader 说要做的事。leader 按上面的约定组队；每次
+              spawn 都要你在选择组件里确认，可以逐个批准或一次全部批准。
+命令          :Ade team start [流程]。已有命名流程时最快；不用逐个确认。
+自动          teams.enabled = true 时，leader 建好团队、且团队还没有
+              worker，前端调用一次 team.start {default 流程}；重连或
+              第二个前端不会重复。
 
-面板按键：m 发消息、p/r/c 暂停/恢复/取消、w 只读查看 worker 转录（重放+实时）、
-s 按模板启动 worker、D 删除已退出 worker 的 worktree、a 回答收件箱项、
-R 重置回合上限、x 结束团队、g? 帮助、q 关闭。
-直连/旧服务/spawn_from_chat=false 时不注入 team MCP server，单 agent 行为不变。
-worker 行显示 worktree 分支（wt ade/...）。
+:Ade team start [流程] 的步骤：
+
+1. 没给流程名时，用 team.workflows 的结果弹出选择器（名字、一行说明、
+   范围）。
+2. 流程要求别的 leader.agent 而当前会话不是时，问你是“另开该 agent 的
+   会话（有团队时先结束）”还是“忽略，用当前 leader”。
+3. 当前 cwd 已有带 worker 的团队时问你：“结束后重新开始”“只补流程里缺
+   的成员”或“取消”。
+4. 输入这次的任务（可留空）。取消输入就什么都不做：不关团队、不切换
+   agent、不新建会话。
+5. 确保 leader 会话：没有会话时打开聊天并新建，等待 leader 绑定。
+6. 调 team.start：服务按流程逐个启动成员（已在团队里的名字跳过），再给
+   leader 发一条 notice：基础说明、任务、流程名和正文、成员（名字、模
+   板、agent、模型、角色）、看板列。leader 收到后建看板、分派任务。
+7. 成功后自动打开团队面板（:Ade team）。
+
+流程的 leader.model 存在时，前端在当前 agent 提供该模型时切过去并提示；不
+提供只提示。团队被挂起（等待 leader 会话恢复）时 :Ade team start 会提示先
+恢复；当前 cwd 没有 leader 会话或团队不属于本前端时会提示，不会去抢别的
+会话的团队。
+
+旧服务（api_version 5）上没有 team.start/看板/流程接口：前端提示“服务版本
+过旧；空闲后会自动更新，或用 :Ade service stop 手动重启”，不会反复重试看
+板。
+
+命令 ~
+                                                          *ade-teams-commands*
+:Ade team                                                          *:Ade-team*
+    打开统一团队面板；没有团队时显示空状态（可用流程列表：光标所在流程按
+    S 启动，<CR> 看全文）。
+
+:Ade team start [流程]                                       *:Ade-team-start*
+    按流程启动团队，见上。
+
+:Ade team close                                              *:Ade-team-close*
+    结束当前 cwd 的团队（确认后 team.close）。当前 cwd 没有团队时提示，
+    不会关闭别的目录的团队。
+
+:Ade team answer [名字]                                 *:Ade-team-answer*
+    显示待处理的选项（提问、spawn、权限、上限）；带名字时用输入框回答该
+    成员没有选项的提问。
+
+:Ade workflows                                                *:Ade-workflows*
+    列出命名流程：名字、范围、一行说明、成员。<CR> 看全文，d 删除（只限
+    project 和 user；config/builtin 提示不能删），q 关闭。
+
+补全：:Ade team <Tab> 补全 start/close；:Ade team start <Tab> 补全流程名
+（配置里的、已知的服务流程名和 default）。
+
+面板 ~
+                                                             *ade-teams-panel*
+`:Ade team` 打开统一面板：成员和看板两栏，标题只在 tabline。
+
+宽屏（列数 >= teams.dashboard.wide，默认 160）在独立 tabpage 里打开：左边
+成员、右边看板；观察 leader 或 worker 时右侧再加一列观察窗口。q 关闭整个
+tabpage，回到原来的位置。<Tab> / <S-Tab> 在窗口之间切换。
+
+窄屏保持居中浮窗，从上到下只有成员和看板两段；看板一次显示一列，zh / zl
+横向滚动。两种布局都用同一套成员、看板和高亮。
+
+标题    tabline 一行：团队、cwd、状态、workers x/y、回合数、流程和阶段进
+        度，以及 ? 待回答 N / ⚑ 待批准 N。窄屏时待处理计数排在最前，先省
+        略 cwd。
+成员    leader 在最上面（★、强调色），下面是 workers N/max。每个 worker
+        显示符号和角色色（◆）、名字、label、agent/短模型名、状态（● 工作
+        中 / ○ 空闲 / ? 等你回答 / ⏸ 暂停 / ✕ 退出）和已持续时间、任务
+        与未读消息（✉ N）。宽度不够时先缩短模型，再缩短 agent；放不下的
+        模型会换到第二行。第二行还显示 ↳ 最近动态，第三行显示 worktree 分
+        支。成员栏宽度由 teams.dashboard.members_width 决定（默认 32，
+        16..120），winfixwidth + nowrap；手动拖动后本次打开期间保持，下次
+        打开恢复配置值。
+看板    列之间是粗竖线（┃），列标题带数量和底色；卡片是圆角框，负责人用
+        角色色画边框，光标所在卡片高亮。列宽只由窗口宽度决定，不随标题长
+        度跳动；列太多时横向滚动（zh / zl），标题行固定。已归档的卡片按阶
+        段折叠显示（例如“S1 · 已提交 · 6 张”）。leader 还没写过看板时显示
+        “leader 还没有创建看板”和“按 L 去和 leader 聊”。
+详情    卡片上按 <CR> 打开浮窗：正文、fields、更新者、时间；q 或 <Esc>
+        关闭。成员上按 <CR> 打开或切换观察窗口。
+消息    worker 发给人的普通消息用 vim.notify 提示，并在该成员行显示 ✉ N；
+        在观察窗口里能看到正文。
+
+多个团队时 tabline 显示 [1/2]，]t / [t 切换。
+
+按键作用于光标下的对象：
+
+    成员上
+      <CR> / w      打开或切换这个人的观察窗口
+      m             给这个人发消息
+      a             回答这个人的待回答提问
+      p / r / c     暂停 / 恢复 / 取消当前回合
+      D             删除已退出 worker 的 worktree
+                    （确认；可 force；未合并分支保留）
+
+    卡片上
+      <CR>          打开卡片详情浮窗
+      m             就这张卡片给 leader 发消息
+      H             查看历史版本（逐版对比）
+      w             打开负责人的观察窗口
+      p / r / c     对负责人生效
+
+    全局
+      !             打开待处理的选择（提问、spawn、权限、回合上限）
+      L / s / R / x / g? / q
+                    跳到 leader 聊天 / 按模板启动 worker / 重置回合
+                    上限 / 结束团队 / 帮助 / 关闭
+      <Tab> / <S-Tab>       切换窗口（宽屏）
+      zh / zl               横向滚动看板
+
+看板卡片上按 m 发消息时走总线排队（kind = notice，task = 卡片 id），不会
+打断 leader 正在跑的回合；服务在正文前加一行卡片摘要（id、标题、列、负责
+人、fields），leader 由此知道你说的是哪张卡片。
+
+spawn 组：leader 在同一个回合里发出的多个 spawn 申请带同一个 group；在
+选择组件里可以逐个批准，也可以选“全部批准”。
+
+需要选择时 ~
+                                                     *ade-teams-choice*
+需要你从选项里选时（带选项的提问、spawn 申请、worker 权限、回合上限、
+agent 自己的权限请求和表单），聊天窗口底部会浮出一张选择卡片；输入框、
+草稿和附件保持可见、不受影响。卡片高度随内容自动调整（切题、展开、输入
+“其他”时都会重算，最多约占聊天窗口的 60%，超出在卡片内滚动）；转录区底部
+留出等高空白，最新输出不会被遮住。
+
+- Tab / Shift-Tab（也接受左右、h/l）切换问题，↑↓/jk 选择，1-9 直接选，
+  Space 多选，Enter 确认，Esc 稍后（团队权限也是稍后；只有 agent 自己的
+  权限请求和表单是取消）。
+- 没有选项的提问不占组件：只提示，用 :Ade team answer 或在成员上按 a
+  回答。
+- 光标在聊天或输入窗口时卡片直接获得焦点；否则只提示，回到面板后按
+  <M-a>（keymaps.chat.focus_choice / keymaps.input.focus_choice）进入。
+  回答或 Esc 后光标回到输入窗口。
+- 面板隐藏时卡片随之关闭，只提示；:Ade open 或 :Ade team answer 后显示。
+- 卡片缓冲区的 filetype 是 ade_choice，并设置 b:ade_choice。
+
+观察窗口 ~
+                                                             *ade-teams-watch*
+在成员上按 <CR> 或 w 打开右侧的观察窗口，用来完整查看这个人的工作过程。
+
+worker：只读，从它会话的第一条消息开始完整重放（内容和聊天窗口一致：总线
+消息、回复正文、工具调用可展开、编辑显示 diff、plan、思考默认折叠），再接
+实时更新；按回合分组，za 折叠回合，[[ / ]] 跳回合；停在底部时自动跟随，
+往上翻暂停，G 回到底部。窗口里没有输入区，也不能回答问题：权限请求和提问
+可以在观察窗口里直接回答（和聊天窗口一样）。对 worker 说话仍然只能在成员
+列表里按 m。
+
+worker 观察窗口下方有输入区：<C-s> 把消息作为 notice 排队发给这个 worker，
+并抄送 leader（leader 收到一条 notice）；<M-CR>（可用
+teams.dashboard.keys.interrupt 改，默认 <M-CR>）先在输入区上方提示“再按一次
+确认打断”，再按一次才 cancel 当前
+回合并优先送达。草稿按 worker 分开保存；切到 leader 时仍复用 leader 聊天，
+不显示这个输入区。输入区 filetype 是 ade_team_input：blink/cmp 的 per_filetype
+只写了 ade_input 时需要再加上它；粘贴图片和附件在这个输入区不可用。worker
+对被打断后新消息的回答仍会作为 report 抄给 leader。
+
+leader：观察窗口显示 leader 的聊天会话本身（你和它的对话 + 总线回合），
+带输入区：在那里发出去的就是你给 leader 的 prompt（你的 prompt 优先于排队
+的总线消息）；权限和提问也能直接回答。如果 leader 的聊天窗口已经打开，观
+察窗口复用同一个聊天会话，不会出现两份输入状态。
+
+会话日志超过 32 MiB 时不能从头重放，窗口顶部提示“会话过长，只显示观察开
+始之后的内容”，并用 team.read 补上最近的消息和最后 3 个回合的正文；不做
+分段重放。
+
+工作流、看板与 token ~
+                                                      *ade-teams-board-tokens*
+leader 的说明分两层：
+
+- 基础说明：每个可当 leader 的会话建立时，MCP initialize 的 instructions
+  字段就会带上（最多 2 KiB，约 300 token）：能组队、只在被要求或提议获准
+  后组队、看板与命名流程的约定。claude/opencode 会把它放进上下文（可被提
+  示缓存），pi 不读；所以每个 leader 会话都有这份固定开销，不组队也一样。
+- 流程全文：只在组队开始时通过一条 notice 发一次，加上成员和任务（基础说
+  明会再带一次）。不组队就不会收到流程全文。
+
+各 agent 对 MCP instructions 的支持（2026-11-17）：
+
+    agent      支持  版本与方式
+    claude     是    claude-agent-acp 0.107.0：系统提示里的 MCP Server
+                     Instructions 段；会话中途新增的 server 以增量说明
+                     补上
+    opencode   是    2.3.0：作为上下文里的 MCP 指导块
+    pi         否    @geohar/pi-acp 0.4.0 → pi-mcp-adapter 7.0.0：适配器
+                     缓存 instructions 但不放进提示，模型要自己调
+                     mcp({instructions="ade-team"}) 才看得到
+
+pi 的工具还走它自己的 mcp 代理：角色卡会写明用
+mcp({tool="bus_send", args={…}}) 调用团队工具。
+
+看板变化不叫醒任何 agent：不进入 leader 或 worker 的信箱，也不触发回合；
+只有前端收到 team.board_changed 后重新拉取。worker 更新自己的卡片不花
+leader 的 token；leader 收到的汇报里应当包含做决定需要的细节，而不是“见
+卡片”。
+
+持久化 ~
+                                                           *ade-teams-storage*
+团队、参与者、排队消息、最近 200 条消息正文、看板、卡片历史和命名流程都写
+入服务的事件日志数据库（权限 0600）。看板和卡片历史随团队删除；命名流程不
+随团队删除。模板的 key/env/launch 不落盘，恢复时要由前端重新提供配置。
+
+服务重启后未关闭的团队变为挂起（suspended）：面板照常显示，标注挂起时间和
+“等待 leader 会话恢复”。恢复 leader 的会话后团队自动继续，worker 按存储
+的 session 和 worktree 恢复，恢复 notice 作为 bus 回合出现在 leader 聊天
+里。挂起期间可以 m 发消息（排队）、回答 question/message/limit、R 重置回
+合上限、D 删除已退出 worker 的 worktree、x 关闭团队；w/s/p/r/c 提示团队
+已挂起。挂起超过 7 天的团队会在服务启动或每小时检查时删除（worktree 与分支
+保留）。如果恢复出的会话不是存储的 leader，团队保持挂起，并提示在面板按 x
+关闭；leader 注入不会被挂起团队阻塞。
+
+--event-log off 时不声明 teams 特性，team.* 返回 -32601，团队、看板和命名
+流程都不会落盘或恢复；此时 workflow_save 返回 -32061（no database）。
+
+服务版本与插件不同且服务里还有团队时（挂起的团队除外）不自动重启，只提示稍
+后重启；需要时用 :Ade service stop 手动重启。
+
+worktree = true 的模板由服务在 stdpath("data")/ade/worktrees/ 下创建独立
+worktree 和 ade/<team>-<stamp>/<name> 分支。worktree 只含已提交内容：团队
+目录有未提交改动时提示 dirty_tree，worker 从最后一次提交开始。worker 退出
+或团队关闭后 worktree 与分支都保留；面板 D 删除（可 force），未合并的分支
+会保留。
+
+直连模式、旧服务或 spawn_from_chat = false 时不注入 team MCP server，单
+agent 行为不变。
 
 ==============================================================================
+
 24. 服务后端（nvim_ade_server）                          *ade-service*
 
 Agent 可以交给 Rust 后台服务 nvim_ade_server 持有，这样 Neovim 退出后 agent 继续运行，

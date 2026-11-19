@@ -7,8 +7,8 @@
 
 use super::*;
 use crate::team::{
-    worktree, AnswerEffect, ItemKind, Kind, Role, SpawnOutcome, SpawnPlan, SpawnRequest, TeamError,
-    TeamEvent, INVALID_TEAM_PARAM, MAX_BODY_BYTES,
+    brief, workflow, worktree, AnswerEffect, ItemKind, Kind, Role, SpawnOutcome, SpawnPlan,
+    SpawnRequest, TeamError, TeamEvent, INVALID_TEAM_PARAM, MAX_BODY_BYTES,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +74,8 @@ pub enum ServiceCall {
         team: String,
         participant: String,
         session: String,
+        /// The relay sequence of this prompt (19.14).
+        seq: u64,
     },
 }
 
@@ -86,6 +88,53 @@ pub enum TeamResult {
         session: String,
         /// `None` means the replay was declined (incomplete or too large).
         messages: Option<Vec<(u64, Value)>>,
+    },
+    /// A team call that needed the cwd's project key first (19.1): computing it
+    /// runs git, so it happens off the hub loop.
+    ProjectKey {
+        conn: u64,
+        frontend_id: Value,
+        call: DeferredTeam,
+        cwd: String,
+        project: String,
+        /// Whether git itself answered (only that is worth caching).
+        cache: bool,
+    },
+}
+
+/// A `bus.*`/`team.*` call whose resolution needs a project key (19.1/19.5).
+#[derive(Debug)]
+pub(crate) enum DeferredTeam {
+    Status {
+        team: String,
+        name: String,
+    },
+    Workflows {
+        cwd: String,
+    },
+    WorkflowSave {
+        team: String,
+        value: Value,
+        scope: Option<String>,
+        replace: bool,
+    },
+    WorkflowGet {
+        team: String,
+        name: String,
+    },
+    WorkflowDelete {
+        team: String,
+        name: String,
+        scope: Option<String>,
+    },
+    WorkflowDeleteCwd {
+        name: String,
+        scope: String,
+    },
+    Start {
+        team: String,
+        workflow: String,
+        task: Option<String>,
     },
 }
 
@@ -149,10 +198,55 @@ impl Hub {
             }
             return;
         }
+        if method == "bus.status" {
+            // The leader's status carries workflows, which need the project key
+            // (19.3); the worker's is unchanged.
+            match self.teams.team(&team).map(|team| team.cwd.clone()) {
+                Some(cwd) => self.run_or_defer(
+                    conn,
+                    id,
+                    &cwd,
+                    DeferredTeam::Status {
+                        team: team.clone(),
+                        name: name.clone(),
+                    },
+                ),
+                None => self.send_error(conn, id, &TeamError::unknown("unknown team")),
+            }
+            return;
+        }
+        if matches!(
+            method,
+            "bus.workflow_save" | "bus.workflow_get" | "bus.workflow_delete"
+        ) {
+            if role != Role::Leader {
+                self.send_error(
+                    conn,
+                    id,
+                    &TeamError::not_allowed("workflow tools are leader only"),
+                );
+            } else {
+                self.bus_workflow(conn, id, method, &team, params);
+            }
+            return;
+        }
         let result = match method {
             "bus.send" => self.bus_send(conn, &team, &name, params),
             "bus.ask_human" => self.bus_ask_human(&team, &name, params),
-            "bus.status" => self.teams.status(&team, &name).map(|value| (value, false)),
+            "bus.board_update" => {
+                if role != Role::Leader {
+                    Err(TeamError::not_allowed("board_update is leader only"))
+                } else {
+                    self.bus_board_update(&team, params)
+                }
+            }
+            "bus.card_update" => {
+                if role != Role::Worker {
+                    Err(TeamError::not_allowed("card_update is worker only"))
+                } else {
+                    self.bus_card_update(&team, &name, params)
+                }
+            }
             "bus.read" => {
                 if role != Role::Leader {
                     Err(TeamError::not_allowed("bus_read is leader only"))
@@ -164,6 +258,14 @@ impl Hub {
         };
         match result {
             Ok((value, delivery)) => {
+                self.teams.note_bus_call(
+                    &team,
+                    &name,
+                    method,
+                    params,
+                    &value,
+                    crate::team::now_ms(),
+                );
                 self.drain_team_events();
                 if delivery {
                     self.team_deliveries();
@@ -189,6 +291,11 @@ impl Hub {
             self.team_remove_worktree(conn, id, params);
             return;
         }
+        if method == "team.workflows" || method == "team.workflow_delete" || method == "team.start"
+        {
+            self.team_deferred(conn, id, method, params);
+            return;
+        }
         let result = match method {
             "team.configure" => self.team_configure(params).map(|value| (value, false)),
             "team.leader_server" => self.team_leader_server(params).map(|value| (value, false)),
@@ -196,7 +303,10 @@ impl Hub {
             "team.list" => Ok((self.teams.list(), false)),
             "team.send" => self.team_send(params),
             "team.read" => self.team_read(params).map(|value| (value, false)),
+            "team.board" => self.team_board(params).map(|value| (value, false)),
+            "team.card_history" => self.team_card_history(params).map(|value| (value, false)),
             "team.answer" => self.team_answer(params),
+            "team.answer_group" => self.team_answer_group(params),
             "team.watch" => {
                 self.team_watch(conn, id, params);
                 return;
@@ -231,8 +341,9 @@ impl Hub {
             .ok_or_else(|| TeamError::invalid("config is required"))?;
         self.teams.configure(&cwd, config)?;
         if let Some((team, instance, session)) = self.teams.config_resume(&cwd) {
-            if self.instances.contains_key(&instance) {
-                self.teams.start_resume(&team, &instance, &session);
+            if let Some(handle) = self.instances.get(&instance) {
+                let agent = handle.key.agent.clone();
+                self.teams.start_resume(&team, &instance, &session, &agent);
                 self.resume_team(&team);
             } else {
                 // The instance that bound before configure is gone; stay
@@ -256,12 +367,16 @@ impl Hub {
 
     fn team_bind_leader(&mut self, params: &Value) -> Result<Value, TeamError> {
         let instance = required_team_string(params, "instance")?;
-        if !self.instances.contains_key(&instance) {
+        let Some(handle) = self.instances.get(&instance) else {
             return Err(TeamError::new(UNKNOWN_INSTANCE, "unknown instance"));
-        }
+        };
+        let agent = handle.key.agent.clone();
         let session = required_team_string(params, "sessionId")?;
         let token_id = required_team_string(params, "token_id")?;
-        match self.teams.bind_leader(&instance, &session, &token_id)? {
+        match self
+            .teams
+            .bind_leader(&instance, &session, &token_id, &agent)?
+        {
             crate::team::BindOutcome::Active(entry) => Ok(entry),
             crate::team::BindOutcome::Resume { team, entry } => {
                 self.resume_team(&team);
@@ -303,6 +418,8 @@ impl Hub {
             }
             let resume_session = participant.session.clone();
             let worktree = participant.worktree.clone();
+            let resume_model = participant.model.clone();
+            let resume_role = participant.spawn_role.clone();
             let leader_cwd = team.cwd.clone();
             let template_worktree = team
                 .config
@@ -346,17 +463,19 @@ impl Hub {
                 .and_then(|team| team.participants.get_mut(&name))
             {
                 participant.starting = true;
-                participant.state = if waiting {
+                participant.set_state(if waiting {
                     crate::team::ParticipantState::WaitingHuman
                 } else {
                     crate::team::ParticipantState::Idle
-                };
+                });
                 participant.instance = None;
             }
             let spawn = SpawnRequest {
                 team: team_id.to_string(),
                 name: name.clone(),
                 template: template_name,
+                model: resume_model,
+                role: resume_role,
                 task: None,
             };
             let opts = StartOptions {
@@ -393,16 +512,135 @@ impl Hub {
                 .get("kind")
                 .ok_or_else(|| TeamError::invalid("kind is required"))?,
         )?;
-        let body = required_team_string(params, "body")?;
-        let task = optional_string(params, "task")?;
+        let mut body = required_team_string(params, "body")?;
+        let mut task = optional_string(params, "task")?;
+        if let Some(card) = optional_string(params, "card")? {
+            let (prefixed, default_task) =
+                self.teams
+                    .card_message(&team, &card, &body, task.as_deref())?;
+            body = prefixed;
+            task = task.or(default_task);
+        }
         let refs = team_refs(params)?;
+        let interrupt = optional_bool(params, "interrupt")?.unwrap_or(false);
+        let cc = match params.get("cc") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(items)) => {
+                let mut names = Vec::new();
+                for item in items {
+                    let Some(name) = item.as_str() else {
+                        return Err(TeamError::invalid("cc must contain participant names"));
+                    };
+                    names.push(name.to_string());
+                }
+                names
+            }
+            Some(_) => return Err(TeamError::invalid("cc must be an array")),
+        };
+        let Some(entry) = self.teams.team(&team) else {
+            return Err(TeamError::unknown("unknown team"));
+        };
+        let role = if to == "human" {
+            None
+        } else {
+            match entry.participants.get(&to) {
+                Some(participant) => Some(participant.role),
+                None => return Err(TeamError::unknown("unknown participant")),
+            }
+        };
+        if interrupt {
+            if kind == Kind::Control {
+                return Err(TeamError::invalid(
+                    "interrupt is not allowed for control messages",
+                ));
+            }
+            if role != Some(Role::Worker) {
+                return Err(TeamError::invalid("interrupt is only allowed for a worker"));
+            }
+        }
+        for name in &cc {
+            if name != "leader" || role != Some(Role::Worker) {
+                return Err(TeamError::invalid(
+                    "cc only accepts \"leader\" and only when to is a worker",
+                ));
+            }
+        }
         let id =
             self.teams
                 .send_message(&team, "human", &to, kind, &body, task.as_deref(), refs)?;
+        let mut cc_failed = None;
+        if interrupt && self.teams.bus_turn_running(&team, &to) {
+            let queue_key = (team.clone(), to.clone());
+            let mut earlier = self.interrupt_queue.remove(&queue_key).unwrap_or_default();
+            earlier.retain(|queued| self.teams.message_queued(&team, &to, *queued));
+            let after = earlier.len();
+            self.teams.prioritize_message(&team, &to, id, after);
+            earlier.push(id);
+            self.interrupt_queue.insert(queue_key, earlier);
+            self.teams.mark_interrupting(&team, &to);
+            let orphaned = self.teams.orphan_open_items(&team, &to);
+            for item in orphaned {
+                let Some(instance) = item.instance.clone() else {
+                    continue;
+                };
+                let Some(agent_id) = item.agent_id.clone() else {
+                    continue;
+                };
+                let response = if item.kind == ItemKind::Permission {
+                    json!({ "outcome": { "outcome": "cancelled" } })
+                } else {
+                    json!({ "action": "cancel" })
+                };
+                self.answer_pending(&instance, agent_id, response);
+            }
+            self.cancel_participant_turn(&team, &to);
+            self.next_interrupt_generation += 1;
+            let generation = self.next_interrupt_generation;
+            let prompt_seq = self.teams.prompt_seq(&team, &to);
+            self.interrupt_generation
+                .insert((team.clone(), to.clone()), (generation, prompt_seq));
+            let sender = self.command_sender.clone();
+            let team_for_timer = team.clone();
+            let participant_for_timer = to.clone();
+            let timeout = std::env::var("NVIM_ADE_SERVER_HELD_TIMEOUT_MS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(30_000);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(timeout)).await;
+                let _ = sender
+                    .send(Command::TeamInterruptDeadline {
+                        team: team_for_timer,
+                        participant: participant_for_timer,
+                        generation,
+                    })
+                    .await;
+            });
+        }
+        for name in cc {
+            if name == "leader" {
+                let notice = format!("to {to}: {body}");
+                if let Err(error) = self.teams.send_message(
+                    &team,
+                    "human",
+                    "leader",
+                    Kind::Notice,
+                    &notice,
+                    task.as_deref(),
+                    vec![],
+                ) {
+                    cc_failed = Some(error.message);
+                }
+            }
+        }
         if kind == Kind::Control && body == "cancel" {
             self.cancel_participant_turn(&team, &to);
         }
-        Ok((json!({ "id": id }), true))
+        let mut result = json!({ "id": id });
+        if let Some(message) = cc_failed {
+            result["cc_failed"] = json!(message);
+        }
+        Ok((result, true))
     }
 
     fn team_read(&mut self, params: &Value) -> Result<Value, TeamError> {
@@ -412,42 +650,36 @@ impl Hub {
         self.teams.read(&team, &participant, since)
     }
 
+    fn team_board(&mut self, params: &Value) -> Result<Value, TeamError> {
+        let team = required_team_string(params, "team")?;
+        self.teams.board(&team)
+    }
+
+    fn team_card_history(&mut self, params: &Value) -> Result<Value, TeamError> {
+        let team = required_team_string(params, "team")?;
+        let card = required_team_string(params, "card")?;
+        self.teams.card_history(&team, &card)
+    }
+
     fn team_answer(&mut self, params: &Value) -> Result<(Value, bool), TeamError> {
         let request = required_team_string(params, "request")?;
         let text = optional_string(params, "text")?;
         let option = optional_string(params, "option")?;
         let allow = optional_bool(params, "allow")?;
-        let before = self.teams.item_by_id(&request);
-        let (effect, team) = self.teams.answer(&request, text, option, allow)?;
-        let spawned = matches!(&effect, AnswerEffect::Spawn(_));
-        match effect {
-            AnswerEffect::Spawn(spawn) => {
-                // The approval notice waits for the worktree result so a
-                // dirty tree can be named (18.16).
-                self.start_worker(
-                    &spawn,
-                    StartOptions {
-                        approved_request: Some(request.clone()),
-                        ..StartOptions::default()
-                    },
-                );
-            }
-            AnswerEffect::Permission {
-                instance,
-                agent_id,
-                response,
-            } => {
-                self.answer_pending(&instance, agent_id, response);
-            }
-            AnswerEffect::Request {
-                instance,
-                agent_id,
-                result,
-            } => {
-                self.answer_pending(&instance, agent_id, result);
-            }
-            AnswerEffect::Question | AnswerEffect::Ack => {}
+        let answers = match params.get("answers") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(crate::team::parse_answers(value)?),
+        };
+        if answers.is_some() && (text.is_some() || option.is_some()) {
+            return Err(TeamError::invalid(
+                "use either answers or text/option, not both",
+            ));
         }
+        let before = self.teams.item_by_id(&request);
+        let (effect, team) = self
+            .teams
+            .answer_with(&request, answers, text, option, allow)?;
+        let spawned = self.apply_answer_effect(&request, effect);
         if let Some(item) = before {
             if item.kind == ItemKind::Spawn && !spawned {
                 self.team_spawn_notice(&team, &request, false, item.name.as_deref().unwrap_or(""));
@@ -477,7 +709,45 @@ impl Hub {
 
     fn team_close(&mut self, params: &Value) -> Result<Value, TeamError> {
         let team = required_team_string(params, "team")?;
+        // Capture the leader before `teams.close` removes the team. Its session
+        // and instance stay alive, but a running prompt (bus or front end) is
+        // cancelled like any other turn; held front-end prompts are dropped.
+        let leader = self
+            .teams
+            .team(&team)
+            .and_then(|row| row.leader_instance.clone().zip(row.leader_session.clone()));
+        // Pending worker writes are flushed before the team (and its board)
+        // goes away (19.2).
+        self.flush_pending_board(&team, false);
         let (_entry, workers) = self.teams.close(&team)?;
+        if let Some((instance, session)) = leader {
+            let running = self
+                .instances
+                .get(&instance)
+                .map(|handle| {
+                    self.bus_prompt_active(&instance, &session)
+                        || handle
+                            .attached
+                            .iter()
+                            .any(|conn| handle.relay.prompt_active(*conn, &session))
+                })
+                .unwrap_or(false);
+            if running {
+                if let Some(handle) = self.instances.get(&instance) {
+                    handle.control.send_frame(json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/cancel",
+                        "params": { "sessionId": session },
+                    }));
+                }
+            }
+            self.cancel_held_session(&instance, &session);
+            // A re-created team may bind the same leader session; its next bus
+            // turn must be able to hold and cancel afresh.
+            self.held_timed_out.remove(&(instance, session));
+        }
+        self.interrupt_queue.retain(|(id, _), _| id != &team);
+        self.interrupt_generation.retain(|(id, _), _| id != &team);
         for instance in workers {
             let Some(handle) = self.instances.get(&instance) else {
                 continue;
@@ -598,6 +868,19 @@ impl Hub {
                 );
                 self.release_gate(conn);
             }
+            TeamResult::ProjectKey {
+                conn,
+                frontend_id,
+                call,
+                cwd,
+                project,
+                cache,
+            } => {
+                if cache {
+                    self.teams.set_project_key(&cwd, &project);
+                }
+                self.run_deferred(conn, &frontend_id, call, &project);
+            }
         }
     }
 
@@ -635,6 +918,20 @@ impl Hub {
         name: &str,
         params: &Value,
     ) -> Result<(Value, bool), TeamError> {
+        if let Some(questions) = params.get("questions").filter(|value| !value.is_null()) {
+            if params.get("question").is_some_and(|value| !value.is_null())
+                || params.get("options").is_some_and(|value| !value.is_null())
+            {
+                return Err(TeamError::invalid(
+                    "use either question/options or questions, not both",
+                ));
+            }
+            let questions = crate::team::parse_questions(questions)?;
+            let request = self
+                .teams
+                .ask_human_questions(team, name, questions, None)?;
+            return Ok((json!({ "request": request }), true));
+        }
         let question = required_team_string(params, "question")?;
         if question.is_empty() || question.len() > MAX_BODY_BYTES {
             return Err(TeamError::invalid("question must be 1..64 KiB"));
@@ -663,18 +960,103 @@ impl Hub {
         Ok((self.teams.read(team, &participant, since)?, false))
     }
 
+    /// `bus.board_update` (leader, 19.2): one atomic write, persisted and
+    /// announced at once. A worker write still waiting for its timer is
+    /// flushed first.
+    fn bus_board_update(&mut self, team: &str, params: &Value) -> Result<(Value, bool), TeamError> {
+        self.flush_pending_board(team, true);
+        let rev = self
+            .teams
+            .board_update(team, params, crate::team::now_ms())?;
+        self.persist_board(team);
+        self.announce_board(team, rev);
+        Ok((json!({ "rev": rev }), false))
+    }
+
+    /// `bus.card_update` (owner worker, 19.2): applied at once, persisted and
+    /// announced by the coalescing timer.
+    fn bus_card_update(
+        &mut self,
+        team: &str,
+        name: &str,
+        params: &Value,
+    ) -> Result<(Value, bool), TeamError> {
+        let now = crate::team::now_ms();
+        let rev = self.teams.card_update(team, name, params, now)?;
+        if let Some(current) = self.teams.team_mut(team) {
+            if current.board_flush_at.is_none() {
+                current.board_flush_at = Some(now + crate::team::board::flush_interval_ms());
+            }
+        }
+        Ok((json!({ "rev": rev }), false))
+    }
+
+    fn announce_board(&self, team: &str, rev: u64) {
+        self.send_to_frontends(&json!({
+            "jsonrpc": "2.0",
+            "method": "team.board_changed",
+            "params": { "team": team, "rev": rev },
+        }));
+    }
+
+    /// Write the board if it changed since the last persistence. Returns the
+    /// persisted rev.
+    fn persist_board(&mut self, team: &str) -> Option<u64> {
+        let persist = self.teams.take_board_persist(team, crate::team::now_ms())?;
+        let rev = persist.rev;
+        self.recorder.save_board(
+            team,
+            persist.rev,
+            persist.json,
+            persist.history,
+            persist.cleared,
+        );
+        Some(rev)
+    }
+
+    fn flush_pending_board(&mut self, team: &str, announce: bool) {
+        if let Some(rev) = self.persist_board(team) {
+            if announce {
+                self.announce_board(team, rev);
+            }
+        }
+    }
+
+    pub(crate) fn flush_due_boards(&mut self) {
+        let now = crate::team::now_ms();
+        for team in self.teams.due_board_flushes(now) {
+            self.flush_pending_board(&team, true);
+        }
+    }
+
+    pub(crate) fn flush_all_boards(&mut self, announce: bool) {
+        for team in self.teams.pending_boards() {
+            self.flush_pending_board(&team, announce);
+        }
+    }
+
     /// `bus.spawn`: a worktree spawn answers after git finished, so the reply
     /// is sent here instead of returning a value.
     fn bus_spawn(&mut self, conn: u64, id: &Value, team: &str, params: &Value) {
+        let mut assigned_name: Option<String> = None;
         let result = (|| -> Result<Option<(Value, bool)>, TeamError> {
             let template = required_team_string(params, "template")?;
             let name = optional_string(params, "name")?;
+            let model = optional_string(params, "model")?;
+            let role = optional_string(params, "role")?;
             let task = optional_string(params, "task")?;
-            match self
-                .teams
-                .request_spawn(team, &template, name.as_deref(), task.as_deref())?
-            {
+            let label = optional_string(params, "label")?;
+            match self.teams.request_spawn_labeled(
+                team,
+                &template,
+                name.as_deref(),
+                model.as_deref(),
+                role.as_deref(),
+                task.as_deref(),
+                label.as_deref(),
+            )? {
                 SpawnOutcome::Started(spawn) => {
+                    assigned_name = Some(spawn.name.clone());
                     let opts = StartOptions {
                         reply: Some((conn, id.clone(), SpawnReplyKind::Bus)),
                         ..StartOptions::default()
@@ -687,24 +1069,58 @@ impl Hub {
                         StartResult::Deferred | StartResult::Replied => Ok(None),
                     }
                 }
-                SpawnOutcome::Awaiting { request, name: _ } => Ok(Some((
-                    json!({
-                        "status": "awaiting_approval",
-                        "request": request,
-                    }),
-                    false,
-                ))),
+                SpawnOutcome::Awaiting { request, name } => {
+                    assigned_name = Some(name);
+                    Ok(Some((
+                        json!({
+                            "status": "awaiting_approval",
+                            "request": request,
+                        }),
+                        false,
+                    )))
+                }
             }
         })();
         match result {
             Ok(Some((value, delivery))) => {
+                // An awaiting approval reply names the request, not the worker;
+                // the activity line still has to show the assigned name.
+                let mut noted = value.clone();
+                if let (Some(name), Some(object)) = (&assigned_name, noted.as_object_mut()) {
+                    object.entry("name").or_insert_with(|| json!(name));
+                }
+                self.teams.note_bus_call(
+                    team,
+                    "leader",
+                    "bus.spawn",
+                    params,
+                    &noted,
+                    crate::team::now_ms(),
+                );
                 self.drain_team_events();
                 if delivery {
                     self.team_deliveries();
                 }
                 self.send_to(conn, &success(id, value));
             }
-            Ok(None) => {}
+            Ok(None) => {
+                // The worktree spawn answers later; the call itself is still
+                // the leader's latest activity, named after the worker the
+                // service actually assigned.
+                let named = assigned_name
+                    .as_ref()
+                    .map(|name| json!({ "name": name }))
+                    .unwrap_or(Value::Null);
+                self.teams.note_bus_call(
+                    team,
+                    "leader",
+                    "bus.spawn",
+                    params,
+                    &named,
+                    crate::team::now_ms(),
+                );
+                self.drain_team_events();
+            }
             Err(error) => self.send_error(conn, id, &error),
         }
     }
@@ -715,9 +1131,19 @@ impl Hub {
             let team = required_team_string(params, "team")?;
             let template = required_team_string(params, "template")?;
             let name = optional_string(params, "name")?;
+            let model = optional_string(params, "model")?;
+            let role = optional_string(params, "role")?;
             let task = optional_string(params, "task")?;
-            self.teams
-                .request_spawn_human(&team, &template, name.as_deref(), task.as_deref())
+            let label = optional_string(params, "label")?;
+            self.teams.request_spawn_human_labeled(
+                &team,
+                &template,
+                name.as_deref(),
+                model.as_deref(),
+                role.as_deref(),
+                task.as_deref(),
+                label.as_deref(),
+            )
         })();
         match result {
             Ok(spawn) => {
@@ -796,6 +1222,486 @@ impl Hub {
         })();
         if let Err(error) = result {
             self.send_error(conn, id, &error);
+        }
+    }
+
+    /// `team.workflows`, `team.workflow_delete` and `team.start` (19.5/19.7):
+    /// they need the cwd's project key, which is computed off the hub loop.
+    fn team_deferred(&mut self, conn: u64, id: &Value, method: &str, params: &Value) {
+        let result = (|| -> Result<(String, DeferredTeam), TeamError> {
+            match method {
+                "team.workflows" => {
+                    let cwd = absolute_cwd(params)?;
+                    Ok((cwd.clone(), DeferredTeam::Workflows { cwd }))
+                }
+                "team.workflow_delete" => {
+                    let cwd = absolute_cwd(params)?;
+                    let name = required_team_string(params, "name")?;
+                    let scope = required_team_string(params, "scope")?;
+                    Ok((cwd, DeferredTeam::WorkflowDeleteCwd { name, scope }))
+                }
+                "team.start" => {
+                    let team = required_team_string(params, "team")?;
+                    let workflow = required_team_string(params, "workflow")?;
+                    let task = optional_string(params, "task")?;
+                    let cwd = self
+                        .teams
+                        .team(&team)
+                        .ok_or_else(|| TeamError::unknown("unknown team"))?
+                        .cwd
+                        .clone();
+                    Ok((
+                        cwd,
+                        DeferredTeam::Start {
+                            team,
+                            workflow,
+                            task,
+                        },
+                    ))
+                }
+                _ => Err(TeamError::new(METHOD_NOT_FOUND, "method not found")),
+            }
+        })();
+        match result {
+            Ok((cwd, call)) => self.run_or_defer(conn, id, &cwd, call),
+            Err(error) => self.send_error(conn, id, &error),
+        }
+    }
+
+    /// `bus.workflow_save/get/delete` from a leader (19.5).
+    fn bus_workflow(&mut self, conn: u64, id: &Value, method: &str, team: &str, params: &Value) {
+        let result = (|| -> Result<(String, DeferredTeam), TeamError> {
+            let cwd = self
+                .teams
+                .team(team)
+                .ok_or_else(|| TeamError::unknown("unknown team"))?
+                .cwd
+                .clone();
+            let call = match method {
+                "bus.workflow_save" => {
+                    let value = params
+                        .get("workflow")
+                        .cloned()
+                        .ok_or_else(|| TeamError::invalid("workflow is required"))?;
+                    if !value.is_object() {
+                        return Err(TeamError::invalid("workflow must be an object"));
+                    }
+                    // `scope` is accepted both inside the workflow and next to
+                    // it; the protocol describes it either way.
+                    let scope = params
+                        .get("scope")
+                        .and_then(Value::as_str)
+                        .or_else(|| value.get("scope").and_then(Value::as_str))
+                        .map(str::to_string);
+                    let replace = optional_bool(params, "replace")?.unwrap_or(false);
+                    DeferredTeam::WorkflowSave {
+                        team: team.to_string(),
+                        value,
+                        scope,
+                        replace,
+                    }
+                }
+                "bus.workflow_get" => DeferredTeam::WorkflowGet {
+                    team: team.to_string(),
+                    name: required_team_string(params, "name")?,
+                },
+                "bus.workflow_delete" => DeferredTeam::WorkflowDelete {
+                    team: team.to_string(),
+                    name: required_team_string(params, "name")?,
+                    scope: optional_string(params, "scope")?,
+                },
+                _ => return Err(TeamError::new(METHOD_NOT_FOUND, "method not found")),
+            };
+            Ok((cwd, call))
+        })();
+        match result {
+            Ok((cwd, call)) => self.run_or_defer(conn, id, &cwd, call),
+            Err(error) => self.send_error(conn, id, &error),
+        }
+    }
+
+    /// Run a deferred call now if the project key is cached, else compute it in
+    /// a task and answer from [`TeamResult::ProjectKey`].
+    fn run_or_defer(&mut self, conn: u64, id: &Value, cwd: &str, call: DeferredTeam) {
+        if let Some(project) = self.teams.project_key(cwd).map(str::to_string) {
+            self.run_deferred(conn, id, call, &project);
+            return;
+        }
+        let sender = self.team_sender.clone();
+        let cwd = cwd.to_string();
+        let frontend_id = id.clone();
+        tokio::spawn(async move {
+            let (project, cache) = match workflow::git_project_key(&cwd).await {
+                Some(project) => (project, true),
+                // A git failure is not cached: the next call tries again.
+                None => (workflow::canonical_cwd(&cwd), false),
+            };
+            let _ = sender.send(TeamResult::ProjectKey {
+                conn,
+                frontend_id,
+                call,
+                cwd,
+                project,
+                cache,
+            });
+        });
+    }
+
+    fn run_deferred(&mut self, conn: u64, id: &Value, call: DeferredTeam, project: &str) {
+        match call {
+            DeferredTeam::Status { team, name } => match self.teams.status(&team, &name, project) {
+                Ok(value) => self.send_to(conn, &success(id, value)),
+                Err(error) => self.send_error(conn, id, &error),
+            },
+            DeferredTeam::Workflows { cwd } => {
+                let value = self.teams.workflows_for_cwd(&cwd, project);
+                self.send_to(conn, &success(id, value));
+            }
+            DeferredTeam::WorkflowSave {
+                team,
+                value,
+                scope,
+                replace,
+            } => {
+                if !self.recorder.enabled() {
+                    self.send_error(conn, id, &TeamError::not_allowed("no database"));
+                    return;
+                }
+                let scope = match stored_scope(scope.as_deref()) {
+                    Ok(scope) => scope,
+                    Err(error) => {
+                        self.send_error(conn, id, &error);
+                        return;
+                    }
+                };
+                match self
+                    .teams
+                    .workflow_save(&team, project, &value, scope, replace)
+                {
+                    Ok(stored) => {
+                        self.persist_workflow(&stored, project);
+                        self.send_to(conn, &success(id, json!({ "name": stored.name })));
+                    }
+                    Err(error) => self.send_error(conn, id, &error),
+                }
+            }
+            DeferredTeam::WorkflowGet { team, name } => {
+                match self.teams.workflow_get(&team, project, &name) {
+                    Ok(value) => self.send_to(conn, &success(id, value)),
+                    Err(error) => self.send_error(conn, id, &error),
+                }
+            }
+            DeferredTeam::WorkflowDelete { team, name, scope } => {
+                if !self.recorder.enabled() {
+                    self.send_error(conn, id, &TeamError::not_allowed("no database"));
+                    return;
+                }
+                let scope = match scope.map(|scope| stored_scope(Some(&scope))).transpose() {
+                    Ok(scope) => scope,
+                    Err(error) => {
+                        self.send_error(conn, id, &error);
+                        return;
+                    }
+                };
+                match self.teams.workflow_delete(&team, project, &name, scope) {
+                    Ok(removed) => {
+                        self.forget_workflow(&removed, project);
+                        self.send_to(conn, &success(id, json!({})));
+                    }
+                    Err(error) => self.send_error(conn, id, &error),
+                }
+            }
+            DeferredTeam::WorkflowDeleteCwd { name, scope } => {
+                if !self.recorder.enabled() {
+                    self.send_error(conn, id, &TeamError::not_allowed("no database"));
+                    return;
+                }
+                let scope = match stored_scope(Some(&scope)) {
+                    Ok(scope) => scope,
+                    Err(error) => {
+                        self.send_error(conn, id, &error);
+                        return;
+                    }
+                };
+                match self.teams.workflow_delete_for_cwd(project, &name, scope) {
+                    Ok(removed) => {
+                        self.forget_workflow(&removed, project);
+                        self.send_to(conn, &success(id, json!({})));
+                    }
+                    Err(error) => self.send_error(conn, id, &error),
+                }
+            }
+            DeferredTeam::Start {
+                team,
+                workflow,
+                task,
+            } => self.team_start_now(conn, id, &team, &workflow, task, project),
+        }
+    }
+
+    /// The database key of a stored workflow: `("user", "", name)` or
+    /// `("project", <project key>, name)`.
+    fn workflow_db_key(stored: &workflow::Workflow, project: &str) -> (String, String, String) {
+        let project = if stored.scope == workflow::Scope::User {
+            String::new()
+        } else {
+            project.to_string()
+        };
+        (
+            stored.scope.as_str().to_string(),
+            project,
+            stored.name.clone(),
+        )
+    }
+
+    fn persist_workflow(&self, stored: &workflow::Workflow, project: &str) {
+        let (scope, project, name) = Self::workflow_db_key(stored, project);
+        let json = serde_json::to_string(stored).unwrap_or_else(|_| "{}".to_string());
+        self.recorder
+            .save_workflow(&scope, &project, &name, json, workflow::updated_ms());
+    }
+
+    fn forget_workflow(&self, stored: &workflow::Workflow, project: &str) {
+        let (scope, project, name) = Self::workflow_db_key(stored, project);
+        self.recorder.delete_workflow(&scope, &project, &name);
+    }
+
+    /// `team.start` (19.7): steps 1, 2, 3 and 5; step 4 is the board hook.
+    fn team_start_now(
+        &mut self,
+        conn: u64,
+        id: &Value,
+        team_id: &str,
+        name: &str,
+        task: Option<String>,
+        project: &str,
+    ) {
+        let result = (|| -> Result<Value, TeamError> {
+            if let Some(task) = &task {
+                if task.len() > MAX_BODY_BYTES {
+                    return Err(TeamError::invalid("task is longer than 64 KiB"));
+                }
+            }
+            if self.teams.team(team_id).is_none() {
+                return Err(TeamError::unknown("unknown team"));
+            }
+            if self.teams.is_suspended(team_id) {
+                return Err(TeamError::not_allowed("team suspended"));
+            }
+            let workflow = self.teams.resolve_workflow(team_id, project, name)?;
+            let (participants, reserved, live, max_workers, config) = {
+                let team = self.teams.team(team_id).expect("checked above");
+                (
+                    team.participants
+                        .keys()
+                        .cloned()
+                        .collect::<HashSet<String>>(),
+                    team.reserved_names.clone(),
+                    team.live_workers() as u64,
+                    team.config.max_workers,
+                    team.config.clone(),
+                )
+            };
+            let mut skipped = Vec::new();
+            let mut pending: Vec<workflow::WorkflowMember> = Vec::new();
+            for member in &workflow.team {
+                if participants.contains(&member.name) {
+                    skipped.push(member.name.clone());
+                } else {
+                    pending.push(member.clone());
+                }
+            }
+            if live + pending.len() as u64 > max_workers {
+                return Err(TeamError::not_allowed(format!(
+                    "the workflow needs {} workers, the team allows {max_workers}",
+                    live + pending.len() as u64
+                )));
+            }
+            let mut seen: HashSet<String> = HashSet::new();
+            for member in &pending {
+                if !crate::team::valid_name(&member.name)
+                    || member.name == "leader"
+                    || member.name == "human"
+                {
+                    return Err(TeamError::invalid(format!(
+                        "member name {} is not a valid worker name",
+                        member.name
+                    )));
+                }
+                if !seen.insert(member.name.clone()) || reserved.contains(&member.name) {
+                    return Err(TeamError::invalid(format!(
+                        "name {} is already in use",
+                        member.name
+                    )));
+                }
+                let Some(template) = config.templates.get(&member.template) else {
+                    return Err(TeamError::not_allowed(format!(
+                        "unknown template {}",
+                        member.template
+                    )));
+                };
+                if let Some(model) = &member.model {
+                    if !template.models.is_empty()
+                        && !template.models.iter().any(|allowed| allowed == model)
+                    {
+                        return Err(TeamError::invalid(format!(
+                            "model {model} is not allowed by template {}",
+                            member.template
+                        )));
+                    }
+                }
+            }
+            let mut started = Vec::new();
+            for member in &pending {
+                let spawn = self.teams.request_spawn_human_labeled(
+                    team_id,
+                    &member.template,
+                    Some(&member.name),
+                    member.model.as_deref(),
+                    member.role.as_deref(),
+                    member.task.as_deref(),
+                    member.label.as_deref(),
+                )?;
+                let name = spawn.name.clone();
+                if !matches!(
+                    self.start_worker(&spawn, StartOptions::default()),
+                    StartResult::Replied
+                ) {
+                    started.push(name);
+                }
+            }
+            self.start_board_hook(team_id, &workflow)?;
+            let members: Vec<(workflow::WorkflowMember, String)> = workflow
+                .team
+                .iter()
+                .map(|member| {
+                    let agent = config
+                        .templates
+                        .get(&member.template)
+                        .map(|template| template.key.agent.clone())
+                        .unwrap_or_default();
+                    (member.clone(), agent)
+                })
+                .collect();
+            let body = brief::start_notice(&workflow, &members, task.as_deref());
+            // A team.start whose notice cannot be queued is not a success: the
+            // leader would never learn the workflow it is supposed to follow.
+            self.teams.send_message(
+                team_id,
+                "human",
+                "leader",
+                Kind::Notice,
+                &body,
+                None,
+                vec![],
+            )?;
+            Ok(json!({
+                "workflow": workflow.name,
+                "started": started,
+                "skipped": skipped,
+            }))
+        })();
+        match result {
+            Ok(value) => {
+                self.drain_team_events();
+                self.team_deliveries();
+                self.send_to(conn, &success(id, value));
+            }
+            Err(error) => {
+                // Members started before the failure must reach the front end
+                // and their first prompts at once.
+                self.drain_team_events();
+                self.team_deliveries();
+                self.send_error(conn, id, &error);
+            }
+        }
+    }
+
+    /// Step 4 of `team.start` (19.7): write the workflow onto the board.
+    ///
+    /// When the board has no `workflow_name`, `workflow_name`, `workflow`
+    /// (the text) and — when the board has no columns and the workflow has
+    /// them — `columns` are written as one service write, then persisted and
+    /// announced like a leader write.
+    fn start_board_hook(
+        &mut self,
+        team: &str,
+        workflow: &workflow::Workflow,
+    ) -> Result<(), TeamError> {
+        // A pending worker write must reach the database before this one.
+        self.flush_pending_board(team, true);
+        let Some(rev) = self.teams.start_board_workflow(team, workflow)? else {
+            return Ok(());
+        };
+        self.persist_board(team);
+        self.announce_board(team, rev);
+        Ok(())
+    }
+
+    fn team_answer_group(&mut self, params: &Value) -> Result<(Value, bool), TeamError> {
+        let group = required_team_string(params, "group")?;
+        let allow = optional_bool(params, "allow")?;
+        let (answers, failed) = self.teams.answer_group(&group, allow)?;
+        let mut answered = Vec::new();
+        for (id, effect) in answers {
+            // Exactly what team.answer does, including the approval notice
+            // (and its dirty-tree warning) for each started worker.
+            let spawned = self.apply_answer_effect(&id, effect);
+            if !spawned {
+                if let Some(item) = self.teams.item_by_id(&id) {
+                    if item.kind == ItemKind::Spawn {
+                        self.team_spawn_notice(
+                            &item.team,
+                            &id,
+                            false,
+                            item.name.as_deref().unwrap_or(""),
+                        );
+                    }
+                }
+            }
+            answered.push(id);
+        }
+        let failed: Vec<Value> = failed
+            .iter()
+            .map(|(id, error)| json!({ "id": id, "code": error.code, "message": error.message }))
+            .collect();
+        Ok((json!({ "answered": answered, "failed": failed }), true))
+    }
+
+    /// Apply one answered inbox item. `team.answer` and `team.answer_group`
+    /// share this so both start workers with the approval notice (19.6).
+    /// Returns whether the item was a spawn.
+    fn apply_answer_effect(&mut self, request: &str, effect: AnswerEffect) -> bool {
+        match effect {
+            AnswerEffect::Spawn(spawn) => {
+                // The approval notice waits for the worktree result so a
+                // dirty tree can be named (18.16).
+                self.start_worker(
+                    &spawn,
+                    StartOptions {
+                        approved_request: Some(request.to_string()),
+                        ..StartOptions::default()
+                    },
+                );
+                true
+            }
+            AnswerEffect::Permission {
+                instance,
+                agent_id,
+                response,
+            } => {
+                self.answer_pending(&instance, agent_id, response);
+                false
+            }
+            AnswerEffect::Request {
+                instance,
+                agent_id,
+                result,
+            } => {
+                self.answer_pending(&instance, agent_id, result);
+                false
+            }
+            AnswerEffect::Question | AnswerEffect::Ack => false,
         }
     }
 
@@ -945,7 +1851,7 @@ impl Hub {
             team: spawn.team.clone(),
             participant: spawn.name.clone(),
             server,
-            model: plan.template.model.clone(),
+            model: spawn.model.clone().or_else(|| plan.template.model.clone()),
             resume: opts.resume.clone(),
         };
         if !self.send_service_request(&instance, "initialize", params, call) {
@@ -1049,7 +1955,7 @@ impl Hub {
                         if self.teams.team(team).is_none() {
                             // The team closed while git ran: the new worktree
                             // belongs to nobody.
-                            eprintln!(
+                            crate::svc_log!(
                                 "nvim_ade_server: discarding worktree {} of closed team {team}",
                                 info.path
                             );
@@ -1164,7 +2070,7 @@ impl Hub {
         &mut self,
         instance: &str,
         agent_id: u64,
-        seq: u64,
+        _seq: u64,
         message: &Value,
     ) {
         let Some(call) = self.driver.remove(&(instance.to_string(), agent_id)) else {
@@ -1342,11 +2248,43 @@ impl Hub {
                     .and_then(|result| result.get("configOptions"))
                     .cloned()
                     .unwrap_or(Value::Null);
+                if let Some(model) = &model {
+                    let offered = model_values(&config_options);
+                    if !offered.iter().any(|value| value == model) {
+                        // 19.6: never go on silently with a model the agent does
+                        // not offer; stop the worker and tell the leader.
+                        self.teams.revoke_instance_tokens(instance);
+                        self.stop_worker_instance(instance);
+                        let reason = format!("model unavailable: {model}");
+                        self.teams.worker_start_failed(&team, &participant, &reason);
+                        let listed: Vec<String> = offered.into_iter().take(50).collect();
+                        let body = if listed.is_empty() {
+                            format!(
+                                "worker {participant} cannot use model {model}: \
+                                 the agent offers no model values"
+                            )
+                        } else {
+                            format!(
+                                "worker {participant} cannot use model {model}: \
+                                 the agent offers {}",
+                                listed.join(", ")
+                            )
+                        };
+                        let _ = self.teams.send_message(
+                            &team,
+                            "human",
+                            "leader",
+                            Kind::Notice,
+                            &body,
+                            None,
+                            vec![],
+                        );
+                        self.drain_team_events();
+                        return;
+                    }
+                }
                 self.teams.worker_session_set(&team, &participant, &session);
-                let wants_model = model
-                    .as_deref()
-                    .is_some_and(|model| offers_model(&config_options, model));
-                if let (Some(model), true) = (model, wants_model) {
+                if let Some(model) = model {
                     let params = json!({
                         "sessionId": session,
                         "configId": "model",
@@ -1379,7 +2317,19 @@ impl Hub {
                 team,
                 participant,
                 session,
+                seq,
             } => {
+                if !self.teams.prompt_is_current(&team, &participant, seq) {
+                    // A forced interrupt deadline already ended this prompt,
+                    // or the team closed while it was running: its late
+                    // completion must not end the next turn. Prompts held
+                    // behind it must not wait forever, unless a newer bus
+                    // turn for this session is already running.
+                    if !self.bus_prompt_active(instance, &session) {
+                        self.release_held_prompts(instance, &session, false);
+                    }
+                    return;
+                }
                 let (success, error) = turn_outcome(message);
                 let cancelled = message
                     .get("result")
@@ -1393,15 +2343,27 @@ impl Hub {
                 let error = if cancelled { None } else { error };
                 self.teams
                     .turn_finished(instance, success, error, String::new());
+                self.teams.clear_prompt_seq(&team, &participant);
                 self.drain_team_events();
                 self.release_held_prompts(instance, &session, false);
-                let _ = (team, participant, seq);
                 self.team_deliveries();
             }
         }
     }
 
     pub(crate) fn team_deliveries(&mut self) {
+        let alive = |teams: &crate::team::Teams, team: &String, participant: &String| {
+            teams.team(team).is_some_and(|entry| {
+                entry
+                    .participants
+                    .get(participant)
+                    .is_some_and(|p| p.state != crate::team::ParticipantState::Exited)
+            })
+        };
+        self.interrupt_queue
+            .retain(|(team, participant), _| alive(&self.teams, team, participant));
+        self.interrupt_generation
+            .retain(|(team, participant), _| alive(&self.teams, team, participant));
         let mut busy: HashSet<String> = self
             .instances
             .iter()
@@ -1465,11 +2427,13 @@ impl Hub {
             self.driver.insert(
                 (instance.clone(), agent_id),
                 ServiceCall::Prompt {
-                    team,
-                    participant,
+                    team: team.clone(),
+                    participant: participant.clone(),
                     session: session.clone(),
+                    seq,
                 },
             );
+            self.teams.prompt_started(&team, &participant, seq);
             let started = json!({
                 "jsonrpc": "2.0",
                 "method": "_ade/turn_started",
@@ -1494,9 +2458,17 @@ impl Hub {
         session: &str,
         message: &Value,
     ) -> bool {
-        // Any service prompt on an attached instance is a leader bus prompt;
-        // after `team.close` the team is gone but the running prompt is still
-        // cancelled/handled the same way.
+        // Only a leader of a live team waits behind a bus prompt. After
+        // `team.close` the conversation continues as a plain session (there
+        // is no bus turn left whose completion could release the prompt),
+        // and the held prompts were already dropped by close.
+        if !self
+            .teams
+            .team_of_instance(instance)
+            .is_some_and(|team| team.is_leader_instance(instance))
+        {
+            return false;
+        }
         if !self.bus_prompt_active(instance, session) {
             return false;
         }
@@ -1557,6 +2529,39 @@ impl Hub {
         }
         self.held_timed_out.insert(key);
         self.release_held_prompts(instance, session, true);
+    }
+
+    pub(crate) fn worker_interrupt_deadline(
+        &mut self,
+        team: &str,
+        participant: &str,
+        generation: u64,
+    ) {
+        let key = (team.to_string(), participant.to_string());
+        let Some((saved_generation, prompt_seq)) = self.interrupt_generation.get(&key).copied()
+        else {
+            return;
+        };
+        if saved_generation != generation {
+            return;
+        }
+        if self.teams.prompt_seq(team, participant) != prompt_seq {
+            // The interrupted turn already ended and a new one started.
+            return;
+        }
+        if !self.teams.bus_turn_running(team, participant) {
+            return;
+        }
+        let Some(instance) = self.teams.participant_instance(team, participant) else {
+            return;
+        };
+        // The agent ignored session/cancel. End the bus turn as 18.11 does, so
+        // the queued interrupt (front of the mailbox) can be delivered.
+        self.teams
+            .turn_finished(&instance, false, None, String::new());
+        self.teams.clear_prompt_seq(team, participant);
+        self.drain_team_events();
+        self.team_deliveries();
     }
 
     fn release_held_prompts(&mut self, instance: &str, session: &str, timed_out: bool) {
@@ -1744,6 +2749,13 @@ impl Hub {
         let Some(update) = params.get("update") else {
             return;
         };
+        let session = params.get("sessionId").and_then(Value::as_str);
+        if self
+            .teams
+            .observe_activity_update(instance, session, update, crate::team::now_ms())
+        {
+            self.drain_team_events();
+        }
         if update.get("sessionUpdate").and_then(Value::as_str) != Some("agent_message_chunk") {
             return;
         }
@@ -1754,8 +2766,12 @@ impl Hub {
         else {
             return;
         };
-        let session = params.get("sessionId").and_then(Value::as_str);
         self.teams.observe_chunk(instance, session, text);
+    }
+
+    pub(crate) fn flush_due_activities(&mut self) {
+        self.teams.flush_due_activities(crate::team::now_ms());
+        self.drain_team_events();
     }
 
     pub(crate) fn instance_left_team(&mut self, instance: &str, reason: &str) {
@@ -1879,6 +2895,10 @@ impl Hub {
     }
 
     pub(crate) fn expire_teams(&mut self) {
+        // A pending worker write is persisted here even when its 10 s timer has
+        // not fired yet. It must be announced too: clearing the timer without
+        // `team.board_changed` would hide that rev from the front end.
+        self.flush_all_boards(true);
         let ttl = team_ttl_ms();
         let expired = self.teams.expire_suspended(crate::team::now_ms(), ttl);
         for id in expired {
@@ -1894,7 +2914,7 @@ impl Hub {
         let mut deletes: HashSet<String> = HashSet::new();
         for event in &events {
             match event {
-                TeamEvent::Changed(id) | TeamEvent::Inbox(id, _) => {
+                TeamEvent::Changed(id) | TeamEvent::Inbox(id, _) | TeamEvent::Board(id, _) => {
                     saves.insert(id.clone());
                 }
                 TeamEvent::InboxJson(item) => {
@@ -1926,6 +2946,15 @@ impl Hub {
                             "method": "team.changed",
                             "params": { "team": entry },
                         }));
+                    }
+                }
+                TeamEvent::Board(team, rev) => {
+                    if self.persist_paused {
+                        self.announce_board(&team, rev);
+                    } else if let Some(persisted) = self.persist_board(&team) {
+                        self.announce_board(&team, persisted);
+                    } else {
+                        self.announce_board(&team, rev);
                     }
                 }
                 TeamEvent::Inbox(team, item) => {
@@ -2051,34 +3080,55 @@ fn turn_outcome(message: &Value) -> (bool, Option<String>) {
     }
 }
 
-fn offers_model(config_options: &Value, model: &str) -> bool {
+/// The model values an agent's `configOptions` offers (19.6), in order.
+fn model_values(config_options: &Value) -> Vec<String> {
+    let mut values = Vec::new();
     let Some(options) = config_options.as_array() else {
-        return false;
+        return values;
     };
     for option in options {
         if option.get("id").and_then(Value::as_str) != Some("model") {
             continue;
         }
-        if let Some(values) = option.get("options").and_then(Value::as_array) {
-            for entry in values {
-                if entry.get("value").and_then(Value::as_str) == Some(model) {
-                    return true;
+        if let Some(entries) = option.get("options").and_then(Value::as_array) {
+            for entry in entries {
+                if let Some(value) = entry.get("value").and_then(Value::as_str) {
+                    values.push(value.to_string());
                 }
                 if let Some(children) = entry.get("options").and_then(Value::as_array) {
-                    if children
-                        .iter()
-                        .any(|child| child.get("value").and_then(Value::as_str) == Some(model))
-                    {
-                        return true;
+                    for child in children {
+                        if let Some(value) = child.get("value").and_then(Value::as_str) {
+                            values.push(value.to_string());
+                        }
                     }
                 }
             }
         }
-        if let Some(values) = option.get("values").and_then(Value::as_array) {
-            if values.iter().any(|value| value.as_str() == Some(model)) {
-                return true;
+        if let Some(entries) = option.get("values").and_then(Value::as_array) {
+            for entry in entries {
+                if let Some(value) = entry.as_str() {
+                    values.push(value.to_string());
+                }
             }
         }
     }
-    false
+    values
+}
+
+/// The `scope` a `workflow_save`/`workflow_delete` asked for (19.5).
+fn stored_scope(scope: Option<&str>) -> Result<workflow::Scope, TeamError> {
+    match scope {
+        None => Ok(workflow::Scope::Project),
+        Some(scope) => workflow::Scope::parse_stored(scope)
+            .ok_or_else(|| TeamError::invalid("scope must be project or user")),
+    }
+}
+
+/// A required absolute `cwd` parameter (19.5).
+fn absolute_cwd(params: &Value) -> Result<String, TeamError> {
+    let cwd = required_team_string(params, "cwd")?;
+    if !std::path::Path::new(&cwd).is_absolute() {
+        return Err(TeamError::invalid("cwd must be an absolute path"));
+    }
+    Ok(cwd)
 }

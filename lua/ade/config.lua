@@ -118,17 +118,24 @@ M.defaults = {
   -- advertise support for are dropped rather than sent and rejected.
   mcp_servers = {},
 
-  -- Teams (PROTOCOL.md section 18). `enabled` starts a configured set of
-  -- workers when a leader creates its team; templates may run in a worktree.
+  -- Teams (PROTOCOL.md section 19). `enabled` starts the default workflow when
+  -- a leader creates its team; templates may run in a worktree.
   teams = {
     enabled = false,
     default = nil,
-    definitions = {},
+    -- Named workflows: `{ <name> = { summary?, text?, leader?, team?, columns? } }`.
+    workflows = {},
     spawn_from_chat = true,
     max_workers = 3,
     spawn_confirm = { auto = {} },
     limits = { max_turns_per_task = 30, max_turns_total = 200 },
     templates = {},
+    -- Team panel layout (W0f): below this width the panel uses a float.
+    dashboard = {
+      wide = 160,
+      members_width = 32,
+      keys = { interrupt = "<M-CR>" },
+    },
   },
 
   completion = {
@@ -347,6 +354,9 @@ M.defaults = {
       pick_model = { n = "M", i = "<M-m>" },
       pick_mode = { n = "m", i = "<M-b>" },
       pick_session = "L",
+      -- Moves the cursor into the pending question/permission card that floats
+      -- over the bottom of the chat window.
+      focus_choice = "<M-a>",
     },
     chat = {
       close_panel = "q",
@@ -367,6 +377,7 @@ M.defaults = {
       pick_session = "L",
       scroll_bottom = "G",
       scroll_top = "gg",
+      focus_choice = "<M-a>",
     },
     -- Inline editing. `visual` applies to the captured selection, `normal`
     -- inserts at the cursor.
@@ -1089,6 +1100,18 @@ function M.validate(cfg)
   if type(teams) ~= "table" then
     fail("teams must be a table")
   end
+  if teams.definitions ~= nil then
+    fail(
+      "teams.definitions was removed; write named workflows instead: "
+        .. 'teams.workflows = { dev = { summary = "...", team = { { name = "w1", template = "..." } } } }'
+    )
+  end
+  if teams.workflow ~= nil then
+    fail(
+      "teams.workflow was removed; replace the built-in default flow with "
+        .. 'teams.workflows = { default = { summary = "...", text = "..." } }'
+    )
+  end
   if type(teams.enabled) ~= "boolean" then
     fail("teams.enabled must be a boolean")
   end
@@ -1123,14 +1146,30 @@ function M.validate(cfg)
     if template.model ~= nil and type(template.model) ~= "string" then
       fail("%s.model must be a string or nil", where)
     end
-    if type(template.role) ~= "string" or template.role:match("^%s*$") then
-      fail("%s.role must be a non-empty string", where)
+    if template.role ~= nil and type(template.role) ~= "string" then
+      fail("%s.role must be a string or nil", where)
+    end
+    if type(template.role) == "string" and #template.role > 16 * 1024 then
+      fail("%s.role is longer than 16 KiB", where)
+    end
+    if template.models ~= nil then
+      if type(template.models) ~= "table" or not vim.islist(template.models) then
+        fail("%s.models must be a list", where)
+      end
+      local models, seen = {}, {}
+      for _, model in ipairs(template.models) do
+        if type(model) ~= "string" or model == "" then
+          fail("%s.models entries must be non-empty strings", where)
+        end
+        if not seen[model] then
+          seen[model] = true
+          models[#models + 1] = model
+        end
+      end
+      template.models = models
     end
     if template.worktree ~= nil and type(template.worktree) ~= "boolean" then
       fail("%s.worktree must be a boolean or nil", where)
-    end
-    if #template.role > 16 * 1024 then
-      fail("%s.role is longer than 16 KiB", where)
     end
   end
   local confirm = teams.spawn_confirm
@@ -1152,68 +1191,204 @@ function M.validate(cfg)
   end
   teams.spawn_confirm.auto = auto
 
-  local definitions = teams.definitions
-  if type(definitions) ~= "table" then
-    fail("teams.definitions must be a table")
+  -- Named workflows (19.1). Every value is sent to the service as-is, so the
+  -- checks here are the same ones the service applies; a mistake is reported
+  -- at setup instead of when the leader is already running.
+  local workflows = teams.workflows
+  if type(workflows) ~= "table" then
+    fail("teams.workflows must be a table")
   end
-  local worker_pattern = "^[a-z0-9][a-z0-9_%-]*$"
-  for name, definition in pairs(definitions) do
-    if type(name) ~= "string" or not name:match(worker_pattern) or #name > 32 then
-      fail("teams.definitions keys must match [a-z0-9][a-z0-9_-]{0,31}, got %s", vim.inspect(name))
+  local name_pattern = "^[a-z0-9][a-z0-9_%-]*$"
+  local function check_name(value, where)
+    if type(value) ~= "string" or not value:match(name_pattern) or #value > 32 then
+      fail("%s must match [a-z0-9][a-z0-9_-]{0,31}", where)
     end
-    if type(definition) ~= "table" then
-      fail("teams.definitions.%s must be a table", name)
+  end
+  local function check_text(value, limit, where, what)
+    if type(value) ~= "string" then
+      fail("%s must be a string", where)
     end
-    for key in pairs(definition) do
-      if key ~= "workers" then
-        fail("teams.definitions.%s has unknown field %s", name, vim.inspect(key))
+    if #value > limit then
+      fail("%s is longer than %s", where, what)
+    end
+  end
+  for name, workflow in pairs(workflows) do
+    check_name(name, "teams.workflows keys")
+    local where = "teams.workflows." .. name
+    if type(workflow) ~= "table" then
+      fail("%s must be a table", where)
+    end
+    for key in pairs(workflow) do
+      if key ~= "summary" and key ~= "text" and key ~= "leader" and key ~= "team" and key ~= "columns" then
+        fail("%s has unknown field %s", where, vim.inspect(key))
       end
     end
-    local workers = definition.workers
-    if workers ~= nil then
-      if type(workers) ~= "table" or not vim.islist(workers) then
-        fail("teams.definitions.%s.workers must be a list", name)
+    if workflow.summary ~= nil then
+      if
+        type(workflow.summary) ~= "string"
+        or workflow.summary == ""
+        or vim.fn.strchars(workflow.summary) > 120
+        or workflow.summary:find("\n", 1, true)
+        or workflow.summary:find("\r", 1, true)
+      then
+        fail("%s.summary must be one line of 1..120 characters", where)
       end
-      if #workers > teams.max_workers then
-        fail("teams.definitions.%s has %d workers but teams.max_workers is %d", name, #workers, teams.max_workers)
+    elseif workflow.text == nil then
+      -- The service requires a summary; derive one from the text so the
+      -- draft's `default = { text = "..." }` replacement keeps working.
+      fail("%s.summary is required when text is absent", where)
+    end
+    if workflow.text ~= nil then
+      check_text(workflow.text, 4 * 1024, where .. ".text", "4 KiB")
+    end
+    if workflow.leader ~= nil then
+      local leader = workflow.leader
+      if type(leader) ~= "table" then
+        fail("%s.leader must be a table", where)
+      end
+      for key in pairs(leader) do
+        if key ~= "agent" and key ~= "model" and key ~= "role" then
+          fail("%s.leader has unknown field %s", where, vim.inspect(key))
+        end
+      end
+      for _, key in ipairs({ "agent", "model", "role" }) do
+        if leader[key] ~= nil and type(leader[key]) ~= "string" then
+          fail("%s.leader.%s must be a string", where, key)
+        end
+      end
+      if leader.agent ~= nil then
+        if type(leader.agent) ~= "string" or cfg.agents[leader.agent] == nil then
+          fail("%s.leader.agent must be a configured agent", where)
+        end
+      end
+      if leader.role ~= nil then
+        -- 19.1: the leader's role is up to 4 KiB (a member's is 16 KiB).
+        check_text(leader.role, 4 * 1024, where .. ".leader.role", "4 KiB")
+      end
+    end
+    if workflow.team ~= nil then
+      local members = workflow.team
+      if type(members) ~= "table" or not vim.islist(members) then
+        fail("%s.team must be a list", where)
+      end
+      if #members > 8 then
+        fail("%s.team has more than 8 entries", where)
+      end
+      if #members > teams.max_workers then
+        fail("%s.team has %d members but teams.max_workers is %d", where, #members, teams.max_workers)
       end
       local seen = {}
-      for index, worker in ipairs(workers) do
-        local where = string.format("teams.definitions.%s.workers[%d]", name, index)
-        if type(worker) ~= "table" then
-          fail("%s must be a table", where)
+      for index, member in ipairs(members) do
+        local at = string.format("%s.team[%d]", where, index)
+        if type(member) ~= "table" then
+          fail("%s must be a table", at)
         end
-        for key in pairs(worker) do
-          if key ~= "name" and key ~= "template" and key ~= "task" then
-            fail("%s has unknown field %s", where, vim.inspect(key))
+        for key in pairs(member) do
+          if key ~= "name" and key ~= "template" and key ~= "model" and key ~= "role" and key ~= "task" then
+            fail("%s has unknown field %s", at, vim.inspect(key))
           end
         end
-        if type(worker.name) ~= "string" or not worker.name:match(worker_pattern) or #worker.name > 32 then
-          fail("%s.name must match [a-z0-9][a-z0-9_-]{0,31}", where)
+        if type(member.name) ~= "string" or not member.name:match(name_pattern) or #member.name > 32 then
+          fail("%s.name must match [a-z0-9][a-z0-9_-]{0,31}", at)
         end
-        if worker.name == "leader" or worker.name == "human" then
-          fail("%s.name %q is reserved", where, worker.name)
+        if member.name == "leader" or member.name == "human" then
+          fail("%s.name %q must not be leader or human", at, member.name)
         end
-        if seen[worker.name] then
-          fail("%s.name %q is duplicated in this definition", where, worker.name)
+        if seen[member.name] then
+          fail("%s.name %q is already used", at, member.name)
         end
-        seen[worker.name] = true
-        if type(worker.template) ~= "string" or teams.templates[worker.template] == nil then
-          fail("%s.template must name a configured template", where)
+        seen[member.name] = true
+        if type(member.template) ~= "string" or teams.templates[member.template] == nil then
+          fail("%s.template must name a configured template", at)
         end
-        if worker.task ~= nil and type(worker.task) ~= "string" then
-          fail("%s.task must be a string or nil", where)
+        if member.model ~= nil and type(member.model) ~= "string" then
+          fail("%s.model must be a string or nil", at)
         end
+        local allowed = member.template and teams.templates[member.template] or nil
+        if
+          type(member.model) == "string"
+          and type(allowed) == "table"
+          and type(allowed.models) == "table"
+          and #allowed.models > 0
+          and not vim.tbl_contains(allowed.models, member.model)
+        then
+          fail("%s.model %q is not allowed by template %s", at, member.model, member.template)
+        end
+        if member.role ~= nil then
+          check_text(member.role, 16 * 1024, at .. ".role", "16 KiB")
+        end
+        if member.task ~= nil then
+          check_text(member.task, 64 * 1024, at .. ".task", "64 KiB")
+        end
+      end
+    end
+    if workflow.columns ~= nil then
+      local columns = workflow.columns
+      if type(columns) ~= "table" or not vim.islist(columns) then
+        fail("%s.columns must be a list", where)
+      end
+      if #columns == 0 or #columns > 16 then
+        fail("%s.columns must have 1..16 entries", where)
+      end
+      local seen = {}
+      for index, title in ipairs(columns) do
+        if type(title) ~= "string" or title == "" or vim.fn.strchars(title) > 40 then
+          fail("%s.columns[%d] must be 1..40 characters", where, index)
+        end
+        if seen[title] then
+          fail("%s.columns[%d] %q is already used", where, index, title)
+        end
+        seen[title] = true
       end
     end
   end
   if teams.default ~= nil then
-    if type(teams.default) ~= "string" or definitions[teams.default] == nil then
-      fail("teams.default must name a configured definition")
+    if type(teams.default) ~= "string" or (teams.default ~= "default" and workflows[teams.default] == nil) then
+      fail('teams.default must name a configured workflow or the built-in "default"')
     end
   end
-  if teams.enabled and teams.default == nil then
-    fail("teams.enabled requires teams.default")
+
+  local dashboard = teams.dashboard
+  if type(dashboard) ~= "table" then
+    fail("teams.dashboard must be a table")
+  end
+  if type(dashboard.wide) ~= "number" or dashboard.wide % 1 ~= 0 or dashboard.wide < 40 or dashboard.wide > 10000 then
+    fail("teams.dashboard.wide must be an integer between 40 and 10000")
+  end
+  if dashboard.keys ~= nil then
+    if type(dashboard.keys) ~= "table" then
+      fail("teams.dashboard.keys must be a table")
+    end
+    local interrupt = dashboard.keys.interrupt
+    if interrupt == nil or (type(interrupt) ~= "string" and type(interrupt) ~= "table" and interrupt ~= false) then
+      fail("teams.dashboard.keys.interrupt must be a key, a list or false")
+    end
+    if type(interrupt) == "string" and interrupt == "" then
+      fail("teams.dashboard.keys.interrupt must not be empty")
+    end
+    local ok, keymaps = pcall(require, "ade.ui.keymaps")
+    if ok then
+      local send = keymaps.expand(cfg.keymaps.input.send, { "n", "i" })
+      local armed = keymaps.expand(interrupt, { "n", "i" })
+      for _, left in ipairs(send) do
+        for _, right in ipairs(armed) do
+          if left.lhs == right.lhs and left.mode == right.mode then
+            fail("teams.dashboard.keys.interrupt clashes with keymaps.input.send: " .. left.lhs)
+          end
+        end
+      end
+    end
+  end
+  if
+    dashboard.members_width ~= nil
+    and (
+      type(dashboard.members_width) ~= "number"
+      or dashboard.members_width % 1 ~= 0
+      or dashboard.members_width < 16
+      or dashboard.members_width > 120
+    )
+  then
+    fail("teams.dashboard.members_width must be an integer between 16 and 120")
   end
 
   local limits = teams.limits

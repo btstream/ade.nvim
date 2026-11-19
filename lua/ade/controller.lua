@@ -363,6 +363,51 @@ function M.open_team()
   return S.view.team_ui:open()
 end
 
+---Start a named workflow (`:Ade team start`); nil picks one (19.7).
+---@param workflow string|nil
+function M.start_team(workflow)
+  if S.view.team_commands then
+    S.view.team_commands:start(workflow)
+  end
+end
+
+---Close the team of this cwd (`:Ade team close`), after a confirmation.
+function M.close_team()
+  if S.view.team_commands then
+    S.view.team_commands:close()
+  end
+end
+
+---Show the pending choices, or answer one participant's question
+---(`:Ade team answer [name]`, draft 8).
+---@param name string|nil
+function M.answer_team(name)
+  if not S.view.choices then
+    return
+  end
+  if name and name ~= "" then
+    local cwd = S.config and S.config.cwd or vim.fn.getcwd()
+    for _, row in ipairs(S.view.team and S.view.team:list_rows() or {}) do
+      if row.cwd == cwd and row.state ~= "closed" then
+        S.view.choices:answer_participant(row.id, name)
+        return
+      end
+    end
+    S.view.choices:notify("no team for this cwd", vim.log.levels.WARN)
+    return
+  end
+  S.view.choices:show_pending(nil)
+end
+
+---Open the named workflows window (`:Ade workflows`, 19.5).
+---@return boolean
+function M.workflows()
+  if not S.view.team_commands then
+    return false
+  end
+  return S.view.team_commands:workflows()
+end
+
 ---Open the picker for every session control the agent offers.
 function M.pick_config()
   if S.view.options then

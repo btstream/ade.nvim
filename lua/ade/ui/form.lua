@@ -10,11 +10,16 @@ local current
 -- A picker or input box opened from a form is part of the form's surface; the
 -- form must be able to close it when the request is withdrawn.
 local active_picker
+local pick_focus = true
 
 local function pick(opts)
+  opts = vim.tbl_extend("force", { dismiss_on_leave = false, focus = pick_focus }, opts)
   active_picker = picker.select(opts)
   return active_picker
 end
+
+-- True while `M.dismiss` closes the single-choice picker.
+local dismissing = false
 
 local function close_picker()
   local handle = active_picker
@@ -24,14 +29,16 @@ local function close_picker()
   end
 end
 
----Close the open form, if any.
+---Close the open form, if any, without answering it.
 function M.dismiss()
   local handle = current
   current = nil
+  dismissing = true
   if handle then
-    handle.close()
+    pcall(handle.close)
   end
-  close_picker()
+  pcall(close_picker)
+  dismissing = false
 end
 
 local function label_for(field, values)
@@ -164,6 +171,7 @@ end
 ---  notify: fun(message: string, level: integer|nil)}
 ---@return boolean opened
 function M.open(request, opts)
+  pick_focus = opts.focus ~= false
   local parsed = schema_parser.parse(request.requestedSchema)
   if not parsed then
     opts.notify("unsupported elicitation schema", vim.log.levels.WARN)
@@ -197,6 +205,13 @@ function M.open(request, opts)
         opts.on_submit({ [only.key] = value })
       end,
       on_cancel = function()
+        -- The picker's close is its cancel. Closing it from `M.dismiss` takes
+        -- the form off screen (replaced by the choice card, or the request
+        -- settled elsewhere); that is not the person cancelling, so the
+        -- request must stay pending.
+        if dismissing then
+          return
+        end
         if current == handle then
           current = nil
         end
@@ -219,7 +234,7 @@ function M.open(request, opts)
   local message = request.message or (request.requestedSchema and request.requestedSchema.title) or "Agent question"
   local message_lines = vim.split(message, "\n", { plain = true })
   local height = math.min(20, #message_lines + #fields + 3)
-  local win = vim.api.nvim_open_win(buf, true, {
+  local win = vim.api.nvim_open_win(buf, pick_focus, {
     relative = "editor",
     style = "minimal",
     border = "rounded",

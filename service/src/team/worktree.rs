@@ -157,10 +157,10 @@ fn lock_for(toplevel: &Path) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-struct GitOutput {
-    ok: bool,
-    stdout: String,
-    stderr: String,
+pub(super) struct GitOutput {
+    pub(super) ok: bool,
+    pub(super) stdout: String,
+    pub(super) stderr: String,
     timed_out: bool,
 }
 
@@ -215,7 +215,7 @@ async fn wait_group_gone(pid: u32) {
     }
 }
 
-async fn git(toplevel: &Path, args: &[&str]) -> Result<GitOutput, TeamError> {
+pub(super) async fn git(toplevel: &Path, args: &[&str]) -> Result<GitOutput, TeamError> {
     let mut command = tokio::process::Command::new("git");
     command.arg("-C").arg(toplevel).args(args);
     command.env_clear();

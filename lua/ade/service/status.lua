@@ -28,6 +28,7 @@ function M.collect(opts)
     configured_path = service_cfg.path,
     dir = paths.dir,
     socket = paths.socket,
+    log = paths.log,
     backend = config.backend,
     installed_version = nil,
     binary = nil,
@@ -194,6 +195,7 @@ function M.lines(status)
   end
   add("info", "directory: " .. status.dir)
   add("info", "socket: " .. status.socket)
+  add("info", "service log: " .. tostring(status.log))
   if status.running then
     add(
       "ok",

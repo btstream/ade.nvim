@@ -174,40 +174,109 @@ return function(t)
 
   t.describe("teams front end", function()
     t.it("validates the teams configuration at setup", function()
-      local function valid(over)
+      local function validate(over)
         return Config.validate(vim.tbl_deep_extend("force", Config.defaults, over or {}))
       end
-      local cfg = valid({ teams = teams_config() })
+      local cfg = validate({ teams = teams_config() })
       t.eq(3, cfg.teams.max_workers)
-      local defined = valid({
+      t.eq(160, cfg.teams.dashboard.wide)
+      local named = validate({
         teams = teams_config({
           enabled = true,
           default = "dev",
-          definitions = { dev = { workers = { { name = "w1", template = "worker", task = "T1" } } } },
-          templates = { worker = { agent = "opencode", role = "You are a worker.", worktree = true } },
+          templates = {
+            worker = { agent = "opencode", models = { "m1", "m2" }, worktree = true },
+          },
+          workflows = {
+            dev = {
+              summary = "two workers",
+              text = "1. write 2. review",
+              team = { { name = "w1", template = "worker", model = "m1", task = "T1" } },
+              columns = { "todo", "review" },
+            },
+          },
         }),
       })
-      t.eq("dev", defined.teams.default)
-      t.eq(true, defined.teams.templates.worker.worktree)
+      t.eq("dev", named.teams.default)
+      t.eq(true, named.teams.templates.worker.worktree)
+      t.eq({ "m1", "m2" }, named.teams.templates.worker.models)
+      t.eq("todo", named.teams.workflows.dev.columns[1])
+      local no_role = validate({ teams = { templates = { worker = { agent = "opencode" } } } })
+      t.eq(nil, no_role.teams.templates.worker.role)
+
+      -- The old keys fail with the new syntax in the message (no migration).
+      local old_errors = {}
+      for _, over in ipairs({
+        { teams = teams_config({ definitions = { dev = { workers = {} } } }) },
+        { teams = teams_config({ workflow = "1. do things" }) },
+      }) do
+        local ok, err = pcall(validate, over)
+        t.eq(false, ok, "an old teams key must be refused")
+        old_errors[#old_errors + 1] = tostring(err)
+      end
+      t.match("teams.workflows", old_errors[1])
+      t.match("teams.workflows", old_errors[2])
+
+      -- A workflow cannot ask for more workers than teams.max_workers (19.1):
+      -- team.start would refuse all of them, so setup fails early and names
+      -- the workflow and both numbers.
+      local ok, err = pcall(validate, {
+        teams = teams_config({
+          workflows = {
+            dev = {
+              summary = "x",
+              team = {
+                { name = "w1", template = "worker" },
+                { name = "w2", template = "worker" },
+                { name = "w3", template = "worker" },
+                { name = "w4", template = "worker" },
+              },
+            },
+          },
+        }),
+      })
+      t.eq(false, ok, "more members than max_workers must be refused")
+      t.match("teams.workflows.dev.team has 4 members but teams.max_workers is 3", tostring(err))
+
       local bad = {
         { teams = teams_config({ max_workers = 0 }) },
         { teams = teams_config({ max_workers = 9 }) },
-        { teams = { templates = { Bad = { agent = "opencode", role = "" } } } },
-        { teams = { templates = { worker = { agent = "missing", role = "" } } } },
-        { teams = { templates = { worker = { agent = "opencode" } } } },
-        { teams = { templates = { worker = { agent = "opencode", role = "   " } } } },
+        { teams = teams_config({ dashboard = { wide = 10 } }) },
+        { teams = teams_config({ dashboard = { wide = "wide" } }) },
+        { teams = { templates = { Bad = { agent = "opencode" } } } },
+        { teams = { templates = { worker = { agent = "missing" } } } },
+        { teams = { templates = { worker = { agent = "opencode", role = 1 } } } },
+        { teams = { templates = { worker = { agent = "opencode", models = "m1" } } } },
+        { teams = { templates = { worker = { agent = "opencode", models = { "" } } } } },
         { teams = teams_config({ spawn_confirm = { auto = { "nope" } } }) },
         { teams = teams_config({ limits = { max_turns_per_task = 0, max_turns_total = 10 } }) },
         { teams = teams_config({ limits = { max_turns_per_task = 50, max_turns_total = 10 } }) },
-        { teams = teams_config({ enabled = true }) },
-        { teams = teams_config({ enabled = true, default = "nope", definitions = {} }) },
-        { teams = teams_config({ definitions = { dev = { workers = { { name = "Bad", template = "worker" } } } } }) },
-        { teams = teams_config({ definitions = { dev = { workers = { { name = "w1", template = "nope" } } } } }) },
+        { teams = teams_config({ default = "nope" }) },
+        { teams = teams_config({ workflows = { Bad = { summary = "x" } } }) },
+        { teams = teams_config({ workflows = { dev = "text" } }) },
+        { teams = teams_config({ workflows = { dev = { summary = "" } } }) },
+        { teams = teams_config({ workflows = { dev = { summary = "a\nb" } } }) },
+        { teams = teams_config({ workflows = { dev = { summary = string.rep("x", 121) } } }) },
+        { teams = teams_config({ workflows = { dev = { summary = "x", text = string.rep("x", 4 * 1024 + 1) } } }) },
+        { teams = teams_config({ workflows = { dev = { summary = "x", unknown = 1 } } }) },
+        { teams = teams_config({ workflows = { dev = { summary = "x", leader = "me" } } }) },
+        { teams = teams_config({ workflows = { dev = { summary = "x", leader = { role = 1 } } } }) },
         {
           teams = teams_config({
-            definitions = {
+            workflows = { dev = { summary = "x", team = { { name = "Bad", template = "worker" } } } },
+          }),
+        },
+        {
+          teams = teams_config({
+            workflows = { dev = { summary = "x", team = { { name = "leader", template = "worker" } } } },
+          }),
+        },
+        {
+          teams = teams_config({
+            workflows = {
               dev = {
-                workers = {
+                summary = "x",
+                team = {
                   { name = "w1", template = "worker" },
                   { name = "w1", template = "worker" },
                 },
@@ -217,27 +286,82 @@ return function(t)
         },
         {
           teams = teams_config({
-            max_workers = 1,
-            definitions = {
+            workflows = { dev = { summary = "x", team = { { name = "w1", template = "nope" } } } },
+          }),
+        },
+        {
+          teams = teams_config({
+            templates = { worker = { agent = "opencode", models = { "m1" } } },
+            workflows = {
+              dev = { summary = "x", team = { { name = "w1", template = "worker", model = "m2" } } },
+            },
+          }),
+        },
+        {
+          teams = teams_config({
+            workflows = { dev = { summary = "x", team = { { name = "w1", template = "worker", task = 1 } } } },
+          }),
+        },
+        {
+          teams = teams_config({
+            workflows = {
               dev = {
-                workers = {
+                summary = "x",
+                team = {
                   { name = "w1", template = "worker" },
                   { name = "w2", template = "worker" },
+                  { name = "w3", template = "worker" },
+                  { name = "w4", template = "worker" },
+                  { name = "w5", template = "worker" },
+                  { name = "w6", template = "worker" },
+                  { name = "w7", template = "worker" },
+                  { name = "w8", template = "worker" },
+                  { name = "w9", template = "worker" },
                 },
               },
             },
           }),
         },
+        { teams = teams_config({ workflows = { dev = { summary = "x", columns = {} } } }) },
+        { teams = teams_config({ workflows = { dev = { summary = "x", columns = { "a", "a" } } } }) },
         {
           teams = teams_config({
-            definitions = { dev = { workers = { { name = "w1", template = "worker", task = 1 } } } },
+            workflows = { dev = { summary = "x", columns = { string.rep("c", 41) } } },
           }),
         },
-        { teams = teams_config({ templates = { worker = { agent = "opencode", role = "x", worktree = "yes" } } }) },
+        {
+          teams = teams_config({
+            workflows = {
+              dev = {
+                summary = "x",
+                columns = {
+                  "c1",
+                  "c2",
+                  "c3",
+                  "c4",
+                  "c5",
+                  "c6",
+                  "c7",
+                  "c8",
+                  "c9",
+                  "c10",
+                  "c11",
+                  "c12",
+                  "c13",
+                  "c14",
+                  "c15",
+                  "c16",
+                  "c17",
+                },
+              },
+            },
+          }),
+        },
+        { teams = teams_config({ templates = { worker = { agent = "opencode", worktree = "yes" } } }) },
       }
       for _, over in ipairs(bad) do
         t.raises(function()
-          Config.validate(vim.tbl_deep_extend("force", Config.defaults, over))
+          validate(over)
         end)
       end
     end)
@@ -361,6 +485,11 @@ return function(t)
       wait(function()
         return state().sess.service.replaying ~= true
       end, 10000, "the load to finish")
+      -- The load's own bind recreates the team on the service; wait for it,
+      -- then drop the binding again so session/resume asks for a new server.
+      wait(function()
+        return team().bound[dir] ~= nil
+      end, 5000, "the load's bind")
       forget_binding()
       state().sess.service:resume("sess_mock", {})
       wait(function()
@@ -443,10 +572,14 @@ return function(t)
       end, 5000, "the bus turn to finish")
     end)
 
-    t.it("shows the panel only with teams and renders participants and inbox", function()
+    t.it("shows the empty dashboard without teams and renders participants and inbox", function()
       local service, dir = start_service(t, "panel")
       setup(t, "panel", service, dir)
-      t.eq(false, controller.open_team(), "no team means no panel")
+      -- W0f: the dashboard is also the empty state (workflow list).
+      t.eq(true, controller.open_team(), "the empty dashboard opens")
+      local ui = state().view.team_ui
+      t.truthy(ui.buf, "the empty dashboard buffer")
+      ui:close()
       local ready = false
       controller.connect()
       wait_ready()
@@ -503,7 +636,6 @@ return function(t)
       t.match("w1", text)
       t.match("paused", text)
       t.match("wt ade/t1%-20260101%-000000/w1", text)
-      t.match("which one%?", text)
       -- Answered items disappear without another team.changed.
       service:team_inbox({
         id = "i1",
@@ -690,14 +822,344 @@ return function(t)
         end
         return false
       end, 5000, "the live watch update")
-      t.truthy(renders >= 2, "the watch view must be re-rendered for live updates")
+      wait(function()
+        return renders >= 2
+      end, 5000, "the watch view to render the live update")
       local ui = state().view.team_ui
       ui:watch(m.watching.session, "t1/w1")
       t.truthy(ui.watch_buf, "the watch view is open")
-      local text = table.concat(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false), "\n")
-      t.match("replay line", text)
-      t.match("live line", text, text)
+      local function text()
+        return table.concat(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false), "\n")
+      end
+      wait(function()
+        return text():find("replay line", 1, true) and text():find("live line", 1, true)
+      end, 5000, "the first watch paint")
+      t.match("replay line", text())
+      t.match("live line", text())
       m:unwatch()
+    end)
+
+    t.it("batches a 2000-frame replay into one render", function()
+      local replay = {}
+      for index = 1, 2000 do
+        replay[index] = {
+          sessionUpdate = "agent_message_chunk",
+          content = { type = "text", text = "frame " .. index .. "\n" },
+        }
+      end
+      local service, dir = start_service(t, "watch-batch", {
+        team_watch = { instance = "inst-w", sessionId = "sess-w", replay = replay },
+      })
+      setup(t, "watch-batch", service, dir)
+      controller.connect()
+      wait_ready()
+      local m = team()
+      local renders = 0
+      local original_watch = m.on_watch
+      m.on_watch = function(session, title)
+        renders = renders + 1
+        return original_watch and original_watch(session, title)
+      end
+      t.cleanup(function()
+        m.on_watch = original_watch
+      end)
+      local ok = nil
+      local started = vim.uv.hrtime()
+      m:watch("t1", "w1", true, function(result)
+        ok = result
+      end)
+      wait(function()
+        return ok == true and m.watching and m.watching.session
+      end, 10000, "the batched replay")
+      local elapsed = (vim.uv.hrtime() - started) / 1e6
+      t.eq(1, renders, "a replay batch renders once")
+      t.truthy(elapsed < 5000, string.format("the replay took %.0f ms", elapsed))
+      local session = m.watching.session
+      local text = {}
+      for _, block in ipairs(session.blocks or {}) do
+        text[#text + 1] = block.text or ""
+      end
+      t.match("frame 2000", table.concat(text, "\n"))
+      -- Live frames are coalesced: a burst may render more than once, but not
+      -- once per frame.
+      for index = 1, 100 do
+        service:watch_update("inst-w", "sess-w", {
+          sessionUpdate = "agent_message_chunk",
+          content = { type = "text", text = "live " .. index .. "\n" },
+        })
+      end
+      wait(function()
+        local joined = {}
+        for _, block in ipairs(session.blocks or {}) do
+          joined[#joined + 1] = block.text or ""
+        end
+        return table.concat(joined, "\n"):find("live 100", 1, true) ~= nil
+      end, 5000, "the live burst")
+      vim.wait(120)
+      t.truthy(renders <= 4, "live frames are coalesced, got " .. tostring(renders) .. " renders")
+      m:unwatch()
+    end)
+
+    t.it("skips a failing replay frame and still completes the watch", function()
+      local reducer = require("ade.session.reducer")
+      local original = reducer.apply
+      local calls = 0
+      reducer.apply = function(session, update)
+        calls = calls + 1
+        if calls == 1 then
+          error("synthetic reducer failure")
+        end
+        return original(session, update)
+      end
+      t.cleanup(function()
+        reducer.apply = original
+      end)
+      local service, dir = start_service(t, "watch-bad-frame", {
+        team_watch = {
+          instance = "inst-w",
+          sessionId = "sess-w",
+          replay = {
+            { sessionUpdate = "agent_message_chunk", content = { type = "text", text = "BAD" } },
+            { sessionUpdate = "agent_message_chunk", content = { type = "text", text = "GOOD" } },
+          },
+        },
+      })
+      setup(t, "watch-bad-frame", service, dir)
+      controller.connect()
+      wait_ready()
+      local m = team()
+      local ok = nil
+      m:watch("t1", "w1", true, function(result)
+        ok = result
+      end)
+      wait(function()
+        return ok == true
+      end, 5000, "the watch after a bad frame")
+      wait(function()
+        for _, block in ipairs(m.watching.session.blocks or {}) do
+          if (block.text or ""):find("GOOD", 1, true) then
+            return true
+          end
+        end
+        return false
+      end, 5000, "the valid frame")
+      t.eq(nil, m.watch_inflight)
+      m:unwatch()
+    end)
+
+    t.it("drops frames from a watch superseded during its replay", function()
+      local service, dir = start_service(t, "watch-stale", {
+        team_watch = {
+          instance = "inst-w",
+          sessionId = "sess-w",
+          delays = { 200, 10 },
+          replay = { { sessionUpdate = "agent_message_chunk", content = { type = "text", text = "STALE A" } } },
+        },
+      })
+      setup(t, "watch-stale", service, dir)
+      controller.connect()
+      wait_ready()
+      local m = team()
+      local ui = state().view.team_ui
+      ui.watcher:open("t1", "w1")
+      vim.wait(20)
+      service.team_watch.replay = {
+        { sessionUpdate = "agent_message_chunk", content = { type = "text", text = "FRESH B" } },
+      }
+      ui.watcher:open("t1", "w2")
+      wait(function()
+        if not (m.watching and m.watching.participant == "w2" and m.watching.session) then
+          return false
+        end
+        for _, block in ipairs(m.watching.session.blocks or {}) do
+          if (block.text or ""):find("FRESH B", 1, true) then
+            return true
+          end
+        end
+        return false
+      end, 5000, "the new watch")
+      local text = {}
+      for _, block in ipairs(m.watching.session.blocks or {}) do
+        text[#text + 1] = block.text or ""
+      end
+      local joined = table.concat(text, "\n")
+      t.match("FRESH B", joined)
+      t.falsy(joined:find("STALE A", 1, true), "stale frames must be dropped")
+      m:unwatch()
+    end)
+
+    t.it("closes during an in-flight replay and ignores the late result", function()
+      local service, dir = start_service(t, "watch-close", {
+        team_watch = {
+          instance = "inst-w",
+          sessionId = "sess-w",
+          delays = { 200 },
+          replay = { { sessionUpdate = "agent_message_chunk", content = { type = "text", text = "LATE" } } },
+        },
+      })
+      setup(t, "watch-close", service, dir)
+      controller.connect()
+      wait_ready()
+      local m = team()
+      local ui = state().view.team_ui
+      ui.watcher:open("t1", "w1")
+      wait(function()
+        return ui.watcher.watch_inflight == true
+      end, 5000, "the watch replay")
+      ui.watcher:close()
+      t.eq(nil, ui.watcher.participant)
+      t.eq(nil, ui.watcher.win)
+      vim.wait(300)
+      t.eq(false, ui.watcher.watch_inflight, "the late result clears the request")
+      t.eq(nil, ui.watcher.participant, "the late result must not reopen the watch")
+      t.eq(nil, m.watching)
+    end)
+
+    t.it("pages a long watch and jumps to the previous turn across pages", function()
+      local replay = {}
+      for turn = 1, 40 do
+        replay[#replay + 1] = {
+          sessionUpdate = "user_message_chunk",
+          content = { type = "text", text = "turn " .. turn },
+        }
+        replay[#replay + 1] = {
+          sessionUpdate = "agent_message_chunk",
+          content = { type = "text", text = "answer " .. turn },
+        }
+      end
+      -- One turn with more blocks than a page, plus an odd tail: the page
+      -- must start on a heading or a continuation line, not mid-turn.
+      for tool = 1, 60 do
+        replay[#replay + 1] = {
+          sessionUpdate = "tool_call",
+          toolCallId = "tail-" .. tool,
+          title = "tail tool " .. tool,
+          status = "completed",
+          rawInput = {},
+        }
+      end
+      local service, dir = start_service(t, "watch-pages", {
+        team_watch = { instance = "inst-w", sessionId = "sess-w", replay = replay },
+      })
+      setup(t, "watch-pages", service, dir)
+      controller.connect()
+      wait_ready()
+      local m = team()
+      local ok = false
+      m:watch("t1", "w1", true, function(result)
+        ok = result
+      end)
+      wait(function()
+        return ok
+      end, 5000, "team.watch")
+      local ui = state().view.team_ui
+      ui:watch(m.watching.session, "t1/w1")
+      local watch = ui.watcher
+      wait(function()
+        return watch.chat and watch.chat.page and not watch.chat.commit_job
+      end, 5000, "the paged watch")
+      local page = watch.chat.page
+      t.truthy(watch.chat.config.ui.render.pagination.turn_start, "watch wires turn alignment")
+      t.truthy(page.first > 1, "the watch pages old turns")
+      local before_first = page.first
+      local old_first = watch.chat.session.blocks[page.first]
+      -- The page starts on a heading, or says it continues the turn.
+      local page_ok = old_first.id:match("^watch%-turn%-") ~= nil
+      if page.continuation then
+        local buffer_text = table.concat(vim.api.nvim_buf_get_lines(watch.buf, 0, -1, false), "\n")
+        page_ok = page_ok or buffer_text:find("（" .. page.continuation .. "）", 1, true) ~= nil
+      end
+      t.truthy(page_ok, "a watch page starts on a turn heading or a continuation line: " .. tostring(old_first.id))
+      local current_turn
+      if page.continuation then
+        current_turn = tonumber(page.continuation:match("(%d+)"))
+      else
+        current_turn = tonumber(old_first.id:match("(%d+)$"))
+      end
+      local previous = current_turn
+      vim.api.nvim_set_current_win(watch.win)
+      vim.api.nvim_win_set_cursor(watch.win, { 1, 0 })
+      watch:jump_turn(-1)
+      wait(function()
+        return watch.chat.page.first < before_first and not watch.chat.commit_job and not watch.chat.layout_job
+      end, 5000, "the older page")
+      local cursor = vim.api.nvim_win_get_cursor(watch.win)[1]
+      local line = vim.api.nvim_buf_get_lines(watch.win and watch.buf or -1, cursor - 1, cursor, false)[1] or ""
+      t.match("── turn " .. tostring(previous - 1), line, "jump to the previous turn heading")
+      t.eq(watch.chat.session.blocks[watch.chat.page.first].kind, "system")
+      -- Collapsing a visible turn keeps the reader on the same heading/page.
+      local visible = watch:turn_lines()
+      local heading = visible[2] or visible[1]
+      t.truthy(heading)
+      vim.api.nvim_win_set_cursor(watch.win, { heading.line, 0 })
+      local page_before_fold = watch.chat.page.first
+      watch:toggle_at_cursor()
+      wait(function()
+        return not watch.chat.commit_job and not watch.chat.layout_job
+      end, 5000, "the collapsed turn")
+      local folded_line = vim.api.nvim_buf_get_lines(watch.buf, heading.line - 1, heading.line, false)[1] or ""
+      t.match("── turn %d+", folded_line, "the reader stays on the heading")
+      t.eq(page_before_fold, watch.chat.page.first)
+      watch:close()
+      m:unwatch()
+    end)
+
+    t.it("reports a failure of the newly selected watch", function()
+      local service, dir = start_service(t, "watch-b-fail", {
+        team_watch = { instance = "inst-w", sessionId = "sess-w", delays = { 10, 30 }, errors = { "", "B failed" } },
+      })
+      setup(t, "watch-b-fail", service, dir)
+      local notices = capture(t)
+      controller.connect()
+      wait_ready()
+      local ui = state().view.team_ui
+      ui.watcher:open("t1", "w1")
+      wait(function()
+        return ui.watch_buf ~= nil and team().watching and team().watching.participant == "w1"
+      end, 5000, "the first watch")
+      ui.watcher:open("t1", "w2")
+      wait(function()
+        for _, note in ipairs(notices) do
+          if note.message:find("B failed", 1, true) then
+            return true
+          end
+        end
+        return false
+      end, 5000, "the B failure notice")
+      t.eq(nil, team().watching)
+      t.eq(nil, ui.watch_buf)
+    end)
+
+    t.it("serializes replays and skips intermediate watch targets", function()
+      local service, dir = start_service(t, "watch-serialize", {
+        team_watch = {
+          instance = "inst-w",
+          sessionId = "sess-w",
+          delays = { 150, 10, 10 },
+          replay = { { sessionUpdate = "agent_message_chunk", content = { type = "text", text = "replay" } } },
+        },
+      })
+      setup(t, "watch-serialize", service, dir)
+      local notices = capture(t)
+      controller.connect()
+      wait_ready()
+      local ui = state().view.team_ui
+      ui.watcher:open("t1", "w1")
+      vim.wait(20)
+      ui.watcher:open("t1", "w2")
+      ui.watcher:open("t1", "w3")
+      wait(function()
+        return team().watching and team().watching.participant == "w3" and ui.watch_buf ~= nil
+      end, 5000, "the last target")
+      vim.wait(200)
+      t.eq("w3", team().watching.participant, "the intermediate target is skipped")
+      for _, note in ipairs(notices) do
+        t.falsy(
+          note.message:find("replay is already in progress", 1, true),
+          "the front end must not ask for two replays at once"
+        )
+      end
+      ui.watcher:close()
     end)
 
     t.it("does not inject anything when no template is configured", function()
@@ -758,13 +1220,14 @@ return function(t)
       t.eq(1, skipped)
     end)
 
-    local function defined_teams(over)
+    local function enabled_teams(over)
       return teams_config(vim.tbl_deep_extend("force", {
         enabled = true,
         default = "dev",
-        definitions = {
+        workflows = {
           dev = {
-            workers = {
+            summary = "two workers write code",
+            team = {
               { name = "w1", template = "worker", task = "T1" },
               { name = "w2", template = "worker" },
             },
@@ -786,124 +1249,75 @@ return function(t)
       }
     end
 
-    t.it("starts configured workers once when the leader creates the team", function()
-      local service, dir = start_service(t, "defined", { team_spawn_warning = "dirty_tree" })
-      setup(t, "defined", service, dir, { teams = defined_teams() })
+    t.it("starts the enabled default workflow once when the leader creates the team", function()
+      local service, dir = start_service(t, "enabled", {})
+      setup(t, "enabled", service, dir, { teams = enabled_teams() })
       local notices = capture(t)
       controller.connect()
       wait_ready()
       wait(function()
-        return #service.team_spawns == 2
-      end, 10000, "the configured workers")
-      t.eq("t1", service.team_spawns[1].team)
-      t.eq("w1", service.team_spawns[1].name)
-      t.eq("worker", service.team_spawns[1].template)
-      t.eq("T1", service.team_spawns[1].task)
-      t.eq("w2", service.team_spawns[2].name)
-      t.eq(nil, service.team_spawns[2].task)
-      wait(function()
-        local found = false
-        for _, note in ipairs(notices) do
-          if note.message:find("last commit", 1, true) then
-            found = true
-          end
-        end
-        return found
-      end, 5000, "the dirty-tree warning")
-      -- A second bind/reconnect for the same team must not start them again.
-      team():start_defined_workers("t1", team():team("t1"))
+        return #service.team_starts == 1
+      end, 10000, "the enabled workflow")
+      t.eq("t1", service.team_starts[1].team)
+      t.eq("dev", service.team_starts[1].workflow)
+      t.eq(nil, service.team_starts[1].task)
+      -- A second bind/reconnect for the same team must not start it again.
+      team():start_enabled_workers("t1", team():team("t1"))
       vim.wait(100)
-      t.eq(2, #service.team_spawns, "workers start only once per team")
+      t.eq(1, #service.team_starts, "the workflow starts only once per team")
+      for _, note in ipairs(notices) do
+        t.falsy(note.message:find("could not start workflow", 1, true), note.message)
+      end
     end)
 
-    t.it("does not start a defined worker that is already in the team", function()
-      local service, dir = start_service(t, "defined-existing", {
+    t.it("does not start the enabled workflow when the team already has a worker", function()
+      local service, dir = start_service(t, "enabled-existing", {
         team_participants = {
           { name = "leader", state = "idle", task = "_", queued = 0, turns = {} },
           { name = "w1", state = "exited", task = "_", queued = 0, turns = {} },
         },
       })
-      setup(t, "defined-existing", service, dir, { teams = defined_teams() })
+      setup(t, "enabled-existing", service, dir, { teams = enabled_teams() })
       controller.connect()
       wait_ready()
       wait(function()
-        return #service.team_spawns >= 1
-      end, 10000, "the missing worker")
-      vim.wait(100)
-      t.eq(1, #service.team_spawns)
-      t.eq("w2", service.team_spawns[1].name)
+        return team().bound[dir] ~= nil
+      end, 10000, "the bind")
+      vim.wait(200)
+      t.eq(0, #service.team_starts, "a team that already ran a workflow is not started again")
     end)
 
-    t.it("reports each defined worker that could not start", function()
-      local service, dir = start_service(t, "defined-failed", {
-        team_spawn_error = { code = -32061, message = "worker limit reached" },
+    t.it("reports a failed enabled workflow once", function()
+      local service, dir = start_service(t, "enabled-failed", {
+        team_start_error = { code = -32061, message = "worker limit reached" },
       })
-      setup(t, "defined-failed", service, dir, { teams = defined_teams() })
-      local notices = capture(t)
-      controller.connect()
-      wait_ready()
-      wait(function()
-        local n = 0
-        for _, note in ipairs(notices) do
-          if note.message:find("could not start worker", 1, true) then
-            n = n + 1
-          end
-        end
-        return n == 2
-      end, 10000, "one warning per failed worker")
-    end)
-
-    t.it("shows git's stderr when a configured worker cannot start", function()
-      local service, dir = start_service(t, "defined-git-error", {
-        team_spawn_error = {
-          code = -32066,
-          message = "git worktree add failed",
-          data = { stderr = "fatal: invalid reference: HEAD" },
-        },
-      })
-      setup(t, "defined-git-error", service, dir, { teams = defined_teams() })
+      setup(t, "enabled-failed", service, dir, { teams = enabled_teams() })
       local notices = capture(t)
       controller.connect()
       wait_ready()
       wait(function()
         for _, note in ipairs(notices) do
-          if note.message:find("fatal: invalid reference: HEAD", 1, true) then
+          if note.message:find("could not start workflow dev", 1, true) then
             return true
           end
         end
         return false
-      end, 10000, "git's stderr in the auto-start warning")
+      end, 10000, "the failed workflow notice")
+      t.eq(1, #service.team_starts)
     end)
 
-    t.it("does not warn when a defined worker name was already taken", function()
-      local service, dir = start_service(t, "defined-duplicate", {
-        team_spawn_error = { code = -32060, message = "worker name is already used" },
-      })
-      setup(t, "defined-duplicate", service, dir, { teams = defined_teams() })
-      local notices = capture(t)
-      controller.connect()
-      wait_ready()
-      wait(function()
-        return #service.team_spawns == 2
-      end, 10000, "the duplicate spawn attempts")
-      vim.wait(100)
-      for _, note in ipairs(notices) do
-        t.falsy(note.message:find("could not start worker", 1, true), "a duplicate start is only logged")
-      end
-    end)
-
-    t.it("does not start configured workers when binding the leader fails", function()
-      local service, dir = start_service(t, "defined-bind-failed", {
+    t.it("does not start the enabled workflow when binding the leader fails", function()
+      local service, dir = start_service(t, "enabled-bind-failed", {
         team_bind_error = { code = -32061, message = "another session leads this team" },
       })
-      setup(t, "defined-bind-failed", service, dir, { teams = defined_teams() })
+      setup(t, "enabled-bind-failed", service, dir, { teams = enabled_teams() })
       controller.connect()
       wait_ready()
       wait(function()
         return team().blocked[dir] == true
       end, 5000, "the failed bind")
       vim.wait(200)
-      t.eq(0, #service.team_spawns)
+      t.eq(0, #service.team_starts)
     end)
 
     t.it("does not inject a leader when another instance already leads the cwd", function()
@@ -1099,7 +1513,7 @@ return function(t)
       ui:close()
     end)
 
-    t.it("the panel's permission answer sends the option id, or none on cancel", function()
+    t.it("the panel delegates pending choices to the choice queue", function()
       local service, dir = start_service(t, "panel-permission")
       setup(t, "panel-permission", service, dir)
       controller.connect()
@@ -1108,7 +1522,42 @@ return function(t)
         id = "t1",
         cwd = dir,
         state = "active",
-        participants = {},
+        participants = { { name = "w1", state = "idle", task = "_", queued = 0, turns = {} } },
+        inbox = {},
+        limits = {},
+      })
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team())
+      local ui = state().view.team_ui
+      local queue = state().view.choices
+      local old_show = queue.show_pending
+      local shown
+      queue.show_pending = function(_, team_id)
+        shown = team_id
+        return true
+      end
+      t.cleanup(function()
+        queue.show_pending = old_show
+      end)
+      vim.api.nvim_set_current_win(ui.win)
+      vim.api.nvim_feedkeys("!", "x", false)
+      t.eq("t1", shown)
+      ui:close()
+    end)
+
+    t.it("the panel's permission answer sends the option id, or none on cancel", function()
+      local service, dir = start_service(t, "panel-permission")
+      setup(t, "panel-permission", service, dir)
+      controller.connect()
+      wait_ready()
+      controller.open()
+      service:team_changed({
+        id = "t1",
+        cwd = dir,
+        state = "active",
+        participants = { { name = "w1", state = "idle", task = "_", queued = 0, turns = {} } },
         inbox = {},
         limits = {},
       })
@@ -1126,27 +1575,28 @@ return function(t)
       end, 5000, "the permission item")
       t.eq(true, controller.open_team())
       local ui = state().view.team_ui
-      local lnum
-      for index, id in pairs(ui.ids) do
-        if id == "item:i1" then
-          lnum = index
-        end
-      end
-      t.truthy(lnum)
-      vim.api.nvim_win_set_cursor(ui.win, { lnum, 0 })
-      local original_select = vim.ui.select
-      t.cleanup(function()
-        vim.ui.select = original_select
-      end)
-      vim.ui.select = function(_, _, cb)
-        cb({ label = "Allow", value = "allow" })
-      end
-      vim.api.nvim_feedkeys("a", "x", false)
+      vim.api.nvim_set_current_win(ui.win)
+      vim.api.nvim_feedkeys("!", "x", false)
+      wait(function()
+        local queue = state().view.choices
+        return queue and queue:is_open()
+      end, 5000, "the choice component")
+      local view = state().view.choices.view
+      view:select(1)
       wait(function()
         return #service.team_answers == 1
       end, 5000, "the permission answer")
       t.eq("allow", service.team_answers[1].option)
 
+      service:team_inbox({
+        id = "i1",
+        team = "t1",
+        kind = "permission",
+        from = "w1",
+        body = "",
+        options = { { kind = "allow_once", optionId = "allow", name = "Allow" } },
+        state = "answered",
+      })
       service:team_inbox({
         id = "i2",
         team = "t1",
@@ -1157,24 +1607,21 @@ return function(t)
         state = "open",
       })
       wait(function()
-        local line
-        for index, id in pairs(ui.ids) do
-          if id == "item:i2" then
-            line = index
-          end
-        end
-        return line ~= nil
+        return team():item("i2") ~= nil and team():item("i1") == nil
       end, 5000, "the second item")
-      for index, id in pairs(ui.ids) do
-        if id == "item:i2" then
-          lnum = index
-        end
+      if not (state().view.team_ui and state().view.team_ui:is_open()) then
+        controller.open_team()
       end
-      vim.api.nvim_win_set_cursor(ui.win, { lnum, 0 })
-      vim.ui.select = function(_, _, cb)
-        cb({ label = "Cancel", value = false })
-      end
-      vim.api.nvim_feedkeys("a", "x", false)
+      ui = state().view.team_ui
+      vim.api.nvim_set_current_win(ui.win)
+      vim.api.nvim_feedkeys("!", "x", false)
+      wait(function()
+        local queue = state().view.choices
+        return queue and queue:is_open()
+      end, 5000, "the second choice component")
+      local second = state().view.choices.view
+      local second_options = second:options(second.model.questions[1])
+      second:select(#second_options)
       wait(function()
         return #service.team_answers == 2
       end, 5000, "the cancelled answer")
@@ -1590,6 +2037,408 @@ return function(t)
       ui:close()
     end)
 
+    t.it("renders watched tools, diffs, turns, plans and bus messages", function()
+      local service, dir = start_service(t, "watch-render", {
+        team_watch = {
+          instance = "inst-w",
+          sessionId = "sess-w",
+          replay = {
+            {
+              sessionUpdate = "user_message_chunk",
+              content = {
+                type = "text",
+                text = 'You are w1, a worker in team t1.\n<team_role>\nROLE TEXT</team_role><bus from="leader" kind="task" task="T4">do work</bus>',
+              },
+            },
+            {
+              sessionUpdate = "tool_call",
+              toolCallId = "call-edit",
+              title = "Edit src/a.rs",
+              kind = "edit",
+              status = "in_progress",
+              content = {
+                { type = "diff", path = "src/a.rs", oldText = "old line", newText = "new line" },
+              },
+            },
+            { sessionUpdate = "agent_message_chunk", content = { type = "text", text = "implemented" } },
+          },
+        },
+      })
+      setup(t, "watch-render", service, dir)
+      controller.connect()
+      wait_ready()
+      local m = team()
+      local ok = false
+      m:watch("t1", "w1", true, function(result)
+        ok = result
+      end)
+      wait(function()
+        return ok
+      end, 5000, "team.watch")
+      local ui = state().view.team_ui
+      ui:watch(m.watching.session, "t1/w1")
+      t.truthy(ui.watch_buf, "the watch view is open")
+      local function text()
+        return table.concat(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false), "\n")
+      end
+      wait(function()
+        return text():find("── turn 1", 1, true) and text():find("leader → task T4", 1, true)
+      end, 5000, "the first turn heading and bus message")
+      t.match("role card", text(), text())
+      t.falsy(text():find("ROLE TEXT", 1, true), "the role card starts collapsed")
+      t.match("src/a.rs", text())
+      local turn1
+      for _, line in ipairs(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false)) do
+        if line:find("── turn 1", 1, true) then
+          turn1 = line
+        end
+      end
+      t.truthy(turn1)
+      t.falsy(turn1:match("%d+%.%ds"), "a replayed turn has no reliable duration")
+
+      -- Synthetic blocks keep their expansion across live refreshes.
+      local role_line
+      for index, line in ipairs(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false)) do
+        if line:find("role card", 1, true) then
+          role_line = index
+        end
+      end
+      t.truthy(role_line)
+      vim.api.nvim_set_current_win(ui.watch_win)
+      vim.api.nvim_win_set_cursor(ui.watch_win, { role_line, 0 })
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Tab>", true, false, true), "x", false)
+      wait(function()
+        return text():find("ROLE TEXT", 1, true)
+      end, 5000, "the role card expansion")
+
+      -- A second live turn with a plan, a diff and a bus tool call.
+      service:turn_started("inst-w", {
+        sessionId = "sess-w",
+        origin = "bus",
+        prompt = {
+          { type = "text", text = '<bus from="leader" kind="task" task="T5">second task</bus>' },
+        },
+      })
+      service:watch_update("inst-w", "sess-w", {
+        sessionUpdate = "plan",
+        entries = {
+          { content = "补 reconnect 的回归测试", status = "in_progress", priority = "high" },
+        },
+      })
+      service:watch_update("inst-w", "sess-w", {
+        sessionUpdate = "tool_call",
+        toolCallId = "call-bus",
+        title = "ade-team_bus_send",
+        status = "completed",
+        rawInput = { to = "leader", kind = "report", task = "T4", body = "tests pass" },
+      })
+      service:turn_finished("inst-w", { sessionId = "sess-w", stopReason = "end_turn" })
+      wait(function()
+        local body = text()
+        return body:find("── turn 2", 1, true)
+          and body:find("leader → task T5", 1, true)
+          and body:find("补 reconnect 的回归测试", 1, true)
+          and body:find("→ leader report T4", 1, true)
+          and body:find("tests pass", 1, true)
+      end, 5000, "the second turn, plan and bus message")
+
+      -- The diff is rendered by the normal tool card, not flattened text.
+      local edit_line
+      for index, line in ipairs(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false)) do
+        if line:find("src/a.rs", 1, true) then
+          edit_line = index
+        end
+      end
+      t.truthy(edit_line)
+      vim.api.nvim_set_current_win(ui.watch_win)
+      vim.api.nvim_win_set_cursor(ui.watch_win, { edit_line, 0 })
+      -- The chat's own tool-expansion key works here too.
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Tab>", true, false, true), "x", false)
+      wait(function()
+        local body = text()
+        return body:find("old line", 1, true) or body:find("new line", 1, true)
+      end, 5000, "the expanded diff")
+
+      -- The watch window owns a read-only Chat and no composer.
+      t.truthy(ui.watcher.chat, "the watch view uses Chat")
+      t.eq("ade_team_watch", vim.bo[ui.watch_buf].filetype)
+      t.eq(1, #vim.fn.win_findbuf(ui.watch_buf), "one watch window")
+
+      -- za on a heading collapses the whole turn; a second za restores it.
+      local heading
+      for index, line in ipairs(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false)) do
+        if line:find("── turn 2", 1, true) then
+          heading = index
+        end
+      end
+      t.truthy(heading)
+      vim.api.nvim_set_current_win(ui.watch_win)
+      vim.api.nvim_win_set_cursor(ui.watch_win, { heading, 0 })
+      vim.api.nvim_feedkeys("za", "x", false)
+      wait(function()
+        return text():find("── turn 2 · bus · leader → task T5 ·", 1, true)
+          and text():find("(collapsed)", 1, true)
+          and not text():find("补 reconnect 的回归测试", 1, true)
+      end, 5000, "the collapsed turn")
+      local heading2
+      for index, line in ipairs(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false)) do
+        if line:find("── turn 2", 1, true) then
+          heading2 = index
+        end
+      end
+      t.truthy(heading2)
+      vim.api.nvim_set_current_win(ui.watch_win)
+      vim.api.nvim_win_set_cursor(ui.watch_win, { heading2, 0 })
+      vim.api.nvim_feedkeys("za", "x", false)
+      wait(function()
+        return not text():find("(collapsed)", 1, true) and text():find("补 reconnect 的回归测试", 1, true)
+      end, 5000, "the expanded turn")
+
+      -- ]] / [[ go to the next / previous turn heading.
+      vim.api.nvim_set_current_win(ui.watch_win)
+      vim.api.nvim_win_set_cursor(ui.watch_win, { 1, 0 })
+      vim.api.nvim_feedkeys("]]", "x", false)
+      local cursor = vim.api.nvim_win_get_cursor(ui.watch_win)[1]
+      t.match("── turn 1", vim.api.nvim_buf_get_lines(ui.watch_buf, cursor - 1, cursor, false)[1] or "")
+      vim.api.nvim_feedkeys("]]", "x", false)
+      cursor = vim.api.nvim_win_get_cursor(ui.watch_win)[1]
+      t.match("── turn 2", vim.api.nvim_buf_get_lines(ui.watch_buf, cursor - 1, cursor, false)[1] or "")
+      vim.api.nvim_feedkeys("[[", "x", false)
+      cursor = vim.api.nvim_win_get_cursor(ui.watch_win)[1]
+      t.match("── turn 1", vim.api.nvim_buf_get_lines(ui.watch_buf, cursor - 1, cursor, false)[1] or "")
+
+      -- Live updates reuse the same display session: no repeated full
+      -- `set_session` and the user's scroll position is preserved.
+      local chat = ui.watcher.chat
+      local original_set_session = chat.set_session
+      local set_sessions = 0
+      chat.set_session = function(self, session)
+        set_sessions = set_sessions + 1
+        return original_set_session(self, session)
+      end
+      chat.follow = false
+      vim.api.nvim_set_current_win(ui.watch_win)
+      vim.api.nvim_win_set_cursor(ui.watch_win, { 1, 0 })
+      service:watch_update("inst-w", "sess-w", {
+        sessionUpdate = "agent_message_chunk",
+        content = { type = "text", text = "follow up" },
+      })
+      wait(function()
+        return text():find("follow up", 1, true)
+      end, 5000, "the live update")
+      t.eq(0, set_sessions, "live updates do not call set_session again")
+      t.eq(1, vim.api.nvim_win_get_cursor(ui.watch_win)[1], "the scroll position is preserved")
+      t.eq(false, chat.follow, "the follow state is preserved")
+      t.match("ROLE TEXT", text(), "synthetic expansion survives a refresh")
+      m:unwatch()
+    end)
+
+    t.it("only bus tools become messages and only the first prompt has a role card", function()
+      local watch = require("ade.ui.team.watch")
+      t.eq(
+        nil,
+        watch.bus_tool({ kind = "tool", tool_name = "create_issue", raw_input = { body = "x" } }),
+        "a tool with a body argument is not a bus message"
+      )
+      local direct = watch.bus_tool({
+        kind = "tool",
+        tool_name = "mcp__ade-team__bus_send",
+        raw_input = { to = "leader", kind = "report", task = "T4", body = "done" },
+      })
+      t.truthy(direct)
+      t.match("→ leader report T4", direct.title)
+      t.match("done", direct.text)
+      local proxy = watch.bus_tool({
+        kind = "tool",
+        tool_name = "mcp",
+        raw_input = {
+          tool = "bus_ask_human",
+          args = { question = "keep it?" },
+        },
+      })
+      t.truthy(proxy)
+      t.match("提问", proxy.title)
+      t.match("keep it?", proxy.text)
+      local role, message = watch.split_role("You are w1, a worker.")
+      t.eq(nil, role)
+      t.match("You are w1", message)
+      role, message = watch.split_role('You are w1<bus from="leader" kind="task">do</bus>')
+      t.truthy(role)
+      t.match("do", message)
+    end)
+
+    t.it("rapid A-B-A switching keeps the last watch and does not unwatch it again", function()
+      local service, dir = start_service(t, "watch-rapid", {
+        team_watch = { instance = "inst-w", sessionId = "sess-w", delays = { 200, 10, 10 } },
+      })
+      setup(t, "watch-rapid", service, dir)
+      controller.connect()
+      wait_ready()
+      local ui = state().view.team_ui
+      ui.watcher:open("t1", "w1")
+      vim.wait(30)
+      ui.watcher:open("t1", "w2")
+      vim.wait(30)
+      ui.watcher:open("t1", "w1")
+      wait(function()
+        return team().watching
+          and team().watching.participant == "w1"
+          and ui.watch_buf ~= nil
+          and vim.api.nvim_buf_is_valid(ui.watch_buf)
+      end, 5000, "the final A watch")
+      vim.wait(400)
+      t.eq("w1", team().watching.participant, "a stale A response must not replace the new A")
+      local unwatches = 0
+      for _, call in ipairs(service.team_unwatch or {}) do
+        if call.participant == "w1" then
+          unwatches = unwatches + 1
+        end
+      end
+      t.eq(0, unwatches, "A stays current, so B is skipped and A is never unwatched")
+      ui.watcher:close()
+    end)
+
+    t.it("a superseded watch failure does not clear the current watch", function()
+      local service, dir = start_service(t, "watch-superseded-fail", {
+        team_watch = {
+          instance = "inst-w",
+          sessionId = "sess-w",
+          delays = { 120, 10 },
+          errors = { "superseded failure" },
+        },
+      })
+      setup(t, "watch-superseded-fail", service, dir)
+      controller.connect()
+      wait_ready()
+      local ui = state().view.team_ui
+      ui.watcher:open("t1", "w1")
+      vim.wait(20)
+      ui.watcher:open("t1", "w2")
+      wait(function()
+        return team().watching and team().watching.participant == "w2" and ui.watch_buf ~= nil
+      end, 5000, "the current w2 watch")
+      vim.wait(200)
+      t.eq("w2", team().watching.participant)
+      t.truthy(ui.watch_buf and vim.api.nvim_buf_is_valid(ui.watch_buf))
+      ui.watcher:close()
+    end)
+
+    t.it("closing during an in-flight watch request releases it", function()
+      local service, dir = start_service(t, "watch-inflight-close", {
+        team_watch = { instance = "inst-w", sessionId = "sess-w", delays = { 120 } },
+      })
+      setup(t, "watch-inflight-close", service, dir)
+      controller.connect()
+      wait_ready()
+      local ui = state().view.team_ui
+      ui.watcher:open("t1", "w1")
+      ui.watcher:close()
+      vim.wait(250)
+      t.eq(nil, team().watching, "the late response must not leave a watch")
+      t.eq(nil, ui.watch_buf, "the late response must not open a window")
+      t.truthy(#(service.team_unwatch or {}) >= 1, "the in-flight watch is released")
+    end)
+
+    t.it("shows the replay fallback notice and supplements it from team.read", function()
+      local service, dir = start_service(t, "watch-fallback", {
+        team_watch = {
+          instance = "inst-w",
+          sessionId = "sess-w",
+          replayed = false,
+          replay = {
+            { sessionUpdate = "agent_message_chunk", content = { type = "text", text = "live only" } },
+          },
+        },
+        team_read = {
+          messages = {
+            { from = "leader", to = "w1", kind = "task", task = "T9", body = "earlier instruction" },
+          },
+          turns = { { at = 1, text = "earlier turn text" } },
+        },
+      })
+      setup(t, "watch-fallback", service, dir)
+      controller.connect()
+      wait_ready()
+      local m = team()
+      local ok = false
+      m:watch("t1", "w1", true, function(result)
+        ok = result
+      end)
+      wait(function()
+        return ok
+      end, 5000, "team.watch")
+      local ui = state().view.team_ui
+      ui:watch(m.watching.session, "t1/w1")
+      local function text()
+        return table.concat(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false), "\n")
+      end
+      wait(function()
+        local body = text()
+        return body:find("会话过长，只显示观察开始之后的内容", 1, true)
+          and body:find("earlier instruction", 1, true)
+          and body:find("earlier turn text", 1, true)
+      end, 5000, "the replay fallback and team.read supplement")
+      m:unwatch()
+    end)
+
+    t.it("watch open toggles the same participant and pairs unwatch/watch", function()
+      local service, dir = start_service(t, "watch-toggle", {
+        team_watch = { instance = "inst-w", sessionId = "sess-w" },
+      })
+      setup(t, "watch-toggle", service, dir)
+      controller.connect()
+      wait_ready()
+      local ui = state().view.team_ui
+      ui.watcher:open("t1", "w1")
+      wait(function()
+        return ui.watch_buf ~= nil and vim.api.nvim_buf_is_valid(ui.watch_buf)
+      end, 5000, "the first watch")
+      local first = ui.watch_buf
+      ui.watcher:open("t1", "w1")
+      wait(function()
+        return ui.watch_buf == nil and team().watching == nil
+      end, 5000, "the same participant to close the watch")
+
+      ui.watcher:open("t1", "w2")
+      wait(function()
+        return ui.watch_buf ~= nil and ui.watch_buf ~= first and team().watching and team().watching.participant == "w2"
+      end, 5000, "the other worker")
+      local found = false
+      for _, call in ipairs(service.team_unwatch or {}) do
+        if call.participant == "w1" then
+          found = true
+        end
+      end
+      t.truthy(found, "switching away unwatches the previous worker")
+      ui.watcher:close()
+      wait(function()
+        return ui.watch_buf == nil and team().watching == nil
+      end, 5000, "the closed watch")
+    end)
+
+    t.it("selecting the leader reuses the existing chat window", function()
+      local service, dir = start_service(t, "watch-leader")
+      setup(t, "watch-leader", service, dir)
+      controller.connect()
+      wait_ready()
+      controller.open()
+      local chat = state().view.chat
+      wait(function()
+        return chat.win ~= nil and vim.api.nvim_win_is_valid(chat.win)
+      end, 5000, "the leader chat window")
+      local ui = state().view.team_ui
+      ui.watcher:open("t1", "w1")
+      wait(function()
+        return ui.watch_buf ~= nil
+      end, 5000, "the worker watch")
+      ui.watcher:open("t1", "leader")
+      wait(function()
+        return ui.watch_buf == nil and vim.api.nvim_get_current_win() == chat.win
+      end, 5000, "focus the leader's own chat")
+      t.eq(nil, ui.watcher.chat, "no second Chat is created for the leader")
+      t.eq(nil, team().watching, "the leader is not watched")
+    end)
+
     t.it("ends the watch when its window, the panel, or the team goes away", function()
       local service, dir = start_service(t, "watch-end")
       setup(t, "watch-end", service, dir)
@@ -1746,8 +2595,13 @@ return function(t)
         local t1 = team():team("t1")
         return t1 ~= nil and t1.stale == true
       end, 5000, "the stale team")
-      local text = table.concat(vim.api.nvim_buf_get_lines(ui.buf, 0, -1, false), "\n")
-      t.match("connection lost", text)
+      local function panel_text()
+        return table.concat(vim.api.nvim_buf_get_lines(ui.buf, 0, -1, false), "\n")
+      end
+      wait(function()
+        return panel_text():find("connection lost", 1, true)
+      end, 5000, "the stale panel notice")
+      t.match("connection lost", panel_text())
 
       local sends = #service.team_sends
       local leader_line
@@ -1799,23 +2653,23 @@ return function(t)
       end, 5000, "a failed refresh to clear the list")
     end)
 
-    t.it("does not start configured workers when bind leaves the team suspended", function()
+    t.it("does not start the enabled workflow for a suspended team", function()
       local service, dir = start_service(t, "suspended-bind", {})
-      setup(t, "suspended-bind", service, dir, { teams = defined_teams() })
+      setup(t, "suspended-bind", service, dir, { teams = enabled_teams() })
       controller.connect()
       wait_ready()
       wait(function()
-        return #service.team_spawns == 2
-      end, 10000, "the configured workers")
-      local before = #service.team_spawns
-      team():start_defined_workers("t-suspended", {
+        return #service.team_starts == 1
+      end, 10000, "the enabled workflow")
+      local before = #service.team_starts
+      team():start_enabled_workers("t-suspended", {
         id = "t-suspended",
         state = "suspended",
         participants = {},
       })
       vim.wait(100)
-      t.eq(before, #service.team_spawns)
-      t.eq(nil, team().started_workers["t-suspended"])
+      t.eq(before, #service.team_starts)
+      t.eq(nil, team().enabled_teams["t-suspended"])
     end)
 
     t.it("keeps teams across a disconnect and shows suspended teams after hello", function()
@@ -1857,11 +2711,7 @@ return function(t)
         { name = "leader", state = "idle", task = "_", queued = 0, turns = {} },
         { name = "w1", state = "idle", task = "_", queued = 0, turns = {}, template = "worker" },
       })
-      setup(t, "suspended-resume", service, dir, {
-        teams = defined_teams({
-          definitions = { dev = { workers = { { name = "w1", template = "worker" } } } },
-        }),
-      })
+      setup(t, "suspended-resume", service, dir, { teams = enabled_teams() })
       controller.connect()
       wait_ready()
       wait(function()
@@ -1890,7 +2740,7 @@ return function(t)
       t.truthy(configure_at and leader_at, "configure and leader_server")
       t.truthy(configure_at < leader_at, "configure must precede leader injection")
       vim.wait(100)
-      t.eq(0, #service.team_spawns, "recovered participants are not started again")
+      t.eq(0, #service.team_starts, "recovered participants are not started again")
 
       local session = state().sess.current
       local instance = state().conn.client.proc.instance
@@ -2067,15 +2917,19 @@ return function(t)
       t.eq("notice", service.team_sends[1].kind)
       t.eq("queued while suspended", service.team_sends[1].body)
 
-      vim.ui.input = function(_, cb)
-        cb("yes please")
+      local queue = state().view.choices
+      local old_answer = queue.answer_participant
+      local answered
+      queue.answer_participant = function(_, _, name)
+        answered = name
+        return true
       end
-      vim.api.nvim_win_set_cursor(ui.win, { line_of("item:i1"), 0 })
+      t.cleanup(function()
+        queue.answer_participant = old_answer
+      end)
+      vim.api.nvim_win_set_cursor(ui.win, { line_of("t1|w1"), 0 })
       vim.api.nvim_feedkeys("a", "x", false)
-      wait(function()
-        return #service.team_answers == 1
-      end, 5000, "the answered question")
-      t.eq("yes please", service.team_answers[1].text)
+      t.eq("w1", answered)
 
       vim.ui.select = function(_, _, cb)
         cb({ label = "Remove worktree", value = false })

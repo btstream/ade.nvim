@@ -1196,13 +1196,119 @@ fn a_version_one_log_migrates_without_losing_events() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let tables: i64 = conn
         .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('teams', 'team_meta')",
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table'
+             AND name IN ('teams', 'team_meta', 'boards', 'card_history', 'workflows')",
             [],
             |row| row.get(0),
         )
         .expect("tables");
-    assert_eq!(tables, 2);
+    assert_eq!(tables, 5);
+}
+
+#[test]
+fn a_version_two_log_with_data_keeps_events_and_teams_when_upgraded() {
+    let dir = TempDir::new("migrate-v2");
+    let path = dir.db();
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    {
+        let store = Store::open(&path).expect("open");
+        store
+            .append(event("old-instance", Some("old-session"), "kept"))
+            .expect("append");
+        store
+            .save_team("t7", r#"{"id":"t7","cwd":"/p"}"#, 7, 3)
+            .expect("save team");
+        store
+            .save_board(
+                "t7",
+                4,
+                r#"{"rev":4,"columns":[],"cards":[]}"#,
+                &[("T1".to_string(), r#"{"id":"T1"}"#.to_string(), 3, 1)],
+                &[],
+            )
+            .expect("save board");
+        store
+            .save_workflow("project", "/p", "review", r#"{"name":"review"}"#, 5)
+            .expect("save workflow");
+    }
+    // Turn the file into the v2 schema: the team tables, none of the v3 ones.
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw");
+        conn.execute_batch(
+            "DROP TABLE boards; DROP TABLE card_history; DROP TABLE workflows; \
+             PRAGMA user_version = 2;",
+        )
+        .expect("downgrade");
+    }
+    let store = Store::open(&path).expect("migrate");
+    let events = store.read(&Query::new("old-instance")).expect("read");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].message, "kept");
+    let teams = store.load_teams().expect("teams");
+    assert_eq!(teams.len(), 1);
+    assert_eq!(teams[0].0, "t7");
+    assert!(store.load_board("t7").expect("board").is_none());
+    assert!(store.load_workflows().expect("workflows").is_empty());
+    let conn = rusqlite::Connection::open(&path).expect("open raw");
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("version");
+    assert_eq!(version, 3);
+    let tables: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table'
+             AND name IN ('boards', 'card_history', 'workflows')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("tables");
+    assert_eq!(tables, 3);
+}
+
+#[test]
+fn workflows_are_stored_per_scope_and_project_and_survive_reopening() {
+    let dir = TempDir::new("workflows");
+    let path = dir.db();
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    let workflow =
+        r#"{"name":"review","summary":"by pi","text":"step","team":[],"scope":"project"}"#;
+    {
+        let store = Store::open(&path).expect("open");
+        store
+            .save_workflow("project", "/repo/.git", "review", workflow, 1)
+            .expect("save");
+        store
+            .save_workflow("user", "", "review", workflow, 2)
+            .expect("save user");
+        store
+            .save_workflow("project", "/repo/.git", "dev", workflow, 3)
+            .expect("save dev");
+    }
+    let store = Store::open(&path).expect("reopen");
+    let rows = store.load_workflows().expect("load");
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert!(rows.iter().any(|(scope, project, name, json)| {
+        scope == "project" && project == "/repo/.git" && name == "review" && json == workflow
+    }));
+    assert!(rows.iter().any(|(scope, project, name, _)| scope == "user"
+        && project.is_empty()
+        && name == "review"));
+    // Replacing keeps one row per key; deleting is exact.
+    store
+        .save_workflow(
+            "project",
+            "/repo/.git",
+            "review",
+            "{\"name\":\"review\"}",
+            4,
+        )
+        .expect("replace");
+    assert_eq!(store.load_workflows().expect("load").len(), 3);
+    store.delete_workflow("user", "", "review").expect("delete");
+    let rows = store.load_workflows().expect("load");
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|(scope, _, _, _)| scope == "project"));
 }

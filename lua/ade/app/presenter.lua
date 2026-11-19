@@ -16,6 +16,13 @@ function M.select(opts)
   return require("ade.ui.picker").select(opts)
 end
 
+---Yes/no confirmation through the same picker as `select`.
+---@param title string
+---@param on_choice fun(choice: string)
+function M.confirm(title, on_choice)
+  return require("ade.ui.picker").confirm(title, on_choice)
+end
+
 ---Own the floating permission-details window.
 M.details = {
   open = function(request, opts)

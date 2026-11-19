@@ -5,7 +5,7 @@ Neovim, one process per user, and holds ACP agent processes so they outlive the
 front end. It relays raw ACP JSON-RPC between an agent and whichever front end
 is attached; it is not an ACP client itself.
 
-The protocol (api_version 5) is specified in [`PROTOCOL.md`](PROTOCOL.md). That
+The protocol (api_version 6) is specified in [`PROTOCOL.md`](PROTOCOL.md). That
 document is the contract: socket and token paths are in "Where things live"
 below, everything else is there.
 
@@ -14,7 +14,7 @@ below, everything else is there.
 | Command | What it does |
 |---|---|
 | `nvim_ade_server serve [--socket <path>] [--idle-timeout <secs>] [--print-paths] [--event-log on\|off] [--event-log-max-mb <n>]` | Run the service. `--idle-timeout` overrides `NVIM_ADE_SERVER_IDLE_TIMEOUT_SECS` (default 1800); `--print-paths` prints the resolved paths and exits without binding. `--event-log` (default `on`) and `--event-log-max-mb` (default 256, 16–4096) are the event log flags of PROTOCOL.md section 15. |
-| `nvim_ade_server version` | Print `{"version":"0.6.0","api_version":5}` on one line. |
+| `nvim_ade_server version` | Print `{"version":"0.7.1","api_version":6}` on one line. |
 | `nvim_ade_server mcp` | MCP over stdio for a team participant. Reads `ADE_TEAM_TOKEN` from the environment (never from argv) and connects to the service socket; it never prints the token. |
 
 `serve` prints exactly one line on stdout:
@@ -26,7 +26,8 @@ below, everything else is there.
 ```
 
 `ready` and `already_running` exit 0; `error` exits 1. Everything else
-(including logs) goes to stderr.
+(including logs) also goes to stderr; the service additionally writes the same
+lines to `<dir>/nvim_ade_server.log` (0600, rotated to `.log.1` at 4 MiB).
 
 ## Where things live
 
@@ -45,6 +46,7 @@ On Windows `<dir>` is `%LOCALAPPDATA%\ade` and the socket is the named pipe
 | `<dir>/nvim_ade_server.sock` | Front-end socket (permission 0600). |
 | `<dir>/nvim_ade_server.token` | Front-end token, one line, permission 0600. Created once and reused while it stays trustworthy. |
 | `<dir>/nvim_ade_server.lock` | Single-instance lock (an OS file lock, so it is released automatically if the process dies). The running instance also writes its socket path here, so a second `serve` can report the live socket. |
+| `<dir>/nvim_ade_server.log` | Service log (0600). Rotated to `nvim_ade_server.log.1` when it reaches 4 MiB; one old file is kept. `:checkhealth ade` and `:Ade service status` print this path. |
 
 `<dir>` itself is 0700.
 
@@ -136,7 +138,7 @@ is kept for `agent.exited`.
 [`PROTOCOL.md`](PROTOCOL.md) is normative; this is a short orientation.
 
 JSON-RPC 2.0, one UTF-8 JSON object per line, terminated by `\n`, max 64 MiB.
-The current `api_version` is **5** and `hello` reports `features: ["tunnel",
+The current `api_version` is **6** and `hello` reports `features: ["tunnel",
 "install", "policy", "log", "teams"]` on unix (`"install"` is absent on Windows;
 with `--event-log off` `"log"` and `"teams"` are absent too, because teams need
 the event log). A participant connection (`hello.participant_token`) gets an
@@ -149,9 +151,11 @@ empty `features` list and may call only `bus.*`.
 | `install.resolve / run / uninstall` | front end → service | managed npm installs, unix only (PROTOCOL.md 16) |
 | `policy.set / clear / list` | front end → service | permission rule sets (PROTOCOL.md 17) |
 | `policy.applied` (notification) | service → attached front ends | a request the policy answered itself |
-| `team.configure / leader_server / bind_leader / list / send / read / answer / watch / unwatch / reset_limits / close` | front end → service | teams and the bus (PROTOCOL.md 18) |
+| `team.configure / leader_server / bind_leader / list / send / read / answer / answer_group / watch / unwatch / reset_limits / close` | front end → service | teams and the bus (PROTOCOL.md 18, 19) |
+| `team.start / workflows / workflow_delete / board / card_history` | front end → service | workflows and the board (PROTOCOL.md 19) |
 | `bus.spawn / send / ask_human / status / read` | participant (MCP) → service | tools for a team agent (PROTOCOL.md 18.6) |
-| `team.changed`, `team.inbox` (notifications) | service → every front end | team state and inbox changes |
+| `bus.board_update / card_update / workflow_save / workflow_get / workflow_delete` | participant (MCP) → service | board and workflow tools (PROTOCOL.md 19.5, 19.10) |
+| `team.changed`, `team.inbox`, `team.board_changed` (notifications) | service → every front end | team state, inbox and board changes |
 | `install.progress` (notification) | service → every front end | install/uninstall progress |
 | `$/cancel_request` (notification) | front end → service | cancel that connection's running install request |
 | `tunnel.send` (notification) | front end → service | one ACP message for an instance |
@@ -259,14 +263,15 @@ dependencies. Each one is listed here as required:
 |---|---|---|
 | `random` | `src/lib.rs`, used in `src/token.rs` | `std::random::random` generates the 32 random bytes of the front-end token, so no `rand`/`getrandom` dependency is needed. Remove it once `std::random` is stabilised. |
 
-## Teams (api_version 5)
+## Teams, boards and workflows (api_version 6)
 
-With the event log on, `hello` also offers `"teams"` (PROTOCOL.md section 18).
-A team is one leader agent plus up to `max_workers` worker agents that talk
-through a bus the service owns, with `human` as a participant. The front end
-configures templates, asks for a leader server entry, binds the leader session
-and drives the team with `team.*`; the agents call the `nvim_ade_server mcp`
-subprocess, which speaks MCP over stdio and translates its tools to `bus.*`.
+With the event log on, `hello` offers `"teams"` (PROTOCOL.md section 19). A team
+is one leader agent plus up to `max_workers` worker agents that talk through a
+bus the service owns, with `human` as a participant. The front end configures
+templates, named workflows and the default workflow, asks for a leader server
+entry, binds the leader session and drives the team with `team.*`; the agents
+call the `nvim_ade_server mcp` subprocess, which speaks MCP over stdio and
+translates its tools to `bus.*`.
 
 Workers are spawned by the service and are deliberately **not** in the
 `agent.attach` identity table: a front end can only watch one with
@@ -276,15 +281,103 @@ Bus messages are delivered as `<bus ...>` prompt blocks; the service records
 the delivered prompt and the agent's notifications in the worker's own event
 log (`team:<instance>`), which is what a watcher replay reads.
 
-Teams live in memory. After a service restart there are none, and a front end
-treats every team it knew as ended. Worktrees for workers, teams started from
-configuration and restart recovery are S4c. Participant tokens are at least 128
-random bits and kept only as hashes; neither tokens nor template environments
-are written to the event log, `team.list` or stderr.
+The service validates, stores, relays and extracts; it has no workflow state
+machine. What matters on the service side:
+
+- **Templates** name an agent (`key.agent`), an optional `model`, `role`,
+  `models` (allowed spawn models; empty = any) and `worktree`; the front end
+  also sends `tool_style` for agents that reach MCP tools through a proxy.
+- **Spawns** take an optional `model` and `role`. After `session/new` the
+  service checks the agent's `configOptions`: a model the agent does not offer
+  stops the worker (`reason: "model unavailable: <model>"`) and sends the
+  leader a notice with the offered values instead of silently ignoring it.
+  Every inbox `spawn` item carries `model`, `role`, `agent` and a `group`;
+  `team.answer_group` answers a whole leader-prompt group at once and reports
+  partially failed items in `failed`.
+- **Named workflows** (`bus.workflow_save/get/delete`, `team.workflows`,
+  `team.workflow_delete`) resolve as config > project > user > builtin
+  `default`. The project key is the canonical
+  `git rev-parse --git-common-dir` of the team's cwd (worktrees share it), or
+  the canonical cwd. Stored workflows are capped at 100 per scope and project.
+- **Boards**: one per team, written with `bus.board_update` (leader) and
+  `bus.card_update` (the card's owner only). A leader write is persisted and
+  announced at once; worker writes apply in memory at once but are persisted
+  and announced at most once per 10 s (`team.board_changed` goes to front ends
+  only, never to an agent). Each card keeps its 20 newest previous versions;
+  archiving or removing a card deletes its history. `team.start` writes the
+  workflow onto a board that has no `workflow_name` yet.
+- **Activity**: the service extracts one line per participant from the
+  `session/update` traffic and the participant's `bus.*` calls (19.9) and
+  throttles activity-only `team.changed` notifications to one per 2 s.
+- **`team.start`** resolves a workflow, skips members that already exist,
+  refuses (starting nothing) when the remaining members would exceed
+  `max_workers`, starts the rest, writes the board and sends the leader one
+  notice with the base instructions, the flow, the members, the columns and
+  the task.
+- A leader token's MCP `initialize` result carries `instructions` (the base
+  team guidance); workers get none.
+
+Teams live in the event log database (below), not in memory: after a service
+restart every unclosed team is **suspended** until its leader session comes
+back, with its board, history and open spawn items. Suspended teams expire
+after 7 days. Participant tokens are at least 128 random bits and kept only as
+hashes; neither tokens nor template environments are written to the event log,
+`team.list` or stderr.
+
+## Team storage (schema v3)
+
+The event log database (`nvim_ade_server.events.sqlite3`, 0600) uses
+`PRAGMA user_version = 3`. Version 1 was the event log, version 2 added the
+team tables; both migrate **in place** and keep their data. Version 3 adds:
+
+| Table | Contents |
+|---|---|
+| `boards (team_id PRIMARY KEY, rev, json)` | the team's board as last persisted: workflow name and text, columns and every card (title, column, owner, stage, body up to 8 KiB, fields). A board serialises to at most 256 KiB. |
+| `card_history (team_id, card_id, rev, json, ts_ms, PRIMARY KEY (team_id, card_id, rev))` | the previously persisted version of every card a write changed; each card keeps its 20 newest versions. |
+| `workflows (scope, project, name, json, updated_ms, PRIMARY KEY (scope, project, name))` | named workflows saved by the leader; `scope` is `project` (with the project key in `project`) or `user` (`project` is `""`). The JSON holds the summary, the flow **text** and the team composition. |
+
+Retention and deletion:
+
+- Boards and card history are deleted with their team (`team.close`, or the
+  7-day expiry of a suspended team). A suspended team keeps both and gets them
+  back on resume.
+- Archiving or removing a card deletes that card's history in the same
+  transaction; the board write and its history changes are one transaction.
+- Named workflows outlive teams and are only deleted by `workflow_delete` or
+  `team.workflow_delete`.
+- Writes go through the same recorder thread as the event log and never block
+  delivery; the last board state is flushed on a clean shutdown.
+- Without the database (`--event-log off`, or the cases where no teams are
+  stored) boards live in memory only and `workflow_save` is `-32061`
+  (`no database`).
+
+## Environment variables
+
+Most of these exist for the integration tests; the defaults are the documented
+behaviour. Values are read when the service starts (or when a related document
+is written), and malformed values fall back to the default, except
+`NVIM_ADE_SERVER_IDLE_TIMEOUT_SECS`: a malformed value there makes `serve`
+fail (only an empty value falls back to 1800).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `NVIM_ADE_SERVER_DIR` | platform path | override the service directory (socket, token, database); also used by the tests |
+| `NVIM_ADE_SERVER_IDLE_TIMEOUT_SECS` | `1800` | idle exit; `--idle-timeout` wins |
+| `NVIM_ADE_SERVER_STOP_TIMEOUT_MS` | `3000` | each step of the stop sequence (test) |
+| `NVIM_ADE_SERVER_HEARTBEAT_MS` | `15000` | install heartbeat interval (test) |
+| `NVIM_ADE_SERVER_GATE_LIMIT_BYTES` | 64 MiB | live-message gate during a replay (test) |
+| `NVIM_ADE_SERVER_REPLAY_LIMIT_BYTES` | 32 MiB | largest log the service replays itself (test) |
+| `NVIM_ADE_SERVER_REPLAY_DELAY_MS` | `0` | delay a replay to exercise the gate (test) |
+| `NVIM_ADE_SERVER_GIT_TIMEOUT_MS` | `60000` | timeout of one git command (test) |
+| `NVIM_ADE_SERVER_HELD_TIMEOUT_MS` | `30000` | grace period after cancelling a bus prompt for a held front-end prompt (test) |
+| `NVIM_ADE_SERVER_TEAM_TTL_MS` | 7 days | how long a suspended team is kept (test) |
+| `NVIM_ADE_SERVER_TEAM_EXPIRY_TICK_MS` | `3600000` | how often expired teams and pending boards are checked (test) |
+| `NVIM_ADE_SERVER_BOARD_FLUSH_MS` | `10000` | coalescing window for worker board writes (test) |
+| `NVIM_ADE_SERVER_ACTIVITY_NOTIFY_MS` | `2000` | throttle for activity-only `team.changed` (test) |
 
 ## Known limitations
 
-Behaviour that is deliberately not implemented in api_version 5 (or not
+Behaviour that is deliberately not implemented in api_version 6 (or not
 verified on every platform). None of these break the contract in
 [`PROTOCOL.md`](PROTOCOL.md); they are the places where the front end or a later
 stage has to compensate.

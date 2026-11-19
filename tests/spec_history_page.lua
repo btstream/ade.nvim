@@ -347,5 +347,48 @@ return function(t)
         t.falsy(chat.follow, "reading older history must not resume following")
       end)
     end)
+    t.it("aligns watch pages on synthetic turn headings within one budget", function()
+      local s = State.new("watch-page", "/tmp")
+      for turn = 1, 40 do
+        s:append({ id = "watch-turn-" .. turn, kind = "system", text = "── turn " .. turn })
+        s:append({ id = "watch-prompt-" .. turn, kind = "message", text = "prompt " .. turn })
+      end
+      local turn_start = function(block)
+        return type(block.id) == "string" and block.id:match("^watch%-turn%-%d+$") ~= nil
+      end
+      local p = Page.new({
+        page_blocks = 24,
+        page_bytes = 1024 * 1024,
+        max_blocks = 48,
+        turn_start = turn_start,
+        turn_name = function(block)
+          local n = block.id:match("^watch%-turn%-(%d+)$")
+          return n and ("回合 " .. n) or nil
+        end,
+      })
+      p:sync(s, true)
+      t.truthy(p.first > 1, "watch page must not load the whole history")
+      t.match("^watch%-turn%-", s.blocks[p.first].id, "page starts at a turn heading")
+      t.eq(nil, p.continuation)
+
+      local long = State.new("watch-long", "/tmp")
+      long:append({ id = "watch-turn-1", kind = "system", text = "── turn 1" })
+      for index = 1, 80 do
+        long:append({ id = "watch-body-" .. index, kind = "agent", text = "body " .. index })
+      end
+      local q = Page.new({
+        page_blocks = 12,
+        page_bytes = 1024 * 1024,
+        max_blocks = 48,
+        turn_start = turn_start,
+        turn_name = function(block)
+          local n = block.id:match("^watch%-turn%-(%d+)$")
+          return n and ("回合 " .. n) or nil
+        end,
+      })
+      q:sync(long, true)
+      t.eq("回合 1 续", q.continuation, "a long turn starts mid-turn with a heading")
+      t.truthy(q.first > 1)
+    end)
   end)
 end

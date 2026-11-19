@@ -458,6 +458,15 @@ function Chat:apply_layout(layout, layout_only, saved_view)
   self:finish_layout(layout, layout_only, saved_view)
 end
 
+---Rows written so far during a chunked commit, or nil when idle.
+---@return {done: integer, total: integer}|nil
+function Chat:commit_status()
+  if not self.commit_job or not self.commit_total then
+    return nil
+  end
+  return { done = self.commit_done or 0, total = self.commit_total or 0 }
+end
+
 ---A first paint or page swap can be tens of thousands of rows. Write it in
 ---bounded slices instead of freezing the loop for the whole buffer.
 function Chat:commit_layout_async(layout, layout_only, saved_view, chunk_rows, old, full)
@@ -466,9 +475,14 @@ function Chat:commit_layout_async(layout, layout_only, saved_view, chunk_rows, o
   self.layout_epoch = epoch
   local job = { epoch = epoch, version = version }
   self.commit_job = job
+  -- A first paint is worth a progress label; an incremental write at the tail
+  -- of a long history reports absolute rows that mean nothing to the reader.
+  self.commit_total = (full or #(old or {}) == 0) and #layout.lines or nil
+  self.commit_done = self.commit_total and 0 or nil
+  local progress = self.commit_total and { done = 0 } or nil
   local win, width, generation, thoughts = self.win, self.width, CodeHL.generation, self.show_thoughts
   local started = metrics.start(self)
-  local co = renderer.write_chunked(buf, layout.lines, layout.meta, old or {}, full, chunk_rows)
+  local co = renderer.write_chunked(buf, layout.lines, layout.meta, old or {}, full, chunk_rows, progress)
   local function current()
     return not self.destroyed
       and self.layout_epoch == epoch
@@ -493,6 +507,10 @@ function Chat:commit_layout_async(layout, layout_only, saved_view, chunk_rows, o
       vim.bo[buf].modifiable = false
     end)
     self.commit_job = nil
+    self.commit_total, self.commit_done = nil, nil
+    if self.on_commit_step then
+      pcall(self.on_commit_step, self)
+    end
     -- Half a layout on screen is not a valid base for the incremental writer.
     self.full_rewrite = true
     self.needs_force = true
@@ -511,6 +529,12 @@ function Chat:commit_layout_async(layout, layout_only, saved_view, chunk_rows, o
       return false
     end
     local ok, err = coroutine.resume(co)
+    if self.commit_total and progress then
+      self.commit_done = math.min(self.commit_total, progress.done or 0)
+    end
+    if self.on_commit_step then
+      pcall(self.on_commit_step, self)
+    end
     if not ok then
       abandon()
       self.keep_block = nil
@@ -525,6 +549,10 @@ function Chat:commit_layout_async(layout, layout_only, saved_view, chunk_rows, o
       return false
     end
     self.commit_job = nil
+    self.commit_total, self.commit_done = nil, nil
+    if self.on_commit_step then
+      pcall(self.on_commit_step, self)
+    end
     metrics.record(self, "write", started, { rows = #layout.lines, chunked = true })
     self.bg_runs = renderer.sync_backgrounds(buf, nil, layout.meta, true)
     self:finish_layout(layout, layout_only, saved_view)
@@ -859,6 +887,24 @@ function Chat:scroll_to_bottom()
   end
 end
 
+---Keep `rows` blank rows below the transcript for the choice card that floats
+---over the bottom of the window; a following view stays on the latest output.
+---@param rows integer
+function Chat:set_bottom_reserve(rows)
+  rows = math.max(0, rows or 0)
+  if rows == (self.bottom_reserve or 0) then
+    return
+  end
+  self.bottom_reserve = rows > 0 and rows or nil
+  if not self.buf or not vim.api.nvim_buf_is_valid(self.buf) then
+    return
+  end
+  renderer.set_reserve(self.buf, rows)
+  if self.follow and not self.layout_job and not self.commit_job and not self.page then
+    self:scroll_to_bottom()
+  end
+end
+
 function Chat:scroll_to_top()
   local win = self.win
   if not win or not vim.api.nvim_win_is_valid(win) then
@@ -911,7 +957,12 @@ function Chat:toggle_current()
   if not block then
     return false
   end
-  if block.kind == "tool" or block.kind == "compaction" or block.kind == "thought" then
+  if
+    block.kind == "tool"
+    or block.kind == "compaction"
+    or block.kind == "thought"
+    or (block.kind == "message" and block.collapsible)
+  then
     self.session:toggle(block)
     -- Expanding changes the transcript height. Without this the renderer would
     -- treat the view as "following output" and jump the cursor to the end of the
@@ -1036,6 +1087,9 @@ function Chat:destroy()
   if self.augroup then
     pcall(vim.api.nvim_del_augroup_by_id, self.augroup)
     self.augroup = nil
+  end
+  if self.buf then
+    renderer.set_reserve(self.buf, 0)
   end
   if self.buf and vim.api.nvim_buf_is_valid(self.buf) then
     pcall(vim.api.nvim_buf_delete, self.buf, { force = true })

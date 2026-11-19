@@ -1,4 +1,4 @@
-# nvim_ade_server protocol (api_version 5, service 0.6.0)
+# nvim_ade_server protocol (api_version 6, service 0.7.1)
 
 This is the contract between the Neovim front end (`lua/ade/service/`) and the
 service (`service/src/`). Both sides implement it as written; a deviation is a
@@ -39,7 +39,7 @@ they do not change what is written here.
 `-> {token, client, client_version, api_version}`
 `<- {server_version, api_version, features}`
 
-`api_version` is `5`. `features` contains `"tunnel"`, `"policy"` (section 17),
+`api_version` is `6`. `features` contains `"tunnel"`, `"policy"` (section 17),
 `"teams"` (section 18),
 `"install"` on unix (section 16), and `"log"` when the event log is enabled (section 10). Errors are unchanged:
 `-32001` bad token (connection closed), `-32002` incompatible api_version with
@@ -268,8 +268,10 @@ interpretation. The service only records `session/prompt` requests to count
 
 ## 7. Connection back pressure
 
-Each connection has an outbound queue capped at **64 MiB**. When it would be
-exceeded the service closes that connection (the agent is unaffected and keeps
+Each connection has an outbound queue capped at **64 MiB** (bytes only; the
+number of queued messages is not limited). When it would be
+exceeded the service closes that connection, writing the reason and the queued
+size to its log (the agent is unaffected and keeps
 running; the front end reconnects and re-attaches). Nothing is dropped
 silently within a live connection. (Catching up on what was missed is the job
 of the event log, a later stage.)
@@ -1221,7 +1223,10 @@ name for `team_spawn` takes the lowest free `w<n>`.
 leader are dropped, then the last `team.changed`. The stop of each worker is
 initiated before that notification; the command does not wait for the processes
 to exit, and the team is gone from `team.list` afterwards. The leader's session
-and instance are left alone. `team.bind_leader` for an existing team with a
+and instance stay (the person keeps the conversation), but a prompt of the
+leader's session that is running when the team closes is cancelled
+(`session/cancel`, as in 18.11), whether it came from the bus or from a front
+end, and prompts held for it are dropped. `team.bind_leader` for an existing team with a
 different session is `-32061`: to change the leader, close the team.
 
 **Watchers.** For a worker instance the watchers play the role of the attached
@@ -1412,3 +1417,393 @@ teams; a team whose state is `suspended` (18.15) does not count.
 | Code | Meaning |
 |---|---|
 | -32066 | a git command failed (`data.stderr`) |
+
+## 19. Boards, workflows and team start (W0, api_version 6)
+
+The `"teams"` feature at api_version 6 adds a **board** per team, named
+**workflows**, `team.start`, per-spawn `model`/`role`, spawn groups and
+participant activity. Section 18 stays in force except where this section
+says otherwise. The service has no workflow state machine: it validates,
+stores, relays and extracts; what a workflow means is text the leader follows.
+Error codes are those of 18.10 and 18.16; no new code is added.
+
+### 19.1 Configuration
+
+`team.configure`'s `config` gains:
+
+```
+config = {
+  ...,                                        // 18.2, 18.12
+  "workflows": { "<name>": workflow },        // optional; read-only workflows from the person's setup
+  "default_workflow": string?,                // a name of "workflows" or "default"
+  "templates": {
+    "<name>": {
+      ...,                                    // 18.2
+      "role":       string?,                  // now optional, default ""; up to 16 KiB
+      "models":     string[]?,                // allowed spawn models; absent or [] = any
+      "tool_style": "direct" | "mcp_proxy"    // optional, default "direct" (19.6)
+    }
+  }
+}
+```
+
+A workflow on the wire:
+
+```
+workflow = {
+  "name":    string,              // [a-z0-9][a-z0-9_-]{0,31}
+  "summary": string,              // one line, 1..120 characters
+  "text":    string?,             // up to 4 KiB; absent = the built-in default's text
+  "leader":  { "agent": string?, "model": string?, "role": string? }?,   // role up to 4 KiB
+  "team":    [member],            // 0..8 entries
+  "columns": string[]?,           // 1..16 unique titles, each 1..40 characters
+  "scope":   "config" | "project" | "user" | "builtin"   // in results only
+}
+member = { "name": string, "template": string, "model": string?, "role": string?, "task": string? }
+```
+
+Validation (`-32060`, `message` names the field): member names are valid
+worker names (18.3), unique, and never `leader` or `human`; each `template`
+exists in the configuration being validated; a member's `model` is in that
+template's `models` when the list is not empty; `role` up to 16 KiB; `task` up
+to 64 KiB. The service does not interpret `leader`: it is stored and returned
+for the front end (the leader is always the session that bound the team).
+
+The **built-in** workflow `default` always exists (`scope: "builtin"`, empty
+`team`, columns `待开发`, `进行中`, `审查中`, `等你决定`) with the text of the
+default flow (`docs/w0-team-dashboard-draft.md` 2.1). A configured workflow
+named `default` replaces it.
+
+**Resolution.** A name resolves in this order: `config` (the team's
+configuration), `project`, `user`, `builtin`. The **project key** is the
+canonical path of `git rev-parse --git-common-dir` run in the team's cwd (git
+as in 18.16), or the canonical cwd when that fails; worktrees of one
+repository therefore share project workflows.
+
+### 19.2 The board
+
+Every team has one board, created empty with the team:
+
+```
+board = {
+  "rev":           integer,       // 0 when created; +1 per successful write
+  "workflow_name": string?,
+  "workflow":      string?,       // up to 4 KiB
+  "columns":       string[],      // up to 16 unique titles, each 1..40 characters
+  "cards":         [card]
+}
+card = {
+  "id":         string,           // [A-Za-z0-9][A-Za-z0-9_.-]{0,31}
+  "title":      string,           // 1..200 characters
+  "column":     string,           // one of columns (not checked for archived cards)
+  "owner":      string?,          // a worker name of the team (any state)
+  "stage":      string?,          // 1..40 characters
+  "body":       string?,          // up to 8 KiB
+  "fields":     object<string,string>?, // up to 12 keys (1..32 chars), values up to 120 chars
+  "archived":   boolean,
+  "updated_by": string,           // "leader", a worker name, or "service"
+  "updated_at": integer           // ms since the epoch
+}
+```
+
+Limits: at most 200 cards that are not archived; at most 500 archived cards
+(beyond that the oldest archived cards, by `updated_at`, are dropped); the
+board serialised as JSON at most 256 KiB. A write that would break a limit is
+refused with `-32060` and changes nothing.
+
+**`bus.board_update`** (tool `board_update`, leader only, `-32061` otherwise):
+`{workflow_name?, workflow?, columns?, upsert?, archive?, remove?}` `<- {rev}`.
+Applied in that order as **one** atomic write; the result is validated as a
+whole:
+
+- `workflow_name` / `workflow`: replace the value (`null` clears).
+- `columns`: replaces the list.
+- `upsert: [partial card]`: by `id`. A new card needs `title` and `column`; an
+  existing card takes the given fields only (`owner: null`, `stage: null`,
+  `body: null` clear; `fields` merges by key and a `null` value deletes the
+  key; `fields: null` removes every key). `archived`, `updated_by` and `updated_at` cannot be written here.
+  Upserting an archived card is `-32061`.
+- `archive: [id]`: sets `archived`; the card's history is deleted (19.4).
+- `remove: [id]`: deletes the card and its history.
+- Unknown ids in `archive`/`remove`, an id listed twice across `upsert`,
+  `archive` and `remove`, an `owner` that is not a worker of the team, or a
+  card that is not archived whose `column` is not in `columns` (for example
+  after removing a column that still has cards) are `-32060`.
+
+**`bus.card_update`** (tool `card_update`, workers only):
+`{card, body?, fields?, archive?}` `<- {rev}`. The card must exist (`-32060`),
+not be archived and have the caller as `owner` (`-32061`, message
+`"not your card"`). `body` replaces (`null` clears), `fields` merges as above,
+`archive: true` archives (19.4); `archive: false` is `-32060`.
+
+The service sets `updated_by` and `updated_at` on every card it changes.
+`rev` increases by one per successful call, even when nothing changed.
+
+**Coalescing.** A leader write is persisted and announced at once. Worker
+writes take effect in memory at once (`team.board` and `bus.status` see them),
+but persistence and `team.board_changed` happen at most once per 10 s per
+team: the first worker write starts a 10 s timer, and when it fires the board
+is persisted and one notification with the current `rev` is sent. A leader
+write while the timer runs flushes it first: the front end then receives two
+`team.board_changed`, the flushed `rev` and then the leader's. Pending writes
+are flushed (and announced) when the team ends, before the expiry check of
+18.15, and when the service shuts down cleanly. The timer is
+`NVIM_ADE_SERVER_BOARD_FLUSH_MS` milliseconds (default 10000), for tests.
+
+**`team.board {team}`** `<- {board}` for front ends (`-32064` for an unknown
+team). When the stored board cannot be read (bad JSON or a database error at
+startup) the board is **unavailable**: it shows as empty with
+`"unavailable": true` (in `team.board` and the leader's `bus.status.board`;
+the field is absent otherwise), every write is `-32061` (`"board
+unavailable"`), and the stored row is never overwritten. **`team.board_changed {team, rev}`** is sent to front-end connections
+only. Board changes are never delivered to any participant.
+
+### 19.3 What agents see of the board
+
+There is no tool that reads cards: the board is for the person. `bus.status`
+for the **leader** gains:
+
+```
+"board": {
+  "rev", "workflow_name", "columns",
+  "cards":    [{ "id", "title", "column", "owner", "stage" }],  // not archived
+  "archived": { "<stage or empty string>": integer }           // archived cards per stage
+},
+"workflows": [{ "name", "summary", "scope" }],                  // as team.workflows, short
+"templates": [{ "name", "agent", "models" }]                     // replaces the list of names
+```
+
+`agent` is the template's `key.agent`; `models` is `[]` when any model is
+allowed. `bus.status` for workers is unchanged.
+
+**Card messages.** `team.send` gains `card?` (a card id, `-32060` if
+unknown). The service prefixes the body with one summary line and a newline,
+`[card <id> · <title> · <column> · <owner or -> · k=v · ...]` (the `fields`
+in key order, the line cut at 400 characters), and uses `card` as `task`
+when `task` is absent. Delivery is otherwise as 18.4: the message queues and
+is merged with other queued messages into the leader's next bus turn.
+
+### 19.4 Card history
+
+When a write is **persisted**, the previously persisted version of every card
+it changed is stored as history (intermediate in-memory versions of coalesced
+worker writes are not). Each card keeps its 20 newest versions; older ones
+are deleted in the same transaction. Archiving or removing a card deletes all
+of its history. History is never shown to agents.
+
+`team.card_history {team, card}` `<- {versions: [card]}`, newest first; `[]`
+for an archived card or a card without history; `-32060` for an unknown card.
+
+### 19.5 Workflow methods
+
+| Method | Who | Params | Result |
+|---|---|---|---|
+| `bus.workflow_save` (tool `workflow_save`) | leader | `workflow` (without `scope`, plus `scope: "project" \| "user"`, default `"project"`), `replace?` | `{name}` |
+| `bus.workflow_get` (tool `workflow_get`) | leader | `name` | `{workflow}` (resolved, 19.1) |
+| `bus.workflow_delete` (tool `workflow_delete`) | leader | `name`, `scope?` | `{}` |
+| `team.workflows {cwd}` | front end | | `{workflows: [workflow]}` |
+| `team.workflow_delete {cwd, name, scope}` | front end | | `{}` |
+
+- `workflow_save` validates against the **team's** configuration (19.1). A
+  stored workflow with the same name and scope is `-32061` (`"workflow
+  exists"`) unless `replace: true`. A name that resolves to a `config`
+  workflow is `-32061` (the configured one would hide it).
+- `workflow_get` of an unknown name is `-32060`.
+- `workflow_delete` without `scope` deletes the stored workflow that the name
+  resolves to; a `config` or `builtin` one, or no stored one, is `-32061`.
+- `team.workflows {cwd}` lists every name visible from `cwd` once, the
+  resolved one, sorted by name, with the configuration of the running team for
+  `cwd` if there is one, else the stored configuration (18.2). Stored
+  workflows whose templates no longer exist are still listed.
+- At most 100 stored workflows per scope and project; `workflow_save` of a
+  new name beyond that is `-32061` (`"too many workflows"`).
+- Stored workflows live in the service's database (19.11) and outlive teams.
+
+### 19.6 Spawning with a model and a role
+
+`bus.spawn` and `team.spawn` gain `model?` and `role?`:
+
+- `model` must be in the template's `models` when that list is not empty
+  (`-32060`). Without `model`, the template's `model` applies (18.3).
+- `role` (up to 16 KiB) is appended to the template's `role` in the role card.
+- **Model check.** When a model applies (from the spawn or the template) and
+  the `session/new` result's `configOptions` has no option with id `model`
+  whose values include it, the service does **not** go on silently: it stops
+  the worker (state `exited`, `reason` `"model unavailable: <model>"`) and
+  sends the leader a `notice` naming the model and the values the agent offers
+  (at most 50). This replaces 18.3's silent skip.
+- **Role card** additions (18.4): the board conventions for workers (keep your
+  own card's `body`/`fields` current with `card_update`; the card is for the
+  person, so reports to the leader carry the details the leader needs; archive
+  your card with `card_update {archive: true}` when the leader confirms the
+  task is done). For a template with `tool_style: "mcp_proxy"` the card also
+  says that team tools are called through the agent's `mcp` proxy tool
+  (`mcp({tool: "bus_send", args: {...}})`); the front end sets it for agents
+  known to work that way (pi).
+- **Spawn items** (18.5) gain `model`, `role`, `agent` (the template's
+  `key.agent`) and `group`.
+
+**Spawn groups.** Every inbox `spawn` item carries `group` (`g<n>`, unique in
+the service). Items created during one prompt of the leader's session (from
+the request to its response, whether the prompt came from the bus or from a
+front end) share a group; an item created while no prompt of the leader runs
+gets a group of its own. `team.answer_group {group, allow}` `<- {answered:
+[item ids], failed: [{id, code, message}]}` answers every **open** item of the
+group as `team.answer` would, in creation order. An item whose answer fails is
+skipped (it stays open and is listed in `failed`); the others take effect.
+`-32063` when none is open; when every item fails, the error of the first.
+
+### 19.7 `team.start`
+
+`team.start {team, workflow, task?}` `<- {workflow, started: [name], skipped:
+[name]}` starts a team's workflow on behalf of `human`:
+
+1. The name resolves as in 19.1 (`-32060` if unknown); `task` is at most
+   64 KiB (`-32060`). A `suspended` team is
+   `-32061`; a `leaderless` one is allowed (the notice queues).
+2. Members whose name is already a participant (any state) are `skipped`.
+   If the remaining members would exceed `max_workers` live workers, nothing
+   starts and the result is `-32061`.
+3. Each remaining member is started as by `team.spawn` (no confirmation;
+   `model`, `role` and `task` from the member), in order.
+4. When the board has no `workflow_name`, the service writes `workflow_name`,
+   `workflow` (the text), and `columns` (when the workflow has them and the
+   board has none) as one write with `updated_by: "service"`. An unavailable
+   board (19.2) is left alone and the start goes on.
+5. The leader receives one `notice` from `human` whose body is, in this
+   order: the base instructions (19.8), `task` if given, the workflow's name,
+   summary and text, the members (name, template, agent, model, role), and the
+   columns. A body over 64 KiB is cut in the member roles and the text, never
+   in the instructions or `task`. If the notice cannot be sent the result is an
+   error (the members already started stay).
+
+The front end uses `team.start` for `:Ade team start` and for the automatic
+start of `teams.enabled` (instead of calling `team.spawn` per worker).
+
+### 19.8 Leader instructions
+
+For a **leader** token the MCP server's `initialize` result carries
+`instructions`: the base instructions, at most 2 KiB, the same text that
+`team.start`'s notice repeats. They say that the agent can build a team; that
+it does so only when the person asks or after proposing it and getting
+consent; the board conventions (the leader owns columns, cards, owners,
+stages and moves; workers write their own cards; cards are for the person and
+not a source of details; archive after the person confirms a stage was
+committed); that a stage is confirmed with the person once, not per card; and
+how named workflows are used and saved (only save when asked; write `leader`
+only when the person mentions the leader). Workers get no `instructions`.
+
+### 19.9 Activity
+
+`team.list` participant entries gain `activity` (`{text, at}` or `null`) and
+`state_since` (ms since the epoch when `state` last changed; set at restart
+for recovered participants). `activity.text` is one line of at most 120
+characters, taken from the latest of:
+
+- for workers: a `tool_call` or `tool_call_update` with a `title` (the title,
+  prefixed by its status when it is `failed`); the `in_progress` entry of a
+  `plan` update; a `bus.*` call it made (`→ leader report T4: <first line of
+  the body>`, `asks: <question>`, `card T4 updated`); at the end of a bus turn
+  without any of these, the first line of the turn's text;
+- for the leader: only its `bus.*` calls (`→ w1 task T4: ...`, `spawn w2`,
+  `board updated`).
+
+An activity change alone sends `team.changed` at most once per 2 s per
+participant (the last value wins); state changes are sent at once as before.
+Activity is not persisted.
+
+`team.list` team entries gain `board_rev`, `workflow_name` and `stages`:
+`[{stage, open, archived}]` counted over the board's cards, in order of the
+first card of each stage, cards without a stage under `""`.
+
+### 19.10 Tools
+
+| Tool | Who | Method |
+|---|---|---|
+| `team_spawn` | leader | `bus.spawn`, input gains `model`, `role` |
+| `board_update` | leader | `bus.board_update` |
+| `workflow_save`, `workflow_get`, `workflow_delete` | leader | `bus.workflow_*` |
+| `card_update` | worker | `bus.card_update` |
+| `bus_status` | all | `bus.status` (19.3) |
+
+A leader's `tools/list` does not contain `card_update`; a worker's does not
+contain the leader tools.
+
+### 19.11 Storage
+
+The event log database (section 10, 18.15) gains three tables, added by a
+schema migration as in 18.15 (the existing data is kept):
+
+- `boards (team_id PRIMARY KEY, rev, json)`: the board as last persisted;
+- `card_history (team_id, card_id, rev, json, ts_ms, PRIMARY KEY (team_id, card_id, rev))`;
+- `workflows (scope, project, name, json, updated_ms, PRIMARY KEY (scope, project, name))`,
+  `project` being `""` for `user`.
+
+A team's board and history are deleted with the team (`team.close`, or the
+7-day expiry of 18.15). A suspended team keeps its board and gets it back on
+resume. Writes go through the store thread as in 18.15 and never block
+delivery. Whenever the service runs without that database (the cases where
+18.15 stores no teams), boards live in memory only and `workflow_save` is
+`-32061` (`"no database"`).
+
+### 19.12 Member labels and owners awaiting approval (W0 v2)
+
+**Labels.** `bus.spawn`, `team.spawn` and workflow members (19.1) gain
+`label?`: a short role label for display, 1..16 characters, one line
+(`-32060` otherwise). Spawn inbox items carry it too.
+
+**`team.list` participant entries** gain `template` (the template name, absent
+for the leader), `agent` (the template's `key.agent`; for the leader the agent
+id of its instance), `model` (the model applied by 19.6, or `null`), and
+`label` (the spawn's `label`, else the template name; `"leader"` for the
+leader). They are persisted with the team and restored with it.
+
+**Owners awaiting approval.** A card's `owner` (19.2) may also be the name of
+an **open** `spawn` inbox item of the team. When that item is refused, or
+becomes `orphaned`, the service clears `owner` on every card that has it (one
+write, `updated_by: "service"`, `team.board_changed`) and sends the leader a
+`notice` naming the cards. When it is approved nothing changes. A name used by
+an open spawn item is reserved: another spawn with that name is `-32060`
+until the item is answered.
+
+### 19.13 Several questions in one `bus.ask_human` (W0 v2)
+
+`bus.ask_human` (tool `bus_ask_human`) accepts either the 18.5 form
+`{question, options?}` or:
+
+```
+{ "questions": [ {
+    "header":       string,     // 1..12 characters, one line (the tab label)
+    "question":     string,     // up to 4 KiB
+    "options":      [ { "label": string, "description": string? } ]?,  // 0 or 2..6; label 1..60 chars, description up to 200
+    "multi_select": boolean?    // default false
+} ] }                           // 1..4 entries
+```
+
+Anything else is `-32060`. The 18.5 form is normalised to one question with
+`header: "Question"` and each option string as a `label`. The `question` inbox
+item carries the normalised `questions` (and keeps `body`/`options` for the 18.5
+form). The person may always answer a question with free text instead of an
+option.
+
+`team.answer` for a question item accepts `answers: [{selected: [label], text?}]`
+(one entry per question, in order; `selected` empty when only `text` is given;
+`-32060` when the count or a label does not match) as well as the 18.5
+`text`/`option`. The asker receives one `answer` message whose body lists, per
+question, `<header>: <selected labels joined by ", ">` and the free text on the
+next line when given.
+
+### 19.14 Talking to a worker directly (W0 v2)
+
+`team.send` (front ends only) gains:
+
+- `interrupt?: boolean` — only for a `to` that is a worker. When the worker has
+  a bus prompt running, the service sends `session/cancel` for it, waits for
+  its response (at most 30 s, as for the leader in 18.11), then delivers this
+  message **before** anything else queued for the worker. Messages of the
+  cancelled turn are not delivered again (as 18.4). When nothing runs it is an
+  ordinary send. `interrupt` to the leader or `human` is `-32060`.
+- `cc?: ["leader"]` — after the message is accepted, the leader also receives
+  a `notice` from `human` whose body is `"to <worker>: <body>"` (`task`
+  copied; the `[card …]` prefix of 19.3 kept). Only `"leader"` is allowed in
+  `cc`, and only when `to` is a worker (`-32060` otherwise).

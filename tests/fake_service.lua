@@ -35,9 +35,19 @@ Server.__index = Server
 ---  install_fail?: boolean, install_log?: string, install_delay_ms?: integer,
 ---  install_busy?: boolean, uninstall_busy?: boolean, resolve_delay_ms?: integer,
 ---  policy_delay_ms?: integer, policy_error?: table,
----  teams?: table, team_watch?: table, team_leader_error?: table,
+---  teams?: table, team_watch?: table, team_read?: table, team_leader_error?: table,
 ---  team_bind_error?: table, team_participants?: table, team_spawn_warning?: string,
 ---  team_spawn_error?: table, team_remove_result?: table, team_remove_error?: table,
+---  team_start_error?: table, team_start_result?: table,
+---  team_answer_group_error?: table, team_workflows?: table, team_workflows_error?: table,
+---  team_workflow_delete_error?: table, team_board?: table, team_boards?: table,
+---  team_board_error?: table, team_board_delay?: integer,
+---  team_answer_group_failed?: table,
+---  team_card_history?: table, team_card_history_error?: table,
+---  team_start_delay?: integer,
+---  team_workflow_delete_delay?: integer,
+---  old_service_methods?: table<string, boolean>,
+---  team_workflows_delay?: integer,
 ---  run_error?: table, uninstall_error?: table, canned_agent?: boolean}|nil
 ---@return FakeService
 function M.new(opts)
@@ -106,6 +116,8 @@ function M.new(opts)
     team_sends = {},
     team_answers = {},
     team_watch = opts.team_watch,
+    team_read = opts.team_read,
+    replay_inflight = false,
     team_leader_error = opts.team_leader_error,
     team_bind_error = opts.team_bind_error,
     team_participants = opts.team_participants,
@@ -121,6 +133,27 @@ function M.new(opts)
     team_spawns = {},
     team_removals = {},
     team_resets = {},
+    team_starts = {},
+    team_answer_groups = {},
+    team_workflow_deletes = {},
+    team_board_requests = {},
+    team_start_error = opts.team_start_error,
+    team_start_delay = opts.team_start_delay or 5,
+    team_start_result = opts.team_start_result,
+    team_answer_group_error = opts.team_answer_group_error,
+    team_answer_group_failed = opts.team_answer_group_failed,
+    team_workflows = opts.team_workflows,
+    team_workflows_error = opts.team_workflows_error,
+    team_workflow_delete_error = opts.team_workflow_delete_error,
+    team_workflow_delete_delay = opts.team_workflow_delete_delay or 5,
+    old_service_methods = opts.old_service_methods or {},
+    team_workflows_delay = opts.team_workflows_delay or 5,
+    team_board = opts.team_board,
+    team_boards = opts.team_boards,
+    team_board_error = opts.team_board_error,
+    team_board_delay = opts.team_board_delay or 5,
+    team_card_history = opts.team_card_history,
+    team_card_history_error = opts.team_card_history_error,
     team_counter = 0,
     policy_responses = 0,
     policy_before_prompt = nil,
@@ -257,6 +290,13 @@ function Server:resume_team(team, instance, session_id)
   end
 end
 
+---Publish a `team.board_changed` notification (19.2).
+---@param team_id string
+---@param rev integer
+function Server:emit_team_board_changed(team_id, rev)
+  self:broadcast("team.board_changed", { team = team_id, rev = rev })
+end
+
 ---@param message table
 ---@param client table
 ---@return table|nil
@@ -266,6 +306,10 @@ function Server:dispatch(message, client)
   local params = type(message.params) == "table" and message.params or {}
   if method then
     self.calls[#self.calls + 1] = { method = method, params = params, id = ident }
+    if self.old_service_methods[method] then
+      -- An api-5 service: the method does not exist.
+      return error_reply(ident, -32601, "method not found")
+    end
   end
   if method == "hello" then
     if self.wrong_token or params.token ~= self.token then
@@ -350,6 +394,7 @@ function Server:dispatch(message, client)
 
   if method == "team.configure" then
     self.team_configures[#self.team_configures + 1] = vim.deepcopy(params)
+    self.team_cwd = params.cwd
     if self.team_configure_error then
       return error_reply(
         ident,
@@ -426,20 +471,25 @@ function Server:dispatch(message, client)
     if existing and existing.leader and existing.leader.sessionId ~= params.sessionId then
       return error_reply(ident, -32061, "another session leads this team")
     end
-    local team = {
-      id = "t1",
-      cwd = params.cwd or "/",
-      state = "active",
-      leader = { instance = params.instance, sessionId = params.sessionId },
-      participants = vim.deepcopy(self.team_participants or {}),
-      inbox = {},
-      limits = { max_turns_per_task = 30, max_turns_total = 200, turns_total = 0 },
-    }
-    if not self.teams.t1 then
-      self.teams.t1 = team
+    local team = existing
+    if not team then
+      -- The service gives every new team a fresh id; reusing `t1` after a
+      -- close would let a start flow mistake the replacement for the team it
+      -- just closed.
+      self.team_seq = (self.team_seq or 0) + 1
+      team = {
+        id = "t" .. self.team_seq,
+        cwd = self.team_cwd or "/",
+        state = "active",
+        leader = { instance = params.instance, sessionId = params.sessionId },
+        participants = vim.deepcopy(self.team_participants or {}),
+        inbox = {},
+        limits = { max_turns_per_task = 30, max_turns_total = 200, turns_total = 0 },
+      }
+      self.teams[team.id] = team
     end
     vim.defer_fn(function()
-      self:send(client, { jsonrpc = "2.0", id = ident, result = { team = self.teams.t1 } })
+      self:send(client, { jsonrpc = "2.0", id = ident, result = { team = team } })
     end, 5)
     return nil
   end
@@ -535,13 +585,118 @@ function Server:dispatch(message, client)
     return nil
   end
   if method == "team.read" then
+    local result = self.team_read or { messages = {}, turns = {} }
     vim.defer_fn(function()
-      self:send(client, { jsonrpc = "2.0", id = ident, result = { messages = {}, turns = {} } })
+      self:send(client, { jsonrpc = "2.0", id = ident, result = vim.deepcopy(result) })
     end, 5)
     return nil
   end
   if method == "team.answer" then
     self.team_answers[#self.team_answers + 1] = vim.deepcopy(params)
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
+    end, 5)
+    return nil
+  end
+  if method == "team.start" then
+    self.team_starts[#self.team_starts + 1] = vim.deepcopy(params)
+    if self.team_start_error then
+      return error_reply(ident, self.team_start_error.code, self.team_start_error.message, self.team_start_error.data)
+    end
+    local result = self.team_start_result and vim.deepcopy(self.team_start_result)
+      or { workflow = params.workflow, started = {}, skipped = {} }
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = result })
+    end, self.team_start_delay)
+    return nil
+  end
+  if method == "team.answer_group" then
+    self.team_answer_groups[#self.team_answer_groups + 1] = vim.deepcopy(params)
+    if self.team_answer_group_error then
+      return error_reply(
+        ident,
+        self.team_answer_group_error.code,
+        self.team_answer_group_error.message,
+        self.team_answer_group_error.data
+      )
+    end
+    local failed = vim.deepcopy(self.team_answer_group_failed or {})
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = { answered = {}, failed = failed } })
+    end, 5)
+    return nil
+  end
+  if method == "team.board" then
+    self.team_board_requests[#self.team_board_requests + 1] = vim.deepcopy(params)
+    if self.team_board_error then
+      return error_reply(ident, self.team_board_error.code, self.team_board_error.message, self.team_board_error.data)
+    end
+    local board
+    if type(self.team_boards) == "table" and #self.team_boards > 0 then
+      board = table.remove(self.team_boards, 1)
+    elseif type(self.team_board) == "table" then
+      board = vim.deepcopy(self.team_board)
+    else
+      board = { rev = #self.team_board_requests, columns = { "todo", "doing" }, cards = {} }
+    end
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = { board = board } })
+    end, self.team_board_delay or 5)
+    return nil
+  end
+  if method == "team.card_history" then
+    if self.team_card_history_error then
+      return error_reply(
+        ident,
+        self.team_card_history_error.code,
+        self.team_card_history_error.message,
+        self.team_card_history_error.data
+      )
+    end
+    local versions = vim.deepcopy(self.team_card_history or {})
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = { versions = versions } })
+    end, 5)
+    return nil
+  end
+  if method == "team.workflows" then
+    if self.team_workflows_error then
+      return error_reply(ident, self.team_workflows_error.code, self.team_workflows_error.message)
+    end
+    local workflows = vim.deepcopy(self.team_workflows or {
+      {
+        name = "default",
+        summary = "the built-in default flow",
+        text = "1. plan 2. work 3. review",
+        team = {},
+        columns = { "待开发", "进行中", "审查中", "等你决定" },
+        scope = "builtin",
+      },
+    })
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = { workflows = workflows } })
+    end, self.team_workflows_delay or 5)
+    return nil
+  end
+  if method == "team.workflow_delete" then
+    self.team_workflow_deletes[#self.team_workflow_deletes + 1] = vim.deepcopy(params)
+    if type(self.team_workflows) == "table" then
+      local left = {}
+      for _, workflow in ipairs(self.team_workflows) do
+        if workflow.name ~= params.name or workflow.scope ~= params.scope then
+          left[#left + 1] = workflow
+        end
+      end
+      self.team_workflows = left
+    end
+    if self.team_workflow_delete_error then
+      return error_reply(
+        ident,
+        self.team_workflow_delete_error.code,
+        self.team_workflow_delete_error.message,
+        self.team_workflow_delete_error.data
+      )
+    end
     vim.defer_fn(function()
       self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
     end, 5)
@@ -553,6 +708,22 @@ function Server:dispatch(message, client)
       return error_reply(ident, -32064, "suspended")
     end
     local watch = self.team_watch or {}
+    if params.replay and self.replay_inflight then
+      return error_reply(ident, -32061, "a replay is already in progress")
+    end
+    local delay = 5
+    if type(watch.delays) == "table" then
+      delay = table.remove(watch.delays, 1) or delay
+    end
+    if type(watch.errors) == "table" then
+      local message = table.remove(watch.errors, 1)
+      if message and message ~= "" then
+        vim.defer_fn(function()
+          self:send(client, { jsonrpc = "2.0", id = ident, error = { code = -32060, message = message } })
+        end, delay)
+        return nil
+      end
+    end
     local instance = watch.instance or "inst-1"
     local session_id = watch.sessionId or "watch-session"
     for _, foreign in ipairs(watch.foreign or {}) do
@@ -581,11 +752,11 @@ function Server:dispatch(message, client)
         },
       })
     end
-    local delay = 5
-    if type(watch.delays) == "table" then
-      delay = table.remove(watch.delays, 1) or delay
+    if params.replay then
+      self.replay_inflight = true
     end
     vim.defer_fn(function()
+      self.replay_inflight = false
       self:send(client, {
         jsonrpc = "2.0",
         id = ident,
@@ -622,7 +793,7 @@ function Server:dispatch(message, client)
     end
     vim.defer_fn(function()
       self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
-    end, 5)
+    end, self.team_workflow_delete_delay or 5)
     return nil
   end
   if method == "policy.set" then
@@ -1217,6 +1388,17 @@ function Server:turn_started(instance, params)
     instance = instance,
     seq = 1,
     message = { jsonrpc = "2.0", method = "_ade/turn_started", params = params },
+  })
+end
+
+---Send one `_ade/turn_finished` to the attached connection of an instance.
+---@param instance string
+---@param params table
+function Server:turn_finished(instance, params)
+  self:broadcast("tunnel.recv", {
+    instance = instance,
+    seq = 1,
+    message = { jsonrpc = "2.0", method = "_ade/turn_finished", params = params },
   })
 end
 

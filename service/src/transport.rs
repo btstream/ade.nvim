@@ -50,7 +50,7 @@ impl Listener {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => {
-                eprintln!(
+                crate::svc_log!(
                     "nvim_ade_server: could not remove socket {}: {error}",
                     self.path.display()
                 );

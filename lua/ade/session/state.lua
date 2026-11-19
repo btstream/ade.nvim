@@ -87,8 +87,14 @@ function M.append_block_text(block, text)
   if text == nil or text == "" then
     return
   end
+  -- Track the byte count on every append, even when no per-block cap applies.
+  -- `memory.bound_block` otherwise sums every buffered chunk on each touch,
+  -- which becomes quadratic while a long replay is being applied.
+  local size = block._text_bytes
+  if size == nil then
+    size = #(rawget(block, "text") or "")
+  end
   if block._max_bytes then
-    local size = block._text_bytes or #(rawget(block, "text") or "")
     local remaining = block._max_bytes - size
     if remaining <= 0 then
       block.truncated = true
@@ -98,8 +104,8 @@ function M.append_block_text(block, text)
       text = memory.clip(text, remaining)
       block.truncated = true
     end
-    block._text_bytes = size + #text
   end
+  block._text_bytes = size + #text
   if getmetatable(block) ~= block_mt then
     setmetatable(block, block_mt)
   end

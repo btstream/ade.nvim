@@ -178,11 +178,19 @@ def mcp_list(session):
             process.stdin.write(json.dumps(frame) + "\n")
         process.stdin.flush()
         process.stdin.close()
+        init_result = None
         for line in process.stdout:
             value = json.loads(line)
+            if value.get("id") == 1:
+                init_result = value.get("result")
             if value.get("id") == 2:
                 names = [tool.get("name") for tool in (value.get("result") or {}).get("tools") or []]
-                log({"event": "tools", "session": session, "names": names})
+                log({
+                    "event": "tools",
+                    "session": session,
+                    "names": names,
+                    "instructions": (init_result or {}).get("instructions"),
+                })
                 return names
         process.wait(timeout=10)
     except Exception as problem:  # noqa: BLE001
@@ -213,6 +221,11 @@ def run_prompt(ident, text, session):
             task = text[len("spawn-task:"):].strip()
             response = mcp_call(session, "team_spawn", {"template": TEMPLATE, **({"name": NAME} if NAME else {}), "task": task})
             log({"event": "spawn-response", "response": response})
+        elif "spawn-pair" in text:
+            # Two spawn requests in one prompt: they must share a group (19.6).
+            for name in ("w1", "w2"):
+                response = mcp_call(session, "team_spawn", {"template": TEMPLATE, "name": name})
+                log({"event": "spawn-response", "name": name, "response": response})
         elif text.startswith("spawn"):
             task = text[len("spawn"):].strip() or "do [report]"
             response = mcp_call(session, "team_spawn", {"template": TEMPLATE, **({"name": NAME} if NAME else {}), "task": task})
@@ -341,6 +354,138 @@ def run_prompt(ident, text, session):
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline and not (event and event.is_set()):
                 time.sleep(0.02)
+        elif "[card-update" in text:
+            rest = text.split("[card-update", 1)[1].lstrip()
+            arguments, _ = json.JSONDecoder().raw_decode(rest)
+            calls = arguments if isinstance(arguments, list) else [arguments]
+            for call in calls:
+                response = mcp_call(session, "card_update", call)
+                log({"event": "card-update-response", "arguments": call, "response": response})
+        elif "[board-create]" in text:
+            response = mcp_call(
+                session,
+                "board_update",
+                {
+                    "workflow_name": "dev",
+                    "workflow": "flow text",
+                    "columns": ["todo", "doing"],
+                    "upsert": [
+                        {"id": "T1", "title": "fix reconnect", "column": "doing", "owner": "w1"},
+                        {"id": "T2", "title": "write docs", "column": "todo", "owner": "w1"},
+                    ],
+                },
+            )
+            log({"event": "board-create-response", "response": response})
+        elif "[workflow-save]" in text:
+            response = mcp_call(
+                session,
+                "workflow_save",
+                {
+                    "workflow": {
+                        "name": "review_by_pi",
+                        "summary": "w1 写代码，reviewer 审查",
+                        "text": "1. w1 实现\n2. reviewer 审查",
+                        "team": [{"name": "w1", "template": TEMPLATE}],
+                        "columns": ["todo", "doing"],
+                    },
+                    "replace": True,
+                },
+            )
+            log({"event": "workflow-save-response", "response": response})
+        elif "[spawn-two]" in text:
+            for _ in range(2):
+                response = mcp_call(session, "team_spawn", {"template": TEMPLATE, "task": "do [report]"})
+                log({"event": "spawn-response", "response": response})
+        elif "[board-update]" in text:
+            response = mcp_call(session, "board_update", {})
+            log({"event": "board-update-response", "response": response})
+        elif "[activity-tool]" in text:
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session,
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "call-1",
+                        "title": "Run cargo test",
+                        "kind": "execute",
+                        "status": "in_progress",
+                    },
+                },
+            })
+        elif "[activity-failed]" in text:
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session,
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "call-2",
+                        "title": "Edit hub.rs",
+                        "status": "failed",
+                    },
+                },
+            })
+        elif "[activity-plan]" in text:
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session,
+                    "update": {
+                        "sessionUpdate": "plan",
+                        "entries": [
+                            {"content": "done", "priority": "medium", "status": "completed"},
+                            {"content": "补 reconnect 的回归测试", "priority": "high", "status": "in_progress"},
+                        ],
+                    },
+                },
+            })
+        elif "[activity-gated]" in text:
+            wait_gate_ignore_cancel()
+            for step in (1, 2):
+                send({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session,
+                        "update": {
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": f"gated-{step}",
+                            "title": f"gated step {step}",
+                            "status": "in_progress",
+                        },
+                    },
+                })
+                time.sleep(0.05)
+            # Stay working while the test watches the notification window.
+            time.sleep(4)
+        elif "[activity-slow]" in text:
+            for step in (1, 2):
+                send({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session,
+                        "update": {
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": f"step-{step}",
+                            "title": f"step {step}",
+                            "status": "in_progress",
+                        },
+                    },
+                })
+                time.sleep(0.05)
+            wait_gate(session)
+        elif "[report-task]" in text:
+            response = mcp_call(
+                session,
+                "bus_send",
+                {"to": "leader", "kind": "report", "task": "T4", "body": "first line\nsecond"},
+            )
+            log({"event": "report-response", "response": response})
         elif "[report]" in text:
             response = mcp_call(session, "bus_send", {"to": "leader", "kind": "report", "body": "worker report"})
             log({"event": "report-response", "response": response})

@@ -10,12 +10,45 @@ local ns = vim.api.nvim_create_namespace("ade_chat")
 -- inline highlight extmarks.
 local ns_bg = vim.api.nvim_create_namespace("ade_chat_bg")
 
+-- Blank rows kept below the last line while the choice card floats over the
+-- bottom of the chat window, so the latest output stays above the card.
+local ns_reserve = vim.api.nvim_create_namespace("ade_chat_reserve")
+local reserved = {}
+
+local function place_reserve(buf)
+  vim.api.nvim_buf_clear_namespace(buf, ns_reserve, 0, -1)
+  local rows = reserved[buf]
+  if not rows or rows <= 0 then
+    return
+  end
+  local virt = {}
+  for i = 1, rows do
+    virt[i] = { { "", "" } }
+  end
+  local last = vim.api.nvim_buf_line_count(buf) - 1
+  pcall(vim.api.nvim_buf_set_extmark, buf, ns_reserve, last, 0, { virt_lines = virt })
+end
+
+---Reserve `rows` blank screen rows below the buffer's last line (0 clears).
+---Kept in place across every later write.
+---@param buf integer
+---@param rows integer
+function M.set_reserve(buf, rows)
+  reserved[buf] = (rows and rows > 0) and rows or nil
+  if vim.api.nvim_buf_is_valid(buf) then
+    place_reserve(buf)
+  end
+end
+
 local function set_lines(buf, first, last, lines)
   vim.bo[buf].modifiable = true
   local ok, err = pcall(vim.api.nvim_buf_set_lines, buf, first, last, false, lines)
   vim.bo[buf].modifiable = false
   if not ok then
     error(err, 0)
+  end
+  if reserved[buf] then
+    place_reserve(buf)
   end
 end
 
@@ -197,7 +230,7 @@ function M.write(buf, lines, meta, old, full)
   return changed
 end
 
-function M.write_sliced(buf, lines, meta, old, full, chunk_rows)
+function M.write_sliced(buf, lines, meta, old, full, chunk_rows, progress)
   return coroutine.create(function()
     -- Buffer writes can be refused while text is locked (for example a scheduled
     -- slice that happens to run during a redraw). Retry on the next slice
@@ -240,11 +273,18 @@ function M.write_sliced(buf, lines, meta, old, full, chunk_rows)
     guarded(function()
       set_lines(buf, prefix, end_line, vim.list_slice(lines, first, stop))
     end)
+    if progress then
+      progress.done = stop
+    end
     coroutine.yield()
     for start = stop + 1, last, chunk_rows do
+      local finish = math.min(last, start + chunk_rows - 1)
       guarded(function()
-        set_lines(buf, start - 1, start - 1, vim.list_slice(lines, start, math.min(last, start + chunk_rows - 1)))
+        set_lines(buf, start - 1, start - 1, vim.list_slice(lines, start, finish))
       end)
+      if progress then
+        progress.done = finish
+      end
       coroutine.yield()
     end
     guarded(function()
@@ -269,8 +309,8 @@ end
 
 ---Write a layout with an explicit row budget between yields.
 ---@return coroutine
-function M.write_chunked(buf, lines, meta, old, full, chunk_rows)
-  return M.write_sliced(buf, lines, meta, old, full, math.max(1, chunk_rows or 500))
+function M.write_chunked(buf, lines, meta, old, full, chunk_rows, progress)
+  return M.write_sliced(buf, lines, meta, old, full, math.max(1, chunk_rows or 500), progress)
 end
 
 ---Repaint backgrounds if their geometry changed.

@@ -122,6 +122,7 @@ local function internal_select(opts)
   vim.bo[buf].buftype = "nofile"
   vim.bo[buf].bufhidden = "wipe"
   vim.bo[buf].swapfile = false
+  vim.b[buf].ade_picker = true
 
   local format = opts.format or function(item)
     return item.label
@@ -133,7 +134,8 @@ local function internal_select(opts)
   local settled = false
   local prev_win = vim.api.nvim_get_current_win()
 
-  local win = vim.api.nvim_open_win(buf, true, {
+  local enter = opts.focus ~= false
+  local win = vim.api.nvim_open_win(buf, enter, {
     relative = "editor",
     style = "minimal",
     border = "rounded",
@@ -149,10 +151,11 @@ local function internal_select(opts)
   vim.wo[win].winhighlight = highlights.picker_winhl()
 
   local function close()
+    local was_current = vim.api.nvim_get_current_win() == win
     if vim.api.nvim_win_is_valid(win) then
       vim.api.nvim_win_close(win, true)
     end
-    if prev_win and vim.api.nvim_win_is_valid(prev_win) and prev_win ~= win then
+    if was_current and prev_win and vim.api.nvim_win_is_valid(prev_win) and prev_win ~= win then
       pcall(vim.api.nvim_set_current_win, prev_win)
     end
   end
@@ -344,14 +347,23 @@ local function internal_select(opts)
   end
 
   render()
+  if not enter then
+    local now = vim.uv.now()
+    if not M._last_focus_notice or now - M._last_focus_notice > 5000 then
+      M._last_focus_notice = now
+      vim.notify("有需要选择的事项；先切到聊天窗口或在面板里回答", vim.log.levels.INFO)
+    end
+  end
 
-  vim.api.nvim_create_autocmd("BufLeave", {
-    buffer = buf,
-    once = true,
-    callback = function()
-      cancel()
-    end,
-  })
+  if opts.dismiss_on_leave ~= false then
+    vim.api.nvim_create_autocmd("BufLeave", {
+      buffer = buf,
+      once = true,
+      callback = function()
+        cancel()
+      end,
+    })
+  end
   return { close = cancel }
 end
 

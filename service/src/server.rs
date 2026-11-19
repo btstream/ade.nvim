@@ -136,6 +136,11 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
             return Ok(ServeStatus::AlreadyRunning { socket });
         }
     };
+    // Only the instance holding the lock owns the log file: a second `serve`
+    // must not rotate the running service's log before exiting.
+    if let Err(error) = crate::logging::init(paths.dir(), crate::logging::MAX_BYTES) {
+        eprintln!("nvim_ade_server: cannot open the service log: {error}");
+    }
     // The lock file records our socket, so a second `serve` (possibly started
     // with a different `--socket`) can report the real one. This happens after
     // the lock is held, so nobody else writes here.
@@ -149,13 +154,13 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
     match token_state {
         token::State::Reused => {}
         token::State::Created => {
-            eprintln!(
+            crate::svc_log!(
                 "nvim_ade_server: generated token {}",
                 paths.token_file().display()
             );
         }
         token::State::Replaced(reason) => {
-            eprintln!(
+            crate::svc_log!(
                 "nvim_ade_server: replaced token file {} ({}); clients must re-read it",
                 paths.token_file().display(),
                 reason.as_str()
@@ -178,7 +183,7 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
         .with_context(|| format!("binding socket {}", socket_string(&paths)))?;
     let socket = socket_string(&paths);
     announce_ready(&socket)?;
-    eprintln!(
+    crate::svc_log!(
         "nvim_ade_server {} (api {}) listening on {}",
         crate::SERVER_VERSION,
         API_VERSION,
@@ -233,12 +238,12 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
             biased;
 
             _ = shutdown.notified() => {
-                eprintln!("nvim_ade_server: shutting down");
+                crate::svc_log!("nvim_ade_server: shutting down");
                 break;
             }
 
             _ = &mut termination => {
-                eprintln!("nvim_ade_server: terminated by a signal");
+                crate::svc_log!("nvim_ade_server: terminated by a signal");
                 break;
             }
 
@@ -260,7 +265,7 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
                         );
                     }
                     Err(error) => {
-                        eprintln!("nvim_ade_server: accept failed: {error}");
+                        crate::svc_log!("nvim_ade_server: accept failed: {error}");
                         // A transient failure (e.g. a client that vanished
                         // mid-handshake) must not kill the service; a broken
                         // listener must not spin forever either.
@@ -293,7 +298,7 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
             }
 
             _ = sleeping => {
-                eprintln!(
+                crate::svc_log!(
                     "nvim_ade_server: idle for {}s, exiting",
                     duration_secs(timeout)
                 );
@@ -337,14 +342,14 @@ async fn termination_signal() {
     let mut terminate = match signal(SignalKind::terminate()) {
         Ok(stream) => stream,
         Err(error) => {
-            eprintln!("nvim_ade_server: cannot watch SIGTERM: {error}");
+            crate::svc_log!("nvim_ade_server: cannot watch SIGTERM: {error}");
             return std::future::pending().await;
         }
     };
     let mut interrupt = match signal(SignalKind::interrupt()) {
         Ok(stream) => stream,
         Err(error) => {
-            eprintln!("nvim_ade_server: cannot watch SIGINT: {error}");
+            crate::svc_log!("nvim_ade_server: cannot watch SIGINT: {error}");
             return std::future::pending().await;
         }
     };
@@ -375,7 +380,7 @@ fn spawn_connection(
         if let Err(error) =
             handle_connection(conn, stream, &token, &shutdown, &hub, event_log, &tokens).await
         {
-            eprintln!("nvim_ade_server: connection error: {error}");
+            crate::svc_log!("nvim_ade_server: connection error: {error}");
         }
         let _ = hub.send(Command::Disconnected { conn }).await;
         let _ = events.send(ConnectionEvent::Closed);
@@ -398,11 +403,14 @@ async fn handle_connection(
     // The writer task owns the outbound side: the hub and this task only
     // queue bytes, so frames from both are written one after another.
     let (close_tx, close_rx) = watch::channel(false);
-    let (outbox, mut outbox_rx) = Outbox::new(close_tx.clone());
+    let (outbox, mut outbox_rx) = Outbox::new(close_tx.clone(), conn);
     let mut writer = writer;
     let writer_task = tokio::spawn(async move {
         while let Some(bytes) = outbox_rx.recv().await {
             if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err() {
+                crate::svc_log!(
+                    "nvim_ade_server: connection {conn} closed: writing to the client failed"
+                );
                 return;
             }
         }
@@ -418,6 +426,8 @@ async fn handle_connection(
         .await;
 
     let mut close_rx = close_rx;
+    #[allow(unused_assignments)]
+    let mut close_reason = "connection ended";
     let result = loop {
         // The hub closes the connection when its outbound queue would exceed
         // its limit; that must end the connection even while no frame arrives.
@@ -425,6 +435,7 @@ async fn handle_connection(
             biased;
             changed = close_rx.changed() => {
                 let _ = changed;
+                close_reason = "the service closed the connection";
                 break Ok(());
             }
             line = protocol::read_message(&mut reader, protocol::MAX_MESSAGE_BYTES) => line,
@@ -432,7 +443,10 @@ async fn handle_connection(
 
         let line = match line {
             Ok(Some(line)) => line,
-            Ok(None) => break Ok(()),
+            Ok(None) => {
+                close_reason = "the client closed the connection";
+                break Ok(());
+            }
             // A client that goes away mid-line is a normal disconnect, not an
             // error worth reporting.
             Err(error)
@@ -440,13 +454,21 @@ async fn handle_connection(
                     || error.kind() == io::ErrorKind::UnexpectedEof
                     || error.kind() == io::ErrorKind::ConnectionReset =>
             {
-                break Ok(())
-            }
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                eprintln!("nvim_ade_server: dropping client: {error}");
+                close_reason = "the client closed the connection";
                 break Ok(());
             }
-            Err(error) => break Err(error),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                crate::svc_log!(
+                    "nvim_ade_server: connection {conn} closed: invalid frame: {error}"
+                );
+                close_reason = "invalid frame (line too long or malformed)";
+                break Ok(());
+            }
+            Err(error) => {
+                crate::svc_log!("nvim_ade_server: connection {conn} read failed: {error}");
+                close_reason = "read error";
+                break Err(error);
+            }
         };
         if line.trim().is_empty() {
             continue;
@@ -495,6 +517,7 @@ async fn handle_connection(
             Local::Close(response) => {
                 outbox.send(&response);
                 flush_outbox(&outbox).await;
+                close_reason = "the client requested close";
                 break Ok(());
             }
             Local::Shutdown(response) => {
@@ -503,6 +526,7 @@ async fn handle_connection(
                 }
                 flush_outbox(&outbox).await;
                 shutdown.notify_one();
+                close_reason = "the service is shutting down";
                 break Ok(());
             }
             Local::Route => {
@@ -524,12 +548,14 @@ async fn handle_connection(
                     }
                 }
                 if hub.send(Command::Frame { conn, frame }).await.is_err() {
+                    close_reason = "the hub is gone";
                     break Ok(());
                 }
             }
         }
     };
 
+    crate::svc_log!("nvim_ade_server: connection {conn} closed: {close_reason}");
     // The hub may still hold a clone of the outbox; closing the watch makes
     // every later send fail, and aborting the writer releases the socket.
     flush_outbox(&outbox).await;
@@ -554,7 +580,7 @@ async fn cancel_writer(task: tokio::task::JoinHandle<()>) {
 }
 
 fn log_authenticated(handshake: &protocol::Handshake) {
-    eprintln!(
+    crate::svc_log!(
         "nvim_ade_server: client {} ({}) authenticated",
         handshake.client().unwrap_or("unknown"),
         handshake.client_version().unwrap_or("unknown")
@@ -596,6 +622,8 @@ fn contains_only_service_files(dir: &std::path::Path) -> bool {
         crate::paths::TOKEN_FILE_NAME,
         crate::paths::LOCK_FILE_NAME,
         "nvim_ade_server.token.tmp",
+        crate::logging::LOG_NAME,
+        crate::logging::ROTATED_NAME,
     ];
     entries.filter_map(Result::ok).all(|entry| {
         let name = entry.file_name();
@@ -683,7 +711,7 @@ fn clear_stale_socket(paths: &Paths) -> Result<()> {
             Err(_) => {
                 std::fs::remove_file(socket)
                     .with_context(|| format!("removing stale socket {}", socket.display()))?;
-                eprintln!("nvim_ade_server: removed stale socket {}", socket.display());
+                crate::svc_log!("nvim_ade_server: removed stale socket {}", socket.display());
             }
         }
     }

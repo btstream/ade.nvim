@@ -11,7 +11,8 @@ Permissions.__index = Permissions
 ---@param opts {config: fun(): table, valid: fun(interaction: table): boolean,
 ---  answer: fun(interaction: table, option_id: string|nil),
 ---  dismiss: fun(interaction: table), notify: fun(message: string, level: integer|nil),
----  session: fun(): table|nil}
+---  session: fun(): table|nil, replacing: (fun(): boolean)|nil,
+---  focus_ok: (fun(): boolean)|nil}
 function Permissions.new(opts)
   return setmetatable({
     config = opts.config,
@@ -20,6 +21,8 @@ function Permissions.new(opts)
     dismiss = opts.dismiss,
     notify = opts.notify,
     current_session = opts.session,
+    replacing = opts.replacing,
+    focus_ok = opts.focus_ok,
     shown = nil,
   }, Permissions)
 end
@@ -169,6 +172,8 @@ function Permissions:present(interaction)
     title = "Permission required: " .. title,
     items = items,
     width = math.min(90, math.max(50, vim.o.columns - 20)),
+    dismiss_on_leave = false,
+    focus = self.focus_ok == nil or self.focus_ok(),
     on_choice = function(value)
       if self.valid(interaction) then
         self.answer(interaction, value and value.id or nil)
@@ -176,6 +181,11 @@ function Permissions:present(interaction)
     end,
     -- Dismissing the dialog must never leave the turn blocked forever.
     on_cancel = function()
+      if self.replacing and self.replacing() then
+        -- The choice component is replacing this picker; closing it must not
+        -- answer the request as a rejection.
+        return
+      end
       if self.valid(interaction) then
         self.dismiss(interaction)
       end

@@ -13,8 +13,8 @@
 -- a version change needs.
 local M = {}
 
-M.VERSION = "0.6.0"
-M.API_VERSION = 5
+M.VERSION = "0.7.1"
+M.API_VERSION = 6
 
 ---Release tag the prebuilt archives are published under.
 ---@return string
