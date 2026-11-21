@@ -248,6 +248,8 @@ M.defaults = {
     },
     follow_output = true,
     wrap = true,
+    -- Number of recent user messages the composer can recall. 0 disables it.
+    input_history_limit = 50,
 
     -- Selector implementation: "vim" uses vim.ui.select (so telescope,
     -- fzf-lua, snacks.nvim and friends apply), "internal" always uses the
@@ -378,6 +380,7 @@ M.defaults = {
     input = {
       -- "<C-s>" while typing, and as the stop key when the composer is empty.
       send = "<C-s>",
+      -- Unclaimed history keys are filled in during normalisation.
       pick_file = false,
       -- Reads an image from the system clipboard while composing. This
       -- deliberately overrides `i_CTRL-V` (literal insert) in the composer and
@@ -960,6 +963,10 @@ function M.validate(cfg)
   check_enum(cfg.ui.session_picker, { "snacks", "internal" }, "ui.session_picker")
   check_enum(cfg.ui.title.placement, { "auto", "winbar", "off" }, "ui.title.placement")
   check_enum(cfg.ui.toolbar.placement, { "auto", "winbar", "off" }, "ui.toolbar.placement")
+  check_number(cfg.ui.input_history_limit, 0, 10000, "ui.input_history_limit")
+  if cfg.ui.input_history_limit % 1 ~= 0 then
+    fail("ui.input_history_limit must be an integer")
+  end
   validate_toolbar(cfg.ui.toolbar)
   validate_icons(cfg.ui.icon_overrides)
   check_enum(cfg.ui.separator.form, { "dot", "turn", "off" }, "ui.separator.form")
@@ -1792,6 +1799,9 @@ function M.normalize_keymaps(cfg)
           fail("unknown keymaps.%s action %q", view, action)
         end
         check_keymap_value(value, "keymaps." .. view .. "." .. action)
+      end
+      if view == "input" then
+        layout.resolve_history_keys(entries, type(cfg.ui) ~= "table" or cfg.ui.input_history_limit ~= 0)
       end
 
       -- Two actions on one key in the same mode: the later mapping would win

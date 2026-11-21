@@ -544,7 +544,7 @@ function M.submit(inv, prompt)
     inline = inv,
     -- A generated inline prompt is mostly instructions; the transcript shows
     -- the user's request, not the whole envelope.
-    local_user = { display_text = "inline: " .. (prompt ~= "" and prompt or "edit request") },
+    local_user = { display_text = "inline: " .. (prompt ~= "" and prompt or "edit request"), generated_prompt = true },
     on_result = function(ok, value)
       local success, problem = xpcall(function()
         M.finish(inv, ok, value)

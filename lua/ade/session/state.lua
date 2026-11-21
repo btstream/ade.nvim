@@ -19,6 +19,7 @@ local memory = require("ade.session.memory")
 ---@field expanded boolean|nil
 ---@field toggled boolean|nil user collapsed/expanded it explicitly
 ---@field optimistic boolean|nil
+---@field generated_prompt boolean|nil Excluded from composer history even after an agent echo.
 ---@field child table|nil
 ---@field entries table[]|nil
 ---@field severity string|nil
@@ -446,7 +447,7 @@ end
 ---Insert the optimistic user message for a prompt.
 ---@param text string
 ---@param attachments table|nil
----@param opts {display_text: string|nil}|nil
+---@param opts {display_text: string|nil, generated_prompt: boolean|nil}|nil
 function Session:add_local_user(text, attachments, opts)
   local positioned = false
   for _, att in ipairs(attachments or {}) do
@@ -463,6 +464,7 @@ function Session:add_local_user(text, attachments, opts)
     -- instructions; the transcript shows a one-line summary instead, and the
     -- full text stays available when the block is expanded.
     display_text = opts and opts.display_text or nil,
+    generated_prompt = opts and opts.generated_prompt or nil,
     status = nil,
     optimistic = true,
     attachments = attachments,

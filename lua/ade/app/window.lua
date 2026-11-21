@@ -147,9 +147,21 @@ end
 function M:install_input_keymaps()
   local S = self:state()
   local actions = self.deps.actions
+  local cfg = self.deps.config()
+  local function history(direction)
+    if cfg.ui.input_history_limit == 0 then
+      return nil
+    end
+    return function()
+      local session = self:state().sess.current
+      return S.view.input:recall(direction, session and session.blocks)
+    end
+  end
   keymaps.attach_input(S.view.input.buf, {
-    keymaps = self.deps.config().keymaps.input,
-    config = self.deps.config(),
+    keymaps = cfg.keymaps.input,
+    config = cfg,
+    on_history_prev = history(1),
+    on_history_next = history(-1),
     get_session = function()
       return self:state().session
     end,

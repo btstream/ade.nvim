@@ -148,9 +148,11 @@ function Input:save_draft()
   if not vim.api.nvim_buf_is_valid(self.buf) then
     return
   end
-  local lines = vim.api.nvim_buf_get_lines(self.buf, 0, -1, false)
-  local empty = #lines == 0 or (#lines == 1 and lines[1] == "")
-  local draft = { text = empty and nil or table.concat(lines, "\n"), attachments = self.attachments }
+  local preview = self.history
+    and self.history.tick == vim.api.nvim_buf_get_changedtick(self.buf)
+    and #self.attachments == 0
+  local text = preview and "" or table.concat(vim.api.nvim_buf_get_lines(self.buf, 0, -1, false), "\n")
+  local draft = { text = text, attachments = self.attachments }
   memory.bound_block(draft, self.config.memory.max_block_bytes)
   draft.used = vim.uv.hrtime()
   self.drafts[self.draft_slot or self.session_key] = draft
@@ -164,7 +166,7 @@ function Input:save_draft()
     end
   end
   if self.on_draft then
-    self.on_draft(self.session_key, empty and "" or table.concat(lines, "\n"), self.attachments, self.draft_owner)
+    self.on_draft(self.session_key, text, self.attachments, self.draft_owner)
   end
 end
 
@@ -177,6 +179,7 @@ function Input:switch_session(key, restored, owner)
     return
   end
   self:save_draft()
+  self.history = nil
   self.draft_epoch = self.draft_epoch + 1
   if self.buf and vim.api.nvim_buf_is_valid(self.buf) then
     vim.api.nvim_buf_clear_namespace(self.buf, anchor_ns, 0, -1)
@@ -201,6 +204,61 @@ function Input:switch_session(key, restored, owner)
     vim.bo[self.buf].modifiable = true
   end
   self:render_images()
+end
+
+---Recall recent user messages from the selected transcript, without attachments.
+---A snapshot keeps navigation stable if more messages arrive while browsing.
+---@param direction 1|-1 1 for older, -1 for newer
+---@param blocks table[]|nil
+---@return boolean handled
+function Input:recall(direction, blocks)
+  if vim.fn.pumvisible() == 1 or not vim.bo[self.buf].modifiable then
+    return false
+  end
+  local tick = vim.api.nvim_buf_get_changedtick(self.buf)
+  local history = self.history
+  if history and (history.tick ~= tick or #self.attachments > 0) then
+    self.history, history = nil, nil
+  end
+  if not history then
+    local limit = self.config.ui.input_history_limit
+    if direction < 0 or limit == 0 or not blocks or #self.attachments > 0 then
+      return false
+    end
+    local lines = vim.api.nvim_buf_get_lines(self.buf, 0, 2, false)
+    if #lines ~= 1 or lines[1] ~= "" then
+      return false
+    end
+    local items = {}
+    for i = #blocks, 1, -1 do
+      local block = blocks[i]
+      if block.kind == "user" and not block.generated_prompt and block.text and block.text:find("%S") then
+        items[#items + 1] = block.text
+        if #items >= limit then
+          break
+        end
+      end
+    end
+    if #items == 0 then
+      return false
+    end
+    history = { items = items, index = 0 }
+  end
+
+  local index = math.min(history.index + direction, #history.items)
+  if index == history.index then
+    return true
+  end
+  local lines = vim.split(history.items[index] or "", "\n", { plain = true })
+  vim.api.nvim_buf_set_lines(self.buf, 0, -1, false, lines)
+  local win = vim.api.nvim_get_current_win()
+  if vim.api.nvim_win_get_buf(win) == self.buf then
+    vim.api.nvim_win_set_cursor(win, { #lines, #lines[#lines] })
+  end
+  history.index = index
+  history.tick = vim.api.nvim_buf_get_changedtick(self.buf)
+  self.history = index > 0 and history or nil
+  return true
 end
 
 ---@return string
@@ -237,6 +295,7 @@ function Input:text()
 end
 
 function Input:clear()
+  self.history = nil
   if not vim.api.nvim_buf_is_valid(self.buf) then
     return
   end

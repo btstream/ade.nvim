@@ -35,10 +35,24 @@ end
 ---`modes` is the set of modes the action is bound in, so a per-mode config
 ---value is filtered by what the view actually supports: `pick_model` accepts a
 ---`{ n = .., i = .. }` table in the composer and only `n` in the transcript.
----@type table<string, {action: string, desc: string, modes: string[], handler: string}[]>
+---@type table<string, {action: string, desc: string, modes: string[], handler: string, fallback?: boolean}[]>
 M.actions = {
   input = {
     { action = "send", desc = "send", modes = { "n", "i" }, handler = "on_send" },
+    {
+      action = "history_prev",
+      desc = "recall older message",
+      modes = { "n", "i" },
+      handler = "on_history_prev",
+      fallback = true,
+    },
+    {
+      action = "history_next",
+      desc = "recall newer message",
+      modes = { "n", "i" },
+      handler = "on_history_next",
+      fallback = true,
+    },
     { action = "cancel", desc = "cancel", modes = { "n" }, handler = "on_cancel" },
     { action = "close_panel", desc = "hide panel", modes = { "n" }, handler = "on_hide" },
     { action = "add_selection", desc = "add selection", modes = { "n" }, handler = "on_add_selection" },
@@ -155,7 +169,20 @@ function M.attach(view, buf, keymaps, handlers)
     local handler = handlers[spec.handler]
     if handler then
       for _, pair in ipairs(pairs_) do
-        vim.keymap.set(pair.mode, pair.lhs, handler, {
+        local callback = handler
+        if spec.fallback then
+          callback = function()
+            if handler() then
+              if pair.mode == "i" then
+                -- Subsequent typing must undo independently of the recalled text.
+                vim.api.nvim_feedkeys(vim.keycode("<C-g>u"), "ni", false)
+              end
+            else
+              vim.api.nvim_feedkeys(vim.keycode(pair.lhs), "ni", false)
+            end
+          end
+        end
+        vim.keymap.set(pair.mode, pair.lhs, callback, {
           buffer = buf,
           silent = true,
           desc = "ade: " .. spec.desc,
@@ -254,6 +281,31 @@ function M.claims(view, keymaps)
     end
   end
   return seen
+end
+
+---Resolve implicit history bindings after user-configured bindings have claimed
+---their keys. Explicit history bindings still get normal conflict validation.
+function M.resolve_history_keys(entries, enabled)
+  local defaults = {
+    history_prev = { "<Up>", "<C-p>" },
+    history_next = { "<Down>", "<C-n>" },
+  }
+  local claimed = M.claims("input", entries)
+  for action, keys in pairs(defaults) do
+    if not enabled then
+      entries[action] = false
+    elseif entries[action] == nil then
+      local available = { n = {}, i = {} }
+      for mode, list in pairs(available) do
+        for _, lhs in ipairs(keys) do
+          if not claimed[mode .. "\0" .. normalize(lhs)] then
+            list[#list + 1] = lhs
+          end
+        end
+      end
+      entries[action] = available
+    end
+  end
 end
 
 return M
