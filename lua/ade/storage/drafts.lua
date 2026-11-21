@@ -4,8 +4,9 @@
 -- session id. Nothing is written when the composer is empty.
 local M = {}
 local memory = require("ade.session.memory")
+local paste_draft = require("ade.storage.paste_draft")
 
-local MAX_TEXT = 200 * 1024
+local MAX_TEXT = paste_draft.max_draft_bytes
 local MAX_DRAFTS = 50
 -- Attachments in a draft keep their metadata plus a bounded slice of text.
 local MAX_ATTACHMENT_TEXT = 2000
@@ -251,17 +252,20 @@ end
 ---@param session_id string|nil
 ---@param text string|nil
 ---@param attachments table|nil
-function M.put(cwd, session_id, text, attachments)
+---@param pastes table|nil
+function M.put(cwd, session_id, text, attachments, pastes)
   local store = load()
   local k = key(cwd, session_id)
   if (not text or text:match("^%s*$")) and #(attachments or {}) == 0 then
     store[k] = nil
   else
+    text = memory.clip(text or "", MAX_TEXT)
     store[k] = {
       cwd = cwd,
       session_id = session_id,
-      text = memory.clip(text or "", MAX_TEXT),
+      text = text,
       attachments = trim_attachments(attachments),
+      pastes = pastes and paste_draft.valid(pastes, vim.split(text, "\n", { plain = true })) or nil,
       saved_at = os.time(),
     }
   end
@@ -290,7 +294,7 @@ end
 
 ---@param cwd string
 ---@param session_id string|nil
----@return {text: string, attachments: table[]}|nil
+---@return {text: string, attachments: table[], pastes: table[]|nil}|nil
 function M.get(cwd, session_id)
   local entry = load()[key(cwd, session_id)]
   if type(entry) ~= "table" then
@@ -306,7 +310,12 @@ function M.get(cwd, session_id)
       end
     end
   end
-  return { text = type(entry.text) == "string" and entry.text or "", attachments = attachments }
+  local text = type(entry.text) == "string" and entry.text or ""
+  return {
+    text = text,
+    attachments = attachments,
+    pastes = entry.pastes and paste_draft.valid(entry.pastes, vim.split(text, "\n", { plain = true })) or nil,
+  }
 end
 
 ---Cache cleanup must not delete images still referenced by persisted drafts.

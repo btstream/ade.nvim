@@ -316,15 +316,12 @@ end
 function M.mentions(text, config, cwd)
   local attachments = {}
   local seen = {}
-  for _, token in ipairs(require("ade.completion.mentions").tokens(text)) do
+  local mentions = require("ade.completion.mentions")
+  for _, token in ipairs(mentions.tokens(text)) do
     local path = token.path
     if not seen[path] then
-      local absolute = path
-      if path:sub(1, 1) ~= "/" and cwd then
-        absolute = cwd .. "/" .. path
-      end
-      absolute = vim.fn.fnamemodify(absolute, ":p")
-      if not seen[absolute] and vim.fn.filereadable(absolute) == 1 then
+      local absolute = mentions.readable_path(path, cwd)
+      if absolute and not seen[absolute] then
         local attachment = M.file(absolute, config)
         if attachment then
           seen[absolute] = true

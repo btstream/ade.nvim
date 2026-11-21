@@ -185,6 +185,12 @@ function M:install_input_keymaps()
     on_pick_file = actions.pick_file,
     on_paste_image = actions.paste_image,
     on_paste_image_path = actions.add_image,
+    on_paste_text = function(lines)
+      return S.view.input:preview_paste(lines)
+    end,
+    paste_epoch = function()
+      return S.view.input.draft_epoch
+    end,
     on_pick_session = actions.pick_session,
     on_focus_choice = function()
       if S.view.choices then

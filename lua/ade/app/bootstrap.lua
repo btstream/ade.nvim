@@ -1061,12 +1061,12 @@ function M.build(ctx, opts, action)
   S.view.input.on_refresh = function()
     ctx.update_input_toolbar()
   end
-  S.view.input.on_draft = function(key, text, attachments, owner)
+  S.view.input.on_draft = function(key, text, attachments, owner, pastes)
     local session = owner or S.sess.all[key]
     if not session then
       return
     end
-    drafts.put(session.cwd, session.id, text, attachments)
+    drafts.put(session.cwd, session.id, text, attachments, pastes)
   end
   S.view.attachments:flush(S.view.input)
 

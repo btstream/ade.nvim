@@ -230,7 +230,8 @@ end
 
 ---@param opts {keymaps: table, on_send: fun(), on_cancel: fun(), on_hide: fun(),
 ---  on_add_selection: fun(), on_pick_model: fun(), on_pick_mode: fun(), on_pick_thinking: fun(),
----  on_pick_session: fun(), on_pick_file: fun(), on_paste_image: fun(), get_session: fun()}
+---  on_pick_session: fun(), on_pick_file: fun(), on_paste_image: fun(), get_session: fun(),
+---  on_paste_text?: fun(lines: string[]): boolean, paste_epoch?: fun(): integer}
 function M.attach_input(buf, opts)
   M.attach("input", buf, opts.keymaps, opts)
   complete.attach(buf, opts.get_session, opts.config)
@@ -244,6 +245,8 @@ function M.attach_input(buf, opts)
     on_image = function(path)
       return opts.on_paste_image_path and opts.on_paste_image_path(path) or false
     end,
+    on_text = opts.on_paste_text,
+    epoch = opts.paste_epoch,
   })
 end
 

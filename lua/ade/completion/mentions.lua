@@ -23,6 +23,15 @@ function M.display(path)
   return path:find("%c") and vim.json.encode(path) or path
 end
 
+---Resolve a token the same way for the composer and for submitted attachments.
+function M.readable_path(path, cwd)
+  if cwd and path:sub(1, 1) ~= "/" then
+    path = cwd .. "/" .. path
+  end
+  path = vim.fn.fnamemodify(path, ":p")
+  return vim.fn.filereadable(path) == 1 and path or nil
+end
+
 function M.tokens(text, incomplete)
   local out, i = {}, 1
   while i <= #text do

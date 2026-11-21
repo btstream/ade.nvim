@@ -590,6 +590,54 @@ return function(t)
       vim.api.nvim_buf_delete(buf, { force = true })
     end)
 
+    t.it("combines streamed composer text without adding newlines at chunk boundaries", function()
+      local c = cfg({ ui = { paste_preview = { min_lines = 2 } } })
+      local input = require("ade.ui.input").new({ config = c })
+      vim.api.nvim_set_current_buf(input.buf)
+      paste.attach(input.buf, {
+        config = function()
+          return c
+        end,
+        is_active = function()
+          return true
+        end,
+        on_image = function()
+          return false
+        end,
+        on_text = function(lines)
+          return input:preview_paste(lines)
+        end,
+        epoch = function()
+          return input.draft_epoch
+        end,
+      })
+      local ok, err = pcall(function()
+        t.truthy(vim.api.nvim_paste("ab", false, 1))
+        t.truthy(vim.api.nvim_paste("cd\n", false, 2))
+        t.truthy(vim.api.nvim_paste("ef", false, 3))
+        t.eq("[Pasted 2 lines]", vim.api.nvim_get_current_line())
+        t.eq("abcd\nef", input:text())
+        input:clear()
+        t.truthy(vim.api.nvim_paste("discard", false, 1))
+        input:switch_session("another")
+        t.falsy(vim.api.nvim_paste("\nremaining", false, 3))
+        t.eq("", input:text())
+        t.truthy(vim.api.nvim_paste("short", false, -1))
+        t.eq("short", vim.api.nvim_get_current_line())
+        input:clear()
+        local large = string.rep("x", require("ade.storage.paste_draft").max_bytes)
+        t.truthy(vim.api.nvim_paste("a", false, 1))
+        t.truthy(vim.api.nvim_paste(large, false, 2))
+        t.truthy(vim.api.nvim_paste("z", false, 3))
+        t.eq("a" .. large .. "z", input:text())
+      end)
+      paste.detach(input.buf)
+      input:destroy()
+      if not ok then
+        error(err, 0)
+      end
+    end)
+
     t.it("claims an image paste only when the attachment was accepted", function()
       local path, dir = tempfile(png())
       local c = cfg()

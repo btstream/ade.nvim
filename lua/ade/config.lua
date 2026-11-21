@@ -250,6 +250,11 @@ M.defaults = {
     wrap = true,
     -- Number of recent user messages the composer can recall. 0 disables it.
     input_history_limit = 50,
+    paste_preview = {
+      enabled = true,
+      min_lines = 4,
+      min_bytes = 512,
+    },
 
     -- Selector implementation: "vim" uses vim.ui.select (so telescope,
     -- fzf-lua, snacks.nvim and friends apply), "internal" always uses the
@@ -966,6 +971,17 @@ function M.validate(cfg)
   check_number(cfg.ui.input_history_limit, 0, 10000, "ui.input_history_limit")
   if cfg.ui.input_history_limit % 1 ~= 0 then
     fail("ui.input_history_limit must be an integer")
+  end
+  local paste = cfg.ui.paste_preview
+  if type(paste) ~= "table" or type(paste.enabled) ~= "boolean" then
+    fail("ui.paste_preview must be a table with a boolean enabled field")
+  end
+  for key, min in pairs({ min_lines = 2, min_bytes = 1 }) do
+    local path = "ui.paste_preview." .. key
+    check_number(paste[key], min, 200 * 1024, path)
+    if paste[key] % 1 ~= 0 then
+      fail("%s must be an integer", path)
+    end
   end
   validate_toolbar(cfg.ui.toolbar)
   validate_icons(cfg.ui.icon_overrides)

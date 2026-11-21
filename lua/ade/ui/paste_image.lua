@@ -1,12 +1,12 @@
--- Turn pasted image paths into attachments.
+-- Route composer pastes to image attachments, text previews, or Neovim.
 --
 -- A terminal can only forward text when the user drops a file or pastes a path,
 -- so this is the one paste path that carries something a screenshot cannot:
--- the image file itself. Everything that is not a single existing image path is
--- handed straight back to Neovim's own handler.
+-- the image file itself.
 local M = {}
 
 local image = require("ade.context.image")
+local paste_draft = require("ade.storage.paste_draft")
 
 ---Bracketed-paste content arrives as one string may be wrapped in the paste
 ---markers by callers that synthesise it; strip them before inspecting.
@@ -60,9 +60,9 @@ end
 ---Install the handler for one composer buffer.
 ---
 ---The override is process-wide because `vim.paste` is, but it delegates unless
----the cursor is in `buf` and the pasted text is exactly one image path.
+---the cursor is in an opted-in composer.
 ---@param buf integer
----@param opts {config: fun(): table, on_image: fun(path: string): boolean, is_active: fun(): boolean}
+---@param opts {config: fun(): table, on_image: fun(path: string): boolean, is_active: fun(): boolean, on_text?: fun(lines: string[]): boolean, epoch?: fun(): integer}
 function M.attach(buf, opts)
   if M.installed then
     M.followers[buf] = opts
@@ -88,31 +88,75 @@ function M.attach(buf, opts)
     return target(lines, phase)
   end
 
+  local function claim(owner, lines)
+    local path = #lines == 1 and M.path_of(join(lines))
+    if path then
+      local images = owner.config().context.images
+      if images.enabled ~= false and M.is_image(path, images.max_bytes) and owner.on_image(path) then
+        return true
+      end
+    end
+    return owner.on_text and owner.on_text(lines) or false
+  end
+
+  local stream
   M.paste = function(lines, phase)
-    -- Neovim may stream a large paste across several phases. Only the final
-    -- phase carries the whole text, so everything else is forwarded untouched.
-    local owner = followers[vim.api.nvim_get_current_buf()]
-    if not owner or not owner.is_active() then
-      return delegate(lines, phase)
+    local buf = vim.api.nvim_get_current_buf()
+    local owner = followers[buf]
+    local active = owner and owner.is_active()
+    if phase < 2 then
+      stream = nil
     end
-    -- A single-line clipboard path arrives as one complete paste; a streaming
-    -- phase or a multi-line paste is ordinary text and must be inserted as-is.
-    if phase ~= -1 or #lines ~= 1 then
-      return delegate(lines, phase)
+    if phase == -1 then
+      if active and claim(owner, lines) then
+        return true
+      end
+    elseif
+      phase == 1
+      and active
+      and owner.on_text
+      and owner.config().ui.paste_preview.enabled
+      and vim.fn.getcmdtype() == ""
+      and vim.api.nvim_get_mode().mode:match("^[ni]")
+    then
+      stream = { buf = buf, owner = owner, epoch = owner.epoch and owner.epoch(), chunks = {}, bytes = 0 }
     end
-    local text = join(lines)
-    local path = M.path_of(text)
-    if not path then
-      return delegate(lines, phase)
+    if stream then
+      local current = stream
+      if
+        not active
+        or buf ~= current.buf
+        or owner ~= current.owner
+        or (owner.epoch and owner.epoch() ~= current.epoch)
+      then
+        stream = nil
+        return false
+      end
+      if phase == 3 then
+        stream = nil
+      end
+      if current.chunks then
+        local text = table.concat(lines, "\n")
+        if #text + current.bytes <= paste_draft.max_bytes then
+          if text ~= "" then
+            current.chunks[#current.chunks + 1] = text
+            current.bytes = current.bytes + #text
+          end
+          if phase ~= 3 then
+            return true
+          end
+          local combined = vim.split(table.concat(current.chunks), "\n", { plain = true })
+          return claim(owner, combined) or delegate(combined, -1)
+        end
+        local chunks = current.chunks
+        current.chunks = nil
+        if phase ~= 1 and not delegate(vim.split(table.concat(chunks), "\n", { plain = true }), 1) then
+          stream = nil
+          return false
+        end
+      end
     end
-    local images = owner.config().context.images
-    if images.enabled == false or not M.is_image(path, images.max_bytes) then
-      return delegate(lines, phase)
-    end
-    if not owner.on_image(path) then
-      return delegate(lines, phase)
-    end
-    return true
+    return delegate(lines, phase)
   end
   vim.paste = M.paste
 end

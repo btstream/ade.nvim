@@ -74,6 +74,7 @@ M.groups = {
   AdeUser = { link = "Function" },
   AdeUserChip = { link = "Visual" },
   AdeInputImage = { fg = "#292929", bg = "#ffcc80", bold = true },
+  AdeInputPaste = { link = "AdeInputImage" },
 
   -- Inline editing. The prompt is a modal-looking float; pending hunks take the
   -- warning colour and the current one the info colour.
