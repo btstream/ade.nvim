@@ -229,6 +229,7 @@ M.defaults = {
   ui = {
     -- Use Nerd Font icons. Set to false for a plain ASCII interface.
     icons = true,
+    -- Per-profile Agent icons: chat_agents = { claude = "C" }.
     -- Per-mode overrides: modes = { claude = { acceptEdits = "E" } }.
     icon_overrides = {},
     -- Show agent thoughts expanded. Off by default, matching Zed's clean
@@ -819,6 +820,16 @@ local function validate_icons(overrides)
           end
           check_icon(icon, path .. "." .. agent .. "." .. id)
         end
+      end
+    elseif key == "chat_agents" then
+      if type(value) ~= "table" then
+        fail("%s must be a table", path)
+      end
+      for agent, icon in pairs(value) do
+        if type(agent) ~= "string" or agent == "" then
+          fail("%s must use non-empty string agent or profile names", path)
+        end
+        check_icon(icon, path .. "." .. agent)
       end
     elseif key == "spinner_frames" and value ~= false then
       if type(value) ~= "table" or not vim.islist(value) or #value == 0 then

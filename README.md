@@ -30,7 +30,7 @@ Neovim 原生的 [Agent Client Protocol](https://agentclientprotocol.com) 客户
 
 ```
 ┌──────────────────────────┬──────────────────────────────┐
-│                          │ opencode · 重构认证中间件      │ ← winbar
+│                          │ 󰆍 opencode      重构认证中间件 │ ← winbar
 │                          ├──────────────────────────────┤
 │                          │ ❯ 你  [auth.lua] [选区 12-40] │
 │                          │   把 token 校验提取成一个函数   │
@@ -1349,9 +1349,17 @@ require("ade").setup({
 到 treesitter 的 `@markup.*` 捕获组，所以在对话记录里的呈现和普通 Markdown buffer
 遵循主题的相应样式，但渲染器并非完整的 Markdown 实现。
 
-`ade_chat` 的标题栏（winbar）与正文共用同一个背景（`AdeNormal`），读起来是对话
-记录的页眉，而不是一条独立的色带。`ade_input` 的工具栏仍然用 `StatusLine` 的颜色，
-因为它是工具栏而非页眉。
+`ade_chat` 的标题栏（winbar）左侧显示 Agent 图标和名称，右侧显示会话名称，与正文
+共用 `AdeNormal` 背景。两侧可通过 `ui.highlights` 分别设置：
+
+- `AdeChatAgentName`：Agent 图标和名称，默认链接到 `AdeTitle`。
+- `AdeChatSessionName`：会话名称，默认链接到 `AdeNormal`。
+
+Claude、OpenCode 和 Pi 默认使用不同的图标。可通过 `ui.icon_overrides.chat_agents` 按 Agent 配置名或
+profile 定制，例如 `chat_agents = { claude = "C", opencode = "O", pi = "P" }`。同名配置优先于
+profile，单项设为 `false` 可隐藏该图标。原有 `ui.icon_overrides.chat_agent` 仍可统一替换或隐藏
+没有单独配置的图标。
+`ade_input` 的工具栏样式不变。
 
 对话记录的标题行拆成了图标和文字两组：`AdeUserIcon` / `AdeUserTitle`、
 `AdeAssistantIcon` / `AdeAssistantTitle`。用户标题默认链接到用户图标；助手两组默认均链接到 `Keyword`；

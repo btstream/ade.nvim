@@ -88,6 +88,10 @@ function M.nerd()
     tool_pending = "󰝦", -- circle-outline
     user = "󰀄", -- account
     assistant = "󰚩", -- robot
+    chat_agent = "󰚩", -- robot
+    chat_agent_claude = "", -- star
+    chat_agent_opencode = "󰬖", -- console
+    chat_agent_pi = "",
     thought = "󰟷", -- brain
     plan = "󰉹", -- format-list
     notice = "󰋼", -- information
@@ -138,6 +142,10 @@ function M.ascii()
     tool_pending = ".",
     user = ">",
     assistant = "#",
+    chat_agent = "@",
+    chat_agent_claude = "C",
+    chat_agent_opencode = "O",
+    chat_agent_pi = "P",
     thought = "+",
     plan = "*",
     notice = "!",
@@ -210,6 +218,29 @@ function M.get(use_icons, overrides)
     cache[base] = set
   end
   return cache[base]
+end
+
+local profile_chat_agent_icons = {
+  claude = "chat_agent_claude",
+  opencode = "chat_agent_opencode",
+  pi = "chat_agent_pi",
+}
+
+---Resolve a transcript icon by agent name, then profile, then global override.
+function M.chat_agent_icon(icons, overrides, agent, profile)
+  local agents = M.override(overrides, "chat_agents")
+  local value = agents and agents[agent]
+  if value == nil and agents then
+    value = agents[profile]
+  end
+  if value ~= nil then
+    return value == false and "" or value
+  end
+  if M.override(overrides, "chat_agent") ~= nil then
+    return icons.chat_agent
+  end
+  local key = profile_chat_agent_icons[profile or agent]
+  return key and icons[key] or icons.chat_agent
 end
 
 local profile_mode_icons = {

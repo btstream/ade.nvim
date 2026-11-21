@@ -23,6 +23,8 @@ M.groups = {
   AdeMuted = { link = "Comment" },
   AdeBorder = { link = "FloatBorder" },
   AdeTitle = { link = "Title" },
+  AdeChatAgentName = { link = "AdeTitle" },
+  AdeChatSessionName = { link = "AdeNormal" },
 
   -- Team dashboard v2: one colour per role label, one background per board
   -- column. Users can override any of these groups directly.

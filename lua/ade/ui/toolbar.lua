@@ -68,7 +68,9 @@ function M.truncate(s, max)
   if dw(s) <= max then
     return s
   end
-  if max <= 1 then
+  local ellipsis = "…"
+  local ellipsis_width = dw(ellipsis)
+  if max <= 1 or max < ellipsis_width then
     return ""
   end
   -- Display width grows monotonically with the prefix, so binary search finds
@@ -79,17 +81,14 @@ function M.truncate(s, max)
   local best = 0
   while lo <= hi do
     local mid = math.floor((lo + hi) / 2)
-    if dw(s:sub(1, starts[mid + 1] - 1)) <= max - 1 then
+    if dw(s:sub(1, starts[mid + 1] - 1)) <= max - ellipsis_width then
       best = mid
       lo = mid + 1
     else
       hi = mid - 1
     end
   end
-  if best == 0 then
-    return "…"
-  end
-  return s:sub(1, starts[best + 1] - 1) .. "…"
+  return s:sub(1, starts[best + 1] - 1) .. ellipsis
 end
 
 ---Wrap text in a highlight group.
@@ -217,32 +216,53 @@ function M.render(info, width)
 end
 
 ---Build the transcript window title.
----@param opts {agent: string, title: string|nil, pending_new: boolean, running: boolean}
+---@param opts {agent: string, profile: string|nil, title: string|nil, pending_new: boolean|nil, icons: boolean|nil, icon_overrides: table|nil}
 ---@param width integer
 ---@return string
 function M.chat_title(opts, width)
+  local base = "%#AdeNormal#"
+  if width <= 2 then
+    return base .. string.rep(" ", math.max(0, width))
+  end
+  width = width - 2 -- One inset cell at each edge.
+
   local title = opts.title
   if not title or title == "" then
     title = "No session"
   end
-  local suffix = opts.pending_new and ("  " .. Icons.get(opts.icons, opts.icon_overrides).arrow_down .. " new") or ""
-  local available = math.max(10, width - dw(opts.agent) - dw(suffix) - 6)
+  local icons = Icons.get(opts.icons, opts.icon_overrides)
+  local icon = Icons.chat_agent_icon(icons, opts.icon_overrides, opts.agent, opts.profile)
+  local prefix = icon ~= "" and (icon .. " ") or ""
+  local agent = opts.agent
+
+  -- Leave a gap between the two sides. When both labels are long, give each
+  -- room to truncate; a short session title can yield its unused space.
+  local title_width = dw(title)
+  local left_budget = width >= 5 and math.max(math.floor((width - 1) / 2), width - 1 - title_width) or width
+  local agent_width = dw(agent)
+  local prefix_width = dw(prefix)
+  if agent_width + prefix_width > left_budget and (agent_width <= left_budget or left_budget - prefix_width < 3) then
+    prefix, prefix_width = "", 0
+  end
+  agent = prefix .. M.truncate(agent, left_budget - prefix_width)
+  local right_budget = width - dw(agent) - (agent ~= "" and 1 or 0)
+  local suffix = opts.pending_new and ("  " .. (icons.arrow_down ~= "" and icons.arrow_down .. " " or "") .. "new")
+    or ""
+  if right_budget < dw(suffix) + math.min(title_width, 2) then
+    suffix = ""
+  end
+  title = M.truncate(title, right_budget - dw(suffix))
+
   -- The title bar sits on the transcript's own background, not the statusline
   -- colour: it is the transcript's header, not a separate strip. `AdeNormal`
   -- opens that background and every region inherits it with `%$...$`, so a
   -- layout manager remapping `WinBar` cannot repaint any of them.
-  return "%#AdeNormal#"
-    .. M.highlight("AdeTitle")
-    .. M.escape(opts.agent)
-    .. M.highlight("AdeNormal")
-    .. M.highlight("AdeMuted")
-    .. "·"
-    .. M.highlight("AdeNormal")
-    .. " "
-    .. M.escape(M.truncate(title, available))
-    .. (
-      opts.pending_new and ("  " .. M.highlight("AdeStreaming") .. M.escape(suffix) .. M.highlight("AdeNormal")) or ""
-    )
+  local left = agent ~= "" and (M.highlight("AdeChatAgentName") .. M.escape(agent) .. base) or ""
+  local right = title ~= "" and (M.highlight("AdeChatSessionName") .. M.escape(title) .. base) or ""
+  if right ~= "" and suffix ~= "" then
+    right = right .. M.highlight("AdeStreaming") .. M.escape(suffix) .. base
+  end
+  return base .. " " .. left .. "%=" .. right .. " "
 end
 
 return M

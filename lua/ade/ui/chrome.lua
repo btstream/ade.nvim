@@ -222,13 +222,15 @@ function Chrome:chat_bar(win)
   win = win or vim.api.nvim_get_current_win()
   local session = self.current()
   local chat = self.get_chat()
+  local agent = session and session.agent_name or cfg.agent
+  local profile = session and session.profile or require("ade.agents").get(cfg.agents and cfg.agents[agent], agent)
   return toolbar.chat_title({
     icons = cfg.ui.icons,
     icon_overrides = cfg.ui.icon_overrides,
-    agent = cfg.agent,
+    agent = agent,
+    profile = profile.name,
     title = self.session_label(session),
     pending_new = chat and chat.pending_new or false,
-    running = session and session.status == "running" or false,
   }, vim.api.nvim_win_get_width(win))
 end
 

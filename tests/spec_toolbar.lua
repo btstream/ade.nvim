@@ -125,6 +125,112 @@ return function(t)
       t.eq("▊ B  Model" .. string.rep(" ", 18) .. "o ", result.str)
     end)
 
+    t.it("aligns the Agent and session at opposite ends of the transcript winbar", function()
+      require("ade.ui.highlights").setup()
+      local raw = toolbar.chat_title({
+        agent = "work",
+        title = "Review 100%",
+        icons = false,
+        icon_overrides = { chat_agent = "%" },
+      }, 24)
+      local result = vim.api.nvim_eval_statusline(raw, { use_winbar = true, maxwidth = 24, highlights = true })
+      t.eq(" % work     Review 100% ", result.str)
+      local function has_group(text, group)
+        local start = assert(result.str:find(text, 1, true)) - 1
+        local active
+        for _, span in ipairs(result.highlights) do
+          if span.start > start then
+            break
+          end
+          active = span
+        end
+        return active and vim.tbl_contains(active.groups or { active.group }, group)
+      end
+      t.truthy(has_group("% work", "AdeChatAgentName"))
+      t.truthy(has_group("Review", "AdeChatSessionName"))
+    end)
+
+    t.it("supports hiding the Agent icon and preserves the pending new marker when it fits", function()
+      local opts = {
+        agent = "work",
+        pending_new = true,
+        icons = false,
+        icon_overrides = { chat_agent = false },
+      }
+      local function rendered(width)
+        return vim.api.nvim_eval_statusline(toolbar.chat_title(opts, width), { use_winbar = true, maxwidth = width }).str
+      end
+      t.eq(" work       No session  v new ", rendered(30))
+      opts.title = "会话"
+      t.eq(" work 会话 ", rendered(11))
+    end)
+
+    t.it("uses distinct built-in Agent icons in both font sets", function()
+      local icons = require("ade.ui.icons")
+      for _, nerd in ipairs({ true, false }) do
+        local set, seen = icons.get(nerd, {}), {}
+        for _, name in ipairs({ "claude", "opencode", "pi", "generic" }) do
+          local icon = icons.chat_agent_icon(set, {}, name)
+          t.truthy(icon ~= "" and not seen[icon])
+          seen[icon] = true
+          local raw = toolbar.chat_title({ agent = name, icons = nerd, icon_overrides = {} }, 40)
+          local result = vim.api.nvim_eval_statusline(raw, { use_winbar = true, maxwidth = 40 })
+          t.truthy(vim.startswith(result.str, " " .. icon .. " " .. name))
+        end
+      end
+    end)
+
+    t.it("uses the configured profile before a session and prefers exact Agent icon overrides", function()
+      local config = require("ade.config")
+      local cfg = config.validate(config.merge(config.defaults, {
+        agent = "work",
+        agents = { work = { command = "claude-agent-acp", profile = "claude" } },
+        ui = { icons = false, icon_overrides = { chat_agent = "?", chat_agents = { claude = "C!", hidden = false } } },
+      }))
+      local session
+      local chrome = require("ade.ui.chrome").new({
+        config = function()
+          return cfg
+        end,
+        current = function()
+          return session
+        end,
+        session_label = function()
+          return "Review"
+        end,
+        chat = function() end,
+      })
+      local function starts_with(prefix)
+        local result = vim.api.nvim_eval_statusline(chrome:chat_bar(), { use_winbar = true })
+        t.truthy(vim.startswith(result.str, " " .. prefix))
+      end
+      starts_with("C! work")
+      session = { agent_name = "hidden", profile = { name = "claude" } }
+      starts_with("hidden")
+      session = { agent_name = "other", profile = { name = "pi" } }
+      starts_with("? other")
+    end)
+
+    t.it("fits both long labels in a narrow transcript, including with double-width ellipses", function()
+      local opts =
+        { agent = "很长的Agent名称", title = "很长的会话名称", icons = false, pending_new = true }
+      local ambiwidth = vim.o.ambiwidth
+      vim.o.ambiwidth = "double"
+      local ok, err = pcall(function()
+        for width = 1, 18 do
+          local raw = toolbar.chat_title(opts, width)
+          local result = vim.api.nvim_eval_statusline(raw, { use_winbar = true, maxwidth = width })
+          t.falsy(result.str:find("[<>]"), "Neovim had to truncate the already fitted labels")
+        end
+        local raw = toolbar.chat_title(opts, 11)
+        t.eq(" 很… 很… ", vim.api.nvim_eval_statusline(raw, { use_winbar = true, maxwidth = 11 }).str)
+      end)
+      vim.o.ambiwidth = ambiwidth
+      if not ok then
+        error(err)
+      end
+    end)
+
     t.it("styles both separator edges and only joins visible components", function()
       local text = toolbar.render({
         mode = "Accept edits",
