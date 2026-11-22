@@ -17,6 +17,7 @@ local SUBCOMMANDS = {
   "login",
   "logout",
   "agent",
+  "close-agent",
   "agents",
   "install",
   "update",
@@ -94,7 +95,7 @@ local function complete(arglead, cmdline)
           end
         end
       end
-    elseif sub == "agent" then
+    elseif sub == "agent" or sub == "close-agent" then
       local ok, config = pcall(require, "ade.config")
       local current = ok and (config.current or config.defaults) or {}
       candidates = vim.tbl_keys(current.agents or {})
@@ -208,6 +209,8 @@ local function setup()
         ade.pick_config()
       elseif sub == "disconnect" then
         ade.disconnect()
+      elseif sub == "close-agent" then
+        ade.close_agent(rest ~= "" and rest or nil)
       elseif sub == "permission" then
         ade.show_permission()
       elseif sub == "model" then
@@ -255,7 +258,7 @@ local function setup()
         vim.notify("ade.nvim: unknown subcommand " .. sub, vim.log.levels.WARN)
       end
     end,
-    "open|hide|toggle|new|stop|reconnect|login|logout|agent|agents|team|workflows|install|update|uninstall|config|disconnect|permission|sessions|delete|model|mode|file|files|image|inline|inline-stop|inline-reset|diagnostics|service",
+    "open|hide|toggle|new|stop|reconnect|login|logout|agent|close-agent|agents|team|workflows|install|update|uninstall|config|disconnect|permission|sessions|delete|model|mode|file|files|image|inline|inline-stop|inline-reset|diagnostics|service",
     true,
     complete
   )

@@ -44,12 +44,15 @@ function M.request(connection, method, params, opts)
   local on_done = opts.on_done or function() end
   local timeout = opts.timeout or M.DEFAULT_TIMEOUT
   local settled = false
-  local timer
+  local timer, channel
   local function finish(ok, value)
     if settled then
       return
     end
     settled = true
+    if channel and connection.unsubscribe_all then
+      connection:unsubscribe_all(channel)
+    end
     if timer then
       timer:stop()
       timer:close()
@@ -59,14 +62,13 @@ function M.request(connection, method, params, opts)
   end
   -- The connection reports a drop through its own fan-out; subscribe so an
   -- in-flight request fails instead of hanging.
-  local channel = "command-" .. tostring(vim.uv.hrtime())
-  connection:subscribe(channel, "__disconnected", function(payload)
-    local reason = type(payload) == "table" and tostring(payload.reason or "connection lost") or "connection lost"
-    finish(false, { code = -32000, message = reason })
-  end)
-  connection:request(method, params, function(ok, value)
-    finish(ok, value)
-  end)
+  if connection.subscribe then
+    channel = "command-" .. tostring(vim.uv.hrtime())
+    connection:subscribe(channel, "__disconnected", function(payload)
+      local reason = type(payload) == "table" and tostring(payload.reason or "connection lost") or "connection lost"
+      finish(false, { code = -32000, message = reason })
+    end)
+  end
   if timeout and timeout > 0 then
     timer = vim.uv.new_timer()
     timer:start(timeout, 0, function()
@@ -78,6 +80,7 @@ function M.request(connection, method, params, opts)
       end)
     end)
   end
+  connection:request(method, params, finish)
   return function()
     finish(false, { code = -32000, message = "command cancelled" })
   end
@@ -357,6 +360,129 @@ function M.kill(instance, opts)
       end
     end,
   })
+end
+
+---Pick and stop one standalone agent in the current project.
+---@param name string|nil configured agent name
+---@param opts {cwd: string, connection?: table, timeout?: integer, notify?: fun(message: string, level: integer|nil), select?: function}
+function M.close_agent(name, opts)
+  local show = opts.notify or notify
+  local select = opts.select or vim.ui.select
+  local status = require("ade.service.status")
+  -- Keep both requests on one socket. Instance IDs can be reused after a
+  -- daemon restart; reconnecting while a picker is open could stop a new one.
+  -- A stop must not run the launcher's start/upgrade path, either.
+  local client = not opts.connection
+    and require("ade.service.client").new({ timeout = opts.timeout or M.DEFAULT_TIMEOUT })
+  local connection = opts.connection or client
+  local function done()
+    if client then
+      client:close()
+    end
+  end
+  local function request(method, params, on_done)
+    return M.request(connection, method, params, { timeout = opts.timeout, on_done = on_done })
+  end
+  local function close(instance)
+    local function stop()
+      request("agent.stop", { instance = instance.instance }, function(ok, value)
+        done()
+        if ok then
+          show("stopped agent " .. instance.instance)
+        else
+          show(
+            "unable to stop " .. instance.instance .. ": " .. require("ade.service.transport").describe(value),
+            vim.log.levels.WARN
+          )
+        end
+      end)
+    end
+    if
+      (tonumber(instance.turns_running) or 0) > 0
+      or (tonumber(instance.pending_requests) or 0) > 0
+      or (tonumber(instance.attached) or 0) > 1
+    then
+      select({ "Keep running", "Stop agent" }, {
+        prompt = "Stop an active or shared agent? " .. status.instance_line(instance),
+      }, function(choice)
+        if choice == "Stop agent" then
+          stop()
+        else
+          done()
+        end
+      end)
+    else
+      stop()
+    end
+  end
+  local function list(ok, value)
+    if not ok then
+      done()
+      show("unable to list agents: " .. require("ade.service.transport").describe(value), vim.log.levels.WARN)
+      return
+    end
+    local instances = type(value) == "table" and value.instances or nil
+    if type(instances) ~= "table" then
+      done()
+      show("unable to list agents: the service returned no instance list", vim.log.levels.WARN)
+      return
+    end
+    local candidates = {}
+    for _, instance in ipairs(instances) do
+      if
+        type(instance) == "table"
+        and type(instance.instance) == "string"
+        and instance.instance ~= ""
+        and instance.cwd == opts.cwd
+        and (not name or instance.agent == name)
+        and not instance.team
+        and not instance.stopping
+      then
+        candidates[#candidates + 1] = instance
+      end
+    end
+    if #candidates == 0 then
+      done()
+      show("no running standalone " .. (name and ("agent " .. name) or "agents") .. " in " .. opts.cwd)
+    elseif name and #candidates == 1 then
+      close(candidates[1])
+    else
+      table.sort(candidates, function(a, b)
+        local a_name, b_name = tostring(a.agent), tostring(b.agent)
+        if a_name == b_name then
+          return a.instance < b.instance
+        end
+        return a_name < b_name
+      end)
+      select(candidates, {
+        prompt = "Close agent in " .. opts.cwd,
+        -- Some pickers pass a second flag (e.g. Snacks' supports_chunks),
+        -- which instance_line would otherwise treat as the current time.
+        format_item = function(instance)
+          return status.instance_line(instance)
+        end,
+      }, function(choice)
+        if choice then
+          close(choice)
+        else
+          done()
+        end
+      end)
+    end
+  end
+  local function fetch()
+    return request("agent.list", {}, list)
+  end
+  if client then
+    return client:connect(function(ok, value)
+      if ok then
+        fetch()
+      else
+        list(false, value)
+      end
+    end)
+  end
+  return fetch()
 end
 
 ---Dispatch one `:Ade service <sub>` invocation.

@@ -262,6 +262,25 @@ function M.disconnect()
   S.conn.service:disconnect()
 end
 
+---Stop a standalone agent without switching the panel to it.
+---@param name string|nil
+function M.close_agent(name)
+  local cfg = S.config
+  local matches = not name or name == cfg.agent
+  local cwd = resolve_cwd()
+  if cfg.backend == "direct" or (matches and S.conn.client and S.conn.service.backend_service == false) then
+    local client = S.conn.client
+    if matches and ((client and client.cwd == cwd) or (not client and S.conn.phase == "starting")) then
+      M.disconnect()
+      notify("stopped agent " .. cfg.agent)
+    else
+      notify("no matching running direct agent", vim.log.levels.WARN)
+    end
+    return
+  end
+  return require("ade.service.commands").close_agent(name, { cwd = cwd, notify = notify })
+end
+
 ---Reconnect after a crash or an explicit disconnect.
 function M.reconnect()
   S.conn.service:reconnect()

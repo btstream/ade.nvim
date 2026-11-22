@@ -208,6 +208,11 @@ function M.disconnect()
   ensure().disconnect()
 end
 
+---Close an agent in the current project; omit the name to pick an instance.
+function M.close_agent(name)
+  return ensure().close_agent(name)
+end
+
 ---Open the oldest pending permission request.
 function M.show_permission()
   ensure().show_pending_permission()

@@ -1707,6 +1707,72 @@ return function(t)
       t.match("unknown instance", table.concat(connection.notes, "\n"))
     end)
 
+    t.it("closes one named agent only in the requested project", function()
+      local connection = listing({
+        { instance = "opencode", agent = "opencode", cwd = "/proj" },
+        { instance = "other", agent = "claude", cwd = "/other" },
+        { instance = "team", agent = "claude", cwd = "/proj", team = "team-1" },
+        { instance = "stopping", agent = "claude", cwd = "/proj", stopping = true },
+        { instance = "wanted", agent = "claude", cwd = "/proj", attached = 1 },
+      })
+      Commands.close_agent("claude", { cwd = "/proj", connection = connection, notify = connection:notify() })
+      settle(connection)
+      t.eq(2, #connection.calls)
+      t.eq("agent.stop", connection.calls[2].method)
+      t.eq("wanted", connection.calls[2].params.instance)
+    end)
+
+    t.it("requires choosing a duplicate instance and confirming an active stop", function()
+      for _, confirm in ipairs({ "Keep running", "Stop agent" }) do
+        local connection = listing({
+          { instance = "a", agent = "claude", cwd = "/proj" },
+          { instance = "b", agent = "claude", cwd = "/proj", turns_running = 1 },
+        })
+        local selections = {}
+        Commands.close_agent("claude", {
+          cwd = "/proj",
+          connection = connection,
+          notify = connection:notify(),
+          select = function(items, _, callback)
+            selections[#selections + 1] = items
+            callback(#selections == 1 and items[2] or confirm)
+          end,
+        })
+        settle(connection)
+        t.eq(2, #selections)
+        t.eq("b", selections[1][2].instance)
+        if confirm == "Stop agent" then
+          t.eq("b", connection.calls[2].params.instance)
+        else
+          t.eq(1, #connection.calls)
+        end
+      end
+    end)
+
+    t.it("formats names for pickers that pass a display flag", function()
+      local connection = listing({
+        { instance = "i1", agent = "opencode", cwd = "/proj", started_at = 1000 },
+        { instance = "i2", agent = "pi", cwd = "/proj", started_at = 2000 },
+      })
+      local labels = {}
+      Commands.close_agent(nil, {
+        cwd = "/proj",
+        connection = connection,
+        notify = connection:notify(),
+        select = function(items, opts, callback)
+          for _, item in ipairs(items) do
+            labels[#labels + 1] = opts.format_item(item, true)
+          end
+          callback(nil)
+        end,
+      })
+      settle(connection)
+      t.eq(2, #labels)
+      t.match("i1  opencode", labels[1])
+      t.match("i2  pi", labels[2])
+      t.eq(1, #connection.calls)
+    end)
+
     t.it("dispatches agents and kill from the service subcommand", function()
       local seen = {}
       local saved = { Commands.agents, Commands.kill }

@@ -1028,6 +1028,11 @@ require("ade").setup({
 | `:Ade service agents` | 列出服务持有的 agent 实例：id、agent、cwd、pid、运行时长、附着数、进行中的回合、待处理请求 |
 | `:Ade service kill <instance>` | 停掉一个实例（agent 进程立即结束） |
 
+要关闭当前项目里的某个 Agent，不必先切换过去：用 `:Ade close-agent` 从实例列表选择，
+或用 `:Ade close-agent claude` 按配置名关闭。同名实例有多个时仍需选择；若实例仍在处理回合、
+等待权限请求，或有多个客户端附着，会先确认。此命令不会停掉服务或其他 Agent，也不会删除会话记录。
+团队成员不在此列表，请用团队命令管理。直连模式只支持关闭当前 Neovim 的 Agent。
+
 服务模式下 `:Ade disconnect` 会真正停止 agent；关闭 Neovim（或切换 agent）时则按
 `service.keep_alive` 决定是 detach（保留）还是 stop。
 
