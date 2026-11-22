@@ -1033,7 +1033,12 @@ require("ade").setup({
 等待权限请求，或有多个客户端附着，会先确认。此命令不会停掉服务或其他 Agent，也不会删除会话记录。
 团队成员不在此列表，请用团队命令管理。直连模式只支持关闭当前 Neovim 的 Agent。
 
-服务模式下 `:Ade disconnect` 会真正停止 agent；关闭 Neovim（或切换 agent）时则按
+关闭面板正在使用的实例后，如果同目录下恰好还有一个已配置的其他独立 Agent 实例，面板会自动切换
+过去，并按现有会话恢复规则恢复对话。关闭后台实例时不切换；有多个候选时可用 `:Ade agent` 手动切换。
+关闭当前项目的最后一个独立 Agent 时，会同时关闭 `ade_chat` 和 `ade_input` 窗口。
+
+
+`:Ade disconnect` 会停止当前 Agent 并关闭这两个窗口；关闭 Neovim（或切换 agent）时则按
 `service.keep_alive` 决定是 detach（保留）还是 stop。
 
 `:checkhealth ade` 里的 “ade.nvim service” 一节与 `status` 内容一致，只报告不修改。

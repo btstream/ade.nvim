@@ -1,31 +1,16 @@
 -- Application controller: wires protocol, session state, layout and UI.
+--
+-- The view and domain modules are required by `app/bootstrap`, which builds
+-- them; only the pieces the wiring here touches are loaded in this file.
 local config_mod = require("ade.config")
 local log = require("ade.log")
-local Chat = require("ade.ui.chat")
-local Input = require("ade.ui.input")
 local highlights = require("ade.ui.highlights")
-local keymaps = require("ade.ui.keymaps")
 local layout = require("ade.layout")
 local drafts = require("ade.storage.drafts")
-local Runtime = require("ade.session.runtime")
 local Tasks = require("ade.tasks")
 local Permissions = require("ade.app.permissions")
-local Elicitation = require("ade.app.elicitation")
-local Auth = require("ade.app.auth")
-local Interactions = require("ade.app.interactions")
-local Options = require("ade.app.options")
-local Chrome = require("ade.ui.chrome")
-local Panel = require("ade.ui.panel")
-local Catalog = require("ade.app.catalog")
-local Sessions = require("ade.app.sessions")
-local Prompts = require("ade.app.prompts")
-local Connection = require("ade.app.connection")
-local Events = require("ade.app.events")
-local Attachments = require("ade.app.attachments")
-local Status = require("ade.app.status")
 local Stores = require("ade.app.stores")
 local Window = require("ade.app.window")
-local ConnectionFlow = require("ade.app.connection_flow")
 local Bootstrap = require("ade.app.bootstrap")
 local RuntimeOps = require("ade.app.runtime_ops")
 local Turn = require("ade.app.turn")
@@ -260,25 +245,13 @@ function M.disconnect()
     S.view.auth:cancel()
   end
   S.conn.service:disconnect()
+  M.hide()
 end
 
----Stop a standalone agent without switching the panel to it.
+---Stop a standalone agent in this project; the switch decision is in the flow.
 ---@param name string|nil
 function M.close_agent(name)
-  local cfg = S.config
-  local matches = not name or name == cfg.agent
-  local cwd = resolve_cwd()
-  if cfg.backend == "direct" or (matches and S.conn.client and S.conn.service.backend_service == false) then
-    local client = S.conn.client
-    if matches and ((client and client.cwd == cwd) or (not client and S.conn.phase == "starting")) then
-      M.disconnect()
-      notify("stopped agent " .. cfg.agent)
-    else
-      notify("no matching running direct agent", vim.log.levels.WARN)
-    end
-    return
-  end
-  return require("ade.service.commands").close_agent(name, { cwd = cwd, notify = notify })
+  return S.conn.flow:close_agent(name)
 end
 
 ---Reconnect after a crash or an explicit disconnect.

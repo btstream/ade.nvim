@@ -233,6 +233,18 @@ return function(t)
   end)
 
   t.describe("catalog lifecycle", function()
+    t.it("closes both panel windows on an explicit disconnect", function()
+      fixture(function(s)
+        controller.open()
+        local chat, input = s.chat.win, s.input.win
+        t.truthy(vim.api.nvim_win_is_valid(chat))
+        t.truthy(vim.api.nvim_win_is_valid(input))
+        controller.disconnect()
+        t.falsy(vim.api.nvim_win_is_valid(chat))
+        t.falsy(vim.api.nvim_win_is_valid(input))
+      end)
+    end)
+
     t.it("releases a cancelled refresh lock without losing cached metadata", function()
       fixture(function(s, client)
         local requests, replies = 0, {}

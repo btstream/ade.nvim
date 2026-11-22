@@ -91,7 +91,10 @@ function M.build(ctx, opts, action)
     config = cfg,
     notify = notify,
     connect = ctx.connect,
+    disconnect = ctx.disconnect,
+    cwd = ctx.resolve_cwd,
     open = ctx.open,
+    hide = ctx.hide,
     dispatch = ctx.dispatch_queued,
     setup = ctx.setup or function(next_opts, next_action)
       return M.build(ctx, next_opts, next_action)

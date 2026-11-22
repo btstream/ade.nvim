@@ -364,12 +364,12 @@ end
 
 ---Pick and stop one standalone agent in the current project.
 ---@param name string|nil configured agent name
----@param opts {cwd: string, connection?: table, timeout?: integer, notify?: fun(message: string, level: integer|nil), select?: function}
+---@param opts {cwd: string, connection?: table, timeout?: integer, notify?: function, select?: function, current_instance?: string, on_current_stopped?: fun(instances: table[])}
 function M.close_agent(name, opts)
   local show = opts.notify or notify
   local select = opts.select or vim.ui.select
   local status = require("ade.service.status")
-  -- Keep both requests on one socket. Instance IDs can be reused after a
+  -- Keep requests on one socket. Instance IDs can be reused after a
   -- daemon restart; reconnecting while a picker is open could stop a new one.
   -- A stop must not run the launcher's start/upgrade path, either.
   local client = not opts.connection
@@ -386,15 +386,23 @@ function M.close_agent(name, opts)
   local function close(instance)
     local function stop()
       request("agent.stop", { instance = instance.instance }, function(ok, value)
-        done()
         if ok then
           show("stopped agent " .. instance.instance)
+          if instance.instance == opts.current_instance and opts.on_current_stopped then
+            return request("agent.list", {}, function(listed, result)
+              done()
+              if listed and type(result) == "table" and type(result.instances) == "table" then
+                opts.on_current_stopped(result.instances)
+              end
+            end)
+          end
         else
           show(
             "unable to stop " .. instance.instance .. ": " .. require("ade.service.transport").describe(value),
             vim.log.levels.WARN
           )
         end
+        done()
       end)
     end
     if

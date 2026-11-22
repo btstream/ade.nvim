@@ -8,7 +8,8 @@ local presenter = require("ade.app.presenter")
 local M = {}
 
 ---@param deps {state: fun(): table, config: fun(): table, notify: fun(message: string, level: integer|nil),
----  connect: fun(), open: fun(), setup: fun(opts: table, action: table|nil), dispatch: fun(session: table)|nil}
+---  connect: fun(), disconnect: fun(), cwd: fun(): string, open: fun(), hide: fun(),
+---  setup: fun(opts: table, action: table|nil), dispatch: fun(session: table)|nil}
 ---@return table
 function M.new(deps)
   return setmetatable({ deps = deps }, { __index = M })
@@ -238,6 +239,54 @@ function M:pick_agent(name)
     title = "Agent",
     items = items,
     on_choice = switch,
+  })
+end
+
+local function fallback_agent(instances, cwd, cfg)
+  local target, remaining
+  for _, instance in ipairs(instances) do
+    if type(instance) == "table" and instance.cwd == cwd and not instance.team and not instance.stopping then
+      remaining = true
+      if instance.agent ~= cfg.agent and cfg.agents[instance.agent] then
+        if target then
+          return nil, true
+        end
+        target = instance.agent
+      end
+    end
+  end
+  return target, remaining
+end
+
+---Stop an agent and switch away only if it was the panel's own instance.
+function M:close_agent(name)
+  local S = self:state()
+  local cfg, client, cwd = S.config, S.conn.client, self.deps.cwd()
+  local matches = not name or name == cfg.agent
+  if cfg.backend == "direct" or (matches and client and S.conn.service.backend_service == false) then
+    if matches and ((client and client.cwd == cwd) or (not client and S.conn.phase == "starting")) then
+      self.deps.disconnect()
+      self:notify("stopped agent " .. cfg.agent)
+    else
+      self:notify("no matching running direct agent", vim.log.levels.WARN)
+    end
+    return
+  end
+  return require("ade.service.commands").close_agent(name, {
+    cwd = cwd,
+    notify = self.deps.notify,
+    current_instance = client and client.proc and client.proc.instance,
+    on_current_stopped = function(instances)
+      if S.config ~= cfg or S.conn.client ~= client or self.deps.cwd() ~= cwd then
+        return
+      end
+      local target, remaining = fallback_agent(instances, cwd, cfg)
+      if target then
+        self:pick_agent(target)
+      elseif not remaining then
+        self.deps.hide()
+      end
+    end,
   })
 end
 
