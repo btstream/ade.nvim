@@ -1517,21 +1517,16 @@ impl Teams {
             .collect()
     }
 
-    /// Every bound session token of a cwd: (instance, session, agent).
-    pub fn sessions_for_cwd(&self, cwd: &str) -> Vec<(String, String, String)> {
+    /// The sessions of one instance that hold a bound session token.
+    pub fn sessions_of_instance(&self, instance: &str) -> Vec<String> {
         self.token_records
             .values()
-            .filter(|record| record.role == Role::Session && record.bound)
-            .filter_map(|record| {
-                if record.cwd.as_deref() != Some(cwd) {
-                    return None;
-                }
-                Some((
-                    record.instance.clone()?,
-                    record.session.clone()?,
-                    record.agent.clone()?,
-                ))
+            .filter(|record| {
+                record.role == Role::Session
+                    && record.bound
+                    && record.instance.as_deref() == Some(instance)
             })
+            .filter_map(|record| record.session.clone())
             .collect()
     }
 

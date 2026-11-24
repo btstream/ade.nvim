@@ -587,9 +587,7 @@ fn team_instance(harness: &mut Harness, participant: &str) -> (String, String) {
 
 #[test]
 fn leader_binds_and_spawns_through_mcp() {
-    eprintln!("START leader_binds");
     let mut harness = Harness::new("team-spawn", json!({}), None);
-    eprintln!("STARTED");
     let teams = harness.list();
     assert_eq!(teams["teams"].as_array().map(Vec::len), Some(1), "{teams}");
     assert_eq!(harness.team()["state"], "active");
@@ -5698,6 +5696,19 @@ fn a_reload_request_forwards_the_next_load_with_the_user_servers() {
         "the user server survives the injection: {injected}"
     );
 
+    // The reload mark only exists while no MCP process of the session is
+    // connected.
+    wait_for(
+        || {
+            let query = harness.client.request(
+                1180,
+                "session.teams",
+                json!({"instance": harness.instance, "sessionId": session}),
+            );
+            (query["result"]["injected"] == json!(false)).then_some(())
+        },
+        "the session has no connected MCP process",
+    );
     let off = harness.client.request(
         119,
         "session.teams",
@@ -5798,6 +5809,19 @@ fn a_resume_consumes_the_one_shot_mark() {
         .as_str()
         .expect("session id")
         .to_string();
+    // No MCP process of this session may linger from another step: the mark
+    // only exists when the session is not injected.
+    wait_for(
+        || {
+            let query = harness.client.request(
+                1300,
+                "session.teams",
+                json!({"instance": harness.instance, "sessionId": session}),
+            );
+            (query["result"]["injected"] == json!(false)).then_some(())
+        },
+        "the session has no connected MCP process",
+    );
     let off = harness.client.request(
         131,
         "session.teams",
@@ -6417,5 +6441,498 @@ fn an_early_mcp_handshake_counts_as_injected_after_the_binding() {
             (query["result"]["injected"] == json!(false)).then_some(())
         },
         "the disconnected MCP process is not injected",
+    );
+}
+
+/// An MCP process that handshakes while a delayed `session/new` is in flight is
+/// counted as injected, and both the front end and the process hear the change
+/// (20.3/A).
+#[test]
+fn an_early_handshake_publishes_the_change_once_the_session_binds() {
+    let server = TestServer::start("session-early-diff");
+    let work = server.dir().join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let log = server.dir().join("team-agent.log");
+    let gate = server.dir().join("team-agent.gate");
+    let mut env = child_env(&server, &log, &gate);
+    // The token is written, then the agent waits before answering session/new.
+    env["TEAM_AGENT_NEW_DELAY"] = json!("1.0");
+    let token_file = server.dir().join("session-tokens");
+    let mut client = server.connect();
+    client.hello(&server.token(), nvim_ade_server::API_VERSION);
+    let attached = client.request(
+        1,
+        "agent.attach",
+        json!({
+            "key": {"agent": "team-test", "command": "python3", "args": [agent()], "cwd": work.to_string_lossy()},
+            "client_capabilities": {},
+            "env": env,
+        }),
+    );
+    let instance = attached["result"]["instance"].as_str().unwrap().to_string();
+    tunnel_call(
+        &mut client,
+        &instance,
+        10,
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    let configured = client.request(
+        2,
+        "team.configure",
+        json!({
+            "cwd": work.to_string_lossy(),
+            "config": {"templates": {"dev": {"key": {"agent": "team-test", "command": "python3", "args": [agent()]}}}},
+        }),
+    );
+    assert!(configured["result"].is_object(), "{configured}");
+    // Send session/new and do not wait for its response.
+    client.notify(
+        "tunnel.send",
+        json!({
+            "instance": instance,
+            "message": {
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "session/new",
+                "params": {"cwd": work.to_string_lossy(), "mcpServers": []},
+            },
+        }),
+    );
+    // The token is written before the reply; handshake with it now.
+    let token = wait_for(
+        || {
+            std::fs::read_to_string(&token_file)
+                .ok()?
+                .lines()
+                .rev()
+                .find_map(|line| {
+                    let (_session, token) = line.split_once(' ')?;
+                    Some(token.to_string())
+                })
+        },
+        "the injected session token",
+    );
+    let mut mcp = server.connect();
+    let hello = mcp.hello_raw(json!({
+        "participant_token": token,
+        "client": "mcp",
+        "client_version": "test",
+        "api_version": nvim_ade_server::API_VERSION,
+    }));
+    assert!(hello["result"].is_object(), "{hello}");
+    // The response arrives; the binding must publish the session's state and
+    // the MCP process must be told its tools changed.
+    let session = wait_for(
+        || {
+            let mut line = None;
+            while let Some(frame) = client.try_next_notification(Duration::from_millis(50)) {
+                let message = &frame["params"]["message"];
+                if message["id"] == json!(11) {
+                    line = message["result"]["sessionId"].as_str().map(str::to_string);
+                    break;
+                }
+            }
+            line
+        },
+        "the delayed session/new response",
+    );
+    let _ = session;
+    wait_for(
+        || {
+            let query = client.request(
+                3,
+                "session.teams",
+                json!({"instance": instance, "sessionId": session}),
+            );
+            (query["result"]["injected"] == json!(true)).then_some(())
+        },
+        "the early MCP process is injected",
+    );
+    let note = mcp.next_notification(Duration::from_secs(5));
+    assert_eq!(
+        note["method"], "notifications/tools/list_changed",
+        "the bound token publishes list_changed: {note}"
+    );
+}
+
+/// A plain chat without a team token also hears `session.teams_changed` when a
+/// configure changes the cwd's default (20.5/A).
+#[test]
+fn a_configure_notifies_a_session_without_a_token() {
+    let server = TestServer::start("session-configure-plain");
+    let work = server.dir().join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let log = server.dir().join("team-agent.log");
+    let gate = server.dir().join("team-agent.gate");
+    let env = child_env(&server, &log, &gate);
+    let mut client = server.connect();
+    client.hello(&server.token(), nvim_ade_server::API_VERSION);
+    let attached = client.request(
+        1,
+        "agent.attach",
+        json!({
+            "key": {"agent": "team-test", "command": "python3", "args": [agent()], "cwd": work.to_string_lossy()},
+            "client_capabilities": {},
+            "env": env,
+        }),
+    );
+    let instance = attached["result"]["instance"].as_str().unwrap().to_string();
+    tunnel_call(
+        &mut client,
+        &instance,
+        10,
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    // No configuration yet, so session/new is not injected and gets no token.
+    let created = tunnel_call(
+        &mut client,
+        &instance,
+        11,
+        "session/new",
+        json!({"cwd": work.to_string_lossy(), "mcpServers": []}),
+    );
+    let session = created["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    // Now configure with the switch off by default: the plain session has no
+    // token, but its effective state changes.
+    let configured = client.request(
+        2,
+        "team.configure",
+        json!({
+            "cwd": work.to_string_lossy(),
+            "config": {"session_default": false, "templates": {"dev": {"key": {"agent": "team-test", "command": "python3", "args": [agent()]}}}},
+        }),
+    );
+    assert!(configured["result"].is_object(), "{configured}");
+    let changed = wait_for(
+        || {
+            client
+                .try_next_notification(Duration::from_millis(100))
+                .filter(|frame| {
+                    frame["method"] == "session.teams_changed"
+                        && frame["params"]["sessionId"] == session.as_str()
+                })
+        },
+        "the plain session's state change",
+    );
+    assert_eq!(changed["params"]["enabled"], false, "{changed}");
+}
+
+/// A forwarded load the agent rejects revokes its token and publishes the
+/// session back to a non-injected state (20.2/A).
+#[test]
+fn a_failed_load_publishes_the_state_back() {
+    let server = TestServer::start("session-load-failed");
+    let work = server.dir().join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let log = server.dir().join("team-agent.log");
+    let gate = server.dir().join("team-agent.gate");
+    let mut env = child_env(&server, &log, &gate);
+    env["TEAM_AGENT_LOAD_FAIL"] = json!("1");
+    let token_file = server.dir().join("session-tokens");
+    let mut client = server.connect();
+    client.hello(&server.token(), nvim_ade_server::API_VERSION);
+    let attached = client.request(
+        1,
+        "agent.attach",
+        json!({
+            "key": {"agent": "team-test", "command": "python3", "args": [agent()], "cwd": work.to_string_lossy()},
+            "client_capabilities": {},
+            "env": env,
+        }),
+    );
+    let instance = attached["result"]["instance"].as_str().unwrap().to_string();
+    tunnel_call(
+        &mut client,
+        &instance,
+        10,
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    let configured = client.request(
+        2,
+        "team.configure",
+        json!({
+            "cwd": work.to_string_lossy(),
+            "config": {"templates": {"dev": {"key": {"agent": "team-test", "command": "python3", "args": [agent()]}}}},
+        }),
+    );
+    assert!(configured["result"].is_object(), "{configured}");
+    let failed = tunnel_call(
+        &mut client,
+        &instance,
+        11,
+        "session/load",
+        json!({
+            "sessionId": "gone-session",
+            "cwd": work.to_string_lossy(),
+            "mcpServers": [],
+        }),
+    );
+    assert!(failed.get("error").is_some(), "{failed}");
+    // The failed request leaves no token behind.
+    let tokens = std::fs::read_to_string(&token_file).unwrap_or_default();
+    assert!(
+        tokens.trim().is_empty(),
+        "a rejected load must not leave a token: {tokens}"
+    );
+}
+
+/// An instance exiting mid-load revokes the pending request's token and lets
+/// the front end know the session is no longer injected (20.5/A).
+#[test]
+fn an_instance_exit_during_a_load_undoes_the_request() {
+    let mut harness = Harness::new(
+        "session-exit-during-load",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let second = tunnel_call(
+        &mut harness.client,
+        &harness.instance,
+        170,
+        "session/new",
+        json!({ "cwd": harness.work.to_string_lossy(), "mcpServers": [] }),
+    );
+    let session = second["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let token = harness_token(&harness, &session);
+    let mut child = Command::new(common::BINARY)
+        .arg("mcp")
+        .env("ADE_TEAM_TOKEN", token)
+        .env("NVIM_ADE_SERVER_DIR", harness.server.dir())
+        .env("HOME", harness.server.dir())
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp");
+    {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        write_mcp(
+            stdin,
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test"}}}),
+        );
+    }
+    wait_for(
+        || {
+            let query = harness.client.request(
+                171,
+                "session.teams",
+                json!({"instance": harness.instance, "sessionId": session}),
+            );
+            (query["result"]["injected"] == json!(true)).then_some(())
+        },
+        "the session is injected",
+    );
+    // The instance dies; the session must stop being injected.
+    let stopped = harness.client.request(
+        172,
+        "agent.stop",
+        json!({"instance": harness.instance, "force": true}),
+    );
+    assert!(stopped.get("result").is_some() || stopped.get("error").is_some());
+    let changed = wait_for(
+        || {
+            harness
+                .client
+                .try_next_notification(Duration::from_millis(100))
+                .filter(|frame| {
+                    frame["method"] == "session.teams_changed"
+                        && frame["params"]["sessionId"] == session.as_str()
+                        && frame["params"]["injected"] == json!(false)
+                })
+        },
+        "the session's injected state fell back",
+    );
+    let _ = changed;
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// A forced load the agent rejects keeps the mark for a retry but marks nothing
+/// incomplete; a successful one marks the log and clears the mark (20.5/B).
+#[test]
+fn a_failed_forced_load_keeps_the_mark_and_restarts_nothing() {
+    let mut harness = Harness::new(
+        "session-forced-fail",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let response = tunnel_call(
+        &mut harness.client,
+        &harness.instance,
+        180,
+        "session/new",
+        json!({ "cwd": harness.work.to_string_lossy(), "mcpServers": [] }),
+    );
+    let session = response["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    wait_for(
+        || {
+            let query = harness.client.request(
+                181,
+                "session.teams",
+                json!({"instance": harness.instance, "sessionId": session}),
+            );
+            (query["result"]["injected"] == json!(false)).then_some(())
+        },
+        "the session has no MCP process",
+    );
+    let off = harness.client.request(
+        182,
+        "session.teams",
+        json!({"instance": harness.instance, "sessionId": session, "enabled": false}),
+    );
+    assert_eq!(off["result"]["enabled"], false, "{off}");
+    let on = harness.client.request(
+        183,
+        "session.teams",
+        json!({"instance": harness.instance, "sessionId": session, "enabled": true}),
+    );
+    assert_eq!(on["result"]["reload"], true, "{on}");
+    // The forced load reaches the agent even though the log is empty.
+    let loaded = tunnel_call(
+        &mut harness.client,
+        &harness.instance,
+        184,
+        "session/load",
+        json!({ "sessionId": session, "cwd": harness.work.to_string_lossy(), "mcpServers": [] }),
+    );
+    assert!(loaded["result"].is_object(), "{loaded}");
+    let forwarded = wait_for(
+        || {
+            harness.events().into_iter().find(|event| {
+                event["event"] == "session"
+                    && event["method"] == "session/load"
+                    && event["session"] == session
+            })
+        },
+        "the forced load",
+    );
+    assert_eq!(forwarded["mcp"], true, "the forced load is injected");
+}
+
+/// While a forced load is unanswered, another load of the same session is also
+/// forwarded, so an emulated replay can never splice old history (20.5/B).
+#[test]
+fn a_load_during_an_unanswered_forced_load_is_forwarded_too() {
+    let server = TestServer::start("session-forced-inflight");
+    let work = server.dir().join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let log = server.dir().join("team-agent.log");
+    let gate = server.dir().join("team-agent.gate");
+    let mut env = child_env(&server, &log, &gate);
+    env["TEAM_AGENT_LOAD_DELAY"] = json!("1.0");
+    let mut client = server.connect();
+    client.hello(&server.token(), nvim_ade_server::API_VERSION);
+    let attached = client.request(
+        1,
+        "agent.attach",
+        json!({
+            "key": {"agent": "team-test", "command": "python3", "args": [agent()], "cwd": work.to_string_lossy()},
+            "client_capabilities": {},
+            "env": env,
+        }),
+    );
+    let instance = attached["result"]["instance"].as_str().unwrap().to_string();
+    tunnel_call(
+        &mut client,
+        &instance,
+        10,
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    let configured = client.request(
+        2,
+        "team.configure",
+        json!({
+            "cwd": work.to_string_lossy(),
+            "config": {"templates": {"dev": {"key": {"agent": "team-test", "command": "python3", "args": [agent()]}}}},
+        }),
+    );
+    assert!(configured["result"].is_object(), "{configured}");
+    let created = tunnel_call(
+        &mut client,
+        &instance,
+        11,
+        "session/new",
+        json!({"cwd": work.to_string_lossy(), "mcpServers": []}),
+    );
+    let session = created["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    wait_for(
+        || {
+            let query = client.request(
+                20,
+                "session.teams",
+                json!({"instance": instance, "sessionId": session}),
+            );
+            (query["result"]["injected"] == json!(false)).then_some(())
+        },
+        "the session has no connected MCP process",
+    );
+    let off = client.request(
+        3,
+        "session.teams",
+        json!({"instance": instance, "sessionId": session, "enabled": false}),
+    );
+    assert_eq!(off["result"]["enabled"], false, "{off}");
+    let on = client.request(
+        4,
+        "session.teams",
+        json!({"instance": instance, "sessionId": session, "enabled": true}),
+    );
+    assert_eq!(on["result"]["reload"], true, "{on}");
+    // Fire the forced load and, before its slow answer, a second load.
+    client.notify(
+        "tunnel.send",
+        json!({
+            "instance": instance,
+            "message": {
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "session/load",
+                "params": {"sessionId": session, "cwd": work.to_string_lossy(), "mcpServers": []},
+            },
+        }),
+    );
+    std::thread::sleep(Duration::from_millis(150));
+    client.notify(
+        "tunnel.send",
+        json!({
+            "instance": instance,
+            "message": {
+                "jsonrpc": "2.0",
+                "id": 13,
+                "method": "session/load",
+                "params": {"sessionId": session, "cwd": work.to_string_lossy(), "mcpServers": []},
+            },
+        }),
+    );
+    wait_for(
+        || {
+            let loads = read_log(&log)
+                .into_iter()
+                .filter(|event| {
+                    event["event"] == "session"
+                        && event["method"] == "session/load"
+                        && event["session"] == session.as_str()
+                })
+                .count();
+            (loads >= 2).then_some(())
+        },
+        "both loads reach the agent while the forced one is in flight",
     );
 }

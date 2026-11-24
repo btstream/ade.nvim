@@ -574,6 +574,11 @@ def main():
                     item.get("name") for item in params.get("mcpServers") or []
                 ],
             })
+            new_delay = os.environ.get("TEAM_AGENT_NEW_DELAY")
+            if new_delay and method == "session/new":
+                # The token was written above: answer late so the MCP process can
+                # handshake before the session is bound.
+                time.sleep(float(new_delay))
             if MCP.get(session):
                 mcp_list(session)
             if method == "session/load":

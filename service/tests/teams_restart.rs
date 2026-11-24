@@ -2621,3 +2621,72 @@ fn a_worker_that_exits_during_initialize_completes_its_removal() {
     );
     let _ = spawn;
 }
+
+/// A leader's forwarded load that the agent rejects revokes its token and
+/// leaves the stored team suspended (20.2/20.7).
+#[test]
+fn a_failed_leader_load_keeps_the_team_suspended() {
+    let fixture = Fixture::new("restart-leader-load-fail");
+    let mut server = fixture.start("a", &[]);
+    let mut client = fixture.connect(&server);
+    let (team, leader_session, _) = fixture.first_team(&server, &mut client, "do [report]");
+    Fixture::shutdown(&mut server);
+    drop(server);
+
+    let mut restarted = fixture.start("b", &[]);
+    let mut second = fixture.connect(&restarted);
+    wait_suspended(&mut second, &team);
+    fixture.configure(&mut second, &fixture.work, &restarted, true);
+    let mut env = child_env(&restarted, &fixture.log, &fixture.gate);
+    env["TEAM_AGENT_LOAD_FAIL"] = json!("1");
+    let attached = second.request(
+        1,
+        "agent.attach",
+        json!({
+            "key": {
+                "agent": "team-test",
+                "command": "python3",
+                "args": [agent()],
+                "cwd": fixture.work.to_string_lossy(),
+            },
+            "client_capabilities": {},
+            "env": env,
+        }),
+    );
+    let instance = attached["result"]["instance"].as_str().unwrap().to_string();
+    tunnel_call(
+        &mut second,
+        &instance,
+        10,
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    let response = tunnel_call(
+        &mut second,
+        &instance,
+        11,
+        "session/load",
+        json!({
+            "sessionId": leader_session,
+            "cwd": fixture.work.to_string_lossy(),
+            "mcpServers": [],
+        }),
+    );
+    assert!(response.get("error").is_some(), "{response}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        team_entry(&mut second, &team)["state"],
+        "suspended",
+        "a failed leader load must not resume the team"
+    );
+    // No token was left bound: the session is not a leader for the hub.
+    let query = second.request(
+        12,
+        "session.teams",
+        json!({"instance": instance, "sessionId": leader_session}),
+    );
+    assert!(query["result"]["leader"].is_null(), "{query}");
+    let closed = second.request(13, "team.close", json!({"team": team}));
+    assert!(closed["result"].is_object(), "{closed}");
+    Fixture::shutdown(&mut restarted);
+}

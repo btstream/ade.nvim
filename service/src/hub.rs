@@ -213,6 +213,8 @@ pub enum Command {
     TeamWorktree {
         team: String,
         participant: String,
+        /// The participant lifecycle that started this job (20.6/E).
+        lifecycle: u64,
         outcome: WorktreeOutcome,
     },
     /// The 30 s grace period after cancelling a bus prompt ended (18.11).
@@ -503,8 +505,6 @@ pub struct Hub {
     policy: Policy,
     /// Teams and the bus (PROTOCOL.md 18).
     teams: crate::team::Teams,
-    /// Participant connections by connection id, holding the token id.
-    participant_conns: HashMap<u64, String>,
     /// Front-end connections that completed `hello` with the user token.
     frontend_conns: HashSet<u64>,
     /// Responses to service-originated requests, by (instance, agent id).
@@ -536,9 +536,6 @@ pub struct Hub {
     /// and the token id it authenticated with. A token's *current* binding
     /// decides which session (if any) it counts for.
     conn_tokens: HashMap<u64, String>,
-    /// Last published effective state per session identity, so notifications
-    /// are only sent for real changes (20.3/20.5).
-    session_cache: HashMap<(String, String), teams::SessionState>,
 }
 
 impl Hub {
@@ -589,7 +586,6 @@ impl Hub {
             install_event_sender,
             policy: Policy::new(),
             teams: crate::team::Teams::new(crate::team::new_shared_tokens()),
-            participant_conns: HashMap::new(),
             frontend_conns: HashSet::new(),
             driver: HashMap::new(),
             held_prompts: HashMap::new(),
@@ -606,7 +602,6 @@ impl Hub {
             pending_session: HashMap::new(),
             forward_loads: HashSet::new(),
             conn_tokens: HashMap::new(),
-            session_cache: HashMap::new(),
         }
     }
 
@@ -777,9 +772,10 @@ impl Hub {
             Command::TeamWorktree {
                 team,
                 participant,
+                lifecycle,
                 outcome,
             } => {
-                self.team_worktree(&team, &participant, outcome);
+                self.team_worktree(&team, &participant, lifecycle, outcome);
                 self.update_busy();
             }
             Command::TeamDeadline {
@@ -802,23 +798,34 @@ impl Hub {
                 if let Some(token) = participant {
                     // The connection holds a token id; its binding is looked up
                     // live, so a token bound after the handshake still counts.
-                    self.conn_tokens.insert(conn, token.clone());
-                    if let Some(identity) = self.teams.session_identity(&token) {
-                        self.sessions_changed(&[identity]);
+                    let identity = self.teams.session_identity(&token);
+                    match identity {
+                        Some(identity) => {
+                            let before = self.session_states(std::slice::from_ref(&identity));
+                            self.conn_tokens.insert(conn, token.clone());
+                            self.publish_session_changes(before);
+                        }
+                        // An early handshake has no identity yet; the binding
+                        // publishes it once the session exists.
+                        None => {
+                            self.conn_tokens.insert(conn, token.clone());
+                        }
                     }
-                    self.participant_conns.insert(conn, token);
                     self.frontend_conns.remove(&conn);
                 } else {
-                    self.participant_conns.remove(&conn);
+                    self.conn_tokens.remove(&conn);
                     self.frontend_conns.insert(conn);
                 }
             }
             Command::Disconnected { conn } => {
                 self.conns.remove(&conn);
-                self.participant_conns.remove(&conn);
-                if let Some(token) = self.conn_tokens.remove(&conn) {
+                if let Some(token) = self.conn_tokens.get(&conn).cloned() {
                     if let Some(identity) = self.teams.session_identity(&token) {
-                        self.sessions_changed(&[identity]);
+                        let before = self.session_states(std::slice::from_ref(&identity));
+                        self.conn_tokens.remove(&conn);
+                        self.publish_session_changes(before);
+                    } else {
+                        self.conn_tokens.remove(&conn);
                     }
                 }
                 let pending: Vec<(String, u64)> = self
@@ -1016,7 +1023,7 @@ impl Hub {
         let id = request_id(&frame);
         let is_request = object.get("id").is_some();
 
-        if let Some(token) = self.participant_conns.get(&conn).cloned() {
+        if let Some(token) = self.conn_tokens.get(&conn).cloned() {
             if method.starts_with("bus.") {
                 self.handle_participant(conn, &token, &method, &params, &id, is_request);
             } else if is_request {
@@ -1966,17 +1973,26 @@ impl Hub {
         } else {
             None
         };
-        // 20.5: the front end asked for this session's reload; either the load
-        // or the resume it chooses consumes the one-shot mark.
+        // 20.5: the front end asked for this session's reload. While a forced
+        // request of that session is still in flight, every load of it is
+        // forwarded too, so an emulated replay never splices old history onto
+        // the new one.
         let is_reload = matches!(
             method.as_deref(),
             Some("session/load") | Some("session/resume")
         );
-        let force_forward = is_reload
-            && session.as_ref().is_some_and(|session| {
-                self.forward_loads
-                    .contains(&(instance_id.to_string(), session.clone()))
-            });
+        let marked = session.as_ref().is_some_and(|session| {
+            self.forward_loads
+                .contains(&(instance_id.to_string(), session.clone()))
+        });
+        let forced_in_flight = session.as_ref().is_some_and(|session| {
+            self.pending_session.values().any(|pending| {
+                pending.forced
+                    && pending.session.as_deref() == Some(session.as_str())
+                    && pending.conn != 0
+            })
+        });
+        let force_forward = is_reload && (marked || forced_in_flight);
         let mut action = {
             let handle = self.instances.get_mut(instance_id).expect("checked above");
             if force_forward {
@@ -1985,18 +2001,17 @@ impl Hub {
                 handle.relay.frontend_message(conn, &message)
             }
         };
-        if force_forward && action.forwarded().is_none() {
-            // The mark is consumed by the request that actually reaches the
-            // agent; a request the relay dropped keeps it for the next try.
-            if let Some(session) = &session {
-                self.forward_loads
-                    .remove(&(instance_id.to_string(), session.clone()));
+        // 20.2: a forwarded session request gets the session's team server; its
+        // token binds only on a successful response. An emulated load never
+        // reaches the agent and gets nothing.
+        let mut pending_session = self.inject_forwarded_session(conn, instance_id, &mut action);
+        if force_forward {
+            // The mark belongs to the session; it is consumed only when this
+            // request really reaches the agent's writer below.
+            if let Some(pending) = pending_session.as_mut() {
+                pending.forced = true;
             }
         }
-        // 20.2: a forwarded session request gets the session's team server; its
-        // token binds and its server list commits only on a successful
-        // response. An emulated load never reaches the agent and gets nothing.
-        let pending_session = self.inject_forwarded_session(conn, instance_id, &mut action);
         // Turn-scoped policy sets bind to the prompt from the installing
         // connection; a forwarded cancel makes them cancelling (17.3). A frame
         // the relay drops never becomes an in-flight prompt, so it must not
@@ -2015,7 +2030,6 @@ impl Hub {
                 }
             }
         }
-        let mut pending_session = pending_session;
         if let Some(pending) = &pending_session {
             match action
                 .forwarded()
@@ -2100,6 +2114,26 @@ impl Hub {
             );
             if let Some(agent_id) = agent_id {
                 self.drop_pending_session(&(instance_id.to_string(), agent_id));
+            }
+            return;
+        }
+        // The frame reached the agent: a one-shot reload is consumed here, by
+        // the request that forced it (20.5/B).
+        if let Some(agent_id) = agent_id {
+            let forced = self
+                .pending_session
+                .get(&(instance_id.to_string(), agent_id))
+                .is_some_and(|pending| pending.forced);
+            if forced {
+                if let Some(pending) = self
+                    .pending_session
+                    .get(&(instance_id.to_string(), agent_id))
+                {
+                    if let Some(session) = &pending.session {
+                        self.forward_loads
+                            .remove(&(instance_id.to_string(), session.clone()));
+                    }
+                }
             }
         }
     }
@@ -2196,41 +2230,39 @@ impl Hub {
     }
 
     /// Forward a `session/load` to the agent (the emulation is not possible).
+    ///
+    /// This is the emulation fallback: it uses the same registration, source
+    /// connection check and send path as a normal forwarded request (20.2/C).
     fn forward_load(&mut self, conn: u64, instance_id: &str, frame: &Value) {
-        if self.instances.get_mut(instance_id).is_none() {
+        if !self.instances.contains_key(instance_id) || !self.conns.contains_key(&conn) {
+            // The front end left while the log was being read: nothing is
+            // forwarded and no token is issued.
             return;
         }
         let mut action = {
             let handle = self.instances.get_mut(instance_id).expect("checked above");
             handle.relay.forward_request(conn, frame)
         };
-        // The fallback really forwards the load, so it gets the injection.
         let pending = self.inject_forwarded_session(conn, instance_id, &mut action);
         let Some(forwarded) = action.forwarded().cloned() else {
             if let Some(pending) = pending {
-                self.teams.revoke(&pending.token_id);
+                self.drop_pending_session_value(pending);
             }
             return;
         };
-        if let Some(pending) = pending {
-            if let Some(agent_id) = forwarded.get("id").and_then(Value::as_u64) {
+        let agent_id = forwarded.get("id").and_then(Value::as_u64);
+        match (pending, agent_id) {
+            (Some(pending), Some(agent_id)) => {
                 self.pending_session
                     .insert((instance_id.to_string(), agent_id), pending);
-            } else {
-                self.teams.revoke(&pending.token_id);
             }
-        }
-        if let Some(handle) = self.instances.get(instance_id) {
-            if !handle.control.send_frame(forwarded) {
-                self.send_tunnel_error(
-                    conn,
-                    instance_id,
-                    FRAME_REJECTED,
-                    "the agent is not accepting messages",
-                    None,
-                );
+            (Some(pending), None) => {
+                self.drop_pending_session_value(pending);
+                return;
             }
+            (None, _) => {}
         }
+        self.send_to_agent(conn, instance_id, forwarded, None);
     }
 
     /// Handle the outcome of an emulated load: replay, answer, then release the

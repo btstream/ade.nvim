@@ -67,6 +67,9 @@ pub(crate) struct PendingSession {
     pub session: Option<String>,
     /// The front-end connection that sent the request.
     pub conn: u64,
+    /// This request consumed the session's one-shot reload mark: its answer
+    /// restarts the session's log (20.5).
+    pub forced: bool,
 }
 
 #[derive(Debug)]
@@ -205,7 +208,7 @@ impl Hub {
             .and_then(|params| params.get("sessionId"))
             .and_then(Value::as_str)
             .map(str::to_string);
-        let inject = self.should_inject(instance, &session, &cwd, &agent);
+        let inject = self.should_inject(&session, &cwd, &agent);
         let (token_id, token) = match inject {
             Some(()) => {
                 let (token_id, token) =
@@ -226,6 +229,7 @@ impl Hub {
             method,
             session,
             conn,
+            forced: false,
         })
     }
 
@@ -250,14 +254,7 @@ impl Hub {
 
     /// Whether a session request gets a token: the cwd is configured and
     /// enabled, and the session's switch is on (20.2). `None` means no token.
-    fn should_inject(
-        &self,
-        instance: &str,
-        session: &Option<String>,
-        cwd: &str,
-        agent: &str,
-    ) -> Option<()> {
-        let _ = instance;
+    fn should_inject(&self, session: &Option<String>, cwd: &str, agent: &str) -> Option<()> {
         if !self.teams.has_config(cwd) || !self.teams.config_for(cwd).enabled {
             return None;
         }
@@ -284,18 +281,7 @@ impl Hub {
         message: &Value,
     ) {
         let key = (instance.to_string(), request.agent_id);
-        let Some(pending) = self
-            .pending_session
-            .get(&key)
-            .map(|pending| PendingSession {
-                token_id: pending.token_id.clone(),
-                cwd: pending.cwd.clone(),
-                agent: pending.agent.clone(),
-                method: pending.method.clone(),
-                session: pending.session.clone(),
-                conn: pending.conn,
-            })
-        else {
+        let Some(pending) = self.pending_session.get(&key).cloned() else {
             return;
         };
         let failed = message.get("error").is_some();
@@ -308,38 +294,39 @@ impl Hub {
             .or_else(|| request.session_id.clone());
         if failed || session.is_none() {
             // One undo path: revoke this request's token, drop the record and
-            // leave the previous binding untouched.
-            self.drop_pending_session(&key);
+            // leave the previous binding untouched. A session that had been
+            // published as injected must hear that it no longer is.
+            self.undo_pending_session(&key);
             return;
         }
         let session = session.expect("checked above");
-        // The reload mark is consumed by this answered request either way: the
-        // log restarts from a successful forced load/resume (20.5).
-        let consumed = matches!(pending.method.as_str(), "session/load" | "session/resume")
-            && self
-                .forward_loads
-                .remove(&(instance.to_string(), session.clone()));
         if pending.token_id.is_empty() {
             self.pending_session.remove(&key);
-            if consumed {
+            if pending.forced {
                 self.mark_log_restarted(instance, &session);
             }
             return;
         }
+        // The identity may not have existed before this binding (the MCP process
+        // handshook early), so the pre-state is "no tools"; the bound token's
+        // connection is what makes it injected (20.3/A).
+        let identity = (instance.to_string(), session.clone());
+        let before = self.session_states(std::slice::from_ref(&identity));
         if self
             .teams
             .bind_session_token(instance, &session, &pending.token_id, &pending.agent)
             .is_err()
         {
-            self.drop_pending_session(&key);
+            self.undo_pending_session(&key);
             return;
         }
         self.pending_session.remove(&key);
-        if consumed {
+        // The log boundary follows the request that actually forced the load,
+        // never the session's current mark (20.5/B).
+        if pending.forced {
             self.mark_log_restarted(instance, &session);
         }
-        let identity = (instance.to_string(), session.clone());
-        self.sessions_changed(&[identity]);
+        self.publish_session_changes(before);
         if matches!(pending.method.as_str(), "session/load" | "session/resume") {
             self.resume_for_session(instance, &session, &pending.agent, &pending.cwd);
         }
@@ -360,12 +347,27 @@ impl Hub {
     /// Undo a forwarded session request that will not be committed: revoke its
     /// token, forget the record and keep the previous binding (20.2).
     pub(crate) fn drop_pending_session(&mut self, key: &(String, u64)) {
-        if let Some(pending) = self.pending_session.remove(key) {
-            self.drop_pending_session_value(pending);
+        self.undo_pending_session(key);
+    }
+
+    /// The single undo path: snapshot the affected session, revoke the token,
+    /// then publish the difference so a session that looked injected hears
+    /// about losing it (20.2/A).
+    pub(crate) fn undo_pending_session(&mut self, key: &(String, u64)) {
+        let Some(pending) = self.pending_session.remove(key) else {
+            return;
+        };
+        let before = pending
+            .session
+            .as_ref()
+            .map(|session| self.session_states(&[(key.0.clone(), session.clone())]));
+        self.drop_pending_session_value(pending);
+        if let Some(before) = before {
+            self.publish_session_changes(before);
         }
     }
 
-    /// The single undo path for a request that will not be committed.
+    /// Revoke a request's token and forget the connection that held it.
     pub(crate) fn drop_pending_session_value(&mut self, pending: PendingSession) {
         if !pending.token_id.is_empty() {
             self.teams.revoke(&pending.token_id);
@@ -387,9 +389,8 @@ impl Hub {
             })
     }
 
-    /// Snapshot the effective state of `identities`. Identities never seen
-    /// before are snapshotted from the hub's cache, so a first notification
-    /// still goes out after a change.
+    /// The effective state of `identities` *now*: callers take this before an
+    /// operation changes anything, then publish the difference (20.3/20.5).
     pub(crate) fn session_states(
         &self,
         identities: &[(String, String)],
@@ -397,12 +398,10 @@ impl Hub {
         identities
             .iter()
             .map(|identity| {
-                let state = self
-                    .session_cache
-                    .get(identity)
-                    .copied()
-                    .unwrap_or_else(|| self.session_state(&identity.0, &identity.1));
-                (identity.clone(), state)
+                (
+                    identity.clone(),
+                    self.session_state(&identity.0, &identity.1),
+                )
             })
             .collect()
     }
@@ -445,15 +444,7 @@ impl Hub {
     ) {
         for (identity, old) in before {
             let new = self.session_state(&identity.0, &identity.1);
-            let known = self.session_cache.insert(identity.clone(), new);
-            // An identity seen for the first time after a change has no
-            // comparable previous state; `before` already carries the state
-            // recorded when the operation started.
-            let changed = match known {
-                Some(previous) => new != previous,
-                None => new != old,
-            };
-            if !changed {
+            if new == old {
                 continue;
             }
             self.teams.refresh_session_auth(&identity.0, &identity.1);
@@ -485,24 +476,30 @@ impl Hub {
         result
     }
 
-    /// Convenience for the common case: one identity, snapshot/change/publish.
-    pub(crate) fn sessions_changed(&mut self, identities: &[(String, String)]) {
-        self.publish_session_changes(self.session_states(identities));
-    }
-
-    /// Every known session of a cwd: bound session tokens and team
-    /// participants of instances running there.
+    /// Every session the service knows in `cwd`: what each instance's relay
+    /// tracks (sessions created through it, with or without a team token), the
+    /// bound session tokens and the team participants (20.3/20.5).
     pub(crate) fn sessions_of_cwd(&self, cwd: &str) -> Vec<(String, String)> {
-        let mut sessions: Vec<(String, String)> = self
-            .teams
-            .token_sessions()
-            .into_iter()
-            .filter(|(instance, _)| {
-                self.instances
-                    .get(instance)
-                    .is_some_and(|handle| handle.key.cwd == cwd)
-            })
-            .collect();
+        let mut sessions: Vec<(String, String)> = Vec::new();
+        for (id, handle) in &self.instances {
+            if handle.key.cwd != cwd {
+                continue;
+            }
+            for summary in handle.relay.session_summaries() {
+                sessions.push((id.clone(), summary.session_id));
+            }
+        }
+        for (instance, _) in self.teams.token_sessions() {
+            if self
+                .instances
+                .get(&instance)
+                .is_some_and(|handle| handle.key.cwd == cwd)
+            {
+                for session in self.teams.sessions_of_instance(&instance) {
+                    sessions.push((instance.clone(), session));
+                }
+            }
+        }
         for (instance, session) in self.teams.participant_sessions() {
             if self
                 .instances
@@ -800,11 +797,12 @@ impl Hub {
             #[cfg(unix)]
             launch: handle.launch.clone(),
         };
-        match self.teams.ensure_team(&instance, &session, &launch) {
-            Ok(team) => {
-                self.sessions_changed(&[(instance.clone(), session.clone())]);
-                Ok(team)
-            }
+        let identity = (instance.clone(), session.clone());
+        let ensured = self.with_session_changes(vec![identity], |hub| {
+            hub.teams.ensure_team(&instance, &session, &launch)
+        });
+        match ensured {
+            Ok(team) => Ok(team),
             Err(error)
                 if error.data.as_ref().and_then(|data| data.get("reason"))
                     == Some(&json!("led_by")) =>
@@ -992,10 +990,11 @@ impl Hub {
         let live = instance
             .as_deref()
             .is_some_and(|instance| self.instances.contains_key(instance));
+        // A cancelled job keeps its record until git returns, and its name
+        // stays taken until then (20.6/E).
         let start_pending = self
             .pending_worktrees
-            .get(&(team.to_string(), name.to_string()))
-            .is_some_and(|pending| !pending.cancelled);
+            .contains_key(&(team.to_string(), name.to_string()));
         (live, start_pending)
     }
 
@@ -1117,9 +1116,10 @@ impl Hub {
                     #[cfg(unix)]
                     launch: handle.launch.clone(),
                 };
-                let team = self.teams.ensure_team(&instance, &session, &launch)?;
-                self.sessions_changed(&[(instance.clone(), session.clone())]);
-                Ok(team)
+                let identity = (instance.clone(), session.clone());
+                self.with_session_changes(vec![identity], |hub| {
+                    hub.teams.ensure_team(&instance, &session, &launch)
+                })
             }
         }
     }
@@ -1216,21 +1216,18 @@ impl Hub {
             .get("config")
             .cloned()
             .ok_or_else(|| TeamError::invalid("config is required"))?;
-        self.teams.configure(&cwd, config)?;
-        self.announce_configured(&cwd);
+        let identities = self.sessions_of_cwd(&cwd);
+        self.with_session_changes(identities, |hub| hub.teams.configure(&cwd, config.clone()))?;
         Ok(json!({}))
     }
 
-    /// A new configuration may inject tools into sessions that were created
-    /// before it (20.2).
-    fn announce_configured(&mut self, cwd: &str) {
-        self.sessions_changed(&self.sessions_of_cwd(cwd));
-    }
-
     /// Start every stored participant of a resumed team (18.15).
-    fn resume_team(&mut self, team_id: &str) {
+    /// Start every stored participant of a resumed team and return the names
+    /// that could not be restarted (18.15). The caller sends the one notice, so
+    /// its wording fits the reason the team resumed (20.4/20.8).
+    fn resume_team(&mut self, team_id: &str) -> Vec<String> {
         let Some(team) = self.teams.team(team_id) else {
-            return;
+            return Vec::new();
         };
         let names: Vec<String> = team
             .order
@@ -1243,7 +1240,7 @@ impl Hub {
         let mut failures: Vec<String> = Vec::new();
         for name in names {
             let Some(team) = self.teams.team(team_id) else {
-                return;
+                return failures;
             };
             let Some(participant) = team.participants.get(&name) else {
                 continue;
@@ -1336,22 +1333,9 @@ impl Hub {
                 failures.push(name.clone());
             }
         }
-        let mut body = "team resumed after a service restart".to_string();
-        if !failures.is_empty() {
-            body.push_str("; not resumed: ");
-            body.push_str(&failures.join(", "));
-        }
-        let _ = self.teams.send_message(
-            team_id,
-            "human",
-            "leader",
-            Kind::Notice,
-            &body,
-            None,
-            vec![],
-        );
         self.drain_team_events();
         self.team_deliveries();
+        failures
     }
 
     /// `team.set_leader` (20.4): deferred because the notice needs the status
@@ -1432,10 +1416,10 @@ impl Hub {
         });
         result?;
         if suspended {
-            // One notice: the resume summary, the base instructions and the
-            // current status (20.4/20.8).
-            self.resume_team(team);
-            self.send_resume_notice(team, &[]);
+            // One notice: the resume summary (with what could not be restarted),
+            // the base instructions and the current status (20.4/20.8).
+            let failures = self.resume_team(team);
+            self.send_resume_notice(team, &failures);
         } else {
             self.send_leader_notice(team);
         }
@@ -1548,8 +1532,6 @@ impl Hub {
                         .to_string()
                 });
                 let identity = (instance.clone(), session.clone());
-                let mut reload = false;
-                let _ = &mut reload;
                 return self.with_session_changes(vec![identity], |hub| {
                     if let Some(team) = close_team {
                         hub.close_team(&team)?;
@@ -1564,15 +1546,15 @@ impl Hub {
                     }))
                 });
             }
-            // Validate before persisting or marking (20.5): a disabled cwd or an
-            // agent without load/resume changes nothing.
+            // Validate before persisting or marking (20.5): a disabled cwd
+            // changes nothing, whether or not an MCP process is connected.
+            if !self.teams.has_config(&cwd) || !self.teams.config_for(&cwd).enabled {
+                let mut error = TeamError::not_allowed("teams are disabled for this cwd");
+                error.data = Some(json!({ "reason": "off" }));
+                return Err(error);
+            }
             let mut reload = false;
             if !injected {
-                if !self.teams.has_config(&cwd) || !self.teams.config_for(&cwd).enabled {
-                    let mut error = TeamError::not_allowed("teams are disabled for this cwd");
-                    error.data = Some(json!({ "reason": "off" }));
-                    return Err(error);
-                }
                 if !can_reload {
                     let mut error = TeamError::not_allowed("the agent cannot reload a session");
                     error.data = Some(json!({ "reason": "reload_unsupported" }));
@@ -1589,8 +1571,9 @@ impl Hub {
                 }
                 let leader = hub.teams.session_team_entry(&instance, &session);
                 let injected = hub.session_injected(&instance, &session);
+                let enabled = hub.teams.enabled_for(&agent, &session, &cwd);
                 Ok(json!({
-                    "enabled": true,
+                    "enabled": enabled,
                     "injected": injected,
                     "leader": leader,
                     "reload": reload,
@@ -1644,7 +1627,8 @@ impl Hub {
             hub.teams
                 .start_resume_with_config(&team_id, instance, session, agent, config);
         });
-        self.resume_team(&team_id);
+        let failures = self.resume_team(&team_id);
+        self.send_resume_notice(&team_id, &failures);
     }
 
     fn team_send(&mut self, params: &Value) -> Result<(Value, bool), TeamError> {
@@ -2291,6 +2275,7 @@ impl Hub {
                     .send(Command::TeamWorktree {
                         team: team_for_git,
                         participant: participant_for_git,
+                        lifecycle: 0,
                         outcome: WorktreeOutcome::Remove(result),
                     })
                     .await;
@@ -2776,8 +2761,9 @@ impl Hub {
                 if hand_over {
                     let _ = self.apply_set_leader(&team, &instance, &session);
                 } else {
+                    // A refusal changes no published state; the requesting
+                    // chat learns it on its next spawn (20.4).
                     self.teams.set_handover_refusal(&instance, &session);
-                    self.sessions_changed(&[(instance, session)]);
                 }
                 false
             }
@@ -2845,6 +2831,7 @@ impl Hub {
             let closing = self.closing_flag.clone();
             let team_for_git = team.clone();
             let name_for_git = participant.clone();
+            let lifecycle = spawn.lifecycle;
             tokio::spawn(async move {
                 let result =
                     worktree::create(&cwd, &root, &team_for_git, &stamp, &name_for_git).await;
@@ -2858,6 +2845,7 @@ impl Hub {
                     .send(Command::TeamWorktree {
                         team,
                         participant,
+                        lifecycle,
                         outcome: WorktreeOutcome::Spawn(result),
                     })
                     .await;
@@ -3018,14 +3006,38 @@ impl Hub {
         &mut self,
         team: &str,
         participant: &str,
+        lifecycle: u64,
         outcome: WorktreeOutcome,
     ) {
         match outcome {
             WorktreeOutcome::Spawn(result) => {
-                let Some(pending) = self
+                // The job is found by its own lifecycle id, never by name: a
+                // cancelled-but-running job keeps its record until this callback
+                // returns, and a newer worker of the same name has its own
+                // (20.6/E).
+                let key = (team.to_string(), participant.to_string());
+                let matches = self
                     .pending_worktrees
-                    .remove(&(team.to_string(), participant.to_string()))
-                else {
+                    .get(&key)
+                    .is_some_and(|pending| pending.spawn.lifecycle == lifecycle);
+                if !matches {
+                    // Nobody is waiting for this lifecycle any more: clean up
+                    // only what this job created.
+                    if let Ok(info) = result {
+                        let discarded = info.clone();
+                        tokio::spawn(async move {
+                            worktree::discard(
+                                &discarded.toplevel,
+                                &discarded.path,
+                                &discarded.branch,
+                            )
+                            .await;
+                        });
+                    }
+                    self.drain_team_events();
+                    return;
+                }
+                let Some(pending) = self.pending_worktrees.remove(&key) else {
                     return;
                 };
                 let stale = self
@@ -3793,6 +3805,9 @@ impl Hub {
             self.drop_pending_session(&key);
         }
         self.forward_loads.retain(|(owner, _)| owner != instance);
+        // Snapshot the instance's sessions *before* its tokens go away, then
+        // publish: a session that looked injected hears that it no longer is
+        // (20.5/A).
         let sessions: Vec<(String, String)> = self
             .conn_tokens
             .values()
@@ -3801,7 +3816,8 @@ impl Hub {
                 (owner == instance).then_some((owner, session))
             })
             .collect();
-        self.sessions_changed(&sessions);
+        let before = self.session_states(&sessions);
+        self.publish_session_changes(before);
     }
 
     pub(crate) fn fail_held_prompts(&mut self, instance: &str) {
