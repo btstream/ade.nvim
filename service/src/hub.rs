@@ -217,6 +217,12 @@ pub enum Command {
         lifecycle: u64,
         outcome: WorktreeOutcome,
     },
+    /// A cancelled worktree job finished discarding its directory: the name is
+    /// free again (20.6/E).
+    WorktreeDiscarded {
+        team: String,
+        participant: String,
+    },
     /// The 30 s grace period after cancelling a bus prompt ended (18.11).
     TeamDeadline {
         instance: String,
@@ -776,6 +782,12 @@ impl Hub {
                 outcome,
             } => {
                 self.team_worktree(&team, &participant, lifecycle, outcome);
+                self.update_busy();
+            }
+            Command::WorktreeDiscarded { team, participant } => {
+                self.pending_worktrees
+                    .remove(&(team.clone(), participant.clone()));
+                self.drain_team_events();
                 self.update_busy();
             }
             Command::TeamDeadline {
@@ -1985,11 +1997,14 @@ impl Hub {
             self.forward_loads
                 .contains(&(instance_id.to_string(), session.clone()))
         });
+        // Only a forced request of the *same instance* and session keeps this
+        // load off the emulation path; another instance with the same session id
+        // is unrelated (20.5).
         let forced_in_flight = session.as_ref().is_some_and(|session| {
-            self.pending_session.values().any(|pending| {
-                pending.forced
+            self.pending_session.iter().any(|((owner, _), pending)| {
+                owner == instance_id
+                    && pending.forced
                     && pending.session.as_deref() == Some(session.as_str())
-                    && pending.conn != 0
             })
         });
         let force_forward = is_reload && (marked || forced_in_flight);
@@ -2117,21 +2132,21 @@ impl Hub {
             }
             return;
         }
-        // The frame reached the agent: a one-shot reload is consumed here, by
-        // the request that forced it (20.5/B).
+        // The frame reached the agent: the request's record now outlives its
+        // front end, and a one-shot reload is consumed here, by the request
+        // that forced it (20.5/B).
         if let Some(agent_id) = agent_id {
-            let forced = self
+            if let Some(pending) = self
                 .pending_session
-                .get(&(instance_id.to_string(), agent_id))
-                .is_some_and(|pending| pending.forced);
-            if forced {
-                if let Some(pending) = self
-                    .pending_session
-                    .get(&(instance_id.to_string(), agent_id))
-                {
-                    if let Some(session) = &pending.session {
+                .get_mut(&(instance_id.to_string(), agent_id))
+            {
+                pending.delivered = true;
+                let forced = pending.forced;
+                let session = pending.session.clone();
+                if forced {
+                    if let Some(session) = session {
                         self.forward_loads
-                            .remove(&(instance_id.to_string(), session.clone()));
+                            .remove(&(instance_id.to_string(), session));
                     }
                 }
             }
@@ -2243,13 +2258,24 @@ impl Hub {
             let handle = self.instances.get_mut(instance_id).expect("checked above");
             handle.relay.forward_request(conn, frame)
         };
-        let pending = self.inject_forwarded_session(conn, instance_id, &mut action);
+        let mut pending = self.inject_forwarded_session(conn, instance_id, &mut action);
         let Some(forwarded) = action.forwarded().cloned() else {
             if let Some(pending) = pending {
                 self.drop_pending_session_value(pending);
             }
             return;
         };
+        // The log read may have raced a `session.teams` reload: this request is
+        // the earliest one that really reaches the agent, so it owns the mark
+        // (20.5).
+        if let (Some(pending), Some(session)) = (pending.as_mut(), forwarded_session(&forwarded)) {
+            if self
+                .forward_loads
+                .contains(&(instance_id.to_string(), session.clone()))
+            {
+                pending.forced = true;
+            }
+        }
         let agent_id = forwarded.get("id").and_then(Value::as_u64);
         match (pending, agent_id) {
             (Some(pending), Some(agent_id)) => {
@@ -2591,7 +2617,19 @@ impl Hub {
             }) => {
                 self.handle_service_response(instance_id, agent_id, seq, &message);
             }
-            Some(AgentAction::Drop) | None => {}
+            Some(AgentAction::Drop) | None => {
+                // The requester left, but the agent still answered a forwarded
+                // session request: its token must go and a forced load still
+                // owns the log boundary (20.5/B).
+                if let Some(request) = &outcome.frontend_request {
+                    if self
+                        .pending_session
+                        .contains_key(&(instance_id.to_string(), request.agent_id))
+                    {
+                        self.finish_session(instance_id, request, &value);
+                    }
+                }
+            }
             Some(AgentAction::Invalid) => {
                 crate::svc_log!(
                     "nvim_ade_server: agent {instance_id} wrote a frame that cannot be relayed; dropped"
@@ -2645,6 +2683,9 @@ impl Hub {
 
     fn instance_exited(&mut self, instance_id: &str) {
         let delivery = self.delivery_conns(instance_id);
+        // The pre-state of every session this instance can affect, taken before
+        // anything is revoked: tokens, leadership and connections (20.5/A).
+        let exiting_sessions = self.instance_sessions(instance_id);
         self.fail_held_prompts(instance_id);
         self.cleanup_instance_pending(instance_id);
         let Some(instance) = self.instances.remove(instance_id) else {
@@ -2701,6 +2742,10 @@ impl Hub {
         // the team cleanup above handles active teams, this covers a team that
         // was already closed or a start failure.
         self.teams.revoke_instance_tokens(instance_id);
+        // Publish once, after the tokens and leadership are gone: a session
+        // that was injected hears `injected:false` and a leader change
+        // (20.5/A).
+        self.publish_session_changes(self.session_states(&exiting_sessions));
     }
 
     fn update_busy(&mut self) {
@@ -3082,6 +3127,14 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn forwarded_session(frame: &Value) -> Option<String> {
+    frame
+        .get("params")
+        .and_then(|params| params.get("sessionId"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 #[cfg(test)]

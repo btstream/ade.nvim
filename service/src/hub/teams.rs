@@ -70,6 +70,9 @@ pub(crate) struct PendingSession {
     /// This request consumed the session's one-shot reload mark: its answer
     /// restarts the session's log (20.5).
     pub forced: bool,
+    /// The frame reached the agent's writer: its answer (or the instance's
+    /// exit) still matters even when the front end left (20.5/B).
+    pub delivered: bool,
 }
 
 #[derive(Debug)]
@@ -230,6 +233,7 @@ impl Hub {
             session,
             conn,
             forced: false,
+            delivered: false,
         })
     }
 
@@ -301,6 +305,8 @@ impl Hub {
         }
         let session = session.expect("checked above");
         if pending.token_id.is_empty() {
+            // The front end left (or the token was revoked): only the log
+            // boundary remains (20.5/B).
             self.pending_session.remove(&key);
             if pending.forced {
                 self.mark_log_restarted(instance, &session);
@@ -353,15 +359,27 @@ impl Hub {
     /// The single undo path: snapshot the affected session, revoke the token,
     /// then publish the difference so a session that looked injected hears
     /// about losing it (20.2/A).
+    ///
+    /// A request the agent already received keeps a record of its log boundary
+    /// until the agent answers or the instance exits (20.5/B): the token goes,
+    /// the forced-load fact stays.
     pub(crate) fn undo_pending_session(&mut self, key: &(String, u64)) {
-        let Some(pending) = self.pending_session.remove(key) else {
+        let Some(mut pending) = self.pending_session.remove(key) else {
             return;
         };
         let before = pending
             .session
             .as_ref()
             .map(|session| self.session_states(&[(key.0.clone(), session.clone())]));
-        self.drop_pending_session_value(pending);
+        if pending.delivered && pending.forced {
+            // Keep the answer path: bind nothing, resume nothing, but mark the
+            // log if the agent's forced replay succeeds.
+            pending.conn = 0;
+            pending.token_id.clear();
+            self.pending_session.insert(key.clone(), pending);
+        } else {
+            self.drop_pending_session_value(pending);
+        }
         if let Some(before) = before {
             self.publish_session_changes(before);
         }
@@ -1333,8 +1351,6 @@ impl Hub {
                 failures.push(name.clone());
             }
         }
-        self.drain_team_events();
-        self.team_deliveries();
         failures
     }
 
@@ -1415,14 +1431,16 @@ impl Hub {
             Ok::<(), TeamError>(())
         });
         result?;
+        // Both resume paths share the order: enqueue the one summary first, then
+        // drain and deliver, so an idle queue sees it at once (20.4/20.8).
         if suspended {
-            // One notice: the resume summary (with what could not be restarted),
-            // the base instructions and the current status (20.4/20.8).
             let failures = self.resume_team(team);
             self.send_resume_notice(team, &failures);
         } else {
             self.send_leader_notice(team);
         }
+        self.drain_team_events();
+        self.team_deliveries();
         Ok(())
     }
 
@@ -1629,6 +1647,8 @@ impl Hub {
         });
         let failures = self.resume_team(&team_id);
         self.send_resume_notice(&team_id, &failures);
+        self.drain_team_events();
+        self.team_deliveries();
     }
 
     fn team_send(&mut self, params: &Value) -> Result<(Value, bool), TeamError> {
@@ -3054,8 +3074,20 @@ impl Hub {
                     // for this lifecycle completes here, whether git worked or
                     // not (20.6).
                     self.finish_stopped_start(team, participant, pending.spawn.lifecycle);
+                    // Only the request that is still waiting gets the reply; a
+                    // stop already answered it and took the reply away.
+                    let reply = pending.opts.reply.clone();
+                    let mut hold = false;
                     if let Ok(info) = result {
+                        // The name stays taken until the directory and branch
+                        // are really gone, so a same-name retry cannot collide
+                        // with the cleanup (20.6/E).
+                        hold = true;
                         let discarded = info.clone();
+                        let sender = self.command_sender.clone();
+                        let team_owner = team.to_string();
+                        let name_owner = participant.to_string();
+                        let closed_flag = self.closing_flag.clone();
                         tokio::spawn(async move {
                             worktree::discard(
                                 &discarded.toplevel,
@@ -3063,11 +3095,21 @@ impl Hub {
                                 &discarded.branch,
                             )
                             .await;
+                            if !closed_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                                let _ = sender
+                                    .send(Command::WorktreeDiscarded {
+                                        team: team_owner,
+                                        participant: name_owner,
+                                    })
+                                    .await;
+                            }
                         });
                     }
-                    // Only the request that is still waiting gets the reply; a
-                    // stop already answered it and took the reply away.
-                    if let Some((conn, id, _)) = pending.opts.reply.clone() {
+                    if hold {
+                        // Keep the record until the discard reports back.
+                        self.pending_worktrees.insert(key.clone(), pending);
+                    }
+                    if let Some((conn, id, _)) = reply {
                         let error = if team_gone {
                             TeamError::unknown("team closed")
                         } else {
@@ -3792,8 +3834,38 @@ impl Hub {
         }
     }
 
-    /// Drop the forwarded session requests, one-shot loads and sessions of a
-    /// dying instance (20.2/20.5).
+    /// Every session an instance can affect: its bound tokens, its relay's
+    /// tracked sessions and the team participants it runs (20.5/A).
+    pub(crate) fn instance_sessions(&self, instance: &str) -> Vec<(String, String)> {
+        let mut sessions: Vec<(String, String)> = self
+            .conn_tokens
+            .values()
+            .filter_map(|token| {
+                let (owner, session) = self.teams.session_identity(token)?;
+                (owner == instance).then_some((owner, session))
+            })
+            .collect();
+        if let Some(handle) = self.instances.get(instance) {
+            for summary in handle.relay.session_summaries() {
+                sessions.push((instance.to_string(), summary.session_id));
+            }
+        }
+        for session in self.teams.sessions_of_instance(instance) {
+            sessions.push((instance.to_string(), session));
+        }
+        for (owner, session) in self.teams.participant_sessions() {
+            if owner == instance {
+                sessions.push((owner, session));
+            }
+        }
+        sessions.sort();
+        sessions.dedup();
+        sessions
+    }
+
+    /// Drop the forwarded session requests and one-shot loads of a dying
+    /// instance; session state is published by the caller after its tokens are
+    /// revoked (20.2/20.5).
     pub(crate) fn cleanup_instance_pending(&mut self, instance: &str) {
         let keys: Vec<(String, u64)> = self
             .pending_session
@@ -3805,19 +3877,6 @@ impl Hub {
             self.drop_pending_session(&key);
         }
         self.forward_loads.retain(|(owner, _)| owner != instance);
-        // Snapshot the instance's sessions *before* its tokens go away, then
-        // publish: a session that looked injected hears that it no longer is
-        // (20.5/A).
-        let sessions: Vec<(String, String)> = self
-            .conn_tokens
-            .values()
-            .filter_map(|token| {
-                let (owner, session) = self.teams.session_identity(token)?;
-                (owner == instance).then_some((owner, session))
-            })
-            .collect();
-        let before = self.session_states(&sessions);
-        self.publish_session_changes(before);
     }
 
     pub(crate) fn fail_held_prompts(&mut self, instance: &str) {

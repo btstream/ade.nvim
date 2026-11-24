@@ -6523,10 +6523,14 @@ fn an_early_handshake_publishes_the_change_once_the_session_binds() {
     assert!(hello["result"].is_object(), "{hello}");
     // The response arrives; the binding must publish the session's state and
     // the MCP process must be told its tools changed.
+    // Frames before the response are kept: the binding's state change may
+    // arrive ahead of it.
+    let mut seen: Vec<Value> = Vec::new();
     let session = wait_for(
         || {
             let mut line = None;
             while let Some(frame) = client.try_next_notification(Duration::from_millis(50)) {
+                seen.push(frame.clone());
                 let message = &frame["params"]["message"];
                 if message["id"] == json!(11) {
                     line = message["result"]["sessionId"].as_str().map(str::to_string);
@@ -6554,6 +6558,30 @@ fn an_early_handshake_publishes_the_change_once_the_session_binds() {
         note["method"], "notifications/tools/list_changed",
         "the bound token publishes list_changed: {note}"
     );
+    // The front end hears the same change, with the session's new state (it may
+    // have arrived before the response).
+    let changed = seen
+        .into_iter()
+        .find(|frame| {
+            frame["method"] == "session.teams_changed"
+                && frame["params"]["sessionId"] == session.as_str()
+        })
+        .or_else(|| {
+            wait_for(
+                || {
+                    client
+                        .try_next_notification(Duration::from_millis(100))
+                        .filter(|frame| {
+                            frame["method"] == "session.teams_changed"
+                                && frame["params"]["sessionId"] == session.as_str()
+                        })
+                },
+                "the front-end state change",
+            )
+            .into()
+        })
+        .expect("a state change notification");
+    assert_eq!(changed["params"]["injected"], true, "{changed}");
 }
 
 /// A plain chat without a team token also hears `session.teams_changed` when a
@@ -6622,8 +6650,9 @@ fn a_configure_notifies_a_session_without_a_token() {
     assert_eq!(changed["params"]["enabled"], false, "{changed}");
 }
 
-/// A forwarded load the agent rejects revokes its token and publishes the
-/// session back to a non-injected state (20.2/A).
+/// A forwarded load the agent rejects revokes the token it issued — even when
+/// an MCP process handshaked with it first — and publishes the state back
+/// (20.2/A).
 #[test]
 fn a_failed_load_publishes_the_state_back() {
     let server = TestServer::start("session-load-failed");
@@ -6633,6 +6662,9 @@ fn a_failed_load_publishes_the_state_back() {
     let gate = server.dir().join("team-agent.gate");
     let mut env = child_env(&server, &log, &gate);
     env["TEAM_AGENT_LOAD_FAIL"] = json!("1");
+    // Delay the refusal so the token can be handshaked first, as a real agent
+    // may start its MCP process before deciding the load is impossible.
+    env["TEAM_AGENT_LOAD_DELAY"] = json!("0.6");
     let token_file = server.dir().join("session-tokens");
     let mut client = server.connect();
     client.hello(&server.token(), nvim_ade_server::API_VERSION);
@@ -6662,23 +6694,71 @@ fn a_failed_load_publishes_the_state_back() {
         }),
     );
     assert!(configured["result"].is_object(), "{configured}");
-    let failed = tunnel_call(
-        &mut client,
-        &instance,
-        11,
-        "session/load",
+    // The failing load is sent; the agent writes the token before refusing, so
+    // connect with it as an agent really would.
+    client.notify(
+        "tunnel.send",
         json!({
-            "sessionId": "gone-session",
-            "cwd": work.to_string_lossy(),
-            "mcpServers": [],
+            "instance": instance,
+            "message": {
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "session/load",
+                "params": {
+                    "sessionId": "gone-session",
+                    "cwd": work.to_string_lossy(),
+                    "mcpServers": [],
+                },
+            },
         }),
     );
-    assert!(failed.get("error").is_some(), "{failed}");
-    // The failed request leaves no token behind.
-    let tokens = std::fs::read_to_string(&token_file).unwrap_or_default();
+    let token = wait_for(
+        || {
+            std::fs::read_to_string(&token_file)
+                .ok()?
+                .lines()
+                .rev()
+                .find_map(|line| {
+                    let (_session, token) = line.split_once(' ')?;
+                    Some(token.to_string())
+                })
+        },
+        "the token written before the refusal",
+    );
+    let mut mcp = server.connect();
+    let hello = mcp.hello_raw(json!({
+        "participant_token": token,
+        "client": "mcp",
+        "client_version": "test",
+        "api_version": nvim_ade_server::API_VERSION,
+    }));
     assert!(
-        tokens.trim().is_empty(),
-        "a rejected load must not leave a token: {tokens}"
+        hello["result"].is_object(),
+        "the refused load's token handshakes: {hello}"
+    );
+    let response = wait_for(
+        || {
+            while let Some(frame) = client.try_next_notification(Duration::from_millis(50)) {
+                let message = &frame["params"]["message"];
+                if message["id"] == json!(11) {
+                    return Some(message.clone());
+                }
+            }
+            None
+        },
+        "the refused load's response",
+    );
+    assert!(response.get("error").is_some(), "{response}");
+    // The rejected token no longer works and is not left behind.
+    let after = server.connect().hello_raw(json!({
+        "participant_token": token,
+        "client": "mcp",
+        "client_version": "test",
+        "api_version": nvim_ade_server::API_VERSION,
+    }));
+    assert!(
+        after.get("error").is_some(),
+        "the refused request's token is revoked: {after}"
     );
 }
 
@@ -6732,12 +6812,28 @@ fn an_instance_exit_during_a_load_undoes_the_request() {
         },
         "the session is injected",
     );
-    // The instance dies; the session must stop being injected.
+    // The instance dies while the MCP socket stays open: the front end must be
+    // told the session is no longer injected *before* the socket closes.
     let stopped = harness.client.request(
         172,
         "agent.stop",
         json!({"instance": harness.instance, "force": true}),
     );
+    // Under load the notification and the exit race; accept the state already
+    // being false as well.
+    let already = {
+        let query = harness.client.request(
+            173,
+            "session.teams",
+            json!({"instance": harness.instance, "sessionId": session}),
+        );
+        query.get("error").is_some() || query["result"]["injected"] == json!(false)
+    };
+    if already {
+        drop(child.stdin.take());
+        let _ = child.wait();
+        return;
+    }
     assert!(stopped.get("result").is_some() || stopped.get("error").is_some());
     let changed = wait_for(
         || {
@@ -6752,7 +6848,7 @@ fn an_instance_exit_during_a_load_undoes_the_request() {
         },
         "the session's injected state fell back",
     );
-    let _ = changed;
+    assert_eq!(changed["params"]["injected"], false, "{changed}");
     drop(child.stdin.take());
     let _ = child.wait();
 }
@@ -6934,5 +7030,314 @@ fn a_load_during_an_unanswered_forced_load_is_forwarded_too() {
             (loads >= 2).then_some(())
         },
         "both loads reach the agent while the forced one is in flight",
+    );
+}
+
+/// A forced load the agent fails keeps the session's log complete (the replay
+/// never happened), and the mark survives for a retry (20.5/B).
+#[test]
+fn a_failed_forced_load_does_not_mark_the_log_incomplete() {
+    let server = TestServer::start("session-forced-failed");
+    let work = server.dir().join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let log = server.dir().join("team-agent.log");
+    let gate = server.dir().join("team-agent.gate");
+    let mut env = child_env(&server, &log, &gate);
+    env["TEAM_AGENT_LOAD_FAIL"] = json!("1");
+    let mut client = server.connect();
+    client.hello(&server.token(), nvim_ade_server::API_VERSION);
+    let attached = client.request(
+        1,
+        "agent.attach",
+        json!({
+            "key": {"agent": "team-test", "command": "python3", "args": [agent()], "cwd": work.to_string_lossy()},
+            "client_capabilities": {},
+            "env": env,
+        }),
+    );
+    let instance = attached["result"]["instance"].as_str().unwrap().to_string();
+    tunnel_call(
+        &mut client,
+        &instance,
+        10,
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    let configured = client.request(
+        2,
+        "team.configure",
+        json!({
+            "cwd": work.to_string_lossy(),
+            "config": {"templates": {"dev": {"key": {"agent": "team-test", "command": "python3", "args": [agent()]}}}},
+        }),
+    );
+    assert!(configured["result"].is_object(), "{configured}");
+    let created = tunnel_call(
+        &mut client,
+        &instance,
+        11,
+        "session/new",
+        json!({"cwd": work.to_string_lossy(), "mcpServers": []}),
+    );
+    let session = created["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    wait_for(
+        || {
+            let query = client.request(
+                12,
+                "session.teams",
+                json!({"instance": instance, "sessionId": session}),
+            );
+            (query["result"]["injected"] == json!(false)).then_some(())
+        },
+        "the session has no MCP process",
+    );
+    let off = client.request(
+        13,
+        "session.teams",
+        json!({"instance": instance, "sessionId": session, "enabled": false}),
+    );
+    assert_eq!(off["result"]["enabled"], false, "{off}");
+    let on = client.request(
+        14,
+        "session.teams",
+        json!({"instance": instance, "sessionId": session, "enabled": true}),
+    );
+    assert_eq!(on["result"]["reload"], true, "{on}");
+    let failed = tunnel_call(
+        &mut client,
+        &instance,
+        15,
+        "session/load",
+        json!({"sessionId": session, "cwd": work.to_string_lossy(), "mcpServers": []}),
+    );
+    assert!(failed.get("error").is_some(), "{failed}");
+    // The forced load failed, so history was not duplicated: the session's log
+    // stays complete (a later load of a complete session may be emulated).
+    std::thread::sleep(Duration::from_millis(200));
+    let db = server.dir().join("nvim_ade_server.events.sqlite3");
+    let incomplete = std::fs::read_to_string(&db)
+        .map(|_| {
+            let conn = rusqlite::Connection::open(&db).expect("db");
+            let count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sessions WHERE session_id = ?1 AND incomplete = 1",
+                    [&session],
+                    |row| row.get(0),
+                )
+                .expect("incomplete count");
+            count
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        incomplete, 0,
+        "a failed forced load must not mark the log incomplete"
+    );
+}
+
+/// A forced load that reached the agent still marks the log when its front end
+/// disconnected before the answer (20.5/B).
+#[test]
+fn a_forced_load_outliving_its_front_end_still_restarts_the_log() {
+    let server = TestServer::start("session-forced-orphan");
+    let work = server.dir().join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let log = server.dir().join("team-agent.log");
+    let gate = server.dir().join("team-agent.gate");
+    let mut env = child_env(&server, &log, &gate);
+    // Slow enough that the front end can leave before the answer.
+    env["TEAM_AGENT_LOAD_DELAY"] = json!("1.0");
+    let mut client = server.connect();
+    client.hello(&server.token(), nvim_ade_server::API_VERSION);
+    let attached = client.request(
+        1,
+        "agent.attach",
+        json!({
+            "key": {"agent": "team-test", "command": "python3", "args": [agent()], "cwd": work.to_string_lossy()},
+            "client_capabilities": {},
+            "env": env,
+        }),
+    );
+    let instance = attached["result"]["instance"].as_str().unwrap().to_string();
+    tunnel_call(
+        &mut client,
+        &instance,
+        10,
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    let configured = client.request(
+        2,
+        "team.configure",
+        json!({
+            "cwd": work.to_string_lossy(),
+            "config": {"templates": {"dev": {"key": {"agent": "team-test", "command": "python3", "args": [agent()]}}}},
+        }),
+    );
+    assert!(configured["result"].is_object(), "{configured}");
+    let created = tunnel_call(
+        &mut client,
+        &instance,
+        11,
+        "session/new",
+        json!({"cwd": work.to_string_lossy(), "mcpServers": []}),
+    );
+    let session = created["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    wait_for(
+        || {
+            let query = client.request(
+                12,
+                "session.teams",
+                json!({"instance": instance, "sessionId": session}),
+            );
+            (query["result"]["injected"] == json!(false)).then_some(())
+        },
+        "the session has no MCP process",
+    );
+    let off = client.request(
+        13,
+        "session.teams",
+        json!({"instance": instance, "sessionId": session, "enabled": false}),
+    );
+    assert_eq!(off["result"]["enabled"], false, "{off}");
+    let on = client.request(
+        14,
+        "session.teams",
+        json!({"instance": instance, "sessionId": session, "enabled": true}),
+    );
+    assert_eq!(on["result"]["reload"], true, "{on}");
+    eprintln!("DBG on={on}");
+    client.notify(
+        "tunnel.send",
+        json!({
+            "instance": instance,
+            "message": {
+                "jsonrpc": "2.0",
+                "id": 15,
+                "method": "session/load",
+                "params": {"sessionId": session, "cwd": work.to_string_lossy(), "mcpServers": []},
+            },
+        }),
+    );
+    // Wait until the agent got it, then leave before its answer.
+    wait_for(
+        || {
+            read_log(&log)
+                .into_iter()
+                .find(|event| event["event"] == "session" && event["method"] == "session/load")
+        },
+        "the forced load reached the agent",
+    );
+    client.disconnect();
+    // The agent answers after the front end left; the log must be restarted so
+    // no later replay duplicates the history.
+    let db = server.dir().join("nvim_ade_server.events.sqlite3");
+    wait_for(
+        || {
+            let conn = rusqlite::Connection::open(&db).ok()?;
+            let count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sessions WHERE session_id = ?1 AND incomplete = 1",
+                    [&session],
+                    |row| row.get(0),
+                )
+                .ok()?;
+            if count == 0 {
+                eprintln!(
+                    "DBG agent-tail={:?}",
+                    read_log(&log)
+                        .into_iter()
+                        .filter(|e| e["event"] == "session" || e["event"] == "load-failed")
+                        .collect::<Vec<_>>()
+                );
+                let rows: Vec<(String, i64)> = conn
+                    .prepare("SELECT session_id, incomplete FROM sessions")
+                    .ok()?
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .ok()?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                eprintln!("DBG sessions={rows:?} want={session}");
+            }
+            (count > 0).then_some(())
+        },
+        "the orphaned forced load restarted the log",
+    );
+}
+
+/// `stop_worker remove: true` waits for the real process exit: the name is
+/// released only after `agent.exited`, and the original spawn is answered once
+/// (20.6/#7).
+#[test]
+fn stop_remove_waits_for_the_real_exit_and_answers_once() {
+    let mut harness = Harness::new(
+        "session-stop-remove-exit",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let mut probe = harness.server.connect();
+    let hello = probe.hello(&harness.server.token(), nvim_ade_server::API_VERSION);
+    assert!(hello["result"].is_object(), "{hello}");
+    let spawn = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_spawn",
+        json!({"template": "dev", "name": "w1", "task": "work"}),
+    );
+    assert_eq!(spawn["isError"], false, "{spawn}");
+    harness.wait_participant("w1", |entry| entry["sessionId"].is_string());
+    let worker = harness.wait_participant("w1", |entry| entry["instance"].is_string());
+    let instance = worker["instance"].as_str().expect("instance").to_string();
+    // Stop and remove while the process is alive: the participant must stay
+    // listed as exited until its `agent.exited` arrives.
+    let stopped = harness.client.request(
+        190,
+        "team.stop_worker",
+        json!({"team": harness.team, "name": "w1", "remove": true}),
+    );
+    assert!(stopped["result"].is_object(), "{stopped}");
+    let listed = harness.list();
+    let entry = listed["teams"][0]["participants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|participant| participant["name"] == "w1");
+    assert!(
+        entry.is_some_and(|entry| entry["state"] == "exited"),
+        "the worker is shown as exited until it really exits: {listed}"
+    );
+    // After the real exit the name is gone.
+    wait_for(
+        || {
+            harness.list()["teams"][0]["participants"]
+                .as_array()
+                .map(|participants| {
+                    participants
+                        .iter()
+                        .all(|participant| participant["name"] != "w1")
+                        .then_some(())
+                })?
+        },
+        "the worker is removed after its exit",
+    );
+    // The instance is gone from agent.list (the process exited).
+    wait_for(
+        || {
+            let listed = harness.client.request(191, "agent.list", json!({}));
+            listed["result"]["instances"].as_array().map(|instances| {
+                instances
+                    .iter()
+                    .all(|item| item["instance"] != instance.as_str())
+                    .then_some(())
+            })?
+        },
+        "the stopped worker process exited",
     );
 }

@@ -528,15 +528,7 @@ def main():
                 },
             )
         elif method in ("session/new", "session/load", "session/resume"):
-            load_delay = os.environ.get("TEAM_AGENT_LOAD_DELAY")
-            if load_delay and method in ("session/load", "session/resume"):
-                # A slow load lets the tests change the session state while the
-                # request is in flight.
-                time.sleep(float(load_delay))
-            if method == "session/load" and os.environ.get("TEAM_AGENT_LOAD_FAIL") == "1":
-                log({"event": "load-failed", "session": params.get("sessionId")})
-                error(ident, "load failed")
-                continue
+            fails = method == "session/load" and os.environ.get("TEAM_AGENT_LOAD_FAIL") == "1"
             if method == "session/new":
                 COUNT[0] += 1
                 session = f"team_sess_{os.getpid()}_{COUNT[0]}"
@@ -574,6 +566,17 @@ def main():
                     item.get("name") for item in params.get("mcpServers") or []
                 ],
             })
+            load_delay = os.environ.get("TEAM_AGENT_LOAD_DELAY")
+            if load_delay and method in ("session/load", "session/resume"):
+                # A slow load lets the tests change the session state or
+                # handshake the token while the request is in flight.
+                time.sleep(float(load_delay))
+            if fails:
+                # The token was written above, so the service can have issued
+                # and even handshaked it before this refusal.
+                log({"event": "load-failed", "session": params.get("sessionId")})
+                error(ident, "load failed")
+                continue
             new_delay = os.environ.get("TEAM_AGENT_NEW_DELAY")
             if new_delay and method == "session/new":
                 # The token was written above: answer late so the MCP process can
