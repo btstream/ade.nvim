@@ -52,7 +52,7 @@ return function(t)
       manager = { root = dir .. "/agents" },
       permissions = { prompt = "native", auto_allow = {} },
       teams = {
-        spawn_from_chat = true,
+        session_default = true,
         max_workers = 3,
         spawn_confirm = { auto = {} },
         limits = { max_turns_per_task = 30, max_turns_total = 200 },
@@ -1019,7 +1019,7 @@ return function(t)
       t.truthy(count <= 4, "a burst coalesces instead of painting once per event")
     end)
 
-    t.it("`:Ade team` with no team opens the pane, not a warning or a session", function()
+    t.it("`:Ade team` with no team opens the tree, not a warning or a session", function()
       wide(t)
       local service, dir = start_service(t, "empty-command")
       setup(t, "empty-command", service, dir)
@@ -1037,10 +1037,10 @@ return function(t)
       vim.cmd("Ade team")
       local UI = ui()
       wait(function()
-        return UI.layout:is_open_pane("members")
-      end, 5000, "the empty members pane")
+        return UI.layout:is_open_pane("tree")
+      end, 5000, "the empty tree pane")
       wait(function()
-        return pane_text(UI, "members"):find("还没有团队", 1, true) ~= nil
+        return pane_text(UI, "tree"):find("还没有会话", 1, true) ~= nil
       end, 5000, "the empty state")
       t.eq(sessions_before, vim.tbl_count(controller.state().sess.all or {}), "no session was started")
       for _, note in ipairs(notices) do

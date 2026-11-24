@@ -48,7 +48,9 @@ Server.__index = Server
 ---  team_workflow_delete_delay?: integer,
 ---  old_service_methods?: table<string, boolean>,
 ---  team_workflows_delay?: integer,
----  run_error?: table, uninstall_error?: table, canned_agent?: boolean}|nil
+---  run_error?: table, uninstall_error?: table, canned_agent?: boolean,
+---  session_reload_unsupported?: boolean|table<string, boolean>,
+---  session_teams_default?: boolean}|nil
 ---@return FakeService
 function M.new(opts)
   opts = opts or {}
@@ -154,6 +156,10 @@ function M.new(opts)
     team_board_delay = opts.team_board_delay or 5,
     team_card_history = opts.team_card_history,
     team_card_history_error = opts.team_card_history_error,
+    session_teams_default = opts.session_teams_default ~= false and true or false,
+    session_reload_unsupported = opts.session_reload_unsupported,
+    -- "instance\0sessionId" -> {enabled, injected}
+    session_switches = {},
     team_counter = 0,
     policy_responses = 0,
     policy_before_prompt = nil,
@@ -297,6 +303,44 @@ function Server:emit_team_board_changed(team_id, rev)
   self:broadcast("team.board_changed", { team = team_id, rev = rev })
 end
 
+---The leader team of a session, or nil.
+---@param session_id string
+---@return table|nil
+function Server:team_led_by(session_id)
+  for _, team in pairs(self.teams) do
+    if team.state ~= "closed" and team.leader and team.leader.sessionId == session_id then
+      return team
+    end
+  end
+end
+
+---@param instance string
+---@param session_id string
+---@return table
+function Server:switch_of(instance, session_id)
+  local key = tostring(instance) .. "\0" .. tostring(session_id)
+  local switch = self.session_switches[key]
+  if not switch then
+    switch = { enabled = self.session_teams_default, injected = true }
+    self.session_switches[key] = switch
+  end
+  return switch
+end
+
+---@param instance string
+---@param session_id string
+function Server:emit_session_teams(instance, session_id)
+  local switch = self:switch_of(instance, session_id)
+  local leader = self:team_led_by(session_id)
+  self:broadcast("session.teams_changed", {
+    instance = instance,
+    sessionId = session_id,
+    enabled = switch.enabled,
+    injected = switch.injected,
+    leader = leader and vim.deepcopy(leader) or nil,
+  })
+end
+
 ---@param message table
 ---@param client table
 ---@return table|nil
@@ -392,6 +436,111 @@ function Server:dispatch(message, client)
     return reply
   end
 
+  if method == "session.teams" then
+    local key = tostring(params.instance) .. "\0" .. tostring(params.sessionId)
+    local switch = self:switch_of(params.instance, params.sessionId)
+    local leader = self:team_led_by(params.sessionId)
+    if params.enabled == nil then
+      return {
+        jsonrpc = "2.0",
+        id = ident,
+        result = { enabled = switch.enabled, injected = switch.injected, leader = leader or nil },
+      }
+    end
+    if params.enabled == false then
+      if leader and not params.close then
+        return error_reply(
+          ident,
+          -32061,
+          "this session leads a team",
+          { reason = "leads_team", team = vim.deepcopy(leader) }
+        )
+      end
+      if leader then
+        leader.state = "closed"
+        self:emit(client, "team.changed", { team = vim.deepcopy(leader) })
+        self.teams[leader.id] = nil
+      end
+      switch.enabled = false
+      self:emit_session_teams(params.instance, params.sessionId)
+      vim.defer_fn(function()
+        self:send(
+          client,
+          { jsonrpc = "2.0", id = ident, result = { enabled = false, injected = switch.injected, leader = nil } }
+        )
+      end, 5)
+      return nil
+    end
+    if not switch.injected then
+      local unsupported = self.session_reload_unsupported
+      local blocked = unsupported == true or (type(unsupported) == "table" and unsupported[params.sessionId])
+      if blocked then
+        return error_reply(ident, -32061, "reload is unsupported", { reason = "reload_unsupported" })
+      end
+      switch.injected = true
+    end
+    switch.enabled = true
+    self.session_cwds = self.session_cwds or {}
+    self:emit_session_teams(params.instance, params.sessionId)
+    local current = self:team_led_by(params.sessionId)
+    vim.defer_fn(function()
+      self:send(client, {
+        jsonrpc = "2.0",
+        id = ident,
+        result = { enabled = true, injected = true, leader = current or nil },
+      })
+    end, 5)
+    self.session_keys = self.session_keys or {}
+    self.session_keys[key] = true
+    return nil
+  end
+  if method == "team.set_leader" then
+    local team = self.teams[params.team]
+    if not team then
+      return error_reply(ident, -32064, "unknown team")
+    end
+    team.leader = { instance = params.instance, sessionId = params.sessionId }
+    for _, participant in ipairs(team.participants or {}) do
+      if participant.name == "leader" then
+        participant.instance = params.instance
+        participant.sessionId = params.sessionId
+      end
+    end
+    team.state = "active"
+    self:broadcast("team.changed", { team = vim.deepcopy(team) })
+    self:emit_session_teams(params.instance, params.sessionId)
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
+    end, 5)
+    return nil
+  end
+  if method == "team.stop_worker" then
+    local team = self.teams[params.team]
+    if not team then
+      return error_reply(ident, -32064, "unknown team")
+    end
+    local found
+    for index, participant in ipairs(team.participants or {}) do
+      if participant.name == params.name then
+        found = index
+        participant.state = "exited"
+        participant.exit_reason = "stopped"
+        participant.instance = nil
+        break
+      end
+    end
+    if not found then
+      return error_reply(ident, -32064, "unknown participant")
+    end
+    if params.remove then
+      table.remove(team.participants, found)
+    end
+    self:broadcast("team.changed", { team = vim.deepcopy(team) })
+    vim.defer_fn(function()
+      self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
+    end, 5)
+    return nil
+  end
   if method == "team.configure" then
     self.team_configures[#self.team_configures + 1] = vim.deepcopy(params)
     self.team_cwd = params.cwd
@@ -637,8 +786,48 @@ function Server:dispatch(message, client)
     if self.team_start_error then
       return error_reply(ident, self.team_start_error.code, self.team_start_error.message, self.team_start_error.data)
     end
+    local ensured
+    if params.instance ~= nil then
+      self.session_cwds = self.session_cwds or {}
+      local key = tostring(params.instance) .. "\0" .. tostring(params.sessionId)
+      local cwd = self.session_cwds[key] or "/"
+      local leader = self:team_led_by(params.sessionId)
+      if leader then
+        ensured = leader
+      else
+        local other
+        for _, candidate in pairs(self.teams) do
+          if candidate.cwd == cwd and candidate.state ~= "closed" then
+            other = candidate
+          end
+        end
+        if other then
+          return error_reply(ident, -32061, "led by another chat", {
+            reason = "led_by",
+            team = vim.deepcopy(other),
+            leader = other.leader,
+          })
+        end
+        self.team_seq = (self.team_seq or 0) + 1
+        ensured = {
+          id = "t" .. self.team_seq,
+          cwd = cwd,
+          state = "active",
+          leader = { instance = params.instance, sessionId = params.sessionId },
+          participants = vim.deepcopy(self.team_participants or {}),
+          inbox = {},
+          limits = { max_turns_per_task = 30, max_turns_total = 200, turns_total = 0 },
+        }
+        self.teams[ensured.id] = ensured
+        self:broadcast("team.changed", { team = vim.deepcopy(ensured) })
+        self:emit_session_teams(params.instance, params.sessionId)
+      end
+    end
     local result = self.team_start_result and vim.deepcopy(self.team_start_result)
       or { workflow = params.workflow, started = {}, skipped = {} }
+    if ensured then
+      result.team = vim.deepcopy(ensured)
+    end
     vim.defer_fn(function()
       self:send(client, { jsonrpc = "2.0", id = ident, result = result })
     end, self.team_start_delay)
@@ -1220,8 +1409,18 @@ function Server:track_message(instance, message, result)
   end
   if method == "session/new" and type(result.sessionId) == "string" then
     put(result.sessionId)
+    self.session_cwds = self.session_cwds or {}
+    self.session_cwds[tostring(instance.id) .. "\0" .. result.sessionId] = cwd
+    self:switch_of(instance.id, result.sessionId)
   elseif method == "session/load" and type(params.sessionId) == "string" then
     put(params.sessionId)
+    self.session_cwds = self.session_cwds or {}
+    self.session_cwds[tostring(instance.id) .. "\0" .. params.sessionId] = cwd
+    self:switch_of(instance.id, params.sessionId)
+  elseif method == "session/resume" and type(params.sessionId) == "string" then
+    self.session_cwds = self.session_cwds or {}
+    self.session_cwds[tostring(instance.id) .. "\0" .. params.sessionId] = cwd
+    self:switch_of(instance.id, params.sessionId)
   elseif (method == "session/close" or method == "session/delete") and params.sessionId ~= nil then
     forget(params.sessionId)
   end

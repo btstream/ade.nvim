@@ -391,7 +391,8 @@ class Editor:
         if self.templates:
             teams["templates"] = self.templates
         if self.spawn_from_chat is not None:
-            teams["spawn_from_chat"] = self.spawn_from_chat
+            teams["enabled"] = self.spawn_from_chat
+            teams["session_default"] = self.spawn_from_chat
         opts = {
             "agent": "coder",
             "agents": {
@@ -1331,9 +1332,10 @@ def scenario_single_agent(case):
     sessions = [event for event in case.agent_events() if event.get("event") == "session"]
     assert sessions, "the agent never started"
     assert not any(event.get("mcp") for event in sessions), sessions
-    assert not editor.teams()["teams"], "a team exists despite spawn_from_chat=false"
-    assert not [name for name in editor.team_calls() if name.startswith("team.")]
-    return "with spawn_from_chat=false no ade-team server or team.* call happens"
+    assert not editor.teams()["teams"], "a team exists despite teams.enabled=false"
+    aggressive = {"team.start", "team.spawn", "team.set_leader"}
+    assert not [name for name in editor.team_calls() if name in aggressive]
+    return "with teams.enabled=false no ade-team server or team action happens"
 
 
 def scenario_default_team(case):

@@ -58,7 +58,8 @@ class W0Editor(base.Editor):
         if self.templates:
             teams["templates"] = self.templates
         if self.spawn_from_chat is not None:
-            teams["spawn_from_chat"] = self.spawn_from_chat
+            teams["enabled"] = self.spawn_from_chat
+            teams["session_default"] = self.spawn_from_chat
         if self.workflows:
             teams["workflows"] = self.workflows
         if self.default_workflow:
