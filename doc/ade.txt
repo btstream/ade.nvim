@@ -44,7 +44,7 @@ ade.nvim 是一个 Neovim 原生的 Agent Client Protocol 客户端。
     files        从项目索引选择文件，插入 @引用，不打开文件或发送消息
     image        读取剪贴板图像并附加；带路径时附加该文件
     diagnostics  把当前 buffer 的诊断附加到输入区
-    team         团队面板；:Ade team start [流程] / :Ade team close
+    team         团队成员；:Ade team board / :Ade team start [流程]
                  （见 |ade-teams|）
     workflows    列出、查看、删除命名流程
 
@@ -1077,6 +1077,12 @@ leader，它可以按需启动 worker（各自是一个独立的 agent 会话，
 git worktree 里工作），worker 之间通过服务总线（bus）传消息；团队和看板
 保存在服务里，Neovim 退出后继续运行。
 
+不写 teams 配置也能组队。直接在聊天里要求 leader 分工，或使用
+:Ade team start default。没有自定义模板时，内置 worker 模板使用 leader
+同类 agent 的启动配置，要求当前 Git 仓库已有提交以创建独立 worktree。
+无法创建时不会回退到共享目录。普通聊天和打开面板都不启动 worker；
+从聊天发起的启动申请默认仍需批准。
+
 服务里没有流程状态机：流程只是一段 leader 遵循的约定，服务只负责校验、
 保存、转发和提取。看板同理：服务保存结构，不解释列名或字段的含义。
 
@@ -1342,8 +1348,13 @@ team 人数不能超过 max_workers，否则 setup 报错（写明流程名和�
 命令 ~
                                                           *ade-teams-commands*
 :Ade team                                                          *:Ade-team*
-    打开统一团队面板；没有团队时显示空状态（可用流程列表：光标所在流程按
-    S 启动，<CR> 看全文）。
+    打开或聚焦成员面板；没有团队时显示可用流程（按 S 启动，<CR> 看全文）。
+
+:Ade team agents                                            *:Ade-team-agents*
+    与 :Ade team 相同；不同于用于管理 agent 安装和配置的 :Ade agents。
+
+:Ade team board                                              *:Ade-team-board*
+    打开或聚焦当前项目的看板。当前项目没有团队时显示空状态。
 
 :Ade team start [流程]                                       *:Ade-team-start*
     按流程启动团队，见上。
@@ -1360,23 +1371,16 @@ team 人数不能超过 max_workers，否则 setup 报错（写明流程名和�
     列出命名流程：名字、范围、一行说明、成员。<CR> 看全文，d 删除（只限
     project 和 user；config/builtin 提示不能删），q 关闭。
 
-补全：:Ade team <Tab> 补全 start/close；:Ade team start <Tab> 补全流程名
-（配置里的、已知的服务流程名和 default）。
+补全：:Ade team <Tab> 补全 agents/board/start/close/answer；
+:Ade team start <Tab> 补全配置里的、已知的服务流程名和 default。
 
 面板 ~
                                                              *ade-teams-panel*
-`:Ade team` 打开统一面板：成员和看板两栏，标题只在 tabline。
+成员面板和看板都在当前 tabpage 内独立打开、聚焦和关闭。宽屏（列数 >=
+teams.dashboard.wide，默认 160）使用分栏；窄屏只显示请求的浮窗。q 关闭
+所在面板，不关闭另一个面板、聊天窗口或团队。
 
-宽屏（列数 >= teams.dashboard.wide，默认 160）在独立 tabpage 里打开：左边
-成员、右边看板；观察 leader 或 worker 时右侧再加一列观察窗口。q 关闭整个
-tabpage，回到原来的位置。<Tab> / <S-Tab> 在窗口之间切换。
-
-窄屏保持居中浮窗，从上到下只有成员和看板两段；看板一次显示一列，zh / zl
-横向滚动。两种布局都用同一套成员、看板和高亮。
-
-标题    tabline 一行：团队、cwd、状态、workers x/y、回合数、流程和阶段进
-        度，以及 ? 待回答 N / ⚑ 待批准 N。窄屏时待处理计数排在最前，先省
-        略 cwd。
+标题    窗口标题显示团队、状态、worker 数、回合数、流程和待处理请求。
 成员    leader 在最上面（★、强调色），下面是 workers N/max。每个 worker
         显示符号和角色色（◆）、名字、label、agent/短模型名、状态（● 工作
         中 / ○ 空闲 / ? 等你回答 / ⏸ 暂停 / ✕ 退出）和已持续时间、任务
@@ -1391,16 +1395,14 @@ tabpage，回到原来的位置。<Tab> / <S-Tab> 在窗口之间切换。
         段折叠显示（例如“S1 · 已提交 · 6 张”）。leader 还没写过看板时显示
         “leader 还没有创建看板”和“按 L 去和 leader 聊”。
 详情    卡片上按 <CR> 打开浮窗：正文、fields、更新者、时间；q 或 <Esc>
-        关闭。成员上按 <CR> 打开或切换观察窗口。
+        关闭。成员上按 <CR> 用普通面板查看对话。
 消息    worker 发给人的普通消息用 vim.notify 提示，并在该成员行显示 ✉ N；
-        在观察窗口里能看到正文。
-
-多个团队时 tabline 显示 [1/2]，]t / [t 切换。
+        选择该成员后可以看到正文。
 
 按键作用于光标下的对象：
 
     成员上
-      <CR> / w      打开或切换这个人的观察窗口
+      <CR> / w      在普通面板里查看或联系这个成员
       m             给这个人发消息
       a             回答这个人的待回答提问
       p / r / c     暂停 / 恢复 / 取消当前回合
@@ -1411,7 +1413,7 @@ tabpage，回到原来的位置。<Tab> / <S-Tab> 在窗口之间切换。
       <CR>          打开卡片详情浮窗
       m             就这张卡片给 leader 发消息
       H             查看历史版本（逐版对比）
-      w             打开负责人的观察窗口
+      w             在普通面板里查看或联系负责人
       p / r / c     对负责人生效
 
     全局
@@ -1448,30 +1450,17 @@ agent 自己的权限请求和表单），聊天窗口底部会浮出一张选�
 - 面板隐藏时卡片随之关闭，只提示；:Ade open 或 :Ade team answer 后显示。
 - 卡片缓冲区的 filetype 是 ade_choice，并设置 b:ade_choice。
 
-观察窗口 ~
+成员对话 ~
                                                              *ade-teams-watch*
-在成员上按 <CR> 或 w 打开右侧的观察窗口，用来完整查看这个人的工作过程。
+在成员上按 <CR> 或 w，在普通 ade_chat / ade_input 面板中切换对话对象。
+Worker 的历史和实时消息带回合分组（含工具、diff 和 plan），za 折叠，[[ / ]]
+跳回合。成员面板按 L 去 Leader 对话；Worker 对话里按 gl 退出 Worker 视图。
 
-worker：只读，从它会话的第一条消息开始完整重放（内容和聊天窗口一致：总线
-消息、回复正文、工具调用可展开、编辑显示 diff、plan、思考默认折叠），再接
-实时更新；按回合分组，za 折叠回合，[[ / ]] 跳回合；停在底部时自动跟随，
-往上翻暂停，G 回到底部。窗口里没有输入区，也不能回答问题：权限请求和提问
-可以在观察窗口里直接回答（和聊天窗口一样）。对 worker 说话仍然只能在成员
-列表里按 m。
-
-worker 观察窗口下方有输入区：<C-s> 把消息作为 notice 排队发给这个 worker，
-并抄送 leader（leader 收到一条 notice）；<M-CR>（可用
-teams.dashboard.keys.interrupt 改，默认 <M-CR>）先在输入区上方提示“再按一次
-确认打断”，再按一次才 cancel 当前
-回合并优先送达。草稿按 worker 分开保存；切到 leader 时仍复用 leader 聊天，
-不显示这个输入区。输入区 filetype 是 ade_team_input：blink/cmp 的 per_filetype
-只写了 ade_input 时需要再加上它；粘贴图片和附件在这个输入区不可用。worker
-对被打断后新消息的回答仍会作为 report 抄给 leader。
-
-leader：观察窗口显示 leader 的聊天会话本身（你和它的对话 + 总线回合），
-带输入区：在那里发出去的就是你给 leader 的 prompt（你的 prompt 优先于排队
-的总线消息）；权限和提问也能直接回答。如果 leader 的聊天窗口已经打开，观
-察窗口复用同一个聊天会话，不会出现两份输入状态。
+在 Worker 对话中，<C-s> 把纯文本作为 notice 排队发给当前成员并抄送 Leader；
+<M-CR>（可用 teams.dashboard.keys.interrupt 修改）连按两次才能打断该 Worker
+的当前回合并优先送达。草稿按成员隔离。已退出的 Worker 只能回看。团队消息
+暂不支持附件或图片，提交时会提示并保留草稿。切到 Leader 的实际会话时，发送
+走普通 Agent 的 prompt，而不是团队消息队列。
 
 会话日志超过 32 MiB 时不能从头重放，窗口顶部提示“会话过长，只显示观察开
 始之后的内容”，并用 team.read 补上最近的消息和最后 3 个回合的正文；不做

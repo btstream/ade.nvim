@@ -331,6 +331,7 @@ class Editor:
         backend="service",
         service_path=None,
         agent_env=None,
+        use_team_defaults=False,
     ):
         self.case = case
         self.label = label
@@ -345,6 +346,7 @@ class Editor:
         self.backend = backend
         self.service_path = service_path or SERVICE
         self.agent_env = agent_env or {}
+        self.use_team_defaults = use_team_defaults
         self.socket = case.dir / f"{label}.sock"
         self.log = case.dir / f"{label}.nvim.log"
         self.proc = None
@@ -413,6 +415,8 @@ class Editor:
         }
         if self.backend is not None:
             opts["backend"] = self.backend
+        if self.use_team_defaults:
+            del opts["teams"]
         self.lua(
             """
             local opts = ...
@@ -1198,7 +1202,7 @@ def scenario_human_first(case):
 
 
 def scenario_watch(case):
-    """7. The read-only view replays a worker and then follows it live."""
+    """7. The ordinary chat and composer can replay and talk to a worker."""
     editor = case.editor("a", templates=template())
     editor.connect()
     editor.submit("spawn-task:do [chunk-slow]")
@@ -1211,6 +1215,12 @@ def scenario_watch(case):
     )
 
     editor.open_panel()
+    ordinary = editor.lua(
+        """
+        local view = require("ade.controller").state().view
+        return { view.chat.buf, view.input.buf }
+        """
+    )
     editor.panel_cursor_participant("w1")
     editor.panel_press("w")
     panel = editor.wait_panel(
@@ -1218,6 +1228,22 @@ def scenario_watch(case):
         "the replayed worker transcript",
     )
     assert any("watching" in line for line in panel["watch"]), panel["watch"]
+    mounted = editor.lua(
+        """
+        local view = require("ade.controller").state().view
+        local chat, input = view.chat.buf, view.input.buf
+        return { view.team_ui.watch_buf, input, vim.bo[chat].filetype, vim.bo[input].filetype }
+        """
+    )
+    assert mounted == [*ordinary, "ade_chat", "ade_input"], mounted
+    editor.lua(
+        """
+        local input = require("ade.controller").state().view.input
+        vim.api.nvim_buf_set_lines(input.buf, 0, -1, false, { ... })
+        input:submit()
+        """,
+        "message from the shared composer",
+    )
 
     case.gate.write_text("go", encoding="utf-8")
     editor.wait_panel(
@@ -1225,10 +1251,11 @@ def scenario_watch(case):
         "the live worker chunk",
     )
     editor.wait_bus_text("worker report", "the worker report")
+    case.wait_worker_prompt("message from the shared composer")
     notifications = editor.notification_lines()
     assert not any("watcher" in line or "-32062" in line for line in notifications), notifications
     editor.unwatch()
-    return "the watch view replayed the worker and followed live updates without sending requests"
+    return "the ordinary chat replayed and followed the worker, and its composer sent to that worker"
 
 
 def scenario_limits(case):
@@ -1269,7 +1296,7 @@ def scenario_limits(case):
 
 
 def scenario_close(case):
-    """9. team.close stops the worker and removes the panel."""
+    """9. team.close stops the worker and leaves the members pane empty."""
     editor = case.editor("a", templates=template())
     editor.connect()
     editor.submit("spawn-task:do [report]")
@@ -1283,39 +1310,66 @@ def scenario_close(case):
     editor.panel_press("x")
     editor.wait_team(lambda value: not value["teams"], "the closed team")
 
-    editor.wait_panel(lambda panel: panel["open"] is False, "the panel to disappear")
+    editor.wait_panel(
+        lambda panel: panel["open"] and any("还没有团队" in line for line in panel["lines"]),
+        "the empty members pane",
+    )
     wait_until(lambda: not pid_alive(worker["pid"]), "the worker process to exit")
-    return "team.close stopped the worker process and the panel disappeared"
+    return "team.close stopped the worker process and the members pane returned to its empty state"
 
 
 def scenario_single_agent(case):
-    """10. No template (and spawn_from_chat=false) keeps the single-agent path."""
-    calls = []
-    for label, templates, spawn_from_chat in (
-        ("no-templates", None, True),
-        ("spawn-off", template(), False),
-    ):
-        editor = case.editor(
-            label,
-            templates=templates,
-            spawn_from_chat=None if spawn_from_chat else False,
-        )
-        editor.probe_team_calls()
-        editor.connect()
-        editor.submit("hello")
-        editor.wait_transcript(
-            lambda blocks: any(block["kind"] == "agent" and "working on it" in block["text"] for block in blocks),
-            "the normal reply",
-        )
-        calls.extend((label, name) for name in editor.team_calls())
-        sessions = [event for event in case.agent_events() if event.get("event") == "session"]
-        assert sessions, "the agent never started"
-        assert not any(event.get("mcp") for event in sessions), (
-            f"{label}: teams injected an ade-team MCP server without a reason: {sessions}"
-        )
-        assert not editor.teams()["teams"], f"{label}: a team exists"
-    assert not [entry for label, entry in calls if entry.startswith("team.")], calls
-    return "without templates (and with spawn_from_chat=false) no ade-team server or team.* call happens"
+    """10. Disabling chat spawn keeps the single-agent path."""
+    editor = case.editor("spawn-off", spawn_from_chat=False)
+    editor.probe_team_calls()
+    editor.connect()
+    editor.submit("hello")
+    editor.wait_transcript(
+        lambda blocks: any(block["kind"] == "agent" and "working on it" in block["text"] for block in blocks),
+        "the normal reply",
+    )
+    sessions = [event for event in case.agent_events() if event.get("event") == "session"]
+    assert sessions, "the agent never started"
+    assert not any(event.get("mcp") for event in sessions), sessions
+    assert not editor.teams()["teams"], "a team exists despite spawn_from_chat=false"
+    assert not [name for name in editor.team_calls() if name.startswith("team.")]
+    return "with spawn_from_chat=false no ade-team server or team.* call happens"
+
+
+def scenario_default_team(case):
+    """11. No Team configuration: ordinary chat stays solo; explicit spawn works."""
+    subprocess.run(["git", "init", "-q", str(case.work)], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(case.work),
+            "-c", "user.name=ADE Test", "-c", "user.email=ade@example.test",
+            "commit", "--allow-empty", "-qm", "Initial commit",
+        ],
+        check=True,
+    )
+    editor = case.editor("builtin", use_team_defaults=True, agent_env={"TEAM_AGENT_TEMPLATE": "worker"})
+    editor.connect()
+    editor.submit("hello")
+    editor.wait_transcript(
+        lambda blocks: any(block["kind"] == "agent" and "working on it" in block["text"] for block in blocks),
+        "the normal reply",
+    )
+    editor.open_panel()
+    assert len([event for event in case.agent_events() if event.get("event") == "session"]) == 1
+    assert not editor.teams()["inbox"], "ordinary chat or opening the panel requested work"
+
+    editor.submit("spawn-task:do [report]")
+    approve(editor, case, "do [report]")
+    worker = editor.wait_participant(
+        "w1", lambda entry: entry.get("worktree") and entry["state"] in ("working", "idle")
+    )
+    assert worker["template"] == "worker", worker
+    worktree = Path(worker["worktree"]["path"])
+    assert worktree.is_dir() and worktree.resolve() != case.work.resolve(), worker
+    prompt = case.wait_worker_prompt("do [report]")
+    assert prompt["pid"] != leader_pid(case), prompt
+    editor.wait_bus_text("worker report", "the default worker's report")
+    return "ordinary chat stayed solo; explicit spawn used the built-in isolated worker"
 
 
 SCENARIOS = [
@@ -1329,6 +1383,7 @@ SCENARIOS = [
     ("8-limits", scenario_limits),
     ("9-close", scenario_close),
     ("10-single-agent", scenario_single_agent),
+    ("11-default-team", scenario_default_team),
 ]
 
 

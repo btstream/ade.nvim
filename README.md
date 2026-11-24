@@ -768,6 +768,12 @@ require("ade").setup({
 **选择组件**审批和回答问题。团队和看板存在服务的 SQLite 事件日志里，Neovim 退出后
 继续运行；服务重启后未关闭的团队变为挂起，恢复 leader 会话后继续。
 
+使用服务后端时，组队不需要写 `teams` 配置。直接让 leader 分工并组队，或用
+`:Ade team start default`。没有自定义模板时，内置 `worker` 模板使用 leader 同类
+Agent 的启动配置，启动独立会话，并要求当前目录是有提交的 Git 仓库，以便创建
+独立 worktree。不能创建 worktree 时不会回退到共享目录。普通聊天和打开面板都
+不会启动 worker；聊天里发起的启动申请默认仍需批准。
+
 团队有一块**看板**（列、卡片、负责人、阶段）：leader 管结构（列、建卡/删卡、挪列、
 指派负责人），worker 只写自己负责卡片的正文和键值。卡片是给你看的，不是 agent 之间
 的信息通道——agent 没有读取卡片的工具，看板变化也不会叫醒任何 agent。默认流程下，
@@ -783,7 +789,7 @@ leader 保存到服务的项目级/用户级流程；同名时按 config > proje
 agent，`leader.role` 最多 4 KiB。每个项目或用户的已存流程最多 100 个；与配置里的流程
 同名时 `workflow_save` 被拒绝（配置的流程遮住它）。
 
-最小配置：
+可选的自定义配置：
 
 ```lua
 teams = {
@@ -812,7 +818,7 @@ teams = {
     },
     pi = { agent = "pi" },
   },
-  dashboard = { wide = 160 },  -- 面板宽度 >= 160 列时用 tabpage
+  dashboard = { wide = 160 },  -- 屏幕宽度 >= 160 列时在当前 Tab 分栏
 }
 ```
 
@@ -850,13 +856,14 @@ teams = {
 
 | 命令 | 作用 |
 |---|---|
-| `:Ade team` | 打开统一面板（成员 / 看板；卡片 `<CR>` 看详情）；没有团队时显示可用流程（光标所在流程按 `S` 启动，`<CR>` 看全文） |
+| `:Ade team` / `:Ade team agents` | 打开或聚焦成员面板；没有团队时显示可用流程（`S` 启动，`<CR>` 看全文） |
+| `:Ade team board` | 打开或聚焦当前项目的看板；卡片上按 `<CR>` 看详情 |
 | `:Ade team start [流程]` | 按流程启动团队 |
 | `:Ade team close` | 确认后结束当前 cwd 的团队 |
 | `:Ade team answer [名字]` | 显示待处理的选项；带名字时用输入框回答该成员的无选项提问 |
 | `:Ade workflows` | 列出/查看/删除命名流程（`<CR>` 全文，`d` 删除，`q` 关闭） |
 
-补全：`:Ade team <Tab>` 补全 `start` / `close`；`:Ade team start <Tab>` 补全配置里的
+补全：`:Ade team <Tab>` 补全 `agents` / `board` / `start` / `close` / `answer`；`:Ade team start <Tab>` 补全配置里的
 流程名、已知的服务流程名和 `default`。
 
 `:Ade team start` 依次：选流程 → 是否切换 leader agent → 已有团队怎么处理 → 输入任务
@@ -865,20 +872,22 @@ teams = {
 前端提示“服务版本过旧；空闲后会自动更新，或用 `:Ade service stop` 手动重启”，不会
 反复重试看板。
 
-面板宽屏（`teams.dashboard.wide`，默认 160）在独立 tabpage 里分两栏：成员和看板；
-观察时右侧再加一列。窄屏用居中浮窗，只有成员和看板。标题只在 tabline。成员栏宽度
-由 `teams.dashboard.members_width`（默认 32，16..120）决定，手动拖动后本次打开期间
-保持。按键作用于光标下的对象：`<CR>` 打开/切换观察窗口（卡片打开详情浮窗），
+成员面板和看板都留在当前 Tab，各自打开和关闭。宽屏（`teams.dashboard.wide`，默认
+160）使用分栏；窄屏使用浮窗，只显示请求的面板。成员栏宽度由
+`teams.dashboard.members_width`（默认 32，16..120）决定。按键作用于光标下的对象：
+成员上 `<CR>` / `w` 在普通聊天面板查看或联系成员，卡片上 `<CR>` 打开详情浮窗，
 `m` 给成员发消息/就卡片给 leader 发消息，`H` 看卡片历史版本，`a` 回答成员提问，
-`!` 打开待处理的选择（提问、spawn、权限、回合上限），`w` 打开观察窗口，
+`!` 打开待处理的选择（提问、spawn、权限、回合上限），
 `p`/`r`/`c` 暂停/恢复/取消，`D` 删除已退出 worker 的 worktree，`L` 跳到 leader
 聊天，`s` 按模板启动 worker，`R` 重置回合上限，`x` 结束团队，`<Tab>`/`<S-Tab>`
-切换窗口，`zh`/`zl` 横向滚动看板，`g?` 帮助，`q` 关闭。观察窗口里 worker 是只读的完整回放（工具、diff、plan、回合分组
-都在），leader 显示聊天会话本身并**带输入区**，可以直接对话。worker 观察窗口下方也有
-输入区：`<C-s>` 排队发给该 worker 并抄送 leader；`<M-CR>` 连按两次先打断当前回合再
-优先送达（`teams.dashboard.keys.interrupt` 可改）；草稿按 worker 分开保存。输入区
-filetype 是 `ade_team_input`：blink/cmp 的 `per_filetype` 只写了 `ade_input` 时要补上；
-图片/附件不在该输入区提供。
+切换窗口，`zh`/`zl` 横向滚动看板，`g?` 帮助，`q` 关闭所在面板。
+
+Leader 和 Worker 共用普通 `ade_chat` / `ade_input`。切换到 Worker 后可以回看历史
+并跟随实时消息（含工具、diff、plan 和回合分组）。`<C-s>` 将纯文本消息排队发给
+当前 Worker，并抄送 Leader；`<M-CR>` 连按两次先打断当前回合再优先送达
+（`teams.dashboard.keys.interrupt` 可改）。草稿按成员隔离，`gl` 退出 Worker
+视图。已退出的 Worker 只能回看；团队通道暂不支持图片和附件，提交时会提示并
+保留草稿。
 
 需要你从选项里选时（带选项的提问、spawn 申请、权限、回合上限、agent 自己的权限和
 表单），聊天窗口底部会浮出一张选择卡片：Tab/Shift-Tab 切题，↑↓ 或 j/k 选择，数字直选，

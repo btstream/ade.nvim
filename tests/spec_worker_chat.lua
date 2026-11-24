@@ -195,6 +195,9 @@ return function(t)
         return input
       end,
       current_session = function()
+        if over.no_current_session then
+          return nil
+        end
         return over.current_session or leader
       end,
       find_session = function(id)
@@ -233,6 +236,17 @@ return function(t)
   end)
 
   t.describe("team router", function()
+    t.it("leaving a worker before opening an ordinary session restores the empty composer", function()
+      local router, _, _, input = setup(t, { no_current_session = true })
+      t.eq(true, router:select("t1", "w1"))
+      input:set_lines({ "worker draft" })
+      t.eq(true, router:leave_worker(false))
+      t.eq(nil, input.session_key)
+      t.eq("", input:text())
+      t.eq(true, router:select("t1", "w1"))
+      t.eq("worker draft", input:text())
+    end)
+
     t.it("queues a notice and copies the leader", function()
       local router, team, chat, input = setup(t)
       t.eq(true, router:select("t1", "w1"))

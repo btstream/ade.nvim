@@ -749,14 +749,12 @@ fn hashes_match(left: &TokenHash, right: &TokenHash) -> bool {
 ///
 /// Two instances may share an agent id (or even the same command) yet run with
 /// a different environment or managed release. A derived worker template may
-/// only be handed back to the exact launch that supplied it, so the front end
-/// and the service compute this digest from the same inputs and compare it:
+/// only be handed back to the exact launch that supplied it. The service
+/// computes this digest for both the template and the running instance:
 /// agent, command, args, cwd, the child environment sorted by name, and the
 /// managed release. It is an identity marker, never a secret; only its hex form
 /// leaves the process.
 ///
-/// The byte layout must match `M.launch_fingerprint` in `lua/ade/app/team.lua`:
-/// each field is `<decimal length>:<bytes>`.
 pub fn launch_fingerprint(
     key: &InstanceKey,
     env: Option<&[(String, String)]>,
@@ -770,6 +768,7 @@ pub fn launch_fingerprint(
     };
     field(&key.agent);
     field(&key.command);
+    field(&key.args.len().to_string());
     for arg in &key.args {
         field(arg);
     }
@@ -1628,7 +1627,6 @@ impl Teams {
                 // here means this instance owns the configuration; what remains
                 // is the stored team, checked just above against its leader
                 // agent.
-                let _ = &config;
                 if !self.configs.contains_key(&cwd) {
                     // A bind before configure is accepted: the token is bound
                     // and the team stays suspended until configure arrives.
@@ -1684,6 +1682,23 @@ impl Teams {
                     if let Some(previous) = previous {
                         self.by_instance.remove(&previous);
                     }
+                    // The old session can still have a live MCP connection
+                    // (including when both sessions share an instance). Once
+                    // ownership moves, that connection must no longer act as
+                    // the leader of this team.
+                    let obsolete: Vec<String> = self
+                        .token_records
+                        .iter()
+                        .filter(|(id, record)| {
+                            id.as_str() != token_id
+                                && record.role == Role::Leader
+                                && record.team.as_deref() == Some(team_id.as_str())
+                        })
+                        .map(|(id, _)| id.clone())
+                        .collect();
+                    for id in obsolete {
+                        self.revoke(&id);
+                    }
                     if let Some(team) = self.teams.get_mut(&team_id) {
                         team.leader_instance = Some(instance.to_string());
                         team.leader_session = Some(session.to_string());
@@ -1695,6 +1710,7 @@ impl Teams {
                         instance.to_string(),
                         (team_id.clone(), "leader".to_string()),
                     );
+                    self.events.push(TeamEvent::Changed(team_id.clone()));
                 }
             }
             if let Some(leader) = self
@@ -6131,6 +6147,7 @@ mod tests {
             panic!("a first bind is not a resume");
         };
         assert_eq!(entry["team"]["participants"][0]["agent"], "opencode");
+        teams.drain_events();
         // The team has no worker and no card, so it is a chat by-product: the
         // second session takes it over instead of being refused. One cwd keeps
         // one team (18.1); the team now runs the new leader and its template.
@@ -6149,6 +6166,11 @@ mod tests {
         assert_eq!(live.leader_fingerprint.as_deref(), Some(pi.as_str()));
         assert_eq!(live.leader_instance.as_deref(), Some("i-pi"));
         assert_eq!(live.leader_session.as_deref(), Some("s-pi"));
+        assert!(teams.role_for_token(&opencode_token).is_none());
+        assert_eq!(teams.role_for_token(&pi_token).unwrap().0, Role::Leader);
+        assert!(teams.drain_events().iter().any(|event| {
+            matches!(event, TeamEvent::Changed(id) if Some(id.as_str()) == taken["team"]["id"].as_str())
+        }));
     }
 
     #[test]

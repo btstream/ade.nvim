@@ -820,6 +820,14 @@ function Router:restore_leader(focus, team, mode)
   if input and session and input.session_key ~= session.id then
     local restored = drafts.get(session.cwd, session.id)
     input:switch_session(session.id, restored, session)
+  elseif input and not session and was_worker then
+    -- The panel can inspect a worker before this editor has connected an
+    -- ordinary session. Do not leave that worker's draft in the newly
+    -- restored ordinary composer, where it would be sent to a different agent.
+    local key = previous and previous.key or nil
+    local owner = previous and previous.owner or nil
+    local restored = key and owner and drafts.get(owner.cwd, key) or nil
+    input:switch_session(key, restored, owner)
   end
   if focus and chat and chat.win and vim.api.nvim_win_is_valid(chat.win) then
     pcall(vim.api.nvim_set_current_win, chat.win)
