@@ -11,6 +11,8 @@
 local Pane = require("ade.ui.team.layout_pane")
 local Router = require("ade.ui.team.router")
 local Members = require("ade.ui.team.members")
+local Tree = require("ade.ui.team.tree")
+local presenter = require("ade.app.presenter")
 local Board = require("ade.ui.team.board")
 local Roles = require("ade.ui.team.roles")
 local Detail = require("ade.ui.team.detail")
@@ -32,7 +34,8 @@ end
 ---  panel: (fun(): table|nil)|nil, leader_chat: (fun(): table|nil)|nil,
 ---  leader_input: (fun(): table|nil)|nil, current_session: (fun(): table|nil)|nil,
 ---  find_session: (fun(id: string): table|nil)|nil, instance: (fun(): string|nil)|nil,
----  start_team: (fun(workflow: string)|nil)|nil, select_session: (fun(session: table)|nil)|nil}
+---  start_team: (fun(workflow: string, session: table|nil)|nil)|nil, select_session: (fun(session: table)|nil)|nil,
+---  sessions: (fun(): table|nil)|nil}
 ---@return table
 function M.dashboard(opts)
   local self = setmetatable({
@@ -44,6 +47,7 @@ function M.dashboard(opts)
     current_session = opts.current_session,
     find_session = opts.find_session,
     select_session = opts.select_session,
+    sessions = opts.sessions,
     instance_of = opts.instance,
     panel = opts.panel,
     start_team = opts.start_team,
@@ -55,6 +59,8 @@ function M.dashboard(opts)
     refresh_timer = nil,
     pending = false,
     requested = {},
+    switch_queried = {},
+    tree_meta = {},
   }, Dashboard)
   self.layout = Pane.new(self)
   self.router = Router.new({
@@ -293,7 +299,102 @@ function Dashboard:render_pane(name)
   if name == "board" then
     return self:render_board()
   end
+  if name == "tree" then
+    return self:render_tree()
+  end
   return self:render_members()
+end
+
+---Sessions grouped by project, each leader's workers beneath it.
+---@return table[]
+function Dashboard:tree_groups()
+  local sessions = (self.sessions and self.sessions()) or {}
+  local instance = self.instance_of and self.instance_of() or nil
+  local by_cwd = {}
+  local order = {}
+  for _, session in pairs(sessions) do
+    local cwd = session.cwd or "?"
+    if not by_cwd[cwd] then
+      by_cwd[cwd] = {}
+      order[#order + 1] = cwd
+    end
+    by_cwd[cwd][#by_cwd[cwd] + 1] = {
+      session = session,
+      switch = instance and self.team:session_teams(instance, session.id) or nil,
+    }
+  end
+  table.sort(order)
+  -- Every session row of a cwd knows its cwd team (`L` works from any row); the
+  -- matching leader session additionally carries the workers.
+  for _, cwd in ipairs(order) do
+    local row = self.team:team_for_cwd(cwd)
+    if row then
+      for _, entry in ipairs(by_cwd[cwd]) do
+        entry.team = row
+        local leader = type(row.leader) == "table" and row.leader or nil
+        if leader and leader.sessionId == entry.session.id then
+          entry.leader = true
+          entry.workers = {}
+          for _, participant in ipairs(row.participants or {}) do
+            if participant.name ~= "leader" and participant.name ~= "human" then
+              entry.workers[#entry.workers + 1] = participant
+            end
+          end
+        end
+      end
+    end
+  end
+  local groups = {}
+  for _, cwd in ipairs(order) do
+    table.sort(by_cwd[cwd], function(a, b)
+      if a.leader ~= b.leader then
+        return a.leader == true
+      end
+      return tostring(a.session.id) < tostring(b.session.id)
+    end)
+    groups[#groups + 1] = { cwd = cwd, sessions = by_cwd[cwd] }
+  end
+  return groups
+end
+
+function Dashboard:render_tree()
+  local win = self.layout:win("tree")
+  local width = win and math.max(20, vim.api.nvim_win_get_width(win)) or 60
+  local groups = self:tree_groups()
+  -- Read every visible session's switch once, so `[team off]` is real data.
+  local instance = self.instance_of and self.instance_of() or nil
+  if instance then
+    for _, group in ipairs(groups) do
+      for _, entry in ipairs(group.sessions) do
+        if not entry.switch and not self.switch_queried[entry.session.id] then
+          self.switch_queried[entry.session.id] = true
+          self.team:query_session_teams(instance, entry.session.id, group.cwd, function()
+            self:schedule_refresh()
+          end)
+        end
+      end
+    end
+  end
+  local lines, ids, meta, marks = Tree.lines(groups, {
+    width = width,
+    current = self.current_session and self.current_session() or nil,
+  })
+  self.tree_meta = {}
+  for index, info in ipairs(meta) do
+    self.tree_meta[index] = info
+  end
+  return lines, ids, meta, marks
+end
+
+---The tree row under the cursor.
+---@return table|nil
+function Dashboard:tree_target()
+  local win = self.layout:win("tree")
+  if not win then
+    return nil
+  end
+  local row = vim.api.nvim_win_get_cursor(win)[1]
+  return self.tree_meta and self.tree_meta[row] or nil
 end
 
 function Dashboard:render_members()
@@ -452,7 +553,7 @@ function Dashboard:update_headers()
 end
 
 ---Open or focus one pane. `nil` means the members pane (compat entry).
----@param kind string|nil "members", "board" or "all"
+---@param kind string|nil "tree", "members", "board" or "all"
 ---@return boolean
 function Dashboard:open(kind)
   kind = kind or "members"
@@ -475,7 +576,7 @@ function Dashboard:open(kind)
     self:refresh()
     return true
   end
-  if not (kind == "members" or kind == "board") then
+  if not (kind == "members" or kind == "board" or kind == "tree") then
     return false
   end
   local ok = self.layout:show(kind)
@@ -763,6 +864,8 @@ function Dashboard:attach_keys(buf, pane)
     ["R"] = "R",
     ["x"] = "x",
     ["S"] = "S",
+    ["t"] = "t",
+    ["b"] = "b",
     ["g?"] = "help",
     ["q"] = "q",
     ["zh"] = "zh",
@@ -806,10 +909,135 @@ function Dashboard:refuse_suspended(team)
   return false
 end
 
+---@param key string
+---@param info table cursor row metadata
+---@return boolean handled
+function Dashboard:handle_tree_key(key, info)
+  local kind = info.kind
+  local session = info.session
+  local instance = self.instance_of and self.instance_of() or nil
+  if key == "help" then
+    self:notify("tree: <CR> open · t teams on/off · x stop/close · L take the lead · S start · b board")
+    return true
+  end
+  if key == "b" then
+    self:open("board")
+    return true
+  end
+  if key == "<CR>" or key == "cr" then
+    if kind == "tree_worker" and info.team then
+      self.router:open(info.team, info.participant and info.participant.name)
+      return true
+    end
+    if kind == "tree_session" and session and self.select_session then
+      self.select_session(session)
+      return true
+    end
+    return true
+  end
+  if key == "S" then
+    if kind == "tree_session" and session then
+      if self.start_team then
+        self.start_team(nil, session)
+      end
+      return true
+    end
+    return true
+  end
+  if kind == "tree_worker" then
+    if key == "x" and info.team and info.participant and instance then
+      self.team:stop_worker(info.team, info.participant.name, false, function(ok, value)
+        if not ok then
+          self:notify(
+            "cannot stop " .. tostring(info.participant.name) .. ": " .. tostring(value and value.message or value)
+          )
+        end
+      end)
+      return true
+    end
+    if key == "L" and info.team and session and instance then
+      self.team:set_leader(info.team, instance, session.id, function(ok, value)
+        if not ok then
+          self:notify("cannot move the lead: " .. tostring(value and value.message or value))
+        end
+      end)
+      return true
+    end
+    return key == "t" and true or false
+  end
+  if kind ~= "tree_session" or not session then
+    return false
+  end
+  if key == "t" and instance then
+    local state = info.switch
+    if state and state.enabled == false then
+      self.team:set_session_teams(instance, session.id, true, false, function(ok, value)
+        if not ok then
+          self:notify("cannot turn teams on: " .. tostring(value and value.message or value))
+        end
+      end)
+      return true
+    end
+    local function turn_off(close)
+      self.team:set_session_teams(instance, session.id, false, close, function(ok, value)
+        if not ok then
+          local data = type(value) == "table" and type(value.data) == "table" and value.data or {}
+          if data.reason == "leads_team" and not close then
+            presenter.confirm("This chat leads a team. Close it with the switch?", function(choice)
+              if choice == "yes" then
+                turn_off(true)
+              end
+            end)
+            return
+          end
+          self:notify("cannot turn teams off: " .. tostring(value and value.message or value))
+        end
+      end)
+    end
+    if info.leader then
+      presenter.confirm(
+        "Turn teams off and close team " .. tostring(info.team and info.team.id or "") .. "?",
+        function(choice)
+          if choice == "yes" then
+            turn_off(true)
+          end
+        end
+      )
+      return true
+    end
+    turn_off(false)
+    return true
+  end
+  if key == "L" and info.team and instance then
+    self.team:set_leader(info.team.id, instance, session.id, function(ok, value)
+      if not ok then
+        self:notify("cannot move the lead: " .. tostring(value and value.message or value))
+      end
+    end)
+    return true
+  end
+  if key == "x" and info.team then
+    presenter.confirm("Close team " .. tostring(info.team.id) .. "?", function(choice)
+      if choice == "yes" then
+        self.team:close(info.team.id, function(ok, value)
+          if not ok then
+            self:notify("cannot close the team: " .. tostring(value and value.message or value))
+          end
+        end)
+      end
+    end)
+    return true
+  end
+  return false
+end
+
 function Dashboard:handle_key(key)
   local kind, team_id, obj, info = self.layout:current()
   local pane = self.layout:name_of()
   local team = team_id or (self:pane_team(pane) and self:pane_team(pane).id) or self:home_team()
+  if pane == "tree" and self:handle_tree_key(key, info or {}) then
+    return
+  end
   if key == "next" then
     self.layout:cycle(1)
     return

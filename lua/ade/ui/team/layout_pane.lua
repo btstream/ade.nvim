@@ -9,14 +9,16 @@ local M = {}
 local Pane = {}
 Pane.__index = Pane
 
-local PANES = { "members", "board" }
+local PANES = { "tree", "members", "board" }
 
 local TITLES = {
+  tree = " ade.nvim · team · 项目与会话 ",
   members = " ade.nvim · team · 成员 ",
   board = " ade.nvim · team · 看板 ",
 }
 
 local FILETYPES = {
+  tree = "ade_team_tree",
   members = "ade_team_members",
   board = "ade_team_board",
 }
@@ -166,7 +168,7 @@ function Pane:create_split(name)
     return nil
   end
   local win = vim.api.nvim_get_current_win()
-  if name == "members" then
+  if name == "members" or name == "tree" then
     pcall(vim.api.nvim_win_set_width, win, self:members_width())
     vim.wo[win].winfixwidth = true
   end
@@ -248,7 +250,7 @@ end
 ---@param name string
 ---@return boolean
 function Pane:show(name)
-  if name ~= "members" and name ~= "board" then
+  if name ~= "members" and name ~= "board" and name ~= "tree" then
     return false
   end
   local existing = self:win(name)
