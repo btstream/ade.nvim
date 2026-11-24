@@ -4947,3 +4947,234 @@ fn team_start_writes_the_workflow_onto_an_empty_board() {
     assert_eq!(board["workflow_name"], "flow", "{board}");
     assert_eq!(board["columns"], json!(["mine"]), "{board}");
 }
+
+/// Two front ends in one cwd must not hand a derived template to a leader of
+/// another agent (19.1).
+///
+/// `team.configure` is keyed by cwd, so the last writer used to win. With a
+/// `derived` declaration the service keeps the template with the agent it was
+/// derived from and refuses the other leader, so a worker can never start a
+/// different adapter than the one that supplied the configuration.
+#[test]
+fn a_derived_template_is_bound_to_its_own_agent_across_front_ends() {
+    let server = TestServer::start("team-derived-agent");
+    let work = server.dir().join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let log = server.dir().join("derived-agent.log");
+    let gate = server.dir().join("derived-agent.gate");
+    let env = child_env(&server, &log, &gate);
+    let cwd = work.to_string_lossy().to_string();
+
+    let mut client = server.connect();
+    let hello = client.hello(&server.token(), nvim_ade_server::API_VERSION);
+    assert!(hello["result"].is_object(), "hello: {hello}");
+
+    // An opencode-like instance and a pi-like one, same cwd.
+    let script = agent();
+    let mut attach = |name: &str, command: &str| {
+        let attached = client.request(
+            1,
+            "agent.attach",
+            json!({
+                "key": {
+                    "agent": name,
+                    "command": command,
+                    "args": [script],
+                    "cwd": cwd,
+                },
+                "client_capabilities": {},
+                "env": env,
+            }),
+        );
+        attached["result"]["instance"]
+            .as_str()
+            .unwrap_or_else(|| panic!("attach {name}: {attached}"))
+            .to_string()
+    };
+    let opencode = attach("opencode", "python3");
+    let pi = attach("pi", "python3");
+
+    let derived_config = |name: &str| {
+        json!({
+            "max_workers": 3,
+            "spawn_confirm": { "auto": [] },
+            "limits": { "max_turns_per_task": 30, "max_turns_total": 200 },
+            "templates": {
+                "worker": {
+                    "key": { "agent": name, "command": "python3", "args": [script] },
+                    "env": env,
+                    "role": "a derived worker",
+                    "worktree": false
+                }
+            },
+            "derived": { "template": "worker", "agent": name }
+        })
+    };
+
+    // Both ask for a leader token first, each for its own instance/agent.
+    let opencode_server = client.request(
+        2,
+        "team.leader_server",
+        json!({ "instance": opencode, "cwd": cwd }),
+    );
+    let opencode_token = opencode_server["result"]["token_id"]
+        .as_str()
+        .expect("opencode token")
+        .to_string();
+    let pi_server = client.request(
+        3,
+        "team.leader_server",
+        json!({ "instance": pi, "cwd": cwd }),
+    );
+    let pi_token = pi_server["result"]["token_id"]
+        .as_str()
+        .expect("pi token")
+        .to_string();
+
+    // The pi front end configures last: its derived template replaces the one
+    // keyed by cwd.
+    let configured = client.request(
+        4,
+        "team.configure",
+        json!({ "cwd": cwd, "config": derived_config("pi") }),
+    );
+    assert!(configured["result"].is_object(), "configure: {configured}");
+
+    // The opencode leader binds now: it must be refused, not given the pi
+    // template, and no team may exist for that cwd.
+    let session = tunnel_call(
+        &mut client,
+        &opencode,
+        10,
+        "session/new",
+        json!({ "cwd": cwd, "mcpServers": [] }),
+    );
+    let session = session["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let refused = client.request(
+        5,
+        "team.bind_leader",
+        json!({ "instance": opencode, "sessionId": session, "token_id": opencode_token }),
+    );
+    assert_eq!(refused["error"]["code"], -32061, "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pi"),
+        "the refusal names the agent the configuration belongs to: {refused}"
+    );
+    let teams = client.request(6, "team.list", json!({}));
+    assert!(
+        teams["result"]["teams"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "no team was created: {teams}"
+    );
+
+    // The pi leader binds with its own configuration.
+    let session = tunnel_call(
+        &mut client,
+        &pi,
+        11,
+        "session/new",
+        json!({ "cwd": cwd, "mcpServers": [] }),
+    );
+    let session = session["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let bound = client.request(
+        7,
+        "team.bind_leader",
+        json!({ "instance": pi, "sessionId": session, "token_id": pi_token }),
+    );
+    let team = bound["result"]["team"].clone();
+    assert_eq!(team["state"], "active", "bind: {bound}");
+    let leader = team["participants"]
+        .as_array()
+        .and_then(|items| items.iter().find(|entry| entry["name"] == "leader"))
+        .cloned()
+        .expect("leader participant");
+    assert_eq!(leader["agent"], "pi", "the leader runs its own agent");
+}
+
+/// A resume after a restart must not start the stored workers with another
+/// agent's template (18.15, 19.1).
+#[test]
+fn a_resume_refuses_a_derived_template_of_another_agent() {
+    use nvim_ade_server::team::Teams;
+
+    let (mut teams, team_id) = {
+        let tokens = nvim_ade_server::team::new_shared_tokens();
+        let mut teams = Teams::new(tokens);
+        let config = json!({
+            "max_workers": 3,
+            "spawn_confirm": { "auto": [] },
+            "limits": { "max_turns_per_task": 30, "max_turns_total": 200 },
+            "templates": {
+                "worker": {
+                    "key": { "agent": "opencode", "command": "python3", "args": [] },
+                    "role": "a derived worker"
+                }
+            },
+            "derived": { "template": "worker", "agent": "opencode" }
+        });
+        teams.configure("/repo", config).expect("configure");
+        let (_server, token) = teams
+            .leader_server("i1", "/repo", "/repo", "opencode")
+            .expect("leader server");
+        teams
+            .bind_leader("i1", "s1", &token, "opencode")
+            .expect("bind");
+        let id = teams.list()["teams"][0]["id"].as_str().unwrap().to_string();
+        let snapshot = teams.snapshot_team(&id).expect("snapshot");
+        let (max_team, max_inbox) = teams.counters();
+
+        let mut restored = Teams::new(nvim_ade_server::team::new_shared_tokens());
+        // Another agent configures the same cwd after the restart.
+        restored
+            .configure(
+                "/repo",
+                json!({
+                    "max_workers": 3,
+                    "spawn_confirm": { "auto": [] },
+                    "limits": { "max_turns_per_task": 30, "max_turns_total": 200 },
+                    "templates": {
+                        "worker": {
+                            "key": { "agent": "pi", "command": "python3", "args": [] },
+                            "role": "a derived worker"
+                        }
+                    },
+                    "derived": { "template": "worker", "agent": "pi" }
+                }),
+            )
+            .expect("configure");
+        restored.restore(vec![(id.clone(), snapshot)], max_team, max_inbox, 0, None);
+        assert_eq!(
+            restored.list()["teams"][0]["state"],
+            "suspended",
+            "a restored team is suspended"
+        );
+        (restored, id)
+    };
+
+    let (_server, token) = teams
+        .leader_server("i2", "/repo", "/repo", "opencode")
+        .expect("leader server");
+    let error = teams
+        .bind_leader("i2", "s1", &token, "opencode")
+        .expect_err("the only configuration belongs to pi");
+    assert_eq!(error.code, -32061, "{error:?}");
+    assert_eq!(
+        teams.list()["teams"][0]["state"],
+        "suspended",
+        "the team stays suspended instead of starting pi workers"
+    );
+    assert!(
+        teams.team(&team_id).is_some_and(|team| team.suspended),
+        "still suspended"
+    );
+}

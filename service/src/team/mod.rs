@@ -445,6 +445,22 @@ pub struct TeamConfig {
     /// Parent directory for worker worktrees; required when a template asks
     /// for one (18.12).
     pub worktree_root: Option<String>,
+    /// The template a front end derived from its own leader's launch.
+    ///
+    /// Nothing in the configuration says which command owns it, so the front end
+    /// states the leader agent it was derived from. The service only hands this
+    /// configuration to a leader of exactly that agent, which is what keeps a
+    /// derived template from starting a different adapter than the session that
+    /// supplied it.
+    pub derived: Option<DerivedTemplate>,
+}
+
+/// `config.derived`: the template derived from a leader's own launch and the
+/// agent it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedTemplate {
+    pub template: String,
+    pub agent: String,
 }
 
 impl Default for TeamConfig {
@@ -458,6 +474,7 @@ impl Default for TeamConfig {
             workflows: HashMap::new(),
             default_workflow: None,
             worktree_root: None,
+            derived: None,
         }
     }
 }
@@ -715,6 +732,8 @@ struct TokenRecord {
     name: Option<String>,
     instance: Option<String>,
     cwd: Option<String>,
+    /// The agent the instance ran when the token was issued (leaders only).
+    agent: Option<String>,
     bound: bool,
 }
 
@@ -796,6 +815,10 @@ pub struct Teams {
     pub tokens: SharedTokens,
     token_records: HashMap<String, TokenRecord>,
     configs: HashMap<String, TeamConfig>,
+    /// (cwd, leader agent) -> configuration whose template was derived from
+    /// that agent's launch. Kept apart from `configs` so two front ends on the
+    /// same cwd cannot overwrite each other's derived template.
+    derived_configs: HashMap<(String, String), TeamConfig>,
     teams: HashMap<String, Team>,
     by_cwd: HashMap<String, String>,
     /// instance -> (team id, participant name); O(1) membership for every agent
@@ -825,6 +848,7 @@ impl Teams {
             tokens,
             token_records: HashMap::new(),
             configs: HashMap::new(),
+            derived_configs: HashMap::new(),
             teams: HashMap::new(),
             by_cwd: HashMap::new(),
             by_instance: HashMap::new(),
@@ -923,12 +947,56 @@ impl Teams {
 
     pub fn configure(&mut self, cwd: &str, config: Value) -> Result<(), TeamError> {
         let config = parse_config(&config)?;
+        if let Some(derived) = config.derived.clone() {
+            // A derived template belongs to the agent it was derived from. It is
+            // stored under that agent, so another front end on the same cwd (a
+            // different agent) cannot replace it and neither leader ever
+            // receives the other's template.
+            self.derived_configs
+                .insert((cwd.to_string(), derived.agent), config.clone());
+            // The plain configuration stays usable for readers that do not know
+            // the agent (workflow listing, pre-leader calls). It is the last
+            // writer, but `config_for_leader` never consults it for a leader of
+            // another agent while a derived entry exists.
+            self.configs.insert(cwd.to_string(), config);
+            return Ok(());
+        }
+        // An explicit configuration replaces everything, including derived
+        // entries: the person wrote it, so it is the one to use for any agent.
+        self.derived_configs
+            .retain(|(stored_cwd, _), _| stored_cwd != cwd);
         self.configs.insert(cwd.to_string(), config);
         Ok(())
     }
 
     pub fn config_for(&self, cwd: &str) -> TeamConfig {
         self.configs.get(cwd).cloned().unwrap_or_default()
+    }
+
+    /// The configuration a leader of `agent` may use for `cwd`.
+    ///
+    /// A derived configuration only serves the agent it was derived from: a
+    /// leader of another agent gets the plain configuration, never a template
+    /// that would start someone else's adapter. When the only configuration
+    /// for the cwd belongs to another agent, that is an error rather than an
+    /// empty team.
+    pub fn config_for_leader(&self, cwd: &str, agent: &str) -> Result<TeamConfig, TeamError> {
+        if let Some(config) = self
+            .derived_configs
+            .get(&(cwd.to_string(), agent.to_string()))
+        {
+            return Ok(config.clone());
+        }
+        let plain = self.config_for(cwd);
+        if let Some(derived) = &plain.derived {
+            if derived.agent != agent {
+                return Err(TeamError::not_allowed(format!(
+                    "the team configuration for this cwd was derived from agent {}",
+                    derived.agent
+                )));
+            }
+        }
+        Ok(plain)
     }
 
     // -- workflows (PROTOCOL.md 19.5) --------------------------------------
@@ -1125,6 +1193,7 @@ impl Teams {
         role: Role,
         instance: Option<String>,
         cwd: Option<String>,
+        agent: Option<String>,
     ) -> (String, String) {
         self.next_token += 1;
         let token_id = format!("k{}", self.next_token);
@@ -1150,6 +1219,7 @@ impl Teams {
                 name: None,
                 instance,
                 cwd,
+                agent,
                 bound: false,
             },
         );
@@ -1214,6 +1284,7 @@ impl Teams {
         instance: &str,
         cwd: &str,
         instance_cwd: &str,
+        agent: &str,
     ) -> Result<(Value, String), TeamError> {
         if cwd != instance_cwd {
             return Err(TeamError::invalid("cwd must equal the instance's cwd"));
@@ -1222,7 +1293,8 @@ impl Teams {
             let team = self.teams.get(team_id).expect("cwd index");
             if team.suspended {
                 // A suspended team accepts a leader server for any instance in
-                // its cwd; the bind decides whether the session matches.
+                // its cwd; the bind decides whether the session (and the agent)
+                // matches.
             } else if team.leader_instance.as_deref() != Some(instance) {
                 return Err(TeamError::not_allowed("a team already exists for this cwd"));
             }
@@ -1231,6 +1303,7 @@ impl Teams {
             Role::Leader,
             Some(instance.to_string()),
             Some(cwd.to_string()),
+            Some(agent.to_string()),
         );
         let command = std::env::current_exe()
             .ok()
@@ -1247,18 +1320,18 @@ impl Teams {
 
     /// Move a suspended team to active once; returns the entry to send. The
     /// caller starts the participants and then calls `finish_resume`.
-    pub fn start_resume(
+    ///
+    /// `config` is the configuration of the agent that is resuming; the caller
+    /// obtained it through `config_for_leader`, so a team whose leader was a
+    /// different agent cannot be resumed with a template of the wrong adapter.
+    pub fn start_resume_with_config(
         &mut self,
         team_id: &str,
         instance: &str,
         session: &str,
         agent: &str,
+        config: TeamConfig,
     ) -> Value {
-        let config = self
-            .teams
-            .get(team_id)
-            .map(|team| self.config_for(&team.cwd))
-            .unwrap_or_default();
         if let Some(team) = self.teams.get_mut(team_id) {
             team.suspended = false;
             team.suspended_at = None;
@@ -1279,6 +1352,23 @@ impl Teams {
         json!({ "team": team_entry(&self.teams[team_id]) })
     }
 
+    /// `start_resume` with the stored configuration, for callers that already
+    /// know the resuming agent matches it (tests, and the cwd's plain config).
+    pub fn start_resume(
+        &mut self,
+        team_id: &str,
+        instance: &str,
+        session: &str,
+        agent: &str,
+    ) -> Value {
+        let config = self
+            .teams
+            .get(team_id)
+            .map(|team| self.config_for(&team.cwd))
+            .unwrap_or_default();
+        self.start_resume_with_config(team_id, instance, session, agent, config)
+    }
+
     /// The token bound for a still-suspended team whose configure has just
     /// arrived.
     pub fn config_resume(&self, cwd: &str) -> Option<(String, String, String)> {
@@ -1292,6 +1382,27 @@ impl Teams {
             return None;
         }
         Some((team_id, instance, session))
+    }
+
+    /// Whether a configuration for `cwd` was supplied by a leader of `agent`.
+    ///
+    /// The hub asks this before resuming on a `team.configure`: a configure from
+    /// another agent must not resume a team whose derived template belongs to a
+    /// different one.
+    pub fn configured_for(&self, cwd: &str, agent: &str) -> bool {
+        if self
+            .derived_configs
+            .contains_key(&(cwd.to_string(), agent.to_string()))
+        {
+            return true;
+        }
+        match self.configs.get(cwd) {
+            Some(config) => config
+                .derived
+                .as_ref()
+                .is_none_or(|derived| derived.agent == agent),
+            None => false,
+        }
     }
 
     pub fn clear_pending_resume(&mut self, team_id: &str) {
@@ -1327,10 +1438,25 @@ impl Teams {
                 "leader token does not belong to this instance",
             ));
         }
+        // The token carries the agent the leader_server was asked for. If the
+        // instance now reports another one, its token and the configuration it
+        // would receive no longer agree: refuse rather than bind an adapter the
+        // derived template was not built for.
+        if let Some(issued) = record.agent.clone() {
+            if issued != agent {
+                return Err(TeamError::not_allowed(format!(
+                    "the leader token was issued for agent {issued}"
+                )));
+            }
+        }
         let cwd = record
             .cwd
             .clone()
             .ok_or_else(|| TeamError::not_allowed("leader token has no cwd"))?;
+        // A derived configuration serves only the agent that supplied it. Check
+        // before touching suspension state, so a mismatched bind leaves the
+        // team exactly as it was.
+        let config = self.config_for_leader(&cwd, agent)?;
 
         if let Some(team_id) = self.by_cwd.get(&cwd).cloned() {
             let suspended = self.teams[&team_id].suspended;
@@ -1357,7 +1483,8 @@ impl Teams {
                         "team": team_entry(&self.teams[&team_id])
                     })));
                 }
-                let entry = self.start_resume(&team_id, instance, session, agent);
+                let entry =
+                    self.start_resume_with_config(&team_id, instance, session, agent, config);
                 if let Some(record) = self.token_records.get_mut(token_id) {
                     record.bound = true;
                     record.team = Some(team_id.clone());
@@ -1398,7 +1525,6 @@ impl Teams {
 
         self.next_team += 1;
         let id = format!("t{}", self.next_team);
-        let config = self.config_for(&cwd);
         let mut team = Team {
             id: id.clone(),
             cwd: cwd.clone(),
@@ -1869,7 +1995,7 @@ impl Teams {
     ) -> Option<(String, String)> {
         let cwd = self.teams.get(team_id)?.cwd.clone();
         let (token_id, token) =
-            self.create_token(Role::Worker, Some(instance.to_string()), Some(cwd));
+            self.create_token(Role::Worker, Some(instance.to_string()), Some(cwd), None);
         if let Some(record) = self.token_records.get_mut(&token_id) {
             record.team = Some(team_id.to_string());
             record.name = Some(name.to_string());
@@ -4336,6 +4462,10 @@ impl Teams {
                 workflows: snapshot.config.workflows.into_iter().collect(),
                 default_workflow: snapshot.config.default_workflow,
                 worktree_root: snapshot.config.worktree_root.clone(),
+                // A derived template is rebuilt from the leader's launch by the
+                // front end that resumes the team; the stored snapshot never
+                // carries one (its command is not persisted either).
+                derived: None,
             };
             let mut participants = HashMap::new();
             let mut crashed = Vec::new();
@@ -4710,6 +4840,37 @@ fn parse_config(value: &Value) -> Result<TeamConfig, TeamError> {
             Some(root.to_string())
         }
     };
+    // The derived template is declared with the agent it belongs to, so the
+    // service can refuse to hand it to a leader of another agent. Both fields
+    // are required together and the template must exist in this configuration.
+    let derived = match object.get("derived") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let derived = value
+                .as_object()
+                .ok_or_else(|| TeamError::invalid("derived must be an object"))?;
+            let template = derived
+                .get("template")
+                .and_then(Value::as_str)
+                .ok_or_else(|| TeamError::invalid("derived.template must be a string"))?;
+            let agent = derived
+                .get("agent")
+                .and_then(Value::as_str)
+                .ok_or_else(|| TeamError::invalid("derived.agent must be a string"))?;
+            if !valid_name(template) || !templates.contains_key(template) {
+                return Err(TeamError::invalid(
+                    "derived.template must name a template of this configuration",
+                ));
+            }
+            if agent.trim().is_empty() {
+                return Err(TeamError::invalid("derived.agent must not be empty"));
+            }
+            Some(DerivedTemplate {
+                template: template.to_string(),
+                agent: agent.to_string(),
+            })
+        }
+    };
     Ok(TeamConfig {
         max_workers,
         spawn_auto,
@@ -4719,6 +4880,7 @@ fn parse_config(value: &Value) -> Result<TeamConfig, TeamError> {
         workflows,
         default_workflow,
         worktree_root,
+        derived,
     })
 }
 
@@ -4932,7 +5094,7 @@ mod tests {
         let mut teams = Teams::new(new_shared_tokens());
         teams.configure("/p", config(extra)).expect("configure");
         let (_server, token) = teams
-            .leader_server("i1", "/p", "/p")
+            .leader_server("i1", "/p", "/p", "opencode")
             .expect("leader server");
         teams
             .bind_leader("i1", "s1", &token, "opencode")
@@ -5328,7 +5490,7 @@ mod tests {
     #[test]
     fn tokens_are_random_hashes_and_resolve_their_role() {
         let mut teams = Teams::new(new_shared_tokens());
-        let (_server, token_id) = teams.leader_server("i1", "/p", "/p").unwrap();
+        let (_server, token_id) = teams.leader_server("i1", "/p", "/p", "opencode").unwrap();
         assert_eq!(token_id, "k1");
         let tokens = teams.tokens.lock().unwrap();
         let raw = tokens.values().next().expect("token");
@@ -5422,11 +5584,13 @@ mod tests {
     fn leader_errors_are_reported() {
         let mut teams = Teams::new(new_shared_tokens());
         teams.configure("/p", config(json!({}))).unwrap();
-        assert!(teams.leader_server("i1", "/other", "/p").is_err());
-        let (_server, first) = teams.leader_server("i1", "/p", "/p").unwrap();
+        assert!(teams
+            .leader_server("i1", "/other", "/p", "opencode")
+            .is_err());
+        let (_server, first) = teams.leader_server("i1", "/p", "/p", "opencode").unwrap();
         teams.bind_leader("i1", "s1", &first, "opencode").unwrap();
-        assert!(teams.leader_server("i2", "/p", "/p").is_err());
-        let (_server, second) = teams.leader_server("i1", "/p", "/p").unwrap();
+        assert!(teams.leader_server("i2", "/p", "/p", "opencode").is_err());
+        let (_server, second) = teams.leader_server("i1", "/p", "/p", "opencode").unwrap();
         assert!(teams.bind_leader("i1", "s2", &second, "opencode").is_err());
     }
 
@@ -5516,7 +5680,7 @@ mod tests {
         );
         // Ids continue after the highest ever stored.
         let (_server, token) = restored
-            .leader_server("i9", "/new", "/new")
+            .leader_server("i9", "/new", "/new", "opencode")
             .expect("leader");
         let outcome = restored
             .bind_leader("i9", "s9", &token, "opencode")
@@ -5541,7 +5705,9 @@ mod tests {
             now_ms(),
             None,
         );
-        let (_server, token) = restored.leader_server("i1", "/p", "/p").unwrap();
+        let (_server, token) = restored
+            .leader_server("i1", "/p", "/p", "opencode")
+            .unwrap();
         let first = restored
             .bind_leader("i1", "s1", &token, "opencode")
             .unwrap();
@@ -5554,6 +5720,291 @@ mod tests {
             "a second bind while resuming must not resume again: {second:?}"
         );
         assert!(!restored.team(&team).unwrap().suspended);
+    }
+
+    #[test]
+    fn a_derived_template_serves_only_the_agent_it_was_derived_from() {
+        let mut teams = Teams::new(new_shared_tokens());
+        teams
+            .configure(
+                "/p",
+                config(json!({
+                    "derived": { "template": "dev", "agent": "opencode" }
+                })),
+            )
+            .expect("configure");
+
+        // The agent that supplied the template gets it.
+        let config = teams
+            .config_for_leader("/p", "opencode")
+            .expect("its own agent");
+        assert!(config.templates.contains_key("dev"));
+
+        // Another agent on the same cwd must not receive it, and the refusal
+        // names the agent the configuration belongs to.
+        let error = teams
+            .config_for_leader("/p", "pi")
+            .expect_err("another agent must not get the derived template");
+        assert_eq!(error.code, NOT_ALLOWED);
+        assert!(error.message.contains("opencode"), "{error:?}");
+    }
+
+    #[test]
+    fn a_second_front_ends_configure_cannot_replace_a_derived_template() {
+        let mut teams = Teams::new(new_shared_tokens());
+        teams
+            .configure(
+                "/p",
+                config(json!({
+                    "derived": { "template": "dev", "agent": "opencode" }
+                })),
+            )
+            .unwrap();
+        // Another front end on the same cwd sends an explicit configuration
+        // (a different command). The derived entry is gone on purpose: the
+        // person wrote one, so it wins.
+        teams
+            .configure("/p", config(json!({ "max_workers": 2 })))
+            .unwrap();
+        assert!(
+            teams.config_for_leader("/p", "pi").is_ok(),
+            "an explicit config serves any agent"
+        );
+
+        // A second derived configuration for another agent is kept next to the
+        // first one: both leaders keep the template they supplied.
+        teams
+            .configure(
+                "/p",
+                config(json!({
+                    "derived": { "template": "dev", "agent": "opencode" }
+                })),
+            )
+            .unwrap();
+        teams
+            .configure(
+                "/p",
+                config(json!({
+                    "derived": { "template": "dev", "agent": "pi" }
+                })),
+            )
+            .unwrap();
+        assert!(teams.config_for_leader("/p", "pi").is_ok());
+        assert!(
+            teams.config_for_leader("/p", "opencode").is_ok(),
+            "the other agent keeps its own derived template"
+        );
+        // Without an entry for its agent, a derived plain configuration refuses
+        // another agent rather than handing it the wrong template.
+        teams
+            .configure(
+                "/p",
+                config(json!({
+                    "derived": { "template": "dev", "agent": "someone-else" }
+                })),
+            )
+            .unwrap();
+        // Two entries still stand for opencode and pi; the plain one (the last
+        // writer) only serves the agent it names.
+        assert!(teams.config_for_leader("/p", "opencode").is_ok());
+        assert!(teams.config_for_leader("/p", "pi").is_ok());
+        let mut alone = Teams::new(new_shared_tokens());
+        alone
+            .configure(
+                "/p",
+                config(json!({
+                    "derived": { "template": "dev", "agent": "someone-else" }
+                })),
+            )
+            .unwrap();
+        assert!(
+            alone.config_for_leader("/p", "opencode").is_err(),
+            "an agent with no derived entry of its own is refused"
+        );
+    }
+
+    #[test]
+    fn interleaved_configure_and_bind_keep_the_derived_template_with_its_leader() {
+        let mut teams = Teams::new(new_shared_tokens());
+        // Two front ends in the same cwd: an opencode leader and a pi one, each
+        // configuring the template derived from its own launch.
+        teams
+            .configure(
+                "/p",
+                config(json!({
+                    "derived": { "template": "dev", "agent": "opencode" }
+                })),
+            )
+            .unwrap();
+        let (_server, opencode_token) = teams
+            .leader_server("i-open", "/p", "/p", "opencode")
+            .unwrap();
+        let (_server, pi_token) = teams.leader_server("i-pi", "/p", "/p", "pi").unwrap();
+        // The pi front end configures after its own leader_server. It must not
+        // take the opencode entry with it.
+        teams
+            .configure(
+                "/p",
+                config(json!({
+                    "derived": { "template": "dev", "agent": "pi" }
+                })),
+            )
+            .unwrap();
+        let opencode = teams.config_for_leader("/p", "opencode").unwrap();
+        let pi = teams.config_for_leader("/p", "pi").unwrap();
+        assert_eq!(
+            opencode
+                .derived
+                .as_ref()
+                .map(|derived| derived.agent.as_str()),
+            Some("opencode"),
+            "the opencode leader keeps its own derived template"
+        );
+        assert_eq!(
+            pi.derived.as_ref().map(|derived| derived.agent.as_str()),
+            Some("pi"),
+            "the pi leader gets its own"
+        );
+
+        // Each bind gets the team's configuration from its own agent.
+        let BindOutcome::Active(entry) = teams
+            .bind_leader("i-open", "s-open", &opencode_token, "opencode")
+            .unwrap()
+        else {
+            panic!("a first bind is not a resume");
+        };
+        assert_eq!(entry["team"]["participants"][0]["agent"], "opencode");
+        // One cwd has one team (18.1): the pi leader cannot create a second,
+        // and the opencode team is not handed the pi template.
+        let error = teams
+            .bind_leader("i-pi", "s-pi", &pi_token, "pi")
+            .expect_err("a second leader for the same cwd is refused");
+        assert_eq!(error.code, NOT_ALLOWED, "{error:?}");
+        assert_eq!(
+            teams
+                .team(entry["team"]["id"].as_str().unwrap())
+                .unwrap()
+                .config
+                .derived
+                .as_ref()
+                .map(|d| d.agent.as_str()),
+            Some("opencode"),
+            "the one team keeps the template of the leader that made it"
+        );
+    }
+
+    #[test]
+    fn a_leader_of_another_agent_cannot_take_the_only_derived_configuration() {
+        let mut teams = Teams::new(new_shared_tokens());
+        teams
+            .configure(
+                "/p",
+                config(json!({
+                    "derived": { "template": "dev", "agent": "pi" }
+                })),
+            )
+            .unwrap();
+        let (_server, token) = teams.leader_server("i1", "/p", "/p", "opencode").unwrap();
+        let error = teams
+            .bind_leader("i1", "s1", &token, "opencode")
+            .expect_err("the only configuration belongs to pi");
+        assert_eq!(error.code, NOT_ALLOWED, "{error:?}");
+        assert!(error.message.contains("pi"), "{error:?}");
+        assert!(teams.list()["teams"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_bind_reports_an_agent_that_differs_from_its_token() {
+        let mut teams = Teams::new(new_shared_tokens());
+        teams.configure("/p", config(json!({}))).unwrap();
+        let (_server, token) = teams.leader_server("i1", "/p", "/p", "opencode").unwrap();
+        // The instance reports another agent than the token was issued for.
+        let error = teams
+            .bind_leader("i1", "s1", &token, "pi")
+            .expect_err("a token issued for opencode must not bind pi");
+        assert_eq!(error.code, NOT_ALLOWED, "{error:?}");
+        assert!(teams.list()["teams"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_resume_with_another_agent_stays_suspended() {
+        let (teams, team) = fixture(json!({}));
+        let json = teams.snapshot_team(&team).unwrap();
+        let (max_team, max_inbox) = teams.counters();
+        let mut restored = Teams::new(new_shared_tokens());
+        restored
+            .configure(
+                "/p",
+                config(json!({
+                    "derived": { "template": "dev", "agent": "pi" }
+                })),
+            )
+            .unwrap();
+        restored.restore(
+            vec![(team.clone(), json)],
+            max_team,
+            max_inbox,
+            now_ms(),
+            None,
+        );
+        let (_server, token) = restored
+            .leader_server("i1", "/p", "/p", "opencode")
+            .unwrap();
+        let error = restored
+            .bind_leader("i1", "s1", &token, "opencode")
+            .expect_err("the derived template belongs to another agent");
+        assert_eq!(error.code, NOT_ALLOWED, "{error:?}");
+        assert!(
+            restored.team(&team).unwrap().suspended,
+            "the team must stay suspended"
+        );
+    }
+
+    #[test]
+    fn a_configure_from_another_agent_does_not_resume_a_suspended_team() {
+        let (teams, team) = fixture(json!({}));
+        let json = teams.snapshot_team(&team).unwrap();
+        let (max_team, max_inbox) = teams.counters();
+        let mut restored = Teams::new(new_shared_tokens());
+        restored.restore(
+            vec![(team.clone(), json)],
+            max_team,
+            max_inbox,
+            now_ms(),
+            None,
+        );
+        let (_server, token) = restored
+            .leader_server("i1", "/p", "/p", "opencode")
+            .unwrap();
+        // The bind arrives before configure: the team is left pending.
+        let pending = restored
+            .bind_leader("i1", "s1", &token, "opencode")
+            .unwrap();
+        assert!(matches!(pending, BindOutcome::Active(_)), "{pending:?}");
+        // A pi front end in the same cwd configures first.
+        restored
+            .configure(
+                "/p",
+                config(json!({
+                    "derived": { "template": "dev", "agent": "pi" }
+                })),
+            )
+            .unwrap();
+        assert!(
+            !restored.configured_for("/p", "opencode"),
+            "the pi configuration must not count for the opencode leader"
+        );
+        assert!(restored.team(&team).unwrap().suspended, "still suspended");
+        // The opencode front end configures again: now the resume is allowed.
+        restored
+            .configure(
+                "/p",
+                config(json!({
+                    "derived": { "template": "dev", "agent": "opencode" }
+                })),
+            )
+            .unwrap();
+        assert!(restored.configured_for("/p", "opencode"));
     }
 
     #[test]
@@ -5640,6 +6091,66 @@ mod tests {
             restored.item(&team, "i9").unwrap().state,
             ItemState::Orphaned
         );
+    }
+
+    #[test]
+    fn a_derived_declaration_is_validated() {
+        let mut teams = Teams::new(new_shared_tokens());
+        let error = teams
+            .configure(
+                "/p",
+                config(json!({"derived": {"template": "missing", "agent": "opencode"}})),
+            )
+            .expect_err("the derived template must exist");
+        assert_eq!(error.code, INVALID_TEAM_PARAM, "{error:?}");
+        assert!(error.message.contains("derived.template"), "{error:?}");
+
+        let error = teams
+            .configure("/p", config(json!({"derived": {"template": "dev"}})))
+            .expect_err("the agent is required");
+        assert!(error.message.contains("derived.agent"), "{error:?}");
+
+        let error = teams
+            .configure(
+                "/p",
+                config(json!({"derived": {"template": "dev", "agent": " "}})),
+            )
+            .expect_err("an empty agent is refused");
+        assert!(error.message.contains("derived.agent"), "{error:?}");
+
+        teams
+            .configure(
+                "/p",
+                config(json!({"derived": {"template": "dev", "agent": "opencode"}})),
+            )
+            .expect("a complete declaration is accepted");
+        assert_eq!(
+            teams.config_for("/p").derived,
+            Some(DerivedTemplate {
+                template: "dev".to_string(),
+                agent: "opencode".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_restored_team_drops_the_derived_declaration() {
+        // `derived` names a command of the leader that supplied it; that command
+        // is never stored, so a restored team must not claim one.
+        let (teams, team) = fixture(json!({
+            "derived": { "template": "dev", "agent": "opencode" }
+        }));
+        let json = teams.snapshot_team(&team).unwrap();
+        let (max_team, max_inbox) = teams.counters();
+        let mut restored = Teams::new(new_shared_tokens());
+        restored.restore(
+            vec![(team.clone(), json)],
+            max_team,
+            max_inbox,
+            now_ms(),
+            None,
+        );
+        assert_eq!(restored.team(&team).unwrap().config.derived, None);
     }
 
     #[test]

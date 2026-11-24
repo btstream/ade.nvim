@@ -129,7 +129,7 @@ function Flow:template_problem(cwd)
     end
   end
   return "cannot start a team: the built-in worker template cannot be started"
-    .. (detail and (": " .. detail) or " (fix the leader agent's launch or configure teams.templates)")
+    .. (detail and (": " .. detail) or " (fix the leader agent's launch)")
 end
 
 ---The team the service owns for this cwd, in any state but closed.
@@ -242,7 +242,7 @@ function Flow:start(name)
   -- Check first: a switch flow waits for the rebuilt Team to reconnect, and an
   -- extra start while that Team is not available yet must not kill it.
   if not self:available() then
-    self:notify("teams are not available: connect to the service and configure a template", vim.log.levels.WARN)
+    self:notify("teams are not available: connect to the service first", vim.log.levels.WARN)
     return
   end
   local problem = self:template_problem(cwd)
@@ -352,6 +352,22 @@ function Flow:pick(workflows, generation, on_choice)
   end)
 end
 
+---Whether a team entry is the unused leader-only team of another session.
+---
+---Such a team can be replaced by the person asking for one; it does not block
+---the flow the way a team with work does.
+---@param cwd string
+---@param entry table|nil
+---@return boolean
+function Flow:unused_team(cwd, entry)
+  local team = self:team()
+  if not team or type(team.unused_team) ~= "function" or not entry then
+    return false
+  end
+  local unused = team:unused_team(cwd)
+  return unused ~= nil and unused.id == entry.id
+end
+
 ---Continue once a workflow is known: leader agent, existing team, task.
 ---@param workflow table
 ---@param cwd string
@@ -366,7 +382,7 @@ function Flow:with_workflow(workflow, cwd, generation)
     local blocked = team and team.blocked or {}
     local why
     if entry then
-      if blocked[cwd] then
+      if blocked[cwd] and not self:unused_team(cwd, entry) then
         why = "another session leads this team; close it there first"
       elseif entry.state == "suspended" then
         why = "the team is suspended; resume it with its leader session first"
@@ -421,9 +437,17 @@ end
 ---@param generation integer
 function Flow:proceed(workflow, cwd, generation)
   local entry = self:team_for_cwd(cwd)
+  local users_team = self:unused_team(cwd, entry)
   local workers = self:workers_of(entry)
-  if #workers == 0 then
+  if #workers == 0 and not users_team then
     self:ask_task(workflow, cwd, generation, nil)
+    return
+  end
+  if #workers == 0 then
+    -- A leader-only team this front end does not lead and that never did work:
+    -- the person asking for a team takes it over by closing it, without being
+    -- asked about workers it does not have.
+    self:ask_task(workflow, cwd, generation, { restart = true, team = entry.id })
     return
   end
   local restart = "close the team and start over"
@@ -548,7 +572,7 @@ function Flow:ensure_session(cwd, team_id, generation, done)
   local entry = self:team_for_cwd(cwd)
   if entry then
     local blocked = (team and team.blocked) or {}
-    if blocked[cwd] then
+    if blocked[cwd] and not self:unused_team(cwd, entry) then
       self:finish()
       self:notify("another session leads this team; close it there first", vim.log.levels.WARN)
       return

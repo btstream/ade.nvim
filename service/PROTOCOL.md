@@ -1436,6 +1436,7 @@ config = {
   ...,                                        // 18.2, 18.12
   "workflows": { "<name>": workflow },        // optional; read-only workflows from the person's setup
   "default_workflow": string?,                // a name of "workflows" or "default"
+  "derived": { "template": string, "agent": string }?,  // a template derived from that agent's own launch
   "templates": {
     "<name>": {
       ...,                                    // 18.2
@@ -1446,6 +1447,18 @@ config = {
   }
 }
 ```
+
+**Derived templates.** A front end that derives a template from its own
+leader's launch (a fresh installation without `teams.templates`) declares it
+with `derived: {template, agent}`: `template` must be a template of this same
+configuration and `agent` is the leader agent it was derived from. Such a
+configuration serves only a leader of that agent — `team.leader_server` binds
+an agent to the token it issues, and `team.bind_leader`, `team.configure`'s
+resume and a restart resume refuse a leader of another agent (`-32061`), so a
+second front end on the same cwd can never start a worker with a different
+adapter. An explicit configuration declares no `derived` and serves any agent.
+`derived` is never written to the event log; a restored team takes it from the
+front end that resumes it.
 
 A workflow on the wire:
 

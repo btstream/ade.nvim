@@ -1,6 +1,15 @@
 -- Configuration defaults, merging and validation.
 local M = {}
 
+---The template name a zero-config editor derives from its own leader launch.
+---
+---`teams.templates` normally names every worker template. When it is empty the
+---front end derives exactly one from the current leader's own launch
+---(`app/team.lua`), and this is its name: a workflow may name it without
+---declaring a template, so a zero-config editor can still ask for workers. Its
+---command never comes from configuration. `app/team.lua` reuses this constant.
+M.BUILTIN_TEMPLATE = "worker"
+
 ---@class AdeAgentConfig
 ---@field command? string
 ---@field args? string[]
@@ -1362,6 +1371,15 @@ function M.validate(cfg)
   if type(teams.templates) ~= "table" then
     fail("teams.templates must be a table")
   end
+  -- With no `teams.templates`, `app/team.lua` derives one template from the
+  -- current leader's own launch. A workflow may name it so a zero-config
+  -- editor can still ask for workers; its command never comes from config.
+  local function builtin_template_name(name, teams_table)
+    return type(name) == "string"
+      and name == M.BUILTIN_TEMPLATE
+      and next(teams_table.templates or {}) == nil
+      and type(cfg.agents[cfg.agent]) == "table"
+  end
   for name, template in pairs(teams.templates) do
     if type(name) ~= "string" or not name:match("^[a-z0-9][a-z0-9_%-]*$") or #name > 32 then
       fail("teams.templates keys must match [a-z0-9][a-z0-9_-]{0,31}, got %s", vim.inspect(name))
@@ -1414,7 +1432,7 @@ function M.validate(cfg)
   end
   local auto, seen = {}, {}
   for _, name in ipairs(confirm.auto) do
-    if type(name) ~= "string" or teams.templates[name] == nil then
+    if type(name) ~= "string" or (teams.templates[name] == nil and not builtin_template_name(name, teams)) then
       fail("teams.spawn_confirm.auto includes unknown template %s", vim.inspect(name))
     end
     if not seen[name] then
@@ -1531,7 +1549,10 @@ function M.validate(cfg)
           fail("%s.name %q is already used", at, member.name)
         end
         seen[member.name] = true
-        if type(member.template) ~= "string" or teams.templates[member.template] == nil then
+        if
+          type(member.template) ~= "string"
+          or (teams.templates[member.template] == nil and not builtin_template_name(member.template, teams))
+        then
           fail("%s.template must name a configured template", at)
         end
         if member.model ~= nil and type(member.model) ~= "string" then

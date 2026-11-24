@@ -204,6 +204,32 @@ return function(t)
       local no_role = validate({ teams = { templates = { worker = { agent = "opencode" } } } })
       t.eq(nil, no_role.teams.templates.worker.role)
 
+      -- Zero config: the built-in template name may be named by a workflow even
+      -- though `teams.templates` is empty; its command comes from the leader.
+      local zero = validate({
+        teams = {
+          templates = {},
+          spawn_confirm = { auto = { "worker" } },
+          workflows = {
+            dev = { summary = "one default worker", team = { { name = "w1", template = "worker" } } },
+          },
+        },
+      })
+      t.eq({ "worker" }, zero.teams.spawn_confirm.auto)
+      t.eq("worker", zero.teams.workflows.dev.team[1].template)
+      -- Once any template is declared, `worker` is an ordinary name: unknown
+      -- templates are still refused, and an explicit set owns them all.
+      local ok_named, err_named = pcall(validate, {
+        teams = {
+          templates = { reviewer = { agent = "opencode" } },
+          workflows = {
+            dev = { summary = "x", team = { { name = "w1", template = "worker" } } },
+          },
+        },
+      })
+      t.eq(false, ok_named, "an unknown template stays an error next to explicit ones")
+      t.match("template must name a configured template", tostring(err_named))
+
       -- The old keys fail with the new syntax in the message (no migration).
       local old_errors = {}
       for _, over in ipairs({
@@ -1302,6 +1328,165 @@ return function(t)
       t.eq("pi-acp", second.templates.worker.key.command)
       t.eq("mcp_proxy", second.templates.worker.tool_style, "the derived template follows the pi profile")
       t.falsy(vim.deep_equal(first, second), "a leader switch is a configuration change")
+    end)
+
+    t.it("declares which agent the derived template belongs to", function()
+      local service, dir = start_service(t, "derived-declaration")
+      setup(t, "derived-declaration", service, dir, {
+        teams = { spawn_from_chat = true, templates = {} },
+      })
+      state().config.teams.templates = {}
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #calls_of(service, "team.configure") == 1
+      end, 5000, "the derived configuration")
+      local configured = calls_of(service, "team.configure")[1].params.config
+      -- The service cannot see which command a template came from; the front
+      -- end states the agent it derived it from, and that is what keeps another
+      -- front end's leader from receiving it.
+      t.eq({ template = "worker", agent = "opencode" }, configured.derived)
+      -- An explicit configuration owns its templates: it declares no derived
+      -- one, so any agent's leader may use it.
+      state().config.teams.templates = { reviewer = { agent = "opencode", role = "review" } }
+      team():configure(dir, true)
+      wait(function()
+        return #calls_of(service, "team.configure") == 2
+      end, 5000, "the explicit configuration")
+      t.eq(nil, calls_of(service, "team.configure")[2].params.config.derived)
+    end)
+
+    -- A team that only a chat session created: leader-only, no card, no inbox.
+    local function leader_only_team(service, dir)
+      -- Create it through the stand-in service's own id counter, so a later
+      -- bind produces a different id (a real service never reuses one).
+      service.team_seq = (service.team_seq or 0) + 1
+      local id = "t" .. service.team_seq
+      local team = {
+        id = id,
+        cwd = dir,
+        state = "active",
+        leader = { instance = "other-instance", sessionId = "s-other" },
+        participants = {
+          { name = "leader", state = "idle", task = "_", queued = 0, turns = {} },
+        },
+        inbox = {},
+        limits = { max_turns_per_task = 30, max_turns_total = 200, turns_total = 0 },
+      }
+      service.teams[id] = team
+      return team, id
+    end
+
+    t.it("stays quiet about the unused team a chat session creates", function()
+      local service, dir = start_service(t, "unused-team")
+      -- Another session leads a leader-only team for this cwd: the by-product
+      -- of ordinary chat there. A session or agent switch must not report a
+      -- conflict the person never asked for.
+      local _, id = leader_only_team(service, dir)
+      setup(t, "unused-team", service, dir, {
+        teams = { spawn_from_chat = true, templates = {} },
+      })
+      state().config.teams.templates = {}
+      local notices = capture(t)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return team().blocked[dir] == true
+      end, 5000, "the blocked cwd")
+      for _, note in ipairs(notices) do
+        t.falsy(
+          note.message:find("already exists for this cwd", 1, true) or note.message:find("another session", 1, true),
+          note.message
+        )
+      end
+      t.eq(id, (team():unused_team(dir) or {}).id, "the by-product team is remembered as unused")
+      -- Once it has real work it is a team of its own again: the unused mark is
+      -- dropped, so a later conflict is reported normally.
+      service:team_changed({
+        id = id,
+        cwd = dir,
+        state = "active",
+        leader = { instance = "other-instance", sessionId = "s-other" },
+        participants = {
+          { name = "leader", state = "idle", task = "_", queued = 0, turns = {} },
+          { name = "w1", state = "idle", task = "_", queued = 0, turns = {} },
+        },
+        inbox = {},
+        limits = {},
+      })
+      wait(function()
+        return team():unused_team(dir) == nil
+      end, 5000, "the team is used")
+    end)
+
+    t.it("takes over an unused team instead of refusing :Ade team start", function()
+      local service, dir = start_service(t, "take-over")
+      leader_only_team(service, dir)
+      setup(t, "take-over", service, dir, {
+        teams = {
+          spawn_from_chat = true,
+          default = "default",
+          workflows = {
+            default = { summary = "one worker", team = { { name = "w1", template = "worker" } } },
+          },
+          templates = {},
+        },
+      })
+      state().config.teams.templates = {}
+      local notices = capture(t)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return team():unused_team(dir) ~= nil
+      end, 5000, "the unused team")
+      local original_input = vim.ui.input
+      t.cleanup(function()
+        vim.ui.input = original_input
+      end)
+      vim.ui.input = function(_, cb)
+        cb("ship it")
+      end
+      controller.start_team("default")
+      wait(function()
+        return #service.team_starts == 1
+      end, 20000, "the workflow after taking the unused team over")
+      t.eq("default", service.team_starts[1].workflow)
+      t.eq("ship it", service.team_starts[1].task)
+      for _, note in ipairs(notices) do
+        t.falsy(note.message:find("another session leads", 1, true), note.message)
+      end
+    end)
+
+    t.it("explains a derived configuration that belongs to another agent", function()
+      local service, dir = start_service(t, "derived-other-agent", {
+        team_bind_error = {
+          code = -32061,
+          message = "the team configuration for this cwd was derived from agent pi",
+        },
+      })
+      setup(t, "derived-other-agent", service, dir, {
+        teams = { spawn_from_chat = true, templates = {} },
+      })
+      state().config.teams.templates = {}
+      local notices = capture(t)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        for _, note in ipairs(notices) do
+          if note.message:find("belongs to another agent", 1, true) then
+            return true
+          end
+        end
+        return false
+      end, 5000, "the derived-config message")
+      local joined = {}
+      for _, note in ipairs(notices) do
+        joined[#joined + 1] = note.message
+      end
+      joined = table.concat(joined, "\n")
+      t.match("belongs to another agent", joined)
+      t.match("teams.templates", joined, "the way out is named")
+      t.falsy(joined:find("another session already leads", 1, true), "it is not a leader conflict")
     end)
 
     t.it("reports a broken leader launch instead of waiting for a leader", function()

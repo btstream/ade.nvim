@@ -343,7 +343,16 @@ impl Hub {
         if let Some((team, instance, session)) = self.teams.config_resume(&cwd) {
             if let Some(handle) = self.instances.get(&instance) {
                 let agent = handle.key.agent.clone();
-                self.teams.start_resume(&team, &instance, &session, &agent);
+                if !self.teams.configured_for(&cwd, &agent) {
+                    // The configure that just arrived belongs to another agent
+                    // (another front end on the same cwd). Resuming would hand
+                    // the team a template of the wrong adapter: stay suspended
+                    // and let the leader of its own agent configure again.
+                    return Ok(json!({}));
+                }
+                let config = self.teams.config_for_leader(&cwd, &agent)?;
+                self.teams
+                    .start_resume_with_config(&team, &instance, &session, &agent, config);
                 self.resume_team(&team);
             } else {
                 // The instance that bound before configure is gone; stay
@@ -361,7 +370,10 @@ impl Hub {
             return Err(TeamError::new(UNKNOWN_INSTANCE, "unknown instance"));
         };
         let instance_cwd = handle.key.cwd.clone();
-        let (server, token_id) = self.teams.leader_server(&instance, &cwd, &instance_cwd)?;
+        let agent = handle.key.agent.clone();
+        let (server, token_id) =
+            self.teams
+                .leader_server(&instance, &cwd, &instance_cwd, &agent)?;
         Ok(json!({ "server": server, "token_id": token_id }))
     }
 
