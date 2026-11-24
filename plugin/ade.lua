@@ -45,7 +45,7 @@ local SUBCOMMANDS = {
 local SERVICE_SUBCOMMANDS = { "install", "status", "start", "stop", "agents", "kill" }
 
 ---Subcommands of `:Ade team`.
-local TEAM_SUBCOMMANDS = { "agents", "board", "start", "close", "answer" }
+local TEAM_SUBCOMMANDS = { "agents", "board", "start", "close", "answer", "on", "off", "stop", "leader" }
 
 ---Workflow names known from the configuration and the last service listing.
 ---@return string[]
@@ -109,6 +109,22 @@ local function complete(arglead, cmdline)
         candidates = TEAM_SUBCOMMANDS
       elseif words[3] == "start" then
         candidates = workflow_names()
+      elseif words[3] == "stop" then
+        local ok, controller = pcall(require, "ade.controller")
+        candidates = {}
+        if ok then
+          local state_ok, state = pcall(controller.state)
+          local view = state_ok and type(state) == "table" and state.view or nil
+          local team = view and view.team or nil
+          local current = state_ok and type(state) == "table" and state.sess and state.sess.current or nil
+          local cwd = current and current.cwd or vim.fn.getcwd()
+          local entry = team and team:team_for_cwd(cwd) or nil
+          for _, participant in ipairs(entry and entry.participants or {}) do
+            if participant.name ~= "leader" and participant.name ~= "human" then
+              candidates[#candidates + 1] = participant.name
+            end
+          end
+        end
       else
         candidates = {}
       end
@@ -126,7 +142,7 @@ local function define(name, fn, desc, range, completer)
     vim.api.nvim_create_user_command,
     name,
     fn,
-    { desc = "ade.nvim: " .. desc, nargs = "*", range = range, complete = completer }
+    { desc = "ade.nvim: " .. desc, nargs = "*", range = range, bang = true, complete = completer }
   )
 end
 
@@ -169,12 +185,14 @@ local function setup()
       elseif sub == "agents" then
         ade.manage_agents()
       elseif sub == "team" then
-        -- `:Ade team` and `:Ade team agents` open or focus the members pane;
-        -- `:Ade team board` does the same for the board. `start [workflow]`
-        -- starts a workflow and `close` ends the team for this cwd (19.7).
+        -- `:Ade team` opens the team tree; `agents`/`board` open the members and
+        -- board panes, `start [workflow]` starts a workflow in this session,
+        -- `on`/`off` flip the per-session switch, `stop[!] <worker>` stops (or
+        -- removes) one worker, `leader` takes the lead and `close` ends the team
+        -- (PROTOCOL.md 20).
         local action, argument = rest:match("^(%S+)%s*(.-)%s*$")
         if action == nil or action == "" then
-          ade.open_team()
+          ade.open_team("tree")
         elseif action == "agents" then
           ade.open_team("members")
         elseif action == "board" then
@@ -185,6 +203,14 @@ local function setup()
           ade.close_team()
         elseif action == "answer" then
           ade.answer_team(argument ~= "" and argument or nil)
+        elseif action == "on" then
+          ade.team_on()
+        elseif action == "off" then
+          ade.team_off()
+        elseif action == "stop" then
+          ade.team_stop(argument ~= "" and argument or nil, args.bang)
+        elseif action == "leader" then
+          ade.team_leader()
         else
           vim.notify("ade.nvim: unknown team command " .. action, vim.log.levels.WARN)
         end

@@ -25,8 +25,8 @@ function M.manage_agents()
   ensure().manage_agents()
 end
 
----Open the team pane. `kind` is "members" (default), "board" or "all";
----with no team the pane shows its empty state.
+---Open the team pane. `kind` is "tree", "members" (default), "board" or
+---"all"; with no team the pane shows its empty state.
 ---@param kind string|nil
 ---@return boolean opened
 function M.open_team(kind)
@@ -35,8 +35,31 @@ end
 
 ---Start a named team workflow (`:Ade team start [workflow]`).
 ---@param workflow string|nil picks one when absent
-function M.start_team(workflow)
-  ensure().start_team(workflow)
+---@param session table|nil start in that session instead of the current one
+function M.start_team(workflow, session)
+  ensure().start_team(workflow, session)
+end
+
+---Turn teams on for the current session (`:Ade team on`).
+function M.team_on()
+  ensure().team_on()
+end
+
+---Turn teams off for the current session (`:Ade team off`).
+function M.team_off()
+  ensure().team_off()
+end
+
+---Stop one worker of this cwd's team (`:Ade team stop[!] <worker>`).
+---@param name string|nil
+---@param remove boolean|nil
+function M.team_stop(name, remove)
+  ensure().team_stop(name, remove)
+end
+
+---Give this session the team leadership (`:Ade team leader`).
+function M.team_leader()
+  ensure().team_leader()
 end
 
 ---Close the team of this cwd, after a confirmation.

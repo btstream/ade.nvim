@@ -31,6 +31,10 @@ function M.new(deps)
     generation = deps.generation,
     report_error = deps.report_error,
     open_team = deps.open_team,
+    choices = deps.choices,
+    find_session = deps.find_session,
+    select_session = deps.select_session,
+    submit = deps.submit,
   })
   return self
 end
@@ -63,13 +67,128 @@ function Commands:current_team()
   if not team then
     return nil
   end
-  local cwd = self:cwd()
-  for _, entry in ipairs(team:list_rows()) do
-    if entry.cwd == cwd and entry.state ~= "closed" then
-      return entry
-    end
+  return team:team_for_cwd(self:cwd())
+end
+
+---The current session and its service instance.
+---@return table|nil session
+---@return string|nil instance
+function Commands:context()
+  local S = self.deps.state()
+  local session = S and S.sess and S.sess.current or nil
+  local client = self.deps.client and self.deps.client() or nil
+  local instance = client and client.proc and client.proc.instance or nil
+  return session, instance
+end
+
+---Turn teams on for the current session (`:Ade team on`).
+function Commands:on()
+  local team = self:team()
+  local session, instance = self:context()
+  if not team or not session or not instance then
+    self.deps.notify("team on requires an open session", vim.log.levels.WARN)
+    return
   end
-  return nil
+  team:set_session_teams(instance, session.id, true, false, function(ok, value)
+    if not ok then
+      self.deps.notify("cannot turn teams on: " .. self.deps.report_error(value), vim.log.levels.WARN)
+    else
+      self.deps.notify("teams are on for this chat", vim.log.levels.INFO)
+    end
+  end)
+end
+
+---Turn teams off for the current session (`:Ade team off`). A session that
+---leads a team is asked first; the team is closed with it.
+function Commands:off()
+  local team = self:team()
+  local session, instance = self:context()
+  if not team or not session or not instance then
+    self.deps.notify("team off requires an open session", vim.log.levels.WARN)
+    return
+  end
+  local state = team:session_teams(instance, session.id)
+  local function apply(close)
+    team:set_session_teams(instance, session.id, false, close, function(ok, value)
+      if not ok then
+        local data = type(value) == "table" and type(value.data) == "table" and value.data or {}
+        if data.reason == "leads_team" and not close then
+          presenter.confirm("This chat leads a team. Close it too?", function(choice)
+            if choice == "yes" then
+              apply(true)
+            end
+          end)
+          return
+        end
+        self.deps.notify("cannot turn teams off: " .. self.deps.report_error(value), vim.log.levels.WARN)
+      else
+        self.deps.notify("teams are off for this chat", vim.log.levels.INFO)
+      end
+    end)
+  end
+  if state and state.leader then
+    presenter.confirm(
+      "This chat leads team " .. tostring(state.leader.id) .. ". Turn teams off and close it?",
+      function(choice)
+        if choice == "yes" then
+          apply(true)
+        end
+      end
+    )
+    return
+  end
+  apply(false)
+end
+
+---Stop one worker of this cwd's team (`:Ade team stop <worker>`); `remove`
+---also drops it from the team.
+---@param name string|nil
+---@param remove boolean|nil
+function Commands:stop_worker(name, remove)
+  local team = self:team()
+  local entry = self:current_team()
+  if not team or not entry then
+    self.deps.notify("no team for this cwd", vim.log.levels.WARN)
+    return
+  end
+  if not name or name == "" then
+    self.deps.notify("usage: :Ade team stop[!] <worker>", vim.log.levels.WARN)
+    return
+  end
+  local known = team:participant(entry.id, name)
+  if not known then
+    self.deps.notify("no worker named " .. name, vim.log.levels.WARN)
+    return
+  end
+  team:stop_worker(entry.id, name, remove, function(ok, value)
+    if not ok then
+      self.deps.notify("cannot stop " .. name .. ": " .. self.deps.report_error(value), vim.log.levels.WARN)
+      return
+    end
+    self.deps.notify((remove and "worker " or "stopping worker ") .. name, vim.log.levels.INFO)
+  end)
+end
+
+---Move this cwd's team leadership to the current session (`:Ade team leader`).
+function Commands:leader()
+  local team = self:team()
+  local entry = self:current_team()
+  local session, instance = self:context()
+  if not team or not entry or not session or not instance then
+    self.deps.notify("no team and session to lead for this cwd", vim.log.levels.WARN)
+    return
+  end
+  if entry.leader and entry.leader.sessionId == session.id and entry.leader.instance == instance then
+    self.deps.notify("this chat already leads the team", vim.log.levels.INFO)
+    return
+  end
+  team:set_leader(entry.id, instance, session.id, function(ok, value)
+    if not ok then
+      self.deps.notify("cannot take the lead: " .. self.deps.report_error(value), vim.log.levels.WARN)
+      return
+    end
+    self.deps.notify("this chat now leads the team", vim.log.levels.INFO)
+  end)
 end
 
 ---Close the team of this cwd after a confirmation.

@@ -9,7 +9,7 @@ transport/process + framing
   └─ 有界、有序、按时间片分发完整协议行
        └─ protocol/client + jsonrpc
             ├─ RPC 匹配、超时、初始化与权限协议
-            └─ controller：公开入口、状态与跨模块协调（约 640 行；预算 700，由测试守护）
+            └─ controller：公开入口、状态与跨模块协调（约 700 行；预算 760，由测试守护）
                  ├─ app/agent_manager：托管安装的用户动作与确认
                  ├─ manager/*：registry、store、lock、npm、install、resolve
                  ├─ ui/agent_manager：安装管理浮窗

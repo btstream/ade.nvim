@@ -1,36 +1,33 @@
--- `:Ade team start`: start a named workflow on behalf of the person
--- (PROTOCOL.md 19.7, docs/w0-team-dashboard-draft.md 2.7).
+-- `:Ade team start`: start a workflow from the current session
+-- (PROTOCOL.md 20.4).
 --
--- The steps are the ones the draft fixes: pick a workflow, make sure its leader
--- session exists (the service only injects the leader MCP server while a
--- session is created), confirm the extras the workflow asks for, ask for the
--- task, let the service start the members and open the panel.
+-- The service owns team creation and leadership now, so the flow is straight
+-- line: pick a workflow, make sure the session's tools are on, ask for the
+-- task, call `team.start` on this session and let the service answer. No
+-- polling and no leader-session juggling: an in-place reload (`session.teams`)
+-- covers sessions created before teams were configured, and a `led_by` answer
+-- becomes a choice card.
 --
 -- Everything that touches the editor is injected by the controller, so the
 -- flow can be driven by tests with fake pickers and a fake team module.
 --
--- A flow is identified by a generation: starting again, cancelling, timing out
--- or a team closing invalidates every pending continuation of the old flow, so
--- a stale `team.changed`/`team.board` callback can never drive a new start.
+-- A flow is identified by a generation: starting again, cancelling or a team
+-- closing invalidates every pending continuation of the old flow.
 local M = {}
 
 local Flow = {}
 Flow.__index = Flow
-
----How long a continuation waits for the leader session or a team to close.
----Tests shorten it through `deps.timeout` or this field.
-M.wait_timeout_ms = 20000
 
 ---cwd -> true while a start flow runs for it. Module level on purpose: the
 ---controller (and its Team/flow objects) is rebuilt when the leader agent is
 ---switched, but the start keeps running across that rebuild.
 local active = {}
 
----cwd -> {flow, generation} for the flow that owns a start right now. Module
----level for the same reason as `active`: `pick_agent` rebuilds the controller
----(and TeamCommands and its Flow), and the new modules must still be able to
----cancel the flow the old ones started.
+---cwd -> {flow, generation} for the flow that owns a start right now.
 local running = {}
+
+---cwd -> a flow waiting for the replacement session it just asked for.
+local pending_new = {}
 
 ---Whether a start flow is running for `cwd`.
 ---@param cwd string
@@ -51,11 +48,35 @@ function M.cancel_for(cwd)
   return true
 end
 
+---A session was opened: continue a flow that asked for a replacement session.
+---Called from `app/team.lua` after the service reports the new session.
+---@param instance string
+---@param session_id string
+---@param cwd string|nil
+function M.session_opened(instance, session_id, cwd)
+  if type(cwd) ~= "string" then
+    return
+  end
+  local pending = pending_new[cwd]
+  if not pending then
+    return
+  end
+  pending_new[cwd] = nil
+  local flow = pending.flow
+  if not flow:alive(pending.generation) then
+    return
+  end
+  flow:handover(instance, session_id, pending)
+end
+
 ---@param deps {state: fun(): table, config: fun(): table, notify: fun(message: string, level: integer|nil),
 ---  resolve_cwd: fun(): string, open: fun(), new_session: fun(), connect: fun(),
 ---  pick_agent: fun(name: string)|nil, options: fun(): table|nil,
 ---  client: fun(): table|nil, generation: fun(): integer|nil,
----  report_error: fun(value: any)}
+---  report_error: fun(value: any), choices: (fun(): table|nil)|nil,
+---  find_session: (fun(id: string): table|nil)|nil,
+---  select_session: (fun(session: table)|nil)|nil,
+---  submit: (fun(text: string)|nil)|nil}
 ---@return table
 function M.new(deps)
   return setmetatable({ deps = deps, starting = false, generation = 0, cwd = nil }, Flow)
@@ -69,6 +90,12 @@ end
 function Flow:team()
   local S = self.deps.state()
   return S and S.view and S.view.team or nil
+end
+
+---@return table|nil
+function Flow:choices()
+  local ok, choices = pcall(self.deps.choices)
+  return ok and choices or nil
 end
 
 ---@return table
@@ -87,83 +114,28 @@ function Flow:cwd()
   return cfg.cwd or vim.fn.getcwd()
 end
 
+---The session the flow acts on, with its instance.
+---@return table|nil session
+---@return string|nil instance
+function Flow:context()
+  local S = self.deps.state()
+  local session = S and S.sess and S.sess.current or nil
+  local client = self.deps.client and self.deps.client() or nil
+  local instance = client and client.proc and client.proc.instance or nil
+  return session, instance
+end
+
 function Flow:available()
   local cfg = self:config()
   local teams = type(cfg.teams) == "table" and cfg.teams or {}
-  if teams.enabled == false or teams.spawn_from_chat == false or cfg.backend == "direct" then
+  if teams.enabled == false or cfg.backend == "direct" then
     return false
   end
   local team = self:team()
   return team ~= nil and team:available()
 end
 
----Whether teams exist but the built-in template cannot start right now.
----
----Only a zero-config editor is reported here: with explicit templates the
----service answers per template when a start needs one (`unknown template x`),
----and a workflow with no members does not need any. Without `teams.templates`
----the worker template is derived from the leader's own launch, so a broken
----launch would otherwise surface only as a timeout waiting for the leader;
----`:Ade team start` is an explicit request and says what is wrong instead.
----@param cwd string
----@return string|nil problem
-function Flow:template_problem(cwd)
-  local cfg = self:config()
-  local teams = type(cfg.teams) == "table" and cfg.teams or {}
-  local templates = teams.templates or {}
-  local worker = templates[require("ade.config").BUILTIN_TEMPLATE]
-  if next(templates) ~= nil and not (worker and worker.agent == "inherit") then
-    return nil
-  end
-  local team = self:team()
-  if not team or type(team.has_usable_templates) ~= "function" then
-    return nil
-  end
-  local ok, usable = pcall(team.has_usable_templates, team, cwd)
-  if not ok or usable then
-    return nil
-  end
-  local detail
-  if type(team.template_error) == "function" then
-    local got, message = pcall(team.template_error, team, cwd)
-    if got and type(message) == "string" and message ~= "" then
-      detail = message
-    end
-  end
-  return "cannot start a team: the built-in worker template cannot be started"
-    .. (detail and (": " .. detail) or " (fix the leader agent's launch)")
-end
-
----The team the service owns for this cwd, in any state but closed.
----@param cwd string
----@return table|nil
-function Flow:team_for_cwd(cwd)
-  local team = self:team()
-  if not team then
-    return nil
-  end
-  for _, entry in ipairs(team:list_rows()) do
-    if entry.cwd == cwd and entry.state ~= "closed" then
-      return entry
-    end
-  end
-  return nil
-end
-
----@param team table|nil
----@return string[]
-function Flow:workers_of(team)
-  local names = {}
-  for _, participant in ipairs(type(team) == "table" and team.participants or {}) do
-    if participant.name ~= "leader" and participant.name ~= "human" then
-      names[#names + 1] = tostring(participant.name)
-    end
-  end
-  return names
-end
-
----End the flow: clear `starting`, release the cwd and invalidate every
----continuation. Safe to call more than once.
+---End the flow and invalidate every continuation.
 function Flow:finish()
   self.starting = false
   local cwd = self.cwd
@@ -172,12 +144,12 @@ function Flow:finish()
     return
   end
   local state = running[cwd]
-  -- Compare against the registration, not the live counter: `cancel` bumps the
-  -- generation before finishing, and a newer start on this same object must
-  -- not be cleared by the older registration's finish.
   if state and state.flow == self and state.generation == self.registered_generation then
     running[cwd] = nil
     active[cwd] = nil
+  end
+  if pending_new[cwd] and pending_new[cwd].flow == self then
+    pending_new[cwd] = nil
   end
 end
 
@@ -202,72 +174,31 @@ function Flow:alive(generation)
   return state ~= nil and state.flow == self and state.generation == generation
 end
 
----Poll until `predicate` holds, without blocking the editor and while staying
----cancellable. A callback rather than `vim.wait`: the flow runs from command
----callbacks and socket notifications, and `vim.wait` cannot be nested.
----@param predicate fun(): boolean
----@param label string
----@param done fun(ok: boolean)
-function Flow:wait_for(predicate, label, done)
-  local generation = self.generation
-  local timeout = M.wait_timeout_ms
-  if type(self.deps.timeout) == "function" then
-    local ok, value = pcall(self.deps.timeout)
-    if ok and type(value) == "number" and value >= 0 then
-      timeout = value
-    end
-  end
-  local deadline = vim.uv.now() + timeout
-  local function check()
-    if not self:alive(generation) then
-      return
-    end
-    if predicate() then
-      done(true)
-      return
-    end
-    if vim.uv.now() >= deadline then
-      self:notify("timed out waiting for " .. tostring(label), vim.log.levels.WARN)
-      self:finish()
-      done(false)
-      return
-    end
-    vim.defer_fn(check, 50)
-  end
-  check()
-end
-
----Entry point. `name` is a workflow name, or nil for the configured default.
+---Entry point. `name` is a workflow name, or nil to select one.
 ---@param name string|nil
 function Flow:start(name)
-  local cwd = self:cwd()
   local cfg = self:config()
   local teams = cfg.teams or {}
-  if teams.enabled == false or teams.spawn_from_chat == false then
-    self:notify("team session tools are disabled in the configuration", vim.log.levels.WARN)
+  if teams.enabled == false then
+    self:notify("teams are disabled in the configuration (teams.enabled)", vim.log.levels.WARN)
     return
   end
   if cfg.backend == "direct" then
     self:notify("team start requires the service backend", vim.log.levels.WARN)
     return
   end
-  local problem = self:template_problem(cwd)
-  if problem then
-    -- An explicit request must name the concrete failure instead of waiting for
-    -- a leader that will never create a team. An already running flow is left
-    -- alone: this request never took over, so it cannot end the other one.
-    self:notify(problem, vim.log.levels.WARN)
+  local session, instance = self:context()
+  if not session or not instance then
+    self:notify("team start requires an open session connected to the service", vim.log.levels.WARN)
     return
   end
-  local available = self:available()
+  local cwd = session.cwd or self:cwd()
+  if not self:available() then
+    self:notify("teams need the service connection; open the panel first", vim.log.levels.WARN)
+    return
+  end
   local previous = running[cwd]
-  if previous and not available then
-    -- A workflow switching agents may be waiting for its new connection.
-    return
-  end
   if previous then
-    -- Starting again replaces the old flow instead of leaving it wedged; the
-    -- old flow may belong to a controller that `pick_agent` rebuilt.
     previous.flow:cancel()
   end
   self.generation = (self.generation or 0) + 1
@@ -277,63 +208,81 @@ function Flow:start(name)
   self.registered_generation = generation
   active[cwd] = true
   running[cwd] = { flow = self, generation = generation }
-  name = name ~= nil and name ~= "" and name or (teams.default or "default")
-  if available then
-    self:load_workflows(name, cwd, generation)
-    return
-  end
-  -- Connect the service socket only. Preparing a Leader before the task
-  -- prompt would create a session even if the person cancels the command.
-  local S = self.deps.state()
-  local service = S and S.conn and S.conn.service
-  if not service or type(service.ensure) ~= "function" then
-    self:finish()
-    self:notify("team start requires a connection to the service", vim.log.levels.WARN)
-    return
-  end
-  service:ensure(function(ok, err)
-    vim.schedule(function()
-      if not self:alive(generation) then
-        return
-      end
-      if not ok or not self:available() then
-        self:finish()
-        local detail = err and self.deps.report_error(err) or "the service does not support teams"
-        self:notify("cannot start a team: " .. tostring(detail), vim.log.levels.WARN)
-        return
-      end
-      self:load_workflows(name, cwd, generation)
-    end)
-  end)
+  self:load_workflows(name, session, instance, cwd, generation)
 end
 
-function Flow:load_workflows(name, cwd, generation)
+function Flow:load_workflows(name, session, instance, cwd, generation)
   local team = self:team()
+  if not team then
+    self:finish()
+    return
+  end
   team:workflows(cwd, function(ok, value)
-    -- The callback runs in the socket's fast event context; the steps below
-    -- prompt and poll, which is only legal on the main loop.
+    -- The callback runs in the socket's fast event context; the pickers below
+    -- are only legal on the main loop.
     vim.schedule(function()
       if not self:alive(generation) then
         return
       end
-      self:on_workflows(ok, value, name, cwd, generation)
+      self:on_workflows(ok, value, name, session, instance, cwd, generation)
     end)
   end)
 end
 
----Continue `start` once the workflow list is known.
 ---@param ok boolean
 ---@param value any
 ---@param name string|nil
+---@param session table
+---@param instance string
 ---@param cwd string
 ---@param generation integer
-function Flow:on_workflows(ok, value, name, cwd, generation)
+function Flow:on_workflows(ok, value, name, session, instance, cwd, generation)
   if not ok then
     self:finish()
     self:notify("cannot list workflows: " .. self.deps.report_error(value), vim.log.levels.WARN)
     return
   end
   local workflows = type(value) == "table" and type(value.workflows) == "table" and value.workflows or {}
+  if name == nil or name == "" then
+    if #workflows == 0 then
+      self:finish()
+      self:notify("no workflow is available; save one with :Ade workflows", vim.log.levels.WARN)
+      return
+    end
+    local default = (self:config().teams or {}).default or "default"
+    local labels, by_label = {}, {}
+    for _, workflow in ipairs(workflows) do
+      labels[#labels + 1] = workflow.name
+      by_label[workflow.name] = workflow
+    end
+    table.sort(labels, function(a, b)
+      if a == default then
+        return b ~= default
+      end
+      if b == default then
+        return false
+      end
+      return a < b
+    end)
+    vim.ui.select(labels, {
+      prompt = "workflow for the team:",
+      format_item = function(item)
+        local workflow = by_label[item]
+        local summary = workflow and workflow.summary or ""
+        return summary ~= "" and (item .. " — " .. summary) or item
+      end,
+    }, function(choice)
+      if not self:alive(generation) then
+        return
+      end
+      if not choice then
+        self:finish()
+        return
+      end
+      self:check_switch(by_label[choice], session, instance, cwd, generation)
+    end)
+    return
+  end
   local workflow
   for _, entry in ipairs(workflows) do
     if entry.name == name then
@@ -346,112 +295,69 @@ function Flow:on_workflows(ok, value, name, cwd, generation)
     self:notify("unknown workflow " .. tostring(name), vim.log.levels.WARN)
     return
   end
-  self:with_workflow(workflow, cwd, generation)
+  self:check_switch(workflow, session, instance, cwd, generation)
 end
 
----Whether a team entry is the unused leader-only team of another session.
----
----Such a team can be replaced by the person asking for one; it does not block
----the flow the way a team with work does.
----@param cwd string
----@param entry table|nil
----@return boolean
-function Flow:unused_team(cwd, entry)
-  local team = self:team()
-  if not team or type(team.unused_team) ~= "function" or not entry then
-    return false
-  end
-  local unused = team:unused_team(cwd)
-  return unused ~= nil and unused.id == entry.id
-end
-
----Continue once a workflow is known: leader agent, existing team, task.
+---Make sure the session's tools are on before asking for a task.
 ---@param workflow table
+---@param session table
+---@param instance string
 ---@param cwd string
 ---@param generation integer
-function Flow:with_workflow(workflow, cwd, generation)
-  local leader = type(workflow.leader) == "table" and workflow.leader or {}
-  local wanted = type(leader.agent) == "string" and leader.agent ~= "" and leader.agent or nil
-  local entry = self:team_for_cwd(cwd)
-  local current_agent = self:config().agent
-  if wanted and wanted ~= current_agent then
-    local team = self:team()
-    local blocked = team and team.blocked or {}
-    local why
-    if entry then
-      if blocked[cwd] and not self:unused_team(cwd, entry) then
-        why = "another session leads this team; close it there first"
-      elseif entry.state == "suspended" then
-        why = "the team is suspended; resume it with its leader session first"
-      elseif entry.stale then
-        why = "the connection to the service is lost; wait for it to reconnect"
-      end
-    end
-    if why then
-      -- Switching would close a team this front end does not lead; refuse
-      -- before promising an option that cannot be carried out.
-      self:finish()
-      self:notify(why, vim.log.levels.WARN)
-      return
-    end
-    local switch = "open a " .. wanted .. " session as the leader"
-    if entry then
-      switch = switch .. " (ends the current team)"
-    end
-    local ignore = "ignore it and use the current leader"
-    vim.ui.select({ switch, ignore }, {
-      prompt = "the workflow wants a " .. wanted .. " leader; this is " .. tostring(current_agent or "?"),
-      format_item = function(item)
-        return item
-      end,
-    }, function(choice)
-      if not self:alive(generation) then
-        return
-      end
-      if choice == nil then
-        self:finish()
-        return
-      end
-      if choice == ignore then
-        self:proceed(workflow, cwd, generation)
-        return
-      end
-      -- Ask for the task before closing/switching: cancelling the input must
-      -- leave the running team (and the current agent) untouched.
-      self:ask_task(workflow, cwd, generation, {
-        switch_agent = wanted,
-        team = entry and entry.id or nil,
-      })
+function Flow:check_switch(workflow, session, instance, cwd, generation)
+  local team = self:team()
+  local state = team and team:session_teams(instance, session.id) or nil
+  if not state then
+    team:query_session_teams(instance, session.id, cwd, function(ok, value)
+      vim.schedule(function()
+        if not self:alive(generation) then
+          return
+        end
+        if not ok then
+          self:finish()
+          self:notify("cannot read the teams switch: " .. self.deps.report_error(value), vim.log.levels.WARN)
+          return
+        end
+        self:check_switch(workflow, session, instance, cwd, generation)
+      end)
     end)
     return
   end
-  self:proceed(workflow, cwd, generation)
+  if state.enabled and state.injected ~= false then
+    self:ask_task(workflow, session, instance, cwd, generation)
+    return
+  end
+  team:set_session_teams(instance, session.id, true, false, function(ok, value)
+    vim.schedule(function()
+      if not self:alive(generation) then
+        return
+      end
+      if not ok then
+        local data = type(value) == "table" and type(value.data) == "table" and value.data or {}
+        if data.reason == "reload_unsupported" then
+          self:offer_new_session(workflow, session, cwd, generation)
+          return
+        end
+        self:finish()
+        self:notify("cannot enable teams for this session: " .. self.deps.report_error(value), vim.log.levels.WARN)
+        return
+      end
+      self:ask_task(workflow, session, instance, cwd, generation)
+    end)
+  end)
 end
 
----Ask about an existing team with workers, then continue.
+---A session that cannot reload has to be replaced; carry its conversation
+---over as a summary.
 ---@param workflow table
+---@param session table
 ---@param cwd string
 ---@param generation integer
-function Flow:proceed(workflow, cwd, generation)
-  local entry = self:team_for_cwd(cwd)
-  local users_team = self:unused_team(cwd, entry)
-  local workers = self:workers_of(entry)
-  if #workers == 0 and not users_team then
-    self:ask_task(workflow, cwd, generation, nil)
-    return
-  end
-  if #workers == 0 then
-    -- A leader-only team this front end does not lead and that never did work:
-    -- the person asking for a team takes it over by closing it, without being
-    -- asked about workers it does not have.
-    self:ask_task(workflow, cwd, generation, { restart = true, team = entry.id })
-    return
-  end
-  local restart = "close the team and start over"
-  local append = "start only the missing members"
+function Flow:offer_new_session(workflow, session, cwd, generation)
+  local accept = "open a new session and hand over a summary"
   local cancel = "cancel"
-  vim.ui.select({ restart, append, cancel }, {
-    prompt = "team already runs " .. table.concat(workers, ", "),
+  vim.ui.select({ accept, cancel }, {
+    prompt = "this agent cannot reload tools in place",
     format_item = function(item)
       return item
     end,
@@ -459,198 +365,98 @@ function Flow:proceed(workflow, cwd, generation)
     if not self:alive(generation) then
       return
     end
-    if choice == nil or choice == cancel then
+    if choice ~= accept then
       self:finish()
       return
     end
-    if choice == restart then
-      -- Ask for the task first: cancelling the input must leave the running
-      -- team untouched.
-      self:ask_task(workflow, cwd, generation, { restart = true, team = entry.id })
-      return
+    local summary = self:summary(session)
+    pending_new[cwd] = {
+      flow = self,
+      generation = generation,
+      workflow = workflow,
+      cwd = cwd,
+      summary = summary,
+    }
+    if self.deps.open then
+      pcall(self.deps.open)
     end
-    self:ask_task(workflow, cwd, generation, nil)
+    pcall(self.deps.new_session)
   end)
 end
 
----Close `team_id` and continue, treating a team that disappeared while the
----task prompt was open as already closed.
----@param team_id string
----@param cwd string
----@param generation integer
----@param on_closed fun()
-function Flow:close_team(team_id, cwd, generation, on_closed)
-  local entry = self:team_for_cwd(cwd)
-  if not entry or entry.id ~= team_id then
-    on_closed()
+---A plain-text digest of the last exchanges, for the replacement session.
+---@param session table
+---@return string
+function Flow:summary(session)
+  local parts = {}
+  for index = #(session.blocks or {}), 1, -1 do
+    local block = session.blocks[index]
+    if type(block) == "table" and type(block.text) == "string" and block.text ~= "" then
+      if block.kind == "user" or block.kind == "assistant" then
+        local text = vim.trim(block.text)
+        if #text > 1200 then
+          text = text:sub(1, 1200) .. "…"
+        end
+        parts[#parts + 1] = (block.kind == "user" and "person: " or "assistant: ") .. text
+      end
+      if #parts >= 12 then
+        break
+      end
+    end
+  end
+  local out = {}
+  for index = #parts, 1, -1 do
+    out[#out + 1] = parts[index]
+  end
+  if #out == 0 then
+    return "（上一会话没有可交接的对话）"
+  end
+  return "交接摘要（来自上一会话）:\n" .. table.concat(out, "\n\n")
+end
+
+---Continue in the replacement session: enable its teams, send the summary,
+---ask the task and start.
+---@param instance string
+---@param session_id string
+---@param pending table
+function Flow:handover(instance, session_id, pending)
+  local generation = pending.generation
+  local team = self:team()
+  if not team then
     return
   end
-  self:team():close(team_id, function(ok, value)
+  team:set_session_teams(instance, session_id, true, false, function(ok, value)
     vim.schedule(function()
       if not self:alive(generation) then
         return
       end
-      -- -32064: the team was closed from somewhere else in the meantime.
-      local gone = type(value) == "table" and value.code == -32064
-      if not ok and not gone then
+      if not ok then
         self:finish()
-        self:notify("cannot end the current team: " .. self.deps.report_error(value), vim.log.levels.WARN)
+        self:notify("cannot enable teams in the new session: " .. self.deps.report_error(value), vim.log.levels.WARN)
         return
       end
-      local team = self:team()
-      if type(team.forget_team) == "function" and (ok or gone) then
-        team:forget_team(team_id)
+      if pending.summary and pending.summary ~= "" and self.deps.submit then
+        pcall(self.deps.submit, pending.summary)
       end
-      self:wait_for(
-        function()
-          local now = self:team_for_cwd(cwd)
-          return now == nil or now.id ~= team_id
-        end,
-        "the old team to close",
-        function(closed)
-          if closed and self:alive(generation) then
-            on_closed()
-          end
-        end
-      )
+      local S = self.deps.state()
+      local session = S and S.sess and S.sess.all and S.sess.all[session_id] or nil
+      if not session then
+        self:finish()
+        self:notify("the replacement session did not open", vim.log.levels.WARN)
+        return
+      end
+      self:ask_task(pending.workflow, session, instance, pending.cwd, generation)
     end)
   end)
 end
 
----Close the current team (if any), switch the leader agent, open a new
----session and start the workflow there.
+---Ask for the task, then start the workflow on this session.
 ---@param workflow table
+---@param session table
+---@param instance string
 ---@param cwd string
 ---@param generation integer
----@param agent string
----@param team_id string|nil
----@param task string|nil
-function Flow:switch_and_launch(workflow, cwd, generation, agent, team_id, task)
-  local function switch()
-    if not self:alive(generation) then
-      return
-    end
-    if self.deps.pick_agent then
-      pcall(self.deps.pick_agent, agent)
-    end
-    if not self:alive(generation) then
-      return
-    end
-    if self:config().agent ~= agent then
-      -- pick_agent refused (unknown agent, or the setup failed): do not go on
-      -- with a leader the person did not choose.
-      self:finish()
-      self:notify("cannot switch the leader agent to " .. tostring(agent), vim.log.levels.WARN)
-      return
-    end
-    pcall(self.deps.open)
-    pcall(self.deps.new_session)
-    self:wait_for_leader(cwd, team_id, generation, function(ok)
-      if ok then
-        self:launch(workflow, cwd, task, generation)
-      end
-    end)
-  end
-  if not team_id then
-    switch()
-    return
-  end
-  self:close_team(team_id, cwd, generation, switch)
-end
-
----Make sure the session that is about to lead exists and has bound its team.
----Never switches the agent: that decision was made (or declined) already.
----@param cwd string
----@param team_id string|nil the team being replaced, must not be accepted
----@param generation integer
----@param done fun()
-function Flow:ensure_session(cwd, team_id, generation, done)
-  local team = self:team()
-  local entry = self:team_for_cwd(cwd)
-  if entry then
-    local blocked = (team and team.blocked) or {}
-    if blocked[cwd] and not self:unused_team(cwd, entry) then
-      self:finish()
-      self:notify("another session leads this team; close it there first", vim.log.levels.WARN)
-      return
-    end
-    if entry.state == "suspended" then
-      self:finish()
-      self:notify("the team is suspended; resume it with its leader session first", vim.log.levels.WARN)
-      return
-    end
-    if entry.stale then
-      self:finish()
-      self:notify("the connection to the service is lost; wait for it to reconnect", vim.log.levels.WARN)
-      return
-    end
-    local bound = team and team.bound and team.bound[cwd] or nil
-    if bound and bound.team == entry.id then
-      done()
-      return
-    end
-    if not bound then
-      -- `team.changed` can arrive a few milliseconds before the bind reply;
-      -- wait for the binding instead of claiming this session is not the
-      -- leader.
-      self:wait_for_leader(cwd, nil, generation, function(ok)
-        if ok then
-          done()
-        end
-      end)
-      return
-    end
-    self:finish()
-    self:notify("this session is not the leader of the team for this cwd", vim.log.levels.WARN)
-    return
-  end
-  pcall(self.deps.open)
-  local S = self.deps.state()
-  if not (S and S.sess and S.sess.current) then
-    pcall(self.deps.connect)
-  end
-  -- A session without a team cannot become a leader: the MCP server is only
-  -- injected while a session is created (18.2/19.8), so start a new one.
-  pcall(self.deps.new_session)
-  self:wait_for_leader(cwd, team_id, generation, function(ok)
-    if ok then
-      done()
-    end
-  end)
-end
-
----Wait until the service reports a team for this cwd, not `except_id`.
----@param cwd string
----@param except_id string|nil
----@param generation integer
----@param done fun(ok: boolean)
-function Flow:wait_for_leader(cwd, except_id, generation, done)
-  self:wait_for(
-    function()
-      local entry = self:team_for_cwd(cwd)
-      if not entry or (except_id and entry.id == except_id) then
-        return false
-      end
-      local team = self:team()
-      local bound = team and team.bound[cwd] or nil
-      return bound ~= nil and bound.team == entry.id
-    end,
-    "the leader session",
-    function(ok)
-      if not self:alive(generation) then
-        return
-      end
-      done(ok)
-    end
-  )
-end
-
----Ask for the task, then start (or restart) the workflow.
----@param workflow table
----@param cwd string
----@param generation integer
----@param restart {restart: boolean, team: string}|nil
-function Flow:ask_task(workflow, cwd, generation, restart)
+function Flow:ask_task(workflow, session, instance, cwd, generation)
   vim.ui.input({ prompt = "task for " .. tostring(workflow.name) .. " (optional): " }, function(task)
     if not self:alive(generation) then
       return
@@ -662,70 +468,139 @@ function Flow:ask_task(workflow, cwd, generation, restart)
     if task == "" then
       task = nil
     end
-    if restart and restart.switch_agent then
-      self:switch_and_launch(workflow, cwd, generation, restart.switch_agent, restart.team, task)
-      return
-    end
-    if restart then
-      self:close_and_relaunch(workflow, cwd, generation, restart.team, task)
-      return
-    end
-    self:ensure_session(cwd, nil, generation, function()
-      if self:alive(generation) then
-        self:launch(workflow, cwd, task, generation)
-      end
-    end)
-  end)
-end
-
----Close `team_id` and continue on the team the new session creates.
----@param workflow table
----@param cwd string
----@param generation integer
----@param team_id string
----@param task string|nil
-function Flow:close_and_relaunch(workflow, cwd, generation, team_id, task)
-  -- The close reply may arrive before `team.changed(closed)`, so close_team
-  -- waits until the old team is really gone instead of trusting list order.
-  self:close_team(team_id, cwd, generation, function()
-    self:ensure_session(cwd, team_id, generation, function()
-      if self:alive(generation) then
-        self:launch(workflow, cwd, task, generation)
-      end
-    end)
+    self:launch(workflow, session, instance, cwd, generation, task, false)
   end)
 end
 
 ---@param workflow table
+---@param session table
+---@param instance string
 ---@param cwd string
----@param task string|nil
 ---@param generation integer
-function Flow:launch(workflow, cwd, task, generation)
-  local entry = self:team_for_cwd(cwd)
-  if not entry then
-    self:finish()
-    self:notify("no team took the workflow: is the leader session connected?", vim.log.levels.WARN)
-    return
-  end
-  self:team():start(entry.id, workflow.name, task, function(ok, value)
-    if not self:alive(generation) then
-      return
-    end
-    if not ok then
+---@param task string|nil
+---@param retried boolean
+function Flow:launch(workflow, session, instance, cwd, generation, task, retried)
+  self:team():start_session(instance, session.id, workflow.name, task, function(ok, value)
+    vim.schedule(function()
+      if not self:alive(generation) then
+        return
+      end
+      if ok then
+        self:apply_leader_model(workflow)
+        self:finish()
+        if self.deps.open_team then
+          pcall(self.deps.open_team)
+        else
+          pcall(self.deps.open)
+        end
+        return
+      end
+      local data = type(value) == "table" and type(value.data) == "table" and value.data or {}
+      if data.reason == "led_by" then
+        self:offer_handover(value, workflow, session, instance, cwd, generation, task)
+        return
+      end
+      if (data.reason == "off" or data.reason == "no_tools") and not retried then
+        self:team():set_session_teams(instance, session.id, true, false, function(ok2, value2)
+          vim.schedule(function()
+            if not self:alive(generation) then
+              return
+            end
+            if ok2 then
+              self:launch(workflow, session, instance, cwd, generation, task, true)
+            else
+              self:finish()
+              self:notify(
+                "cannot start " .. tostring(workflow.name) .. ": " .. self.deps.report_error(value2),
+                vim.log.levels.WARN
+              )
+            end
+          end)
+        end)
+        return
+      end
       self:finish()
       self:notify(
         "cannot start " .. tostring(workflow.name) .. ": " .. self.deps.report_error(value),
         vim.log.levels.WARN
       )
+    end)
+  end)
+end
+
+---Another chat leads this cwd's team: jump there, move the team here, or stop.
+---@param value any the `-32061` error
+---@param workflow table
+---@param session table
+---@param instance string
+---@param cwd string
+---@param generation integer
+---@param task string|nil
+function Flow:offer_handover(value, workflow, session, instance, cwd, generation, task)
+  local data = type(value) == "table" and type(value.data) == "table" and value.data or {}
+  local leader = type(data.leader) == "table" and data.leader or {}
+  local team_id = type(data.team) == "table" and data.team.id or data.team
+  local choices = self:choices()
+  local function choose(choice)
+    if not self:alive(generation) then
       return
     end
-    self:apply_leader_model(workflow)
-    self:finish()
-    if self.deps.open_team then
-      pcall(self.deps.open_team)
-    else
-      pcall(self.deps.open)
+    if choice == "jump" then
+      local target = self.deps.find_session and self.deps.find_session(leader.sessionId) or nil
+      if target and self.deps.select_session then
+        self.deps.select_session(target)
+        self:finish()
+      else
+        self:notify("the leader session is not open in this front end", vim.log.levels.WARN)
+        self:finish()
+      end
+      return
     end
+    if choice == "move" then
+      if not team_id then
+        self:finish()
+        self:notify("the service did not name the team to take over", vim.log.levels.WARN)
+        return
+      end
+      self:team():set_leader(team_id, instance, session.id, function(ok, err)
+        vim.schedule(function()
+          if not self:alive(generation) then
+            return
+          end
+          if not ok then
+            self:finish()
+            self:notify("cannot take the team over: " .. self.deps.report_error(err), vim.log.levels.WARN)
+            return
+          end
+          self:launch(workflow, session, instance, cwd, generation, task, true)
+        end)
+      end)
+      return
+    end
+    self:finish()
+  end
+  if choices and type(choices.ask) == "function" then
+    choices:ask({
+      title = "团队已有 leader",
+      question = "这个项目已有团队，leader 是会话 "
+        .. tostring(leader.sessionId or "?")
+        .. "。要跳到那里，还是把团队移交到本会话？",
+      options = {
+        { label = "跳到 leader 会话", value = "jump" },
+        { label = "移交到本会话", value = "move" },
+        { label = "取消", value = "cancel" },
+      },
+      on_choice = choose,
+    })
+    return
+  end
+  vim.ui.select({ "跳到 leader 会话", "移交到本会话", "取消" }, {
+    prompt = "团队已有 leader",
+    format_item = function(item)
+      return item
+    end,
+  }, function(item)
+    choose(item == "跳到 leader 会话" and "jump" or (item == "移交到本会话" and "move" or "cancel"))
   end)
 end
 

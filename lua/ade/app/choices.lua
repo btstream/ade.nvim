@@ -360,6 +360,115 @@ function Choices:limit_model(team, item, pending)
   }
 end
 
+function Choices:handover_model(team, item, pending)
+  local leader = type(item.leader) == "table" and item.leader or {}
+  local options = {
+    option("跳到 leader 会话", "jump"),
+    option("移交到本会话", "move"),
+    option("取消", "cancel"),
+  }
+  return {
+    title = "团队移交 · team " .. tostring(item.team),
+    status_fn = self:status_fn(item.team),
+    questions = {
+      {
+        header = "Handover",
+        question = "这个项目已有团队，leader 是会话 "
+          .. tostring(leader.sessionId or "?")
+          .. "；要让本会话接管吗？",
+        options = options,
+      },
+    },
+    on_cancel = function()
+      self:refresh()
+    end,
+    on_submit = function(answers)
+      local answer = answers[1] or {}
+      local index = (answer.selected_index or {})[1]
+      local picked = index and options[index]
+      local choice = picked and picked.value or answer.selected[1]
+      if choice == "jump" then
+        local session = self.deps.find_session and self.deps.find_session(leader.sessionId) or nil
+        if session and self.deps.select_session then
+          self.deps.select_session(session)
+        else
+          self:notify("leader 会话不在本前端，无法切换", vim.log.levels.WARN)
+        end
+        self:refresh()
+        return
+      end
+      if choice == "move" then
+        team:answer(item.id, { option = "move" }, function(ok, value)
+          if not ok then
+            self:notify(
+              "cannot take the team over: " .. tostring(value and value.message or value),
+              vim.log.levels.WARN
+            )
+          end
+          self.handled["team:" .. item.team .. ":" .. item.id] = true
+          self:refresh()
+        end)
+        self.handled["team:" .. item.team .. ":" .. item.id] = true
+        self:refresh()
+        return
+      end
+      -- Cancel keeps the item open (the asker session was already told).
+      self:refresh()
+    end,
+  }
+end
+
+---Show an ad-hoc choice card (not backed by an inbox item).
+---
+---Used for decisions made by a command, such as the `led_by` handover. Falls
+---back to `vim.ui.select` when the panel (and so the card) is not available.
+---@param opts {title: string, question: string, options: {label: string, value: string}[],
+---  on_choice: fun(value: string|nil)}
+---@return boolean
+function Choices:ask(opts)
+  opts = opts or {}
+  local entry = { key = "custom:" .. tostring(vim.uv.hrtime()), kind = "custom" }
+  local options = {}
+  for _, item in ipairs(opts.options or {}) do
+    options[#options + 1] = option(tostring(item.label), tostring(item.value))
+  end
+  local model = {
+    title = opts.title or "选择",
+    questions = { { header = "Choice", question = opts.question or "", options = options } },
+    on_cancel = function()
+      self.current = nil
+      if opts.on_choice then
+        opts.on_choice(nil)
+      end
+    end,
+    on_submit = function(answers)
+      local answer = answers[1] or {}
+      local index = (answer.selected_index or {})[1]
+      local picked = index and options[index]
+      local value = picked and picked.value or answer.selected[1]
+      self.current = nil
+      if opts.on_choice then
+        opts.on_choice(value)
+      end
+    end,
+  }
+  local open = { entry }
+  if self:show(entry, open) then
+    return true
+  end
+  vim.ui.select(opts.options or {}, {
+    prompt = (opts.title or "选择") .. ": " .. tostring(opts.question or ""),
+    format_item = function(item)
+      return item.label or item.value
+    end,
+  }, function(item)
+    if opts.on_choice then
+      opts.on_choice(item and item.value or nil)
+    end
+  end)
+  return true
+end
+
 function Choices:participant(team, team_id, name)
   local row = team and team:team(team_id)
   for _, entry in ipairs(row and row.participants or {}) do
@@ -446,6 +555,19 @@ function Choices:team_entries(team_id)
           item = item,
           build = function(self_, pending)
             return self_:limit_model(team, item, pending)
+          end,
+        }
+      elseif item.kind == "handover" then
+        -- PROTOCOL.md 20.4: another chat leads this cwd; the person decides
+        -- whether it moves here or not.
+        approval_count = approval_count + 1
+        open[#open + 1] = {
+          key = "team:" .. item.team .. ":" .. item.id,
+          kind = "approval",
+          team = item.team,
+          item = item,
+          build = function(self_, pending)
+            return self_:handover_model(team, item, pending)
           end,
         }
       end
@@ -797,11 +919,17 @@ function Choices:answer_participant(team_id, name)
   local team = self:team()
   local free, option_entry
   for _, entry in ipairs(team and self:items(team, team_id) or {}) do
-    if entry.state == "open" and entry.kind == "question" and entry.from == name then
-      if item_has_options(entry) then
+    if entry.state == "open" then
+      if entry.kind == "question" and entry.from == name then
+        if item_has_options(entry) then
+          option_entry = option_entry or entry
+        else
+          free = free or entry
+        end
+      elseif entry.kind == "handover" and (name == nil or name == "" or name == "handover") then
+        -- The card's "跳到 leader 会话" works from here too; a bare
+        -- `:Ade team answer` shows the pending queue.
         option_entry = option_entry or entry
-      else
-        free = free or entry
       end
     end
   end

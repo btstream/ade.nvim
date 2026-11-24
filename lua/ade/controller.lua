@@ -346,8 +346,9 @@ function M.manage_agents()
   end
 end
 
----Open the team panes. `kind` is "members" (default), "board" or "all".
----With no team the pane shows its empty state (18.5).
+---Open the team panes. `kind` is "tree", "members", "board" or "all";
+---with no argument the members pane opens (the `:Ade team` command passes
+---"tree" itself).
 ---@param kind string|nil
 ---@return boolean opened
 function M.open_team(kind)
@@ -359,9 +360,43 @@ end
 
 ---Start a named workflow (`:Ade team start`); nil picks one (19.7).
 ---@param workflow string|nil
-function M.start_team(workflow)
+---@param session table|nil start in that session instead of the current one
+function M.start_team(workflow, session)
+  if session and S.sess.service then
+    S.sess.service:activate(session)
+  end
   if S.view.team_commands then
     S.view.team_commands:start(workflow)
+  end
+end
+
+---Turn teams on for the current session (`:Ade team on`).
+function M.team_on()
+  if S.view.team_commands then
+    S.view.team_commands:on()
+  end
+end
+
+---Turn teams off for the current session (`:Ade team off`).
+function M.team_off()
+  if S.view.team_commands then
+    S.view.team_commands:off()
+  end
+end
+
+---Stop one worker (`:Ade team stop[!] <worker>`).
+---@param name string|nil
+---@param remove boolean|nil
+function M.team_stop(name, remove)
+  if S.view.team_commands then
+    S.view.team_commands:stop_worker(name, remove)
+  end
+end
+
+---Move the team leadership to the current session (`:Ade team leader`).
+function M.team_leader()
+  if S.view.team_commands then
+    S.view.team_commands:leader()
   end
 end
 

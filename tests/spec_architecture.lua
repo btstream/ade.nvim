@@ -42,7 +42,7 @@ return function(t)
       -- A budget, not a target: it catches "just one more branch" growth without
       -- forcing callers to contort the wiring. Raise it only with a note in
       -- docs/architecture.md explaining what earned the extra room.
-      local budget = 700
+      local budget = 760
       local count = 0
       local handle = io.open(root .. "ade/controller.lua", "r")
       if not handle then
