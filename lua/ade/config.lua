@@ -128,14 +128,15 @@ M.defaults = {
   -- advertise support for are dropped rather than sent and rejected.
   mcp_servers = {},
 
-  -- Teams (PROTOCOL.md section 19). Enabling the feature does not auto-start it.
+  -- Teams (PROTOCOL.md section 20). `enabled` is the global switch; every new
+  -- session starts with its own switch at `session_default`.
   teams = {
     enabled = true,
+    session_default = true,
     auto_start = false,
     default = "default",
     -- Named workflows: `{ <name> = { summary?, text?, leader?, team?, columns? } }`.
     workflows = {},
-    spawn_from_chat = true,
     max_workers = 3,
     spawn_confirm = { auto = {} },
     limits = { max_turns_per_task = 30, max_turns_total = 200 },
@@ -1357,11 +1358,16 @@ function M.validate(cfg)
   if type(teams.enabled) ~= "boolean" then
     fail("teams.enabled must be a boolean")
   end
+  if type(teams.session_default) ~= "boolean" then
+    fail("teams.session_default must be a boolean")
+  end
+  if teams.spawn_from_chat ~= nil then
+    fail(
+      "teams.spawn_from_chat was removed; teams.enabled is the global switch and teams.session_default controls new sessions"
+    )
+  end
   if type(teams.auto_start) ~= "boolean" then
     fail("teams.auto_start must be a boolean")
-  end
-  if type(teams.spawn_from_chat) ~= "boolean" then
-    fail("teams.spawn_from_chat must be a boolean")
   end
   if
     type(teams.max_workers) ~= "number"
