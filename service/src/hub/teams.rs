@@ -343,16 +343,23 @@ impl Hub {
         if let Some((team, instance, session)) = self.teams.config_resume(&cwd) {
             if let Some(handle) = self.instances.get(&instance) {
                 let agent = handle.key.agent.clone();
-                if !self.teams.configured_for(&cwd, &agent) {
-                    // The configure that just arrived belongs to another agent
-                    // (another front end on the same cwd). Resuming would hand
-                    // the team a template of the wrong adapter: stay suspended
-                    // and let the leader of its own agent configure again.
+                let fingerprint = handle.fingerprint.clone();
+                if !self.teams.configured_for(&cwd, &fingerprint) {
+                    // The configure that just arrived belongs to another
+                    // instance (another front end on the same cwd). Resuming
+                    // would hand the team a template of the wrong adapter: stay
+                    // suspended and let the right leader configure again.
                     return Ok(json!({}));
                 }
-                let config = self.teams.config_for_leader(&cwd, &agent)?;
-                self.teams
-                    .start_resume_with_config(&team, &instance, &session, &agent, config);
+                let config = self.teams.config_for_leader(&cwd, &fingerprint)?;
+                self.teams.start_resume_with_config(
+                    &team,
+                    &instance,
+                    &session,
+                    &agent,
+                    &fingerprint,
+                    config,
+                );
                 self.resume_team(&team);
             } else {
                 // The instance that bound before configure is gone; stay
@@ -363,6 +370,14 @@ impl Hub {
         Ok(json!({}))
     }
 
+    /// `leader_server`, `bind_leader` and a resume need the fingerprint of an
+    /// instance's launch: two leaders may share an agent id yet differ.
+    fn instance_fingerprint(&self, instance: &str) -> Option<String> {
+        self.instances
+            .get(instance)
+            .map(|handle| handle.fingerprint.clone())
+    }
+
     fn team_leader_server(&mut self, params: &Value) -> Result<Value, TeamError> {
         let instance = required_team_string(params, "instance")?;
         let cwd = required_team_string(params, "cwd")?;
@@ -371,9 +386,12 @@ impl Hub {
         };
         let instance_cwd = handle.key.cwd.clone();
         let agent = handle.key.agent.clone();
+        let Some(fingerprint) = self.instance_fingerprint(&instance) else {
+            return Err(TeamError::new(UNKNOWN_INSTANCE, "unknown instance"));
+        };
         let (server, token_id) =
             self.teams
-                .leader_server(&instance, &cwd, &instance_cwd, &agent)?;
+                .leader_server(&instance, &cwd, &instance_cwd, &agent, &fingerprint)?;
         Ok(json!({ "server": server, "token_id": token_id }))
     }
 
@@ -383,11 +401,14 @@ impl Hub {
             return Err(TeamError::new(UNKNOWN_INSTANCE, "unknown instance"));
         };
         let agent = handle.key.agent.clone();
+        let Some(fingerprint) = self.instance_fingerprint(&instance) else {
+            return Err(TeamError::new(UNKNOWN_INSTANCE, "unknown instance"));
+        };
         let session = required_team_string(params, "sessionId")?;
         let token_id = required_team_string(params, "token_id")?;
         match self
             .teams
-            .bind_leader(&instance, &session, &token_id, &agent)?
+            .bind_leader(&instance, &session, &token_id, &agent, &fingerprint)?
         {
             crate::team::BindOutcome::Active(entry) => Ok(entry),
             crate::team::BindOutcome::Resume { team, entry } => {
@@ -418,16 +439,17 @@ impl Hub {
             let Some(participant) = team.participants.get(&name) else {
                 continue;
             };
-            let template_name = participant.template.clone().unwrap_or_default();
-            if !team.config.templates.contains_key(&template_name) {
-                self.teams.worker_start_failed(
-                    team_id,
-                    &name,
-                    &format!("template {template_name} is no longer configured"),
-                );
-                failures.push(name.clone());
-                continue;
-            }
+            // A participant stored with one agent resumes only with a template
+            // that starts that same agent: its stored session belongs to a
+            // conversation the other adapter never had.
+            let template_name = match self.teams.resume_template(team_id, &name) {
+                Ok((template_name, _)) => template_name,
+                Err(reason) => {
+                    self.teams.worker_start_failed(team_id, &name, &reason);
+                    failures.push(name.clone());
+                    continue;
+                }
+            };
             let resume_session = participant.session.clone();
             let worktree = participant.worktree.clone();
             let resume_model = participant.model.clone();

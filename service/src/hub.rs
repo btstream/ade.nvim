@@ -430,6 +430,11 @@ struct Instance {
     /// True once `agent.stop` was accepted; the instance stays reachable by id
     /// until the process exits (PROTOCOL.md 3.4).
     stopping: bool,
+    /// Fingerprint of the launch this instance runs (`team::launch_fingerprint`).
+    ///
+    /// It covers the key, the environment and the managed release, so two
+    /// instances that share an agent id but start differently are told apart.
+    fingerprint: String,
     /// Lease for a managed release this instance runs (PROTOCOL.md 16.4).
     #[cfg(unix)]
     _lease: Option<install_lock::ReleaseLease>,
@@ -1618,7 +1623,7 @@ impl Hub {
             command: key.command.clone(),
             args: key.args.clone(),
             cwd: key.cwd.clone().into(),
-            env,
+            env: env.clone(),
         };
         let exited = Exited::new();
         let started = runtime::start(
@@ -1648,6 +1653,10 @@ impl Hub {
                 key
             }
         };
+        #[cfg(unix)]
+        let fingerprint = crate::team::launch_fingerprint(&key, env.as_deref(), launch.as_ref());
+        #[cfg(not(unix))]
+        let fingerprint = crate::team::launch_fingerprint(&key, env.as_deref());
         self.instances.insert(
             instance_id.clone(),
             Instance {
@@ -1661,6 +1670,7 @@ impl Hub {
                 log_key,
                 attached: Vec::new(),
                 stopping: false,
+                fingerprint,
                 #[cfg(unix)]
                 _lease: lease,
             },
@@ -3161,6 +3171,7 @@ mod tests {
             log_key: "i1".to_string(),
             attached: vec![1, 2],
             stopping: false,
+            fingerprint: "fp".to_string(),
             #[cfg(unix)]
             _lease: None,
         };

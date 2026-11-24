@@ -425,7 +425,21 @@ function Server:dispatch(message, client)
         and team.leader
         and team.leader.instance ~= params.instance
       then
-        return error_reply(ident, -32061, "a team already exists for this cwd")
+        -- A leader-only team is what a chat session leaves behind: the service
+        -- allows another session to take it over, so the fake does too. A team
+        -- with any worker, card or inbox item still refuses.
+        local worked = false
+        for _, participant in ipairs(team.participants or {}) do
+          if participant.name ~= "leader" and participant.name ~= "human" then
+            worked = true
+          end
+        end
+        if #(team.inbox or {}) > 0 or (team.board_rev or 0) > 0 or team.workflow_name ~= nil then
+          worked = true
+        end
+        if worked then
+          return error_reply(ident, -32061, "a team already exists for this cwd")
+        end
       end
     end
     local result = {
@@ -469,7 +483,27 @@ function Server:dispatch(message, client)
       return nil
     end
     if existing and existing.leader and existing.leader.sessionId ~= params.sessionId then
-      return error_reply(ident, -32061, "another session leads this team")
+      local worked = false
+      for _, participant in ipairs(existing.participants or {}) do
+        if participant.name ~= "leader" and participant.name ~= "human" then
+          worked = true
+        end
+      end
+      if #(existing.inbox or {}) > 0 or (existing.board_rev or 0) > 0 or existing.workflow_name ~= nil then
+        worked = true
+      end
+      if worked then
+        return error_reply(ident, -32061, "another session leads this team")
+      end
+      -- A chat by-product: the new session takes the team over.
+      existing.leader = { instance = params.instance, sessionId = params.sessionId }
+      for _, participant in ipairs(existing.participants or {}) do
+        if participant.name == "leader" then
+          participant.instance = params.instance
+          participant.sessionId = params.sessionId
+        end
+      end
+      self:emit(client, "team.changed", { team = vim.deepcopy(existing) })
     end
     local team = existing
     if not team then

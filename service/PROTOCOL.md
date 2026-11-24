@@ -1451,14 +1451,31 @@ config = {
 **Derived templates.** A front end that derives a template from its own
 leader's launch (a fresh installation without `teams.templates`) declares it
 with `derived: {template, agent}`: `template` must be a template of this same
-configuration and `agent` is the leader agent it was derived from. Such a
-configuration serves only a leader of that agent — `team.leader_server` binds
-an agent to the token it issues, and `team.bind_leader`, `team.configure`'s
-resume and a restart resume refuse a leader of another agent (`-32061`), so a
-second front end on the same cwd can never start a worker with a different
-adapter. An explicit configuration declares no `derived` and serves any agent.
-`derived` is never written to the event log; a restored team takes it from the
-front end that resumes it.
+configuration whose `key.agent` equals `agent` (`-32060` otherwise).
+
+The service derives a fingerprint from that template's launch (`key`, `env`
+and managed release) and keeps the configuration under `(cwd, fingerprint)`.
+A leader may only use the entry whose fingerprint equals its own instance's,
+so two leaders that share an agent id but start with a different command,
+arguments, environment or managed release are told apart (`-32061` for the
+other). An explicit configuration declares no `derived`, replaces every derived
+entry for its cwd and serves any instance. `derived` is never written to the
+event log; a restored team takes its configuration from the front end that
+resumes it.
+
+**Recovery.** A restart resume checks the stored team against what the resuming
+front end supplies. A team stored for one leader *agent* is refused (`-32061`)
+when the resuming bind reports another, whatever the session id says. A stored
+participant resumes only under a template that starts the agent it ran; if the
+template now starts another one, the participant stays `exited` with that
+reason instead of handing its stored session to a different adapter.
+
+**Chat by-products.** A team a session creates by merely chatting has no
+worker, card or inbox item. `team.leader_server` and `team.bind_leader` let
+another session of the same cwd take such a team over (the bind moves the
+leader instance, session and configuration), so asking for a team in a new
+session works through ordinary chat. A team with any worker, card or inbox item
+keeps its leader: another leader is `-32061`.
 
 A workflow on the wire:
 

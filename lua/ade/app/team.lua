@@ -683,17 +683,22 @@ function Team:leader_server(instance, cwd)
           return done(nil)
         elseif entry.leader.instance ~= nil then
           self.suspended_cwd[cwd] = nil
-          self.blocked[cwd] = true
           if M.inactive(entry) then
             -- A team with no worker, card or inbox item is what this session
             -- would itself have created: switching sessions must not report a
-            -- conflict the person never asked for.
+            -- conflict the person never asked for. Keep asking for a leader
+            -- server below, so chatting in the new session can take the team
+            -- over instead of only `:Ade team start` doing it.
             self.unused[cwd] = entry.id
-          elseif not self.warned_blocked[cwd] then
-            self.warned_blocked[cwd] = true
-            self.notify("a team already exists for this cwd; close it before starting another", vim.log.levels.WARN)
+            self.blocked[cwd] = nil
+          else
+            self.blocked[cwd] = true
+            if not self.warned_blocked[cwd] then
+              self.warned_blocked[cwd] = true
+              self.notify("a team already exists for this cwd; close it before starting another", vim.log.levels.WARN)
+            end
+            return done(nil)
           end
-          return done(nil)
         end
       end
     end
@@ -710,10 +715,12 @@ function Team:leader_server(instance, cwd)
           -- Another session already leads that cwd's team; a single-agent
           -- session must not be injected with a leader server. A leader-only
           -- team of a chat session is not a conflict worth reporting.
-          self.blocked[cwd] = true
           local entry = self:team_for_cwd(cwd)
           if M.inactive(entry) then
             self.unused[cwd] = entry.id
+            self.blocked[cwd] = nil
+          else
+            self.blocked[cwd] = true
           end
         end
         settled(ok2, value)
@@ -807,8 +814,20 @@ function Team:bind_leader(instance, session_id, cwd)
       end
       return
     end
-    local team_id = type(value) == "table" and type(value.team) == "table" and value.team.id or nil
+    local bound_team = type(value) == "table" and type(value.team) == "table" and value.team or nil
+    local team_id = bound_team and bound_team.id or nil
     self.bound[cwd] = { instance = instance, session_id = session_id, team = team_id }
+    -- This session leads the cwd now, including after taking over a team a chat
+    -- session had left unused: nothing blocks it any more.
+    self.blocked[cwd] = nil
+    self.unused[cwd] = nil
+    self.warned_blocked[cwd] = nil
+    if bound_team then
+      -- The bind reply is authoritative: it names this instance and session as
+      -- the leader, which a `team.list` racing it can still show as the old
+      -- one.
+      self.teams[team_id] = bound_team
+    end
     self:refresh()
     self:start_enabled_workers(team_id, type(value) == "table" and value.team or nil)
   end)

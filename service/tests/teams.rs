@@ -4947,17 +4947,16 @@ fn team_start_writes_the_workflow_onto_an_empty_board() {
     assert_eq!(board["workflow_name"], "flow", "{board}");
     assert_eq!(board["columns"], json!(["mine"]), "{board}");
 }
-
-/// Two front ends in one cwd must not hand a derived template to a leader of
-/// another agent (19.1).
+/// Two front ends in one cwd must not hand a derived template to another
+/// launch (19.1).
 ///
-/// `team.configure` is keyed by cwd, so the last writer used to win. With a
-/// `derived` declaration the service keeps the template with the agent it was
-/// derived from and refuses the other leader, so a worker can never start a
-/// different adapter than the one that supplied the configuration.
+/// `team.configure` is keyed by cwd, so the last writer used to win. A derived
+/// declaration must match its own template's `key.agent`, and the service binds
+/// the configuration to the launch its template describes: another agent (or
+/// the same agent id started with another command) cannot take it.
 #[test]
-fn a_derived_template_is_bound_to_its_own_agent_across_front_ends() {
-    let server = TestServer::start("team-derived-agent");
+fn a_derived_template_is_bound_to_its_own_launch_across_front_ends() {
+    let server = TestServer::start("team-derived-launch");
     let work = server.dir().join("work");
     std::fs::create_dir_all(&work).expect("work dir");
     let log = server.dir().join("derived-agent.log");
@@ -4969,17 +4968,18 @@ fn a_derived_template_is_bound_to_its_own_agent_across_front_ends() {
     let hello = client.hello(&server.token(), nvim_ade_server::API_VERSION);
     assert!(hello["result"].is_object(), "hello: {hello}");
 
-    // An opencode-like instance and a pi-like one, same cwd.
     let script = agent();
-    let mut attach = |name: &str, command: &str| {
+    let mut next_id = 1;
+    let mut attach = |agent: &str, variant: &str| {
+        next_id += 1;
         let attached = client.request(
-            1,
+            next_id,
             "agent.attach",
             json!({
                 "key": {
-                    "agent": name,
-                    "command": command,
-                    "args": [script],
+                    "agent": agent,
+                    "command": "python3",
+                    "args": [script, variant],
                     "cwd": cwd,
                 },
                 "client_capabilities": {},
@@ -4988,20 +4988,22 @@ fn a_derived_template_is_bound_to_its_own_agent_across_front_ends() {
         );
         attached["result"]["instance"]
             .as_str()
-            .unwrap_or_else(|| panic!("attach {name}: {attached}"))
+            .unwrap_or_else(|| panic!("attach {agent}/{variant}: {attached}"))
             .to_string()
     };
-    let opencode = attach("opencode", "python3");
-    let pi = attach("pi", "python3");
+    // Same agent id and command, different arguments: two launches, which is
+    // exactly what the agent id alone cannot tell apart.
+    let launch_a = attach("opencode", "--variant-a");
+    let launch_b = attach("opencode", "--variant-b");
 
-    let derived_config = |name: &str| {
+    let derived_config = |name: &str, variant: &str| {
         json!({
             "max_workers": 3,
             "spawn_confirm": { "auto": [] },
             "limits": { "max_turns_per_task": 30, "max_turns_total": 200 },
             "templates": {
                 "worker": {
-                    "key": { "agent": name, "command": "python3", "args": [script] },
+                    "key": { "agent": name, "command": "python3", "args": [script, variant] },
                     "env": env,
                     "role": "a derived worker",
                     "worktree": false
@@ -5011,40 +5013,168 @@ fn a_derived_template_is_bound_to_its_own_agent_across_front_ends() {
         })
     };
 
-    // Both ask for a leader token first, each for its own instance/agent.
-    let opencode_server = client.request(
-        2,
-        "team.leader_server",
-        json!({ "instance": opencode, "cwd": cwd }),
+    let (token_a, token_b) = {
+        let first = client.request(
+            100,
+            "team.leader_server",
+            json!({ "instance": launch_a, "cwd": cwd }),
+        );
+        let second = client.request(
+            101,
+            "team.leader_server",
+            json!({ "instance": launch_b, "cwd": cwd }),
+        );
+        (
+            first["result"]["token_id"]
+                .as_str()
+                .expect("A token")
+                .to_string(),
+            second["result"]["token_id"]
+                .as_str()
+                .expect("B token")
+                .to_string(),
+        )
+    };
+
+    // Both front ends configure; B writes last, so a cwd-keyed map would leave
+    // A with B's template.
+    let configured_a = client.request(
+        102,
+        "team.configure",
+        json!({ "cwd": cwd, "config": derived_config("opencode", "--variant-a") }),
     );
-    let opencode_token = opencode_server["result"]["token_id"]
-        .as_str()
-        .expect("opencode token")
-        .to_string();
-    let pi_server = client.request(
+    assert!(
+        configured_a["result"].is_object(),
+        "configure A: {configured_a}"
+    );
+    let configured_b = client.request(
+        103,
+        "team.configure",
+        json!({ "cwd": cwd, "config": derived_config("opencode", "--variant-b") }),
+    );
+    assert!(
+        configured_b["result"].is_object(),
+        "configure B: {configured_b}"
+    );
+
+    let mut session_for = |instance: &str, id: i64| {
+        let response = tunnel_call(
+            &mut client,
+            instance,
+            id,
+            "session/new",
+            json!({ "cwd": cwd, "mcpServers": [] }),
+        );
+        response["result"]["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string()
+    };
+    let session_a = session_for(&launch_a, 10);
+    let session_b = session_for(&launch_b, 11);
+
+    // A binds first and gets its own template.
+    let bound = client.request(
+        104,
+        "team.bind_leader",
+        json!({ "instance": launch_a, "sessionId": session_a, "token_id": token_a }),
+    );
+    let team = bound["result"]["team"].clone();
+    assert_eq!(team["state"], "active", "bind A: {bound}");
+
+    // Team A has no worker and no card yet: it is a chat by-product, so B takes
+    // it over. One cwd keeps one team (18.1); the team now runs B and B's own
+    // derived template, which is the template a worker would be started from.
+    let taken = client.request(
+        105,
+        "team.bind_leader",
+        json!({ "instance": launch_b, "sessionId": session_b, "token_id": token_b }),
+    );
+    let taken = taken["result"]["team"].clone();
+    assert_eq!(taken["id"], team["id"], "the same team: {taken}");
+    let teams = client.request(106, "team.list", json!({}));
+    let listed = teams["result"]["teams"].as_array().unwrap();
+    assert_eq!(listed.len(), 1, "one team: {teams}");
+    let participant = listed[0]["participants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "leader")
+        .expect("leader participant");
+    assert_eq!(participant["agent"], "opencode");
+    assert_eq!(
+        participant["instance"],
+        json!(launch_b),
+        "the by-product team moved to the new session"
+    );
+}
+
+/// The configuration of a launch that never supplied one is not substituted:
+/// a third launch of the same agent id cannot bind with someone else's template.
+#[test]
+fn a_launch_that_never_configured_cannot_bind_a_team() {
+    let server = TestServer::start("team-derived-stranger");
+    let work = server.dir().join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let log = server.dir().join("stranger.log");
+    let gate = server.dir().join("stranger.gate");
+    let env = child_env(&server, &log, &gate);
+    let cwd = work.to_string_lossy().to_string();
+    let script = agent();
+
+    let mut client = server.connect();
+    client.hello(&server.token(), nvim_ade_server::API_VERSION);
+    let attach = |client: &mut Client, variant: &str| {
+        let attached = client.request(
+            1,
+            "agent.attach",
+            json!({
+                "key": { "agent": "opencode", "command": "python3", "args": [script, variant], "cwd": cwd },
+                "client_capabilities": {},
+                "env": env,
+            }),
+        );
+        attached["result"]["instance"]
+            .as_str()
+            .unwrap_or_else(|| panic!("attach {variant}: {attached}"))
+            .to_string()
+    };
+    let configured = attach(&mut client, "--configured");
+    let stranger = attach(&mut client, "--stranger");
+
+    let configured_config = json!({
+        "max_workers": 3,
+        "spawn_confirm": { "auto": [] },
+        "limits": { "max_turns_per_task": 30, "max_turns_total": 200 },
+        "templates": {
+            "worker": {
+                "key": { "agent": "opencode", "command": "python3", "args": [script, "--configured"] },
+                "env": env,
+                "role": "a derived worker",
+                "worktree": false
+            }
+        },
+        "derived": { "template": "worker", "agent": "opencode" }
+    });
+    let response = client.request(
+        2,
+        "team.configure",
+        json!({ "cwd": cwd, "config": configured_config }),
+    );
+    assert!(response["result"].is_object(), "configure: {response}");
+
+    let leader = client.request(
         3,
         "team.leader_server",
-        json!({ "instance": pi, "cwd": cwd }),
+        json!({ "instance": stranger, "cwd": cwd }),
     );
-    let pi_token = pi_server["result"]["token_id"]
+    let token = leader["result"]["token_id"]
         .as_str()
-        .expect("pi token")
+        .expect("stranger token")
         .to_string();
-
-    // The pi front end configures last: its derived template replaces the one
-    // keyed by cwd.
-    let configured = client.request(
-        4,
-        "team.configure",
-        json!({ "cwd": cwd, "config": derived_config("pi") }),
-    );
-    assert!(configured["result"].is_object(), "configure: {configured}");
-
-    // The opencode leader binds now: it must be refused, not given the pi
-    // template, and no team may exist for that cwd.
     let session = tunnel_call(
         &mut client,
-        &opencode,
+        &stranger,
         10,
         "session/new",
         json!({ "cwd": cwd, "mcpServers": [] }),
@@ -5054,127 +5184,247 @@ fn a_derived_template_is_bound_to_its_own_agent_across_front_ends() {
         .expect("session id")
         .to_string();
     let refused = client.request(
-        5,
+        4,
         "team.bind_leader",
-        json!({ "instance": opencode, "sessionId": session, "token_id": opencode_token }),
+        json!({ "instance": stranger, "sessionId": session, "token_id": token }),
     );
     assert_eq!(refused["error"]["code"], -32061, "{refused}");
     assert!(
         refused["error"]["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("pi"),
-        "the refusal names the agent the configuration belongs to: {refused}"
+            .contains("another leader launch"),
+        "the refusal names the launch: {refused}"
     );
-    let teams = client.request(6, "team.list", json!({}));
-    assert!(
-        teams["result"]["teams"]
-            .as_array()
-            .is_some_and(Vec::is_empty),
-        "no team was created: {teams}"
-    );
-
-    // The pi leader binds with its own configuration.
-    let session = tunnel_call(
-        &mut client,
-        &pi,
-        11,
-        "session/new",
-        json!({ "cwd": cwd, "mcpServers": [] }),
-    );
-    let session = session["result"]["sessionId"]
-        .as_str()
-        .expect("session id")
-        .to_string();
-    let bound = client.request(
-        7,
-        "team.bind_leader",
-        json!({ "instance": pi, "sessionId": session, "token_id": pi_token }),
-    );
-    let team = bound["result"]["team"].clone();
-    assert_eq!(team["state"], "active", "bind: {bound}");
-    let leader = team["participants"]
+    let teams = client.request(5, "team.list", json!({}));
+    assert!(teams["result"]["teams"]
         .as_array()
-        .and_then(|items| items.iter().find(|entry| entry["name"] == "leader"))
-        .cloned()
-        .expect("leader participant");
-    assert_eq!(leader["agent"], "pi", "the leader runs its own agent");
+        .is_some_and(Vec::is_empty));
+    let _ = configured;
 }
 
-/// A resume after a restart must not start the stored workers with another
-/// agent's template (18.15, 19.1).
+/// Starting B, sending B's configuration and replaying A's session id must not
+/// resume A's stored team (18.15).
 #[test]
-fn a_resume_refuses_a_derived_template_of_another_agent() {
+fn a_restart_resume_refuses_a_team_stored_for_another_agent() {
     use nvim_ade_server::team::Teams;
 
-    let (mut teams, team_id) = {
-        let tokens = nvim_ade_server::team::new_shared_tokens();
-        let mut teams = Teams::new(tokens);
-        let config = json!({
+    let worker_config = |agent: &str, command: &str| {
+        json!({
             "max_workers": 3,
             "spawn_confirm": { "auto": [] },
             "limits": { "max_turns_per_task": 30, "max_turns_total": 200 },
             "templates": {
                 "worker": {
-                    "key": { "agent": "opencode", "command": "python3", "args": [] },
+                    "key": { "agent": agent, "command": command, "args": [] },
+                    "role": "a derived worker"
+                }
+            },
+            "derived": { "template": "worker", "agent": agent }
+        })
+    };
+
+    // A team stored for agent A.
+    let mut original = Teams::new(nvim_ade_server::team::new_shared_tokens());
+    original
+        .configure("/repo", worker_config("opencode", "python3"))
+        .expect("configure A");
+    let fingerprint_a = original
+        .derived_fingerprint_for("/repo")
+        .expect("A fingerprint");
+    let (_server, token) = original
+        .leader_server("i-a", "/repo", "/repo", "opencode", &fingerprint_a)
+        .expect("A leader");
+    original
+        .bind_leader("i-a", "s1", &token, "opencode", &fingerprint_a)
+        .expect("bind A");
+    let id = original.list()["teams"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let snapshot = original.snapshot_team(&id).expect("snapshot");
+    let (max_team, max_inbox) = original.counters();
+
+    // A restart, then B's front end: it configures its own template and replays
+    // the stored session id.
+    let mut restored = Teams::new(nvim_ade_server::team::new_shared_tokens());
+    restored
+        .configure("/repo", worker_config("pi", "pi-acp"))
+        .expect("configure B");
+    restored.restore(vec![(id.clone(), snapshot)], max_team, max_inbox, 0, None);
+    assert_eq!(
+        restored.list()["teams"][0]["state"],
+        "suspended",
+        "a restored team is suspended"
+    );
+    let fingerprint_b = restored
+        .derived_fingerprint_for("/repo")
+        .expect("B fingerprint");
+    let (_server, token) = restored
+        .leader_server("i-b", "/repo", "/repo", "pi", &fingerprint_b)
+        .expect("B leader");
+    let error = restored
+        .bind_leader("i-b", "s1", &token, "pi", &fingerprint_b)
+        .expect_err("the team was stored for opencode");
+    assert_eq!(error.code, -32061, "{error:?}");
+    assert!(error.message.contains("opencode"), "{error:?}");
+    assert!(
+        restored.team(&id).is_some_and(|team| team.suspended),
+        "the team stays suspended instead of starting pi workers"
+    );
+}
+
+/// A restored worker whose stored agent differs from the template that now
+/// carries its name must not be resumed with that template: its session belongs
+/// to another adapter's conversation (18.15, 19.1).
+#[test]
+fn a_restored_worker_does_not_resume_under_another_agent() {
+    use nvim_ade_server::team::{SpawnOutcome, Teams};
+
+    // A team whose worker ran agent `opencode` under template `worker`.
+    let mut original = Teams::new(nvim_ade_server::team::new_shared_tokens());
+    original
+        .configure(
+            "/repo",
+            json!({
+                "max_workers": 3,
+                "spawn_confirm": { "auto": ["worker"] },
+                "limits": { "max_turns_per_task": 30, "max_turns_total": 200 },
+                "templates": {
+                    "worker": {
+                        "key": { "agent": "opencode", "command": "python3", "args": [] },
+                        "role": "a worker"
+                    }
+                }
+            }),
+        )
+        .expect("configure");
+    let (_server, token) = original
+        .leader_server("i1", "/repo", "/repo", "opencode", "fp")
+        .expect("leader");
+    original
+        .bind_leader("i1", "s1", &token, "opencode", "fp")
+        .expect("bind");
+    let team_id = original.list()["teams"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let SpawnOutcome::Started(spawn) = original
+        .request_spawn(&team_id, "worker", Some("w1"), None, None, None)
+        .expect("spawn")
+    else {
+        panic!("auto-approved template starts");
+    };
+    let name = spawn.name;
+    original.worker_instance_set(&team_id, &name, "w1-i");
+    original.worker_session_set(&team_id, &name, "w1-s");
+    original.worker_started(&team_id, &name);
+    let snapshot = original.snapshot_team(&team_id).expect("snapshot");
+    let (max_team, max_inbox) = original.counters();
+
+    // After the restart the same template name starts another agent.
+    let mut restored = Teams::new(nvim_ade_server::team::new_shared_tokens());
+    restored
+        .configure(
+            "/repo",
+            json!({
+                "max_workers": 3,
+                "spawn_confirm": { "auto": ["worker"] },
+                "limits": { "max_turns_per_task": 30, "max_turns_total": 200 },
+                "templates": {
+                    "worker": {
+                        "key": { "agent": "pi", "command": "pi-acp", "args": [] },
+                        "role": "a worker"
+                    }
+                }
+            }),
+        )
+        .expect("configure");
+    restored.restore(
+        vec![(team_id.clone(), snapshot)],
+        max_team,
+        max_inbox,
+        0,
+        None,
+    );
+    let reason = restored
+        .resume_template(&team_id, &name)
+        .expect_err("the template now starts another agent");
+    assert!(
+        reason.contains("pi") && reason.contains("opencode"),
+        "{reason}"
+    );
+}
+
+/// A restore that supplies a configuration of another launch resumes with that
+/// launch's own template, never the stored one (18.15, 19.1).
+#[allow(dead_code)]
+#[test]
+fn a_restart_resume_takes_the_resuming_launchs_template() {
+    use nvim_ade_server::team::{BindOutcome, Teams};
+
+    let worker_config = |command: &str| {
+        json!({
+            "max_workers": 3,
+            "spawn_confirm": { "auto": [] },
+            "limits": { "max_turns_per_task": 30, "max_turns_total": 200 },
+            "templates": {
+                "worker": {
+                    "key": { "agent": "opencode", "command": command, "args": [] },
                     "role": "a derived worker"
                 }
             },
             "derived": { "template": "worker", "agent": "opencode" }
-        });
-        teams.configure("/repo", config).expect("configure");
-        let (_server, token) = teams
-            .leader_server("i1", "/repo", "/repo", "opencode")
-            .expect("leader server");
-        teams
-            .bind_leader("i1", "s1", &token, "opencode")
-            .expect("bind");
-        let id = teams.list()["teams"][0]["id"].as_str().unwrap().to_string();
-        let snapshot = teams.snapshot_team(&id).expect("snapshot");
-        let (max_team, max_inbox) = teams.counters();
-
-        let mut restored = Teams::new(nvim_ade_server::team::new_shared_tokens());
-        // Another agent configures the same cwd after the restart.
-        restored
-            .configure(
-                "/repo",
-                json!({
-                    "max_workers": 3,
-                    "spawn_confirm": { "auto": [] },
-                    "limits": { "max_turns_per_task": 30, "max_turns_total": 200 },
-                    "templates": {
-                        "worker": {
-                            "key": { "agent": "pi", "command": "python3", "args": [] },
-                            "role": "a derived worker"
-                        }
-                    },
-                    "derived": { "template": "worker", "agent": "pi" }
-                }),
-            )
-            .expect("configure");
-        restored.restore(vec![(id.clone(), snapshot)], max_team, max_inbox, 0, None);
-        assert_eq!(
-            restored.list()["teams"][0]["state"],
-            "suspended",
-            "a restored team is suspended"
-        );
-        (restored, id)
+        })
     };
 
-    let (_server, token) = teams
-        .leader_server("i2", "/repo", "/repo", "opencode")
-        .expect("leader server");
-    let error = teams
-        .bind_leader("i2", "s1", &token, "opencode")
-        .expect_err("the only configuration belongs to pi");
-    assert_eq!(error.code, -32061, "{error:?}");
+    let mut original = Teams::new(nvim_ade_server::team::new_shared_tokens());
+    original
+        .configure("/repo", worker_config("python3"))
+        .expect("configure A");
+    let fingerprint_a = original
+        .derived_fingerprint_for("/repo")
+        .expect("A fingerprint");
+    let (_server, token) = original
+        .leader_server("i-a", "/repo", "/repo", "opencode", &fingerprint_a)
+        .expect("A leader");
+    original
+        .bind_leader("i-a", "s1", &token, "opencode", &fingerprint_a)
+        .expect("bind A");
+    let id = original.list()["teams"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let snapshot = original.snapshot_team(&id).expect("snapshot");
+    let (max_team, max_inbox) = original.counters();
+
+    // The same agent id with another command: the launch differs, but the team
+    // stores only its leader's *agent*, and the same session id is the same
+    // conversation. The resume therefore proceeds with the resuming launch's
+    // configuration — never the stored template string copied forward.
+    let mut restored = Teams::new(nvim_ade_server::team::new_shared_tokens());
+    restored
+        .configure("/repo", worker_config("/opt/other/opencode"))
+        .expect("configure B");
+    restored.restore(vec![(id.clone(), snapshot)], max_team, max_inbox, 0, None);
+    let fingerprint_b = restored
+        .derived_fingerprint_for("/repo")
+        .expect("B fingerprint");
+    assert_ne!(fingerprint_a, fingerprint_b, "different launches");
+    let (_server, token) = restored
+        .leader_server("i-b", "/repo", "/repo", "opencode", &fingerprint_b)
+        .expect("B leader");
+    let outcome = restored
+        .bind_leader("i-b", "s1", &token, "opencode", &fingerprint_b)
+        .expect("the same agent may resume its stored session");
+    assert!(matches!(outcome, BindOutcome::Resume { .. }), "{outcome:?}");
+    let live = restored.team(&id).unwrap();
     assert_eq!(
-        teams.list()["teams"][0]["state"],
-        "suspended",
-        "the team stays suspended instead of starting pi workers"
+        live.leader_fingerprint.as_deref(),
+        Some(fingerprint_b.as_str())
     );
-    assert!(
-        teams.team(&team_id).is_some_and(|team| team.suspended),
-        "still suspended"
+    assert_eq!(
+        live.config.templates["worker"].key.command, "/opt/other/opencode",
+        "the resumed team takes the configuration the resuming launch supplied"
     );
 }

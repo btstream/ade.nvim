@@ -1391,8 +1391,8 @@ return function(t)
       controller.connect()
       wait_ready()
       wait(function()
-        return team().blocked[dir] == true
-      end, 5000, "the blocked cwd")
+        return team():unused_team(dir) ~= nil
+      end, 5000, "the unused team")
       for _, note in ipairs(notices) do
         t.falsy(
           note.message:find("already exists for this cwd", 1, true) or note.message:find("another session", 1, true),
@@ -1400,6 +1400,9 @@ return function(t)
         )
       end
       t.eq(id, (team():unused_team(dir) or {}).id, "the by-product team is remembered as unused")
+      -- It never blocks this session: a new session may take it over, which is
+      -- what lets ordinary chat ask for a team instead of needing the command.
+      t.eq(nil, team().blocked[dir], "an unused team does not block the cwd")
       -- Once it has real work it is a team of its own again: the unused mark is
       -- dropped, so a later conflict is reported normally.
       service:team_changed({
@@ -1698,14 +1701,17 @@ return function(t)
       t.eq(0, #service.team_starts)
     end)
 
-    t.it("does not inject a leader when another instance already leads the cwd", function()
+    t.it("does not inject a leader when another session leads a team with work", function()
       local service, dir = start_service(t, "other-leader")
       service.teams.t1 = {
         id = "t1",
         cwd = dir,
         state = "active",
         leader = { instance = "someone-else", sessionId = "s-other" },
-        participants = {},
+        participants = {
+          { name = "leader", state = "idle", task = "_", queued = 0, turns = {} },
+          { name = "w1", state = "idle", task = "_", queued = 0, turns = {} },
+        },
         inbox = {},
         limits = {},
       }
@@ -1715,6 +1721,37 @@ return function(t)
       t.eq(0, #calls_of(service, "team.leader_server"))
       t.eq(0, #sent_frames(service, "session/new")[1].params.mcpServers)
       t.eq(true, team().blocked[dir])
+    end)
+
+    t.it("takes over a leader-only team a chat session left behind", function()
+      local service, dir = start_service(t, "chat-take-over")
+      service.teams.t1 = {
+        id = "t1",
+        cwd = dir,
+        state = "active",
+        leader = { instance = "someone-else", sessionId = "s-other" },
+        participants = {
+          { name = "leader", state = "idle", task = "_", queued = 0, turns = {} },
+        },
+        inbox = {},
+        limits = {},
+      }
+      local notices = capture(t)
+      setup(t, "chat-take-over", service, dir)
+      controller.connect()
+      wait_ready()
+      -- The new session asks for a leader server and the bind performs the
+      -- switch: chatting in the new session can form a team without the
+      -- explicit command.
+      wait(function()
+        return team().bound[dir] ~= nil and team():unused_team(dir) == nil
+      end, 5000, "the take-over bind")
+      t.eq(nil, team().blocked[dir], "no conflict for a team that never did work")
+      t.eq(nil, team():unused_team(dir), "the take-over clears the unused mark")
+      t.eq("sess_mock", team().bound[dir] and team().bound[dir].session_id)
+      for _, note in ipairs(notices) do
+        t.falsy(note.message:find("already exists for this cwd", 1, true), note.message)
+      end
     end)
 
     t.it("blocks a second leader after a -32061 bind failure", function()
