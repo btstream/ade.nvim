@@ -549,6 +549,11 @@ function Flow:handover(workflow, session, instance, cwd, generation, summary, cb
       -- switched elsewhere while the switch RPC was in flight.
       pcall(self.deps.submit, summary, session)
     end
+    -- A login during `session/new` restarts the agent: the model write at the
+    -- end of the start must use the replacement's current client, not the one
+    -- captured before the restart.
+    local client = self.deps.client and self.deps.client() or nil
+    self.target = { session = session, client = client }
     self:ask_task(workflow, session, instance, cwd, generation)
     cb(true, nil)
   end, { workflow = workflow, cwd = cwd, generation = generation, replacement = true })

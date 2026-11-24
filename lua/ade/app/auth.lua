@@ -243,7 +243,8 @@ end
 ---Run one method, then hand control back through `retry`.
 ---@param method table
 ---@param retry fun()|nil
-function Auth:run(method, retry)
+---@param on_failed (fun(message: string)|nil)|nil
+function Auth:run(method, retry, on_failed)
   local client = self.get_client()
   if type(method) ~= "table" or type(method.id) ~= "string" then
     self.notify("the agent did not offer a usable login method", vim.log.levels.WARN)
@@ -270,6 +271,9 @@ function Auth:run(method, retry)
       else
         local message = type(err) == "table" and (err.message or vim.inspect(err)) or tostring(err)
         self.notify("login failed: " .. message, vim.log.levels.ERROR)
+        if on_failed then
+          pcall(on_failed, message)
+        end
       end
       self.on_changed()
     end)
@@ -308,10 +312,16 @@ function Auth:run(method, retry)
       self.on_changed()
       if self.cancelled then
         self.cancelled = false
+        if on_failed then
+          pcall(on_failed, "the login was cancelled")
+        end
         return
       end
       if code ~= 0 then
         self.notify(string.format("login command exited with %d; still logged out", code), vim.log.levels.WARN)
+        if on_failed then
+          pcall(on_failed, string.format("login command exited with %d", code))
+        end
         return
       end
       self.attempts = self.attempts + 1
@@ -325,6 +335,9 @@ function Auth:run(method, retry)
         )
         -- Stay stopped: an automatic retry loop must not reopen terminals
         -- forever. `:Ade login` resets the counter for a deliberate retry.
+        if on_failed then
+          pcall(on_failed, "the agent still refuses after logging in")
+        end
         return
       end
       self.notify("login finished; restarting the agent", vim.log.levels.INFO)
@@ -341,13 +354,16 @@ function Auth:run(method, retry)
     self.running = false
     self.on_changed()
     self.notify("unable to open a login terminal: " .. tostring(err), vim.log.levels.ERROR)
+    if on_failed then
+      pcall(on_failed, "unable to open a login terminal: " .. tostring(err))
+    end
   end
 end
 
 ---Choose a method (single method runs directly) and log in.
 ---@param methods table[]|nil
 ---@param retry fun()|nil
-function Auth:login(methods, retry)
+function Auth:login(methods, retry, on_failed)
   methods = methods or self:methods()
   if #methods == 0 then
     self.notify(
@@ -357,7 +373,7 @@ function Auth:login(methods, retry)
     return false
   end
   if #methods == 1 then
-    self:run(methods[1], retry)
+    self:run(methods[1], retry, on_failed)
     return true
   end
   local items = {}
@@ -372,7 +388,7 @@ function Auth:login(methods, retry)
     title = "Log in",
     items = items,
     on_choice = function(method)
-      self:run(method, retry)
+      self:run(method, retry, on_failed)
     end,
   })
   return true
@@ -383,13 +399,15 @@ end
 ---Returns false when the error is not an auth error, so callers can keep their
 ---normal error path.
 ---@param err any
----@param opts {retry: fun()|nil, methods: table[]|nil, pending: fun(): boolean}|nil
+---@param opts {retry: fun()|nil, on_failed: fun(message: string)|nil, methods: table[]|nil,
+---  pending: fun(): boolean}|nil
 ---@return boolean handled
 function Auth:require(err, opts)
   if not M.is_auth_error(err) then
     return false
   end
   local retry = opts and opts.retry or nil
+  local on_failed = opts and opts.on_failed or nil
   -- A login already in flight (or a parked retry waiting for it) must not be
   -- doubled: a second terminal would be torn down by the first one's restart
   -- and its retry would overwrite the earlier message. Park behind it instead.
@@ -402,7 +420,7 @@ function Auth:require(err, opts)
   end
   local methods = (opts and opts.methods) or M.methods_from(err) or self:methods()
   self.notify("This agent requires a login", vim.log.levels.WARN)
-  return self:login(methods, retry)
+  return self:login(methods, retry, on_failed)
 end
 
 ---Log out, when the agent declares support.

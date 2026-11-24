@@ -108,6 +108,14 @@ function Sessions:open(session, opts)
   if not session then
     return false
   end
+  if not self:ready() then
+    -- The cached path below would activate a session with no live agent: a row
+    -- may only be opened once the connection is ready again.
+    if opts.on_failed then
+      pcall(opts.on_failed, "no agent process is running")
+    end
+    return false
+  end
   local client = self.get_client()
   local live = client and client.proc and client.proc.instance or nil
   local own = session.instance
@@ -203,6 +211,9 @@ function Sessions:create(on_missing, opts)
             -- replacement session ended.
             self:create(on_missing, opts)
           end,
+          -- A login that fails or is cancelled is the end of this creation: the
+          -- flow waiting on it must not hang.
+          on_failed = fail,
         })
       then
         return
@@ -274,7 +285,8 @@ end
 ---the agent-side context comes back, the transcript does not. The user is told,
 ---because an empty transcript after "open session" otherwise looks like a bug.
 ---@param session_id string
----@param opts {kind: string|nil, on_failed: fun(err: string)|nil, on_restored: fun()|nil}|nil
+---@param opts {kind: string|nil, select: boolean|nil, on_failed: fun(err: string)|nil,
+---  on_restored: fun()|nil}|nil
 function Sessions:resume(session_id, opts)
   opts = opts or {}
   local client = self.get_client()
@@ -285,8 +297,18 @@ function Sessions:resume(session_id, opts)
   local runtime = self.get_runtime()
   local cwd = opts.cwd or self.catalog:session_cwd(session_id, self.resolve_cwd())
   local entry = runtime:stage(session_id, cwd)
-  local intent = opts.intent or runtime:intend()
+  -- `select = false` commits the projection without taking over the screen: a
+  -- flow starting a background session must not replace (or close) the chat the
+  -- person is reading.
+  local select = opts.select ~= false
+  local intent = opts.intent
+  if intent == nil and select then
+    intent = runtime:intend()
+  end
   opts.intent = intent
+  local function selected()
+    return intent == nil or runtime.selection == intent
+  end
   -- Whether the caller was told how this attempt ended: a cancelled attempt
   -- still has to settle the flow waiting on it (`on_failed`), exactly once.
   local settled = false
@@ -296,7 +318,7 @@ function Sessions:resume(session_id, opts)
     end
     settled = true
     if ok then
-      if opts.on_restored and (not opts.cold_restore or runtime.selection == intent) then
+      if opts.on_restored and (not opts.cold_restore or selected()) then
         pcall(opts.on_restored)
       end
     elseif opts.on_failed then
@@ -318,7 +340,7 @@ function Sessions:resume(session_id, opts)
         auth
         and auth:require(result, {
           retry = function()
-            if not opts.cold_restore or runtime.selection == intent then
+            if not opts.cold_restore or selected() then
               self:resume(session_id, opts)
             end
           end,
@@ -362,13 +384,15 @@ function Sessions:resume(session_id, opts)
     if self.catalog:apply_title(entry) then
       self.on_changed()
     end
-    if runtime.selection == intent then
+    if select and runtime.selection == intent then
       self.activate(entry)
       self.render()
     end
     self.prune()
     self.on_changed()
-    self.notify("Session resumed (history is not replayed)")
+    if select then
+      self.notify("Session resumed (history is not replayed)")
+    end
     self.catalog:refresh_title(entry)
     settle(true)
   end, function(err)
@@ -400,13 +424,21 @@ end
 ---Used both when switching sessions and when restoring the current one after a
 ---reconnect.
 ---@param session_id string
----@param opts {kind: string|nil, intent: integer|nil}
+---@param opts {kind: string|nil, intent: integer|nil, select: boolean|nil}
 function Sessions:replay(session_id, opts)
   local runtime = self.get_runtime()
   local cwd = opts.cwd or self.catalog:session_cwd(session_id, self.resolve_cwd())
   local entry = runtime:stage(session_id, cwd)
-  local intent = opts.intent or runtime:intend()
+  -- `select = false`: commit without showing (see `Sessions:resume`).
+  local select = opts.select ~= false
+  local intent = opts.intent
+  if intent == nil and select then
+    intent = runtime:intend()
+  end
   opts.intent = intent
+  local function selected()
+    return intent == nil or runtime.selection == intent
+  end
   local client = self.get_client()
   local settled = false
   local function settle(ok, message)
@@ -415,7 +447,7 @@ function Sessions:replay(session_id, opts)
     end
     settled = true
     if ok then
-      if opts.on_restored and (not opts.cold_restore or runtime.selection == intent) then
+      if opts.on_restored and (not opts.cold_restore or selected()) then
         pcall(opts.on_restored)
       end
     elseif opts.on_failed then
@@ -440,7 +472,7 @@ function Sessions:replay(session_id, opts)
         auth
         and auth:require(result, {
           retry = function()
-            if not opts.cold_restore or runtime.selection == intent then
+            if not opts.cold_restore or selected() then
               self:replay(session_id, opts)
             end
           end,
@@ -500,7 +532,7 @@ function Sessions:replay(session_id, opts)
     if self.catalog:apply_title(entry) then
       self.on_changed()
     end
-    if runtime.selection == intent then
+    if select and runtime.selection == intent then
       self.activate(entry)
       self.render()
     end
@@ -572,8 +604,8 @@ end
 ---automatic restore: the user must be able to tell "reopened your conversation"
 ---from "started a new one because X".
 ---@param session_id string
----@param opts {kind: string|nil, reload: boolean|nil, client: table|nil, cwd: string|nil,
----  on_failed: fun(err: string)|nil, on_restored: fun()|nil}|nil
+---@param opts {kind: string|nil, reload: boolean|nil, select: boolean|nil, client: table|nil,
+---  cwd: string|nil, on_failed: fun(err: string)|nil, on_restored: fun()|nil}|nil
 function Sessions:load(session_id, opts)
   opts = opts or {}
   local function failed(message)
@@ -606,6 +638,14 @@ function Sessions:load(session_id, opts)
     return
   end
   if not forced and cached and not cached.needs_load and (cached.status ~= "idle" or #cached.queue > 0) then
+    if opts.select == false then
+      -- A background target: its cached projection is already committed, and
+      -- the caller only needed the tools; never take the screen.
+      if opts.on_restored then
+        pcall(opts.on_restored)
+      end
+      return
+    end
     runtime:intend()
     self.activate(cached)
     self.dispatch_queued(cached)

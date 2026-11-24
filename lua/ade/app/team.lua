@@ -803,6 +803,15 @@ function Team:query_session_teams(instance, session_id, cwd, cb, opts)
   end
   if query.inflight then
     query.again = true
+    -- Keep every source that joined this in-flight request: a tree read must
+    -- not swallow the real session event that arrives while it runs, or the
+    -- re-sent query would stay a pure read and never evaluate auto-start.
+    local source = type(opts) == "table" and opts.source or "session"
+    if source ~= "tree" or query.again_source == "session" then
+      query.again_source = "session"
+    else
+      query.again_source = "tree"
+    end
     query.waiters = query.waiters or {}
     query.waiters[#query.waiters + 1] = cb
     return
@@ -827,9 +836,14 @@ function Team:query_session_teams(instance, session_id, cwd, cb, opts)
     end
     query.waiters = nil
     local again = query.again
+    local again_source = query.again_source
     query.again = false
+    query.again_source = nil
     if again and self.session_queries[key] == query then
-      self:query_session_teams(instance, session_id, cwd, function() end, opts)
+      -- Re-send with the strongest source that joined the in-flight request.
+      self:query_session_teams(instance, session_id, cwd, function() end, {
+        source = again_source or "session",
+      })
     end
   end)
 end

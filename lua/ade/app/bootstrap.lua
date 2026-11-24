@@ -538,9 +538,15 @@ function M.build(ctx, opts, action)
         end
         cb(ok, value)
       end
+      -- Only a reload of the chat on screen may change the display: a flow
+      -- starting a background session must not switch the person's chat (and so
+      -- must not let the idle-close of a switch fire on it).
+      local current = S.sess.current
+      local select = current ~= nil and current.id == session_id
       local ok, err = pcall(S.sess.service.load, S.sess.service, session_id, {
         kind = "reload",
         reload = true,
+        select = select,
         client = client,
         on_restored = function()
           finish(true, { reloaded = true })
