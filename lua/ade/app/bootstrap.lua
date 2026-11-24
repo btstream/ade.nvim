@@ -255,6 +255,14 @@ function M.build(ctx, opts, action)
       return S.config or merged
     end,
     notify = notify,
+    find_session = function(id)
+      return S.sess.all and S.sess.all[id] or nil
+    end,
+    select_session = function(session)
+      if S.sess.service then
+        S.sess.service:activate(session)
+      end
+    end,
     input_win = function()
       return S.view.input and S.view.input.win or nil
     end,
@@ -450,8 +458,8 @@ function M.build(ctx, opts, action)
       return S.view.input
     end,
   })
-  -- Teams (PROTOCOL.md 18). Created before sessions because session/new,
-  -- session/load and session/resume ask it for the leader's MCP server.
+  -- Teams (PROTOCOL.md 20). Created before sessions because the cwd
+  -- configuration must reach the service before its session requests.
   S.view.team = Team.new({
     config = function()
       return S.config or merged
@@ -501,6 +509,17 @@ function M.build(ctx, opts, action)
       end
     end,
   })
+  -- Switching a session is also when the per-session team switch is read, so
+  -- the tree can mark a session `[team off]` before the person acts on it.
+  local function activate_session(session)
+    ctx.activate_session(session)
+    if session and S.view.team then
+      local client = S.conn.client
+      local instance = client and client.proc and client.proc.instance or nil
+      S.view.team:session_opened(instance, session.id, session.cwd or ctx.resolve_cwd())
+    end
+  end
+
   S.sess.service = Sessions.new({
     config = cfg,
     runtime = function()
@@ -525,7 +544,7 @@ function M.build(ctx, opts, action)
       return ctx.Operations:cancel_session(session, except)
     end,
     current = ctx.current,
-    activate = ctx.activate_session,
+    activate = activate_session,
     render = function()
       if S.view.chat then
         S.view.chat:render(true)
@@ -546,14 +565,17 @@ function M.build(ctx, opts, action)
       S.conn.creating_session = value
     end,
     prune = ctx.prune_sessions,
-    -- Teams (PROTOCOL.md 18.2): the leader's MCP server goes in before
-    -- session/new|load|resume, and the leader is bound after the response.
+    -- Teams (PROTOCOL.md 20.2): configure the cwd before the first session
+    -- request, then ask the service for the new session's switch state.
     before_session = function(cwd, client)
-      local instance = client and client.proc and client.proc.instance or nil
-      return S.view.team:leader_server(instance, cwd)
+      if S.view.team then
+        S.view.team:prepare(cwd, client)
+      end
     end,
     after_session = function(cwd, session_id, instance)
-      return S.view.team:bind_leader(instance, session_id, cwd)
+      if S.view.team then
+        S.view.team:session_opened(instance, session_id, cwd)
+      end
     end,
     -- PROTOCOL.md 13: the adoption notification precedes the committed replay,
     -- so it is deferred until the session exists, then applied from here.
@@ -1013,6 +1035,9 @@ function M.build(ctx, opts, action)
     current_session = function()
       return S.sess.current
     end,
+    sessions = function()
+      return S.sess.all or {}
+    end,
     find_session = function(id)
       if type(id) ~= "string" then
         return nil
@@ -1025,9 +1050,7 @@ function M.build(ctx, opts, action)
       -- addressable as a transcript, so it does not count.
       return nil
     end,
-    select_session = function(session)
-      ctx.activate_session(session)
-    end,
+    select_session = activate_session,
     instance = function()
       local client = S.conn.client
       local instance = client and client.proc and client.proc.instance or nil
@@ -1035,12 +1058,18 @@ function M.build(ctx, opts, action)
         return instance
       end
       -- Before an agent client attaches (or in a restored window), the team
-      -- module still remembers which instance bound this cwd's leader.
+      -- module's recorded binding (or the team leader) names our instance.
       local cwd = ctx.resolve_cwd()
       local bound = cwd and S.view.team and S.view.team.bound and S.view.team.bound[cwd] or nil
-      return bound and bound.instance or nil
+      if bound and bound.instance then
+        return bound.instance
+      end
+      return cwd and S.view.team and S.view.team:leader_instance(cwd) or nil
     end,
-    start_team = function(workflow)
+    start_team = function(workflow, session)
+      if session and S.sess.service then
+        S.sess.service:activate(session)
+      end
       if S.view.team_commands then
         S.view.team_commands:start(workflow)
       end
@@ -1076,6 +1105,18 @@ function M.build(ctx, opts, action)
       return ctx.Operations.generation
     end,
     report_error = Team.error_text,
+    choices = function()
+      return S.view.choices
+    end,
+    find_session = function(id)
+      return S.sess.all and S.sess.all[id] or nil
+    end,
+    select_session = function(session)
+      return activate_session(session)
+    end,
+    submit = function(text)
+      ctx.submit(text, nil)
+    end,
     open_team = function()
       return ctx.open_team()
     end,

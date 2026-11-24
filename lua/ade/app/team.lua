@@ -1,9 +1,10 @@
--- Teams: the front end's half of the service-owned team bus (PROTOCOL.md 18).
+-- Teams: the front end's half of the service-owned team bus (PROTOCOL.md 20).
 --
--- The service owns the bus, participants, delivery and limits. This module
--- turns the configuration into `team.configure`, injects the leader's MCP
--- server into session/new|load|resume, binds the leader, keeps the inbox and
--- team list warm, and exposes the methods the panel uses.
+-- The service owns the bus, participants, delivery, limits and the session
+-- tools injection. This module sends the per-cwd configuration, caches the
+-- `team.list` snapshot per cwd, tracks each session's `session.teams` switch,
+-- and exposes the methods the panel uses. No session request carries an
+-- `ade-team` server any more: the service appends it.
 local log = require("ade.log")
 local Resolve = require("ade.manager.resolve")
 local State = require("ade.session.state")
@@ -58,25 +59,18 @@ function M.new(opts)
     resolved_config = {},
     configure_inflight = {},
     warned_skipped = {},
-    pending_bind = {},
-    -- instance+cwd -> {instance, cwd, token_id} while a leader token is unused.
-    leader_pending = {},
-    -- cwd -> true while a leader_server request is in flight for this cwd.
-    leader_inflight = {},
-    -- cwd -> {instance, session_id, team} once this front end's leader binds.
+    -- cwd -> array of `team.list` entries, newest snapshot only.
+    list_by_cwd = {},
+    -- "instance\0sessionId" -> {enabled, injected, leader} from session.teams
+    -- and `session.teams_changed`.
+    session_states = {},
+    -- cwd -> {instance, session_id, team} derived from a session state whose
+    -- `leader` names a team (router/bootstrap read it).
     bound = {},
-    -- cwd -> true when another session already leads that team (-32061).
-    blocked = {},
-    warned_blocked = {},
-    -- cwd -> team id when the blocking team has no work at all (leader only).
-    -- Such a team is a session's by-product, not a team the person uses.
-    unused = {},
-    -- cwd -> team id when team.list showed a suspended team for it.
-    suspended_cwd = {},
     warned_suspended = {},
     notified = {},
-    -- team id -> true once this front end started the enabled workflow.
-    enabled_teams = {},
+    -- session key -> true once auto_start asked for a team there.
+    auto_started = {},
     -- team id -> {board, inflight, again, seq} for the board cache (19.2).
     boards = {},
     -- team id -> the board_rev whose fetch was already attempted (19.2): a
@@ -109,7 +103,9 @@ end
 ---configuration validator so a workflow may ask for it.
 M.BUILTIN_TEMPLATE = require("ade.config").BUILTIN_TEMPLATE
 
----Whether any template can be offered: explicit ones, or the built-in default.
+---Whether any template can be offered: explicit ones, or the service's
+---built-in worker (created from the leader's own launch when the list is
+---empty, PROTOCOL.md 20.4).
 ---@param cfg table
 ---@param teams table
 ---@return boolean
@@ -117,27 +113,18 @@ local function templates_possible(cfg, teams)
   if next(teams.templates or {}) ~= nil then
     return true
   end
-  -- Without `teams.templates` the built-in worker template is derived from the
-  -- current leader agent (see `builtin_template`), so teams stay available.
-  -- Whether it actually resolves is decided by `has_usable_templates`.
-  local agent = cfg.agent
-  return type(agent) == "string" and type(cfg.agents) == "table" and type(cfg.agents[agent]) == "table"
+  return type(cfg.agent) == "string" and type(cfg.agents) == "table" and type(cfg.agents[cfg.agent]) == "table"
 end
 
 ---Whether this editor should use service teams at all.
 ---
----This is the cheap configuration/connection gate; it does not resolve an
----agent, and the built-in default template only needs `cfg.agent` to be a
----configured agent. A launch that cannot be resolved still suppresses the
----leader injection through `has_usable_templates`.
+---This is only the backend/connection gate: the global switch (`teams.enabled`)
+---is part of the configuration sent to the service, and the per-session switch
+---decides what a session may do.
 ---@return boolean
 function Team:available()
   local cfg = self.config() or {}
-  local teams = type(cfg.teams) == "table" and cfg.teams or {}
-  if cfg.backend == "direct" or teams.enabled == false or teams.spawn_from_chat == false then
-    return false
-  end
-  if not templates_possible(cfg, teams) then
+  if cfg.backend == "direct" then
     return false
   end
   local raw = self:_raw()
@@ -170,6 +157,9 @@ function Team:_attach(raw)
     raw:subscribe("teams", "team.board_changed", function(payload)
       self:on_board_changed_payload(payload)
     end)
+    raw:subscribe("teams", "session.teams_changed", function(payload)
+      self:on_session_teams_changed(payload)
+    end)
     raw:subscribe("teams", "__disconnected", function()
       self:forget_connection()
     end)
@@ -183,8 +173,6 @@ function Team:forget_connection()
       team.stale = true
     end
   end
-  self.leader_pending = {}
-  self.leader_inflight = {}
   local inflight_config = self.configure_inflight
   self.configure_inflight = {}
   for _, entry in pairs(inflight_config or {}) do
@@ -193,10 +181,8 @@ function Team:forget_connection()
     end
   end
   self.sent_config = {}
+  self.session_states = {}
   self.bound = {}
-  self.blocked = {}
-  self.unused = {}
-  self.suspended_cwd = {}
   -- A board request that was in flight when the connection died may still
   -- call back; bumping its token makes that late reply a no-op while the next
   -- `team.changed` can start a fresh request.
@@ -209,8 +195,8 @@ function Team:forget_connection()
   end
   -- A reconnect may reach a different service; let revisions be tried again.
   self.board_requested = {}
-  -- `warned_blocked` / `warned_suspended` / `notified` survive a reconnect:
-  -- a conflict that was already announced must not be announced again.
+  -- `warned_suspended` / `notified` survive a reconnect: a conflict that was
+  -- already announced must not be announced again.
   self:unwatch(true)
   self:changed()
 end
@@ -219,7 +205,6 @@ end
 function Team:reset()
   self.teams = {}
   self.inbox = {}
-  self.enabled_teams = {}
   self.boards = {}
   self:forget_connection()
 end
@@ -256,56 +241,11 @@ function Team:is_stale(team_id)
   return type(team) == "table" and team.stale == true
 end
 
----The role card text of the built-in worker template.
----
----It describes the worker's job, never a command: the command is whatever
----started the leader, resolved by the same code that starts the leader.
-M.BUILTIN_ROLE = table.concat({
-  "你是团队的 worker，在自己的独立 git worktree 里工作。",
-  "只做 leader 交给你的任务，不要启动其他 agent、不要改主工作区的文件。",
-  '完成后用 bus_send(kind="report") 汇报改了什么、测试结果和遗留问题；卡住时同样汇报。',
-  "更新你负责的看板卡片的正文和字段，但不要改看板结构。",
-}, "\n")
-
----The worker template used when `teams.templates` is empty or inherits.
----
----The entry is derived from the leader's own resolved launch: a template only
----names an entry, and the service may only start what the person could have
----started from Neovim. No template name, tool argument or stored workflow can
----supply a different command.
----`worktree = true` keeps workers from writing into the leader's tree: when
----the cwd is not a git work tree the spawn fails and says so, rather than
----silently sharing the directory.
----@param cfg table
----@param store table|nil
----@return table|nil template `teams.templates` shape: `agent`, `role`, `worktree`
----@return table|nil launch the resolved launch this template runs
----@return string|nil err
-function M.builtin_template(cfg, store)
-  local agent_id = cfg.agent
-  if type(agent_id) ~= "string" or agent_id == "" then
-    return nil, nil, "no agent is configured for the current session"
-  end
-  if type(cfg.agents) ~= "table" or type(cfg.agents[agent_id]) ~= "table" then
-    return nil, nil, "agent " .. tostring(agent_id) .. " is not configured"
-  end
-  local launch, err = Resolve.resolve(cfg, agent_id, cfg.launch_origin, store)
-  if not launch then
-    return nil, nil, string.format("the built-in worker template cannot start agent %s: %s", agent_id, tostring(err))
-  end
-  return {
-    agent = agent_id,
-    role = M.BUILTIN_ROLE,
-    worktree = true,
-  }, launch
-end
-
 ---Whether a team entry carries no work at all.
 ---
----A team every session creates just by chatting has only its leader and no
----worker, inbox item, workflow or card. Such a team is not "another team" from
----the person's point of view: switching sessions may quiet it and take it
----over, and no conflict is announced for it.
+---A team of a chat session has only its leader and no worker, inbox item,
+---workflow or card. The tree can still show it, but the start flow treats it
+---like any other team the service answers `led_by` for.
 ---@param entry table|nil team.list entry
 ---@return boolean
 function M.inactive(entry)
@@ -332,15 +272,28 @@ function M.inactive(entry)
   return true
 end
 
----The inactive team this front end found for a cwd, if any.
----
----It is the leader-only team of a session that never did team work. Any
----conflict with it is silent, and `:Ade team start` may replace it.
----@param cwd string
----@return table|nil team entry
-function Team:unused_team(cwd)
-  local id = self.unused[cwd]
-  return id and self.teams[id] or nil
+---The team of a cwd from the last snapshot, in any state but closed.
+---@param cwd string|nil
+---@return table|nil
+function Team:team_for_cwd(cwd)
+  if type(cwd) ~= "string" then
+    return nil
+  end
+  for _, entry in ipairs(self.list_by_cwd[cwd] or {}) do
+    if entry.state ~= "closed" then
+      return entry
+    end
+  end
+end
+
+---The leader instance a cwd's team runs on, for callers that need one before
+---an agent client attaches.
+---@param cwd string|nil
+---@return string|nil
+function Team:leader_instance(cwd)
+  local team = self:team_for_cwd(cwd)
+  local leader = type(team) == "table" and type(team.leader) == "table" and team.leader or nil
+  return leader and leader.instance or nil
 end
 
 ---The absolute directory the service creates worker worktrees under (18.12).
@@ -387,12 +340,12 @@ local function wire_template(cfg, agent_id, launch, template)
   return entry
 end
 
----Resolve the configuration the service expects (18.2, 19.1).
+---Resolve the configuration the service expects (18.2, 19.1, 20.2).
 ---
----With no `teams.templates`, exactly one built-in template named
----`M.BUILTIN_TEMPLATE` is derived from the current leader agent. It is added
----here and nowhere else, so the same resolved command starts the leader and
----its workers.
+---With no `teams.templates` the list stays empty: the service builds its one
+---`worker` template from the leader instance's own `key`, `env` and `launch`
+---(PROTOCOL.md 20.4). An `inherit` template is resolved from the current agent
+---here because it still has to name a concrete launch on the wire.
 ---@param cwd string
 ---@return table|nil config
 ---@return table|nil skipped
@@ -402,39 +355,21 @@ function Team:service_config(cwd)
   local store = self.store and self.store() or nil
   local templates = {}
   -- Problems that keep a template from starting, in the order they were found.
-  -- `builtin` marks the derived default template, so its message can explain
-  -- what the person can do instead of naming a template they never wrote.
   local skipped = {}
-  -- Set only by the built-in fallback below; an explicit configuration owns
-  -- every template it names.
-  local derived = nil
-  local inherited = (teams.templates or {})[M.BUILTIN_TEMPLATE]
-  inherited = inherited and inherited.agent == "inherit" and inherited or nil
   for name, template in pairs(teams.templates or {}) do
-    if template ~= inherited then
-      local launch, err = Resolve.resolve(cfg, template.agent, cfg.launch_origin, store)
+    local agent_id = template.agent
+    if agent_id == "inherit" then
+      agent_id = type(cfg.agent) == "string" and cfg.agent or nil
+    end
+    if type(agent_id) ~= "string" or agent_id == "" then
+      skipped[#skipped + 1] = { name = name, text = string.format("%s: no agent to inherit", name) }
+    else
+      local launch, err = Resolve.resolve(cfg, agent_id, cfg.launch_origin, store)
       if not launch then
         skipped[#skipped + 1] = { name = name, text = string.format("%s: %s", name, tostring(err)) }
       else
-        templates[name] = wire_template(cfg, template.agent, launch, template)
+        templates[name] = wire_template(cfg, agent_id, launch, template)
       end
-    end
-  end
-  if inherited or next(teams.templates or {}) == nil then
-    local template, launch, err = M.builtin_template(cfg, store)
-    if not template then
-      skipped[#skipped + 1] = {
-        name = M.BUILTIN_TEMPLATE,
-        builtin = not inherited,
-        text = tostring(err),
-      }
-    else
-      local options = vim.tbl_extend("force", template, inherited or {})
-      templates[M.BUILTIN_TEMPLATE] = wire_template(cfg, template.agent, launch, options)
-      -- State which agent the template belongs to. The service only gives this
-      -- configuration to a leader of that agent, so another front end on the
-      -- same cwd cannot make a worker start a different adapter.
-      derived = { template = M.BUILTIN_TEMPLATE, agent = template.agent }
     end
   end
   local confirm = type(teams.spawn_confirm) == "table" and teams.spawn_confirm or {}
@@ -460,6 +395,8 @@ function Team:service_config(cwd)
     workflows[name] = copy
   end
   return {
+    enabled = teams.enabled ~= false,
+    session_default = teams.session_default ~= false,
     max_workers = teams.max_workers or 3,
     worktree_root = M.worktree_root(),
     spawn_confirm = { auto = vim.deepcopy(confirm.auto or {}) },
@@ -472,18 +409,21 @@ function Team:service_config(cwd)
     -- object for `workflows` (19.1).
     workflows = next(workflows) and workflows or vim.empty_dict(),
     default_workflow = teams.default,
-    -- The derived template belongs to this leader's agent: the service refuses
-    -- to hand it to a leader of another agent, so a second front end on the
-    -- same cwd can never make a worker start a different adapter.
-    derived = derived,
   },
     skipped
 end
 
----Whether at least one template resolves to a launchable agent.
+---Whether the service has a template to work with: our explicit ones or its
+---built-in worker. An explicit configuration whose every template failed is
+---not usable.
 ---@param cwd string
 ---@return boolean
 function Team:has_usable_templates(cwd)
+  local cfg = self.config() or {}
+  local teams = type(cfg.teams) == "table" and cfg.teams or {}
+  if next(teams.templates or {}) == nil then
+    return templates_possible(cfg, teams)
+  end
   local config = self:service_config(cwd)
   return config ~= nil and next(config.templates or {}) ~= nil
 end
@@ -536,10 +476,6 @@ function Team:template_error(cwd)
   return "no template is configured"
 end
 
-local function pending_key(instance, cwd)
-  return tostring(instance) .. "\0" .. tostring(cwd)
-end
-
 ---Send `team.configure` for a cwd when the resolved config changed.
 ---@param cwd string
 ---@param force boolean|nil
@@ -574,8 +510,10 @@ function Team:configure(cwd, force, cb)
     end
   end
   self.warned_skipped[cwd] = warned
-  if next(config.templates or {}) == nil then
-    -- Every template failed to resolve: behave as if teams were unavailable.
+  local explicit = next(((self.config() or {}).teams or {}).templates or {}) ~= nil
+  if explicit and next(config.templates or {}) == nil then
+    -- Every explicitly configured template failed to resolve: behave as if
+    -- teams were unavailable.
     self.sent_config[cwd] = nil
     cb(false, "no usable team templates")
     return
@@ -586,9 +524,9 @@ function Team:configure(cwd, force, cb)
   end
   local inflight = self.configure_inflight[cwd]
   if inflight then
-    -- Two hello listeners can race, and a leader_server arriving while the
-    -- hello configure is still in flight must wait for its real result: it
-    -- cannot inject a leader before the service has the configuration.
+    -- Two hello listeners can race, and a session request arriving while the
+    -- hello configure is still in flight must wait for its real result before
+    -- the service can append the session token.
     inflight.waiters[#inflight.waiters + 1] = cb
     return
   end
@@ -611,282 +549,222 @@ function Team:configure(cwd, force, cb)
   end)
 end
 
----Ask for the leader's MCP server before session/new|load|resume.
 ---@param instance string|nil
+---@param session_id string|nil
+---@return string|nil
+local function session_key(instance, session_id)
+  if not instance or not session_id then
+    return nil
+  end
+  return tostring(instance) .. "\0" .. tostring(session_id)
+end
+
+---Prepare a cwd before its first session request (PROTOCOL.md 20.2): the
+---configuration must reach the service before it augments `mcpServers`.
+---
+---Blocks the session task through the async scope; a cached, unchanged
+---configuration returns immediately.
 ---@param cwd string
----@return table|nil server
-function Team:leader_server(instance, cwd)
-  if not self:available() or not instance then
-    return nil
+function Team:prepare(cwd)
+  if not self:available() then
+    return
   end
-  local bound = self.bound[cwd]
-  if bound and bound.instance == instance then
-    -- This instance already leads the team for cwd; a second session does not
-    -- become another leader.
-    return nil
-  end
-  if self.blocked[cwd] then
-    return nil
-  end
-  -- Concurrent session/new|load|resume for the same cwd must not each ask
-  -- for (and inject) a leader server.
-  if self.leader_inflight[cwd] then
-    return nil
-  end
-  -- Every template failed to resolve: nothing to configure or inject.
-  if not self:has_usable_templates(cwd) then
-    return nil
-  end
-  local key = pending_key(instance, cwd)
-  -- No stale token may bind a session whose request never completed.
-  self.leader_pending[key] = nil
-  local inflight = {}
-  self.leader_inflight[cwd] = inflight
-  local finished = false
-  local function done(server)
-    if not finished then
-      finished = true
-      if self.leader_inflight[cwd] == inflight then
-        self.leader_inflight[cwd] = nil
-      end
-    end
-    return server
-  end
-  -- Backstop if an unexpected error unwinds before `done` runs; the identity
-  -- check keeps a stale finalizer from clearing a newer request.
-  async.finally(function()
-    if self.leader_inflight[cwd] == inflight then
-      self.leader_inflight[cwd] = nil
-    end
-  end)
-  -- A reconnect empties `bound`; ask the service who leads this cwd before
-  -- injecting a second leader server for the same instance.
-  local listed_ok, listed = async.await(function(settled)
-    local raw = self:_raw()
-    if not raw then
-      settled(false, nil)
-      return
-    end
-    raw:request_tracked("team.list", {}, function(ok, value)
+  async.await(function(settled)
+    self:configure(cwd, false, function(ok, value)
       settled(ok, value)
     end)
   end)
-  if listed_ok and type(listed) == "table" and type(listed.teams) == "table" then
-    for _, entry in ipairs(listed.teams) do
-      if entry.cwd == cwd and type(entry.leader) == "table" then
-        if entry.state == "suspended" then
-          -- PROTOCOL.md 18.15: a suspended team may be resumed by any instance
-          -- whose session cwd matches; leader.instance is null, never a conflict.
-          self.suspended_cwd[cwd] = entry.id
-        elseif entry.leader.instance == instance then
-          self.suspended_cwd[cwd] = nil
-          self.bound[cwd] = { instance = instance, session_id = entry.leader.sessionId, team = entry.id }
-          return done(nil)
-        elseif entry.leader.instance ~= nil then
-          self.suspended_cwd[cwd] = nil
-          if M.inactive(entry) then
-            -- A team with no worker, card or inbox item is what this session
-            -- would itself have created: switching sessions must not report a
-            -- conflict the person never asked for. Keep asking for a leader
-            -- server below, so chatting in the new session can take the team
-            -- over instead of only `:Ade team start` doing it.
-            self.unused[cwd] = entry.id
-            self.blocked[cwd] = nil
-          else
-            self.blocked[cwd] = true
-            if not self.warned_blocked[cwd] then
-              self.warned_blocked[cwd] = true
-              self.notify("a team already exists for this cwd; close it before starting another", vim.log.levels.WARN)
-            end
-            return done(nil)
-          end
-        end
-      end
-    end
-  end
-  local ok, result = async.await(function(settled)
-    self:configure(cwd, false, function(ok)
-      if not ok then
-        settled(false, nil)
-        return
-      end
-      local raw = self:_raw()
-      raw:request_tracked("team.leader_server", { instance = instance, cwd = cwd }, function(ok2, value)
-        if not ok2 and type(value) == "table" and value.code == -32061 then
-          -- Another session already leads that cwd's team; a single-agent
-          -- session must not be injected with a leader server. A leader-only
-          -- team of a chat session is not a conflict worth reporting.
-          local entry = self:team_for_cwd(cwd)
-          if M.inactive(entry) then
-            self.unused[cwd] = entry.id
-            self.blocked[cwd] = nil
-          else
-            self.blocked[cwd] = true
-          end
-        end
-        settled(ok2, value)
-      end)
-    end)
-  end)
-  if not ok or type(result) ~= "table" or type(result.server) ~= "table" then
-    return done(nil)
-  end
-  self.leader_pending[key] = {
-    instance = instance,
-    cwd = cwd,
-    token_id = result.token_id,
-  }
-  return done(result.server)
 end
 
----The team of this cwd, in any state but closed.
----@param cwd string
----@return table|nil
-function Team:team_for_cwd(cwd)
-  for _, entry in ipairs(self:list_rows()) do
-    if entry.cwd == cwd and entry.state ~= "closed" then
-      return entry
-    end
-  end
-end
-
----Bind the leader after session/new|load|resume succeeded.
+---The known `session.teams` state of a session.
 ---@param instance string|nil
+---@param session_id string|nil
+---@return table|nil
+function Team:session_teams(instance, session_id)
+  local key = session_key(instance, session_id)
+  local state = key and self.session_states[key] or nil
+  return type(state) == "table" and state or nil
+end
+
+---Record one `session.teams` state and keep the router's leader shortcut warm.
+---@param instance string
 ---@param session_id string
----@param cwd string
-function Team:bind_leader(instance, session_id, cwd)
-  local key = pending_key(instance, cwd)
-  local pending = self.leader_pending[key]
-  if not pending or pending.instance ~= instance or pending.cwd ~= cwd then
+---@param value table
+function Team:apply_session_teams(instance, session_id, value)
+  local key = session_key(instance, session_id)
+  if not key or type(value) ~= "table" then
     return
   end
-  self.leader_pending[key] = nil
-  local raw = self:_raw()
-  if not raw then
+  local state = {
+    enabled = value.enabled == true,
+    injected = value.injected == true,
+    leader = type(value.leader) == "table" and value.leader or nil,
+  }
+  self.session_states[key] = state
+  for cwd, bound in pairs(self.bound) do
+    if bound.session_id == session_id then
+      self.bound[cwd] = nil
+    end
+  end
+  if state.leader then
+    local cwd = state.leader.cwd or (self.teams[state.leader.id] or {}).cwd
+    if cwd then
+      self.bound[cwd] = { instance = instance, session_id = session_id, team = state.leader.id }
+    end
+  end
+  self:changed()
+end
+
+---@param payload table
+function Team:on_session_teams_changed(payload)
+  if type(payload) ~= "table" then
     return
   end
-  raw:request_tracked("team.bind_leader", {
-    instance = instance,
-    sessionId = session_id,
-    token_id = pending.token_id,
-  }, function(ok, value)
-    if not ok then
-      local message = type(value) == "table" and (value.message or value.code) or tostring(value)
-      log.warn("team.bind_leader failed: %s", tostring(message))
-      if type(value) == "table" and value.code == -32061 then
-        if self.suspended_cwd[cwd] then
-          -- The restored session is not the stored leader; the team stays
-          -- suspended and the person can close it from the panel.
-          if not self.warned_suspended[cwd] then
-            self.warned_suspended[cwd] = true
-            self.notify(
-              "the team for this cwd is still suspended; open :Ade team and press x to close it",
-              vim.log.levels.WARN
-            )
-          end
-        else
-          self.blocked[cwd] = true
-          local entry = self:team_for_cwd(cwd)
-          local message = tostring(type(value) == "table" and (value.message or "") or "")
-          local derived = message:find("derived from agent", 1, true) ~= nil
-          if M.inactive(entry) and not derived then
-            -- The same by-product team as above, now found through the bind
-            -- reply. Switching sessions (or agents) must stay quiet.
-            self.unused[cwd] = entry.id
-          elseif derived then
-            -- The configuration this cwd carries was derived from another
-            -- agent's launch. Say so plainly: it is not another session
-            -- leading, and switching back to that agent, or writing
-            -- `teams.templates`, is what helps.
-            if not self.warned_blocked[cwd] then
-              self.warned_blocked[cwd] = true
-              self.notify(
-                "this cwd's team configuration belongs to another agent; "
-                  .. "switch back to it or write teams.templates: "
-                  .. message,
-                vim.log.levels.WARN
-              )
-            end
-          elseif not self.warned_blocked[cwd] then
-            self.warned_blocked[cwd] = true
-            self.notify("another session already leads this team: " .. message, vim.log.levels.WARN)
-          end
-        end
-      end
-      return
+  self:apply_session_teams(payload.instance, payload.sessionId, payload)
+end
+
+---Query the switch and leadership of one session.
+---@param instance string|nil
+---@param session_id string|nil
+---@param cwd string|nil known cwd, for the auto-start decision
+---@param cb fun(ok: boolean, value: any)|nil
+function Team:query_session_teams(instance, session_id, cwd, cb)
+  cb = cb or function() end
+  local key = session_key(instance, session_id)
+  if not key or not self:available() then
+    cb(false, "teams are not available")
+    return
+  end
+  self:_call("session.teams", { instance = instance, sessionId = session_id }, function(ok, value)
+    if ok and type(value) == "table" then
+      self:apply_session_teams(instance, session_id, value)
+      self:maybe_auto_start(instance, session_id, cwd, value)
     end
-    local bound_team = type(value) == "table" and type(value.team) == "table" and value.team or nil
-    local team_id = bound_team and bound_team.id or nil
-    self.bound[cwd] = { instance = instance, session_id = session_id, team = team_id }
-    -- This session leads the cwd now, including after taking over a team a chat
-    -- session had left unused: nothing blocks it any more.
-    self.blocked[cwd] = nil
-    self.unused[cwd] = nil
-    self.warned_blocked[cwd] = nil
-    if bound_team then
-      -- The bind reply is authoritative: it names this instance and session as
-      -- the leader, which a `team.list` racing it can still show as the old
-      -- one.
-      self.teams[team_id] = bound_team
-    end
-    self:refresh()
-    self:start_enabled_workers(team_id, type(value) == "table" and value.team or nil)
+    cb(ok, value)
   end)
 end
 
----Start the enabled default workflow once per team (19.7).
----
----`teams.auto_start = true` opts into starting the workflow on bind: the
----service starts the workflow's members and skips names that already exist, so
----a re-bind, a reconnect or a second front end never starts them twice.
----@param team_id string|nil
----@param entry table|nil team.list entry returned by bind_leader
-function Team:start_enabled_workers(team_id, entry)
-  if type(team_id) ~= "string" then
+---A session was created or restored: learn its switch state.
+---@param instance string|nil
+---@param session_id string|nil
+---@param cwd string|nil
+function Team:session_opened(instance, session_id, cwd)
+  if not self:available() or not instance or not session_id then
     return
   end
+  self:query_session_teams(instance, session_id, cwd, function() end)
+  pcall(require("ade.app.team_start").session_opened, instance, session_id, cwd)
+end
+
+---Flip the per-session switch (PROTOCOL.md 20.5).
+---@param instance string
+---@param session_id string
+---@param enabled boolean
+---@param close boolean|nil close a led team first
+---@param cb fun(ok: boolean, value: any)|nil
+function Team:set_session_teams(instance, session_id, enabled, close, cb)
+  cb = cb or function() end
+  local params = { instance = instance, sessionId = session_id, enabled = enabled }
+  if close then
+    params.close = true
+  end
+  self:_call("session.teams", params, function(ok, value)
+    if ok and type(value) == "table" then
+      self:apply_session_teams(instance, session_id, value)
+    end
+    -- A closed team disappears from the snapshot only after `team.changed`.
+    if ok and close then
+      self:refresh()
+    end
+    cb(ok, value)
+  end)
+end
+
+---Move a team's leadership to a session (PROTOCOL.md 20.4).
+---@param team string
+---@param instance string
+---@param session_id string
+---@param cb fun(ok: boolean, value: any)|nil
+function Team:set_leader(team, instance, session_id, cb)
+  cb = cb or function() end
+  self:_call("team.set_leader", { team = team, instance = instance, sessionId = session_id }, function(ok, value)
+    if ok then
+      self:refresh()
+    end
+    cb(ok, value)
+  end)
+end
+
+---Stop one worker; `remove` drops it from the team afterwards (20.6).
+---@param team string
+---@param name string
+---@param remove boolean|nil
+---@param cb fun(ok: boolean, value: any)|nil
+function Team:stop_worker(team, name, remove, cb)
+  cb = cb or function() end
+  local params = { team = team, name = name }
+  if remove then
+    params.remove = true
+  end
+  self:_call("team.stop_worker", params, function(ok, value)
+    if ok then
+      self:refresh()
+    end
+    cb(ok, value)
+  end)
+end
+
+---Start a workflow in one session (PROTOCOL.md 20.4).
+---@param instance string
+---@param session_id string
+---@param workflow string
+---@param task string|nil
+---@param cb fun(ok: boolean, value: any)|nil
+function Team:start_session(instance, session_id, workflow, task, cb)
+  cb = cb or function() end
+  self:_call(
+    "team.start",
+    { instance = instance, sessionId = session_id, workflow = workflow, task = task },
+    function(ok, value)
+      if ok then
+        self:refresh()
+      end
+      cb(ok, value)
+    end
+  )
+end
+
+---Start the configured default workflow after a session's switch comes up on
+---a cwd with no team yet. At most once per session.
+---@param instance string|nil
+---@param session_id string|nil
+---@param cwd string|nil
+---@param value table the `session.teams` state
+function Team:maybe_auto_start(instance, session_id, cwd, value)
   local cfg = self.config() or {}
   local teams = type(cfg.teams) == "table" and cfg.teams or {}
-  if teams.enabled == false or teams.auto_start ~= true then
+  if teams.enabled == false or teams.auto_start ~= true or value.enabled ~= true or value.injected ~= true then
     return
   end
-  local team = self.teams[team_id]
-  local cwd = team and team.cwd or (type(entry) == "table" and entry.cwd or nil)
-  local bound = cwd and self.bound[cwd] or nil
-  if not bound or bound.team ~= team_id then
-    -- Another front end leads this team (or it belongs to another cwd): its
-    -- workflow is not this front end's to start.
+  if value.leader ~= nil or not cwd then
     return
   end
-  if cwd and require("ade.app.team_start").active(cwd) then
-    -- `:Ade team start` is picking a workflow for this cwd: its own team.start
-    -- must not be pre-empted by the configured default. Remember the decision
-    -- even if that flow is cancelled: the person already chose a workflow, so
-    -- the default must not start behind their back later.
-    self.enabled_teams[team_id] = true
+  if self:team_for_cwd(cwd) then
     return
   end
-  if type(entry) == "table" and entry.state == "suspended" then
-    -- A resume still waiting for its configuration cannot take team.start; do
-    -- not mark the team so the active `team.changed` can try later.
+  if require("ade.app.team_start").active(cwd) then
     return
   end
-  if self.enabled_teams[team_id] then
+  local key = session_key(instance, session_id)
+  if not key or self.auto_started[key] then
     return
   end
-  for _, participant in ipairs(type(entry) == "table" and entry.participants or {}) do
-    if participant.name ~= "leader" and participant.name ~= "human" then
-      -- The team already has a worker: this is not its first start.
-      return
-    end
-  end
-  self.enabled_teams[team_id] = true
+  self.auto_started[key] = true
   local workflow = teams.default or "default"
-  self:start(team_id, workflow, nil, function(ok, value)
+  self:start_session(instance, session_id, workflow, nil, function(ok, err)
     if not ok then
-      self.notify("could not start workflow " .. tostring(workflow) .. ": " .. M.error_text(value), vim.log.levels.WARN)
+      self.notify("could not start workflow " .. tostring(workflow) .. ": " .. M.error_text(err), vim.log.levels.WARN)
     end
-    self:refresh()
   end)
 end
 
@@ -896,6 +774,7 @@ function Team:refresh(cb)
   if not self:available() then
     self.teams = {}
     self.inbox = {}
+    self.list_by_cwd = {}
     self:changed()
     if cb then
       cb()
@@ -906,9 +785,17 @@ function Team:refresh(cb)
   raw:request_tracked("team.list", {}, function(ok, value)
     if ok and type(value) == "table" and type(value.teams) == "table" then
       local teams = {}
+      local by_cwd = {}
       for _, team in ipairs(value.teams) do
+        team.stale = false
         teams[team.id] = team
+        local cwd = team.cwd
+        if type(cwd) == "string" then
+          by_cwd[cwd] = by_cwd[cwd] or {}
+          by_cwd[cwd][#by_cwd[cwd] + 1] = team
+        end
       end
+      self.list_by_cwd = by_cwd
       -- Keep open items announced by `team.inbox` when an older snapshot does
       -- not list them yet: the list and the notification stream race.
       local announced = {}
@@ -940,6 +827,7 @@ function Team:refresh(cb)
       -- A failed refresh means the stored list can no longer be trusted.
       self.teams = {}
       self.inbox = {}
+      self.list_by_cwd = {}
       self:changed()
     end
     self:_sync_boards()
@@ -1062,26 +950,9 @@ function Team:on_changed_payload(payload)
   end
   if team.state == "closed" then
     self:forget_team(team.id)
-    for cwd, id in pairs(self.suspended_cwd) do
-      if id == team.id then
-        self.suspended_cwd[cwd] = nil
-        self.warned_suspended[cwd] = nil
-      end
-    end
     for cwd, entry in pairs(self.bound) do
       if entry.team == team.id or team.cwd == cwd then
         self.bound[cwd] = nil
-      end
-    end
-    for cwd in pairs(self.blocked) do
-      if team.cwd == cwd then
-        self.blocked[cwd] = nil
-        self.warned_blocked[cwd] = nil
-      end
-    end
-    for cwd, id in pairs(self.unused) do
-      if id == team.id or team.cwd == cwd then
-        self.unused[cwd] = nil
       end
     end
     if self.watching and self.watching.team_id == team.id then
@@ -1091,30 +962,27 @@ function Team:on_changed_payload(payload)
     self:closed(team.id)
   else
     self.teams[team.id] = team
-    if team.state ~= "suspended" then
-      for cwd, id in pairs(self.suspended_cwd) do
-        if id == team.id then
-          self.suspended_cwd[cwd] = nil
-          self.warned_suspended[cwd] = nil
+    -- Keep the per-cwd snapshot in step with the notification stream so the
+    -- tree does not wait for a full refresh.
+    local cwd = team.cwd
+    if type(cwd) == "string" then
+      local rows = self.list_by_cwd[cwd] or {}
+      local found = false
+      for index, entry in ipairs(rows) do
+        if entry.id == team.id then
+          rows[index] = team
+          found = true
+          break
         end
       end
-    end
-    -- A team that gained work is no longer the by-product of a session; a
-    -- conflict with it is worth reporting again.
-    for cwd, id in pairs(self.unused) do
-      if id == team.id and not M.inactive(team) then
-        self.unused[cwd] = nil
-        self.warned_blocked[cwd] = nil
+      if not found then
+        rows[#rows + 1] = team
       end
+      self.list_by_cwd[cwd] = rows
     end
     -- A team created after the cache was cleared (or a reconnect) gets its
     -- board when its revision differs from the cache.
     self:_fetch_board_if_needed(team)
-    -- A suspended team may become active later; then the enabled workflow can
-    -- start (still at most once per team).
-    if team.state ~= "suspended" then
-      self:start_enabled_workers(team.id, team)
-    end
   end
   self:changed()
 end
@@ -1208,6 +1076,9 @@ local NEW_METHODS = {
   ["team.card_history"] = true,
   ["team.workflows"] = true,
   ["team.workflow_delete"] = true,
+  ["team.set_leader"] = true,
+  ["team.stop_worker"] = true,
+  ["session.teams"] = true,
 }
 
 ---Explain that the running service predates boards/workflows, once.
@@ -1357,7 +1228,18 @@ function Team:forget_team(team_id)
   local known = self.teams[team_id]
   local cwd = type(known) == "table" and known.cwd or nil
   self.teams[team_id] = nil
-  self.enabled_teams[team_id] = nil
+  if cwd then
+    local rows = self.list_by_cwd[cwd]
+    if rows then
+      local kept = {}
+      for _, row in ipairs(rows) do
+        if row.id ~= team_id then
+          kept[#kept + 1] = row
+        end
+      end
+      self.list_by_cwd[cwd] = #kept > 0 and kept or nil
+    end
+  end
   for id, item in pairs(self.inbox) do
     if item.team == team_id then
       self.inbox[id] = nil
@@ -1368,19 +1250,6 @@ function Team:forget_team(team_id)
     if bound.team == team_id then
       self.bound[bound_cwd] = nil
     end
-  end
-  -- The team is gone, so it can no longer block its cwd. Without this a
-  -- "start over" (or a `:Ade team start` that takes over an unused team) would
-  -- close the team and then refuse to bind the new session for the same cwd.
-  for unused_cwd, id in pairs(self.unused) do
-    if id == team_id then
-      self.unused[unused_cwd] = nil
-      cwd = cwd or unused_cwd
-    end
-  end
-  if cwd then
-    self.blocked[cwd] = nil
-    self.warned_blocked[cwd] = nil
   end
 end
 

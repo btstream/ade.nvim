@@ -47,9 +47,9 @@ function Sessions.new(opts)
     on_changed = opts.on_changed,
     on_replaying = opts.on_replaying,
     on_creating = opts.on_creating,
-    -- Teams (PROTOCOL.md 18.2): inject the leader MCP server before the
-    -- session request and bind afterwards. Returning nil keeps single-agent
-    -- behaviour byte-for-byte.
+    -- Teams (PROTOCOL.md 20.2): the service appends its session MCP server, so
+    -- the front end only sends the configuration first and learns the new
+    -- session's switch afterwards.
     before_session = opts.before_session,
     after_session = opts.after_session,
     prune = opts.prune,
@@ -63,22 +63,17 @@ function Sessions:ready()
   return self.connection() == "ready" and self.get_client() ~= nil
 end
 
----Extra MCP servers for the leader's session request, if teams are active.
+---Make sure the cwd configuration reached the service before the session
+---request (PROTOCOL.md 20.2). Nothing is injected into `mcpServers` here.
 ---@param client table
 ---@param cwd string
----@return table|nil
-function Sessions:team_mcp(client, cwd)
-  if not self.before_session then
-    return nil
+function Sessions:prepare_team(client, cwd)
+  if self.before_session then
+    self.before_session(cwd, client)
   end
-  local server = self.before_session(cwd, client)
-  if type(server) ~= "table" then
-    return nil
-  end
-  return { server }
 end
 
----Bind the leader once the session call succeeded.
+---Learn the new session's `session.teams` switch after a successful request.
 ---@param client table
 ---@param cwd string
 ---@param session_id string
@@ -113,8 +108,8 @@ function Sessions:create(on_missing)
   local intent = runtime:intend()
   local token = runtime:expect_create()
   self.run("create", client, nil, function(task)
-    local extra = self:team_mcp(client, cwd)
-    local ok, result = task:call("new_session", cwd, extra)
+    self:prepare_team(client, cwd)
+    local ok, result = task:call("new_session", cwd)
     if not ok then
       task.status = "failed"
       runtime:drop_create(token)
@@ -200,8 +195,8 @@ function Sessions:resume(session_id, opts)
   self.replaying = true
   self.on_replaying(true)
   self.run("resume", client, entry, function(task)
-    local extra = self:team_mcp(client, cwd)
-    local ok, result = task:call("resume_session", session_id, cwd, extra)
+    self:prepare_team(client, cwd)
+    local ok, result = task:call("resume_session", session_id, cwd)
     if not ok then
       task.status = "failed"
       runtime:rollback(entry)
@@ -307,8 +302,8 @@ function Sessions:replay(session_id, opts)
   self.replaying = true
   self.on_replaying(true)
   self.run("replay", client, entry, function(task)
-    local extra = self:team_mcp(client, cwd)
-    local ok, result = task:call("load_session", session_id, cwd, extra)
+    self:prepare_team(client, cwd)
+    local ok, result = task:call("load_session", session_id, cwd)
     if not ok then
       task.status = "failed"
       -- No rollback here: `on_finally` always runs and is the single cleanup
