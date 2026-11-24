@@ -631,13 +631,6 @@ pub struct Team {
     pub suspended_at: Option<u64>,
     pub leader_instance: Option<String>,
     pub leader_session: Option<String>,
-    /// The launch fingerprint of the leader instance while it lives.
-    ///
-    /// A restored team cannot know its leader's fingerprint (the launch is not
-    /// stored), so a resume is checked against the stored leader *agent* and a
-    /// live team against this. It keeps two leaders that share an agent id but
-    /// start differently from acting as one.
-    pub leader_fingerprint: Option<String>,
     pub participants: HashMap<String, Participant>,
     /// Leader first, then workers in creation order.
     pub order: Vec<String>,
@@ -746,61 +739,6 @@ fn hashes_match(left: &TokenHash, right: &TokenHash) -> bool {
         differing |= left ^ right;
     }
     differing == 0
-}
-
-/// A stable fingerprint of how an agent instance is started.
-///
-/// Two instances may share an agent id (or even the same command) yet run with
-/// a different environment or managed release. A derived worker template may
-/// only be handed back to the exact launch that supplied it. The service
-/// computes this digest for both the template and the running instance:
-/// agent, command, args, cwd, the child environment sorted by name, and the
-/// managed release. It is an identity marker, never a secret; only its hex form
-/// leaves the process.
-///
-pub fn launch_fingerprint(
-    key: &InstanceKey,
-    env: Option<&[(String, String)]>,
-    #[cfg(unix)] launch: Option<&crate::install::Launch>,
-) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    let mut field = |value: &str| {
-        hasher.update(format!("{}:", value.len()).as_bytes());
-        hasher.update(value.as_bytes());
-    };
-    field(&key.agent);
-    field(&key.command);
-    field(&key.args.len().to_string());
-    for arg in &key.args {
-        field(arg);
-    }
-    field(&key.cwd);
-    // `parse_env` yields an unordered object walk; sort so equal maps agree.
-    let mut env_pairs: Vec<&(String, String)> = env.unwrap_or(&[]).iter().collect();
-    env_pairs.sort();
-    field(&env_pairs.len().to_string());
-    for (name, value) in env_pairs {
-        field(name);
-        field(value);
-    }
-    #[cfg(unix)]
-    match launch {
-        Some(launch) => {
-            field("managed");
-            field(&launch.root.to_string_lossy());
-            field(&launch.agent);
-            field(&launch.install_id);
-        }
-        None => field("external"),
-    }
-    #[cfg(not(unix))]
-    field("external");
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 pub fn authenticate(tokens: &SharedTokens, token: &str) -> Option<ParticipantAuth> {
@@ -925,13 +863,6 @@ pub struct Teams {
     pub tokens: SharedTokens,
     token_records: HashMap<String, TokenRecord>,
     configs: HashMap<String, TeamConfig>,
-    ///
-    /// The agent id alone is not enough: two leaders may run the same agent id
-    /// with different commands, arguments, environments or managed releases.
-    /// The fingerprint is computed by the service from the template the
-    /// configuration itself describes, and each leader binds only the entry it
-    /// supplied. One cwd still has one team (18.1), so the first bind wins and
-    /// the other is refused by the existing "team already exists" rule.
     teams: HashMap<String, Team>,
     by_cwd: HashMap<String, String>,
     /// instance -> (team id, participant name); O(1) membership for every agent
@@ -953,16 +884,8 @@ pub struct Teams {
     /// Explicit per-session switch state (20.5), keyed by (agent, sessionId).
     /// Absent means the cwd configuration's `session_default`.
     session_switches: HashMap<(String, String), bool>,
-    /// (agent, sessionId) -> connected session-token MCP processes (20.5).
-    injected: HashMap<(String, String), usize>,
-    /// (instance, session) -> stored team whose resume waits for an accepted
-    /// load/resume (20.7).
-    resume_candidates: HashMap<(String, String), String>,
     /// Sessions whose handover was refused (20.4).
     handover_refusals: HashSet<(String, String)>,
-    /// Sessions whose team was closed: their `bus.*` answers "team closed"
-    /// until they lead or join one again (18.11/20.5).
-    closed_sessions: HashSet<(String, String)>,
     /// Tests inspect the board of a closed team after it is removed.
     #[cfg(test)]
     closed_boards: HashMap<String, board::Board>,
@@ -989,10 +912,7 @@ impl Teams {
             workflows: workflow::StoredWorkflows::new(),
             project_keys: HashMap::new(),
             session_switches: HashMap::new(),
-            injected: HashMap::new(),
-            resume_candidates: HashMap::new(),
             handover_refusals: HashSet::new(),
-            closed_sessions: HashSet::new(),
             #[cfg(test)]
             closed_boards: HashMap::new(),
             #[cfg(test)]
@@ -1394,27 +1314,6 @@ impl Teams {
         }
     }
 
-    /// Revoke a token and keep the `injected` counter truthful when it was a
-    /// connected session token.
-    pub fn revoke_counting_injected(&mut self, token_id: &str) {
-        let key = self.token_records.get(token_id).and_then(|record| {
-            if record.role == Role::Session {
-                Some((record.agent.clone()?, record.session.clone()?))
-            } else {
-                None
-            }
-        });
-        self.revoke(token_id);
-        if let Some(key) = key {
-            if let Some(count) = self.injected.get_mut(&key) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    self.injected.remove(&key);
-                }
-            }
-        }
-    }
-
     pub fn revoke(&mut self, token_id: &str) {
         if let Some(record) = self.token_records.remove(token_id) {
             if let Ok(mut map) = self.tokens.lock() {
@@ -1491,55 +1390,6 @@ impl Teams {
         }
     }
 
-    /// True while some connected MCP process holds a bound token of the
-    /// session (20.5).
-    pub fn is_injected(&self, agent: &str, session: &str) -> bool {
-        self.injected
-            .get(&(agent.to_string(), session.to_string()))
-            .is_some_and(|count| *count > 0)
-    }
-
-    pub fn session_connected(&mut self, instance: &str, session: &str) {
-        let Some(record) = self
-            .token_records
-            .values()
-            .find(|record| {
-                record.role == Role::Session
-                    && record.instance.as_deref() == Some(instance)
-                    && record.session.as_deref() == Some(session)
-            })
-            .and_then(|record| record.agent.clone())
-        else {
-            return;
-        };
-        *self
-            .injected
-            .entry((record, session.to_string()))
-            .or_insert(0) += 1;
-    }
-
-    pub fn session_disconnected(&mut self, instance: &str, session: &str) {
-        let agent = self
-            .token_records
-            .values()
-            .find(|record| {
-                record.role == Role::Session
-                    && record.instance.as_deref() == Some(instance)
-                    && record.session.as_deref() == Some(session)
-            })
-            .and_then(|record| record.agent.clone());
-        let Some(agent) = agent else {
-            return;
-        };
-        let key = (agent, session.to_string());
-        if let Some(count) = self.injected.get_mut(&key) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.injected.remove(&key);
-            }
-        }
-    }
-
     /// Issue a session token. `session` is set for load/resume (bound at
     /// once); a `session/new` token is bound by its response.
     pub fn issue_session_token(
@@ -1612,15 +1462,6 @@ impl Teams {
 
     /// Revoke every session token bound to `(instance, session)`.
     pub fn revoke_session_tokens(&mut self, instance: &str, session: &str) {
-        let agent = self
-            .token_records
-            .values()
-            .find(|record| {
-                record.role == Role::Session
-                    && record.instance.as_deref() == Some(instance)
-                    && record.session.as_deref() == Some(session)
-            })
-            .and_then(|record| record.agent.clone());
         let ids: Vec<String> = self
             .token_records
             .iter()
@@ -1633,9 +1474,6 @@ impl Teams {
             .collect();
         for id in ids {
             self.revoke(&id);
-        }
-        if let Some(agent) = agent {
-            self.injected.remove(&(agent, session.to_string()));
         }
     }
 
@@ -1650,11 +1488,6 @@ impl Teams {
             record.session.as_deref()?,
             record.agent.as_deref()?,
         ))
-    }
-
-    pub fn session_closed(&self, instance: &str, session: &str) -> bool {
-        self.closed_sessions
-            .contains(&(instance.to_string(), session.to_string()))
     }
 
     pub fn session_cwd(&self, token_id: &str) -> Option<String> {
@@ -1677,6 +1510,19 @@ impl Teams {
                 ))
             })
             .collect()
+    }
+
+    /// The bound session token id of `(instance, session)`, if one exists.
+    pub fn session_token_of(&self, instance: &str, session: &str) -> Option<String> {
+        self.token_records
+            .iter()
+            .find(|(_, record)| {
+                record.role == Role::Session
+                    && record.bound
+                    && record.instance.as_deref() == Some(instance)
+                    && record.session.as_deref() == Some(session)
+            })
+            .map(|(id, _)| id.clone())
     }
 
     /// The first connected token id of `(instance, session)`.
@@ -1809,7 +1655,6 @@ impl Teams {
             suspended_at: None,
             leader_instance: Some(instance.to_string()),
             leader_session: Some(session.to_string()),
-            leader_fingerprint: None,
             participants: HashMap::new(),
             order: vec!["leader".to_string()],
             reserved_names: HashSet::new(),
@@ -1834,8 +1679,6 @@ impl Teams {
         leader.session = Some(session.to_string());
         leader.agent = Some(agent.to_string());
         team.participants.insert("leader".to_string(), leader);
-        self.closed_sessions
-            .remove(&(instance.to_string(), session.to_string()));
         self.by_cwd.insert(cwd.to_string(), id.clone());
         self.by_instance
             .insert(instance.to_string(), (id.clone(), "leader".to_string()));
@@ -1944,8 +1787,6 @@ impl Teams {
         leader.agent = Some(agent.clone());
         leader.set_state(ParticipantState::Idle);
         leader.reason = None;
-        self.closed_sessions
-            .remove(&(instance.to_string(), session.to_string()));
         self.by_instance.insert(
             instance.to_string(),
             (team_id.to_string(), "leader".to_string()),
@@ -1966,7 +1807,6 @@ impl Teams {
         instance: &str,
         session: &str,
         agent: &str,
-        fingerprint: &str,
         config: TeamConfig,
     ) -> Value {
         if let Some(team) = self.teams.get_mut(team_id) {
@@ -1974,7 +1814,6 @@ impl Teams {
             team.suspended_at = None;
             team.leader_instance = Some(instance.to_string());
             team.leader_session = Some(session.to_string());
-            team.leader_fingerprint = Some(fingerprint.to_string());
             team.leaderless = false;
             team.config = config;
             if let Some(leader) = team.participants.get_mut("leader") {
@@ -2008,12 +1847,7 @@ impl Teams {
             .get(team_id)
             .map(|team| self.config_for(&team.cwd))
             .unwrap_or_default();
-        let fingerprint = self
-            .teams
-            .get(team_id)
-            .and_then(|team| team.leader_fingerprint.clone())
-            .unwrap_or_default();
-        self.start_resume_with_config(team_id, instance, session, agent, &fingerprint, config)
+        self.start_resume_with_config(team_id, instance, session, agent, config)
     }
 
     /// The token bound for a still-suspended team whose configure has just
@@ -2028,63 +1862,6 @@ impl Teams {
             .participants
             .get("leader")
             .and_then(|leader| leader.agent.clone())
-    }
-
-    /// Remember that a session requested its stored leader session; the
-    /// resume starts only after the agent accepted the load/resume (20.7).
-    pub fn note_resume_candidate(&mut self, instance: &str, session: &str, agent: &str) -> bool {
-        let Some(team) = self
-            .teams
-            .values()
-            .find(|team| team.suspended && team.leader_session.as_deref() == Some(session))
-        else {
-            return false;
-        };
-        if self.stored_leader_agent(&team.id).as_deref() != Some(agent) {
-            return false;
-        }
-        self.resume_candidates
-            .insert((instance.to_string(), session.to_string()), team.id.clone());
-        true
-    }
-
-    pub fn candidates_of_instance(&self, instance: &str) -> Vec<String> {
-        self.resume_candidates
-            .keys()
-            .filter(|(owner, _)| owner == instance)
-            .map(|(_, session)| session.clone())
-            .collect()
-    }
-
-    pub fn drop_resume_candidate(&mut self, instance: &str, session: &str) {
-        self.resume_candidates
-            .remove(&(instance.to_string(), session.to_string()));
-    }
-
-    /// Take the candidate of `(instance, session)` when it still names a
-    /// suspended team; returns the team id.
-    pub fn take_resume_candidate(&mut self, instance: &str, session: &str) -> Option<String> {
-        let team = self
-            .resume_candidates
-            .remove(&(instance.to_string(), session.to_string()))?;
-        self.teams
-            .get(&team)
-            .is_some_and(|entry| entry.suspended)
-            .then_some(team)
-    }
-
-    /// `(instance, session)` candidates whose team is in `cwd` (configure just
-    /// arrived).
-    pub fn resume_candidates_for_cwd(&self, cwd: &str) -> Vec<(String, String)> {
-        self.resume_candidates
-            .iter()
-            .filter(|(_, team)| {
-                self.teams
-                    .get(*team)
-                    .is_some_and(|entry| entry.cwd == cwd && entry.suspended)
-            })
-            .map(|((instance, session), _)| (instance.clone(), session.clone()))
-            .collect()
     }
 
     /// Cwd of the session token bound to `(instance, session)`.
@@ -2254,13 +2031,6 @@ impl Teams {
         // documented "team closed" answer instead of "unknown token"; the
         // worker instances are stopped and revoke their own tokens on exit.
         self.closed_teams.insert(id.clone());
-        if let (Some(instance), Some(session)) = (
-            entry["leader"]["instance"].as_str(),
-            entry["leader"]["sessionId"].as_str(),
-        ) {
-            self.closed_sessions
-                .insert((instance.to_string(), session.to_string()));
-        }
         self.revoke_team_hashes(&id);
         for item in orphaned {
             self.events.push(TeamEvent::InboxJson(item));
@@ -4347,6 +4117,11 @@ impl Teams {
         let instance = participant.instance.clone();
         let lifecycle = participant.lifecycle;
         let starting = participant.starting;
+        // A participant whose state is already `exited` has no live process,
+        // even if its historical instance id is still recorded.
+        let live = (participant.state != ParticipantState::Exited)
+            .then(|| instance.clone())
+            .flatten();
         let closed = team.closed;
         if participant.state != ParticipantState::Exited {
             participant.set_state(ParticipantState::Exited);
@@ -4362,9 +4137,11 @@ impl Teams {
             }
         }
         participant.remove_after_exit = remove;
-        // Without an instance and without a start in flight the exit already
-        // happened: the participant can be dropped now.
-        let drop_now = remove && instance.is_none() && !starting;
+        // A participant with no instance and no start in flight has already
+        // exited: the removal is complete right away (20.6). A start that is
+        // still running completes it through its callback.
+        let alive = live.is_some() || starting;
+        let drop_now = remove && !alive;
         if drop_now {
             team.participants.remove(name);
             team.order.retain(|entry| entry != name);
@@ -4395,7 +4172,7 @@ impl Teams {
         }
         self.events.push(TeamEvent::Changed(team_id.to_string()));
         Ok(StopOutcome {
-            instance,
+            instance: live,
             lifecycle,
             remove,
         })
@@ -4496,17 +4273,6 @@ impl Teams {
     }
 
     pub fn revoke_instance_tokens(&mut self, instance: &str) {
-        let sessions: Vec<(String, String)> = self
-            .token_records
-            .values()
-            .filter(|record| record.role == Role::Session)
-            .filter_map(|record| {
-                if record.instance.as_deref() != Some(instance) {
-                    return None;
-                }
-                Some((record.agent.clone()?, record.session.clone()?))
-            })
-            .collect();
         let ids: Vec<String> = self
             .token_records
             .iter()
@@ -4515,9 +4281,6 @@ impl Teams {
             .collect();
         for id in ids {
             self.revoke(&id);
-        }
-        for key in sessions {
-            self.injected.remove(&key);
         }
     }
 
@@ -5372,7 +5135,6 @@ impl Teams {
                 suspended: true,
                 suspended_at: Some(suspended_at),
                 leader_instance: None,
-                leader_fingerprint: None,
                 leader_session: snapshot.leader_session.clone(),
                 participants,
                 order: snapshot.order,
@@ -7878,16 +7640,5 @@ mod tests {
         assert_eq!(teams.switch("opencode", "s1"), Some(false));
         assert_eq!(teams.switch("opencode", "s2"), Some(true));
         assert!(!teams.set_switch("opencode", "s2", true));
-    }
-
-    #[test]
-    fn injected_count_tracks_session_connections() {
-        let mut teams = Teams::new(new_shared_tokens());
-        session(&mut teams, "i1", "/p", "s1");
-        assert!(!teams.is_injected("opencode", "s1"));
-        teams.session_connected("i1", "s1");
-        assert!(teams.is_injected("opencode", "s1"));
-        teams.session_disconnected("i1", "s1");
-        assert!(!teams.is_injected("opencode", "s1"));
     }
 }

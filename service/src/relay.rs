@@ -933,6 +933,12 @@ impl Relay {
             .unwrap_or(false)
     }
 
+    /// Whether the agent can reload a session: `loadSession` or a resume
+    /// capability, either a boolean or an object (20.5).
+    pub fn agent_reloads_sessions(&self) -> bool {
+        self.agent_loads_sessions() || self.agent_resumes_sessions()
+    }
+
     /// Whether the agent advertised `sessionCapabilities.resume`.
     pub fn agent_resumes_sessions(&self) -> bool {
         self.initialize

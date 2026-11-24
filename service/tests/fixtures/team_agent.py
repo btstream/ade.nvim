@@ -565,9 +565,25 @@ def main():
                 "mcp": bool(entry),
                 "cwd": params.get("cwd"),
                 "mcp_entry": safe_entry,
+                "mcp_servers": [
+                    item.get("name") for item in params.get("mcpServers") or []
+                ],
             })
             if MCP.get(session):
                 mcp_list(session)
+            if method == "session/load":
+                # A distinguishable replay the tests can look for.
+                send({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "replayed-history"},
+                        },
+                    },
+                })
             result(
                 ident,
                 {

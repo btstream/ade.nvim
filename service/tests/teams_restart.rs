@@ -1587,7 +1587,7 @@ fn a_failed_session_load_falls_back_and_resends_the_role_card() {
 }
 
 #[test]
-fn configure_after_bind_starts_the_resume() {
+fn configure_after_the_session_request_does_not_resume() {
     let fixture = Fixture::new("restart-configure-late");
     let mut server = fixture.start("a", &[]);
     let mut client = fixture.connect(&server);
@@ -1598,8 +1598,8 @@ fn configure_after_bind_starts_the_resume() {
     let mut restarted = fixture.start("b", &[]);
     let mut second = fixture.connect(&restarted);
     wait_suspended(&mut second, &team);
-    // The session request comes first, before any configure: the service keeps
-    // the stored team suspended and remembers the candidate (20.7).
+    // The session request comes first, before any configure: it is not
+    // injected, so the load must not resume the team (20.7).
     let (_instance, _session, _token, bound) = fixture.attach_leader_with(
         &restarted,
         &mut second,
@@ -1608,11 +1608,23 @@ fn configure_after_bind_starts_the_resume() {
         false,
     );
     assert_eq!(bound["result"]["team"]["state"], "suspended", "{bound}");
-    assert_eq!((&team_entry(&mut second, &team))["state"], "suspended");
-    // The configure that follows resumes it.
+    // A later configure does not resume either: the front end configures
+    // before its session requests (20.2/20.7).
     fixture.configure(&mut second, &fixture.work, &restarted, true);
-    wait_active(&mut second, &team);
-    wait_worker_session(&mut second, &team);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        team_entry(&mut second, &team)["state"],
+        "suspended",
+        "a late configure must not resume on its own"
+    );
+    // Only an injected (configured, enabled) session request resumes, so this
+    // session has no team tools and the explicit path refuses it as well.
+    let moved = second.request(
+        107,
+        "team.set_leader",
+        json!({"team": team, "instance": _instance, "sessionId": _session}),
+    );
+    assert_eq!(moved["error"]["data"]["reason"], "no_tools", "{moved}");
     let closed = second.request(104, "team.close", json!({"team": team}));
     assert!(closed["result"].is_object(), "{closed}");
     Fixture::shutdown(&mut restarted);
@@ -2012,4 +2024,156 @@ fn team_start_skips_an_unavailable_board_and_still_notifies() {
     assert_eq!(board["result"]["board"]["unavailable"], true, "{board}");
 
     Fixture::shutdown(&mut restarted);
+}
+
+/// A resume needs the team's cwd, the stored agent and a token: another
+/// instance in another cwd replaying the same session id must not touch it
+/// (20.7).
+#[test]
+fn a_load_from_another_cwd_or_agent_does_not_resume_the_stored_team() {
+    let fixture = Fixture::new("restart-resume-conditions");
+    let mut server = fixture.start("a", &[]);
+    let mut client = fixture.connect(&server);
+    let (team, leader_session, _) = fixture.first_team(&server, &mut client, "do [report]");
+    wait_for(
+        || participant(&mut client, &team, "w1").filter(|entry| entry["instance"].is_string()),
+        "w1 started",
+    );
+    Fixture::shutdown(&mut server);
+    drop(server);
+
+    let mut restarted = fixture.start("b", &[]);
+    let mut second = fixture.connect(&restarted);
+    wait_suspended(&mut second, &team);
+    // Configure the real cwd, but attach an instance in another directory with
+    // the same agent and replay the leader's session id there.
+    fixture.configure(&mut second, &fixture.work, &restarted, true);
+    let other = fixture.dir.path().join("other");
+    std::fs::create_dir_all(&other).expect("other dir");
+    let attached = second.request(
+        1,
+        "agent.attach",
+        json!({
+            "key": {
+                "agent": "team-test",
+                "command": "python3",
+                "args": [agent()],
+                "cwd": other.to_string_lossy(),
+            },
+            "client_capabilities": {},
+            "env": child_env(&restarted, &fixture.log, &fixture.gate),
+        }),
+    );
+    let instance = attached["result"]["instance"].as_str().unwrap().to_string();
+    tunnel_call(
+        &mut second,
+        &instance,
+        10,
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    let response = tunnel_call(
+        &mut second,
+        &instance,
+        11,
+        "session/load",
+        json!({
+            "sessionId": leader_session,
+            "cwd": other.to_string_lossy(),
+            "mcpServers": [],
+        }),
+    );
+    assert!(response["result"].is_object(), "{response}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        team_entry(&mut second, &team)["state"],
+        "suspended",
+        "another cwd must not resume the team"
+    );
+    let closed = second.request(120, "team.close", json!({"team": team}));
+    assert!(closed["result"].is_object(), "{closed}");
+    Fixture::shutdown(&mut restarted);
+}
+
+/// `remove: true` completes whether git failed or the worker had already
+/// exited (20.6/I).
+#[test]
+fn removing_a_worker_completes_after_a_failed_or_finished_start() {
+    use nvim_ade_server::team::{SpawnOutcome, Teams};
+
+    let mut teams = Teams::new(nvim_ade_server::team::new_shared_tokens());
+    teams
+        .configure(
+            "/repo",
+            json!({
+                "max_workers": 2,
+                "spawn_confirm": { "auto": ["dev"] },
+                "templates": {
+                    "dev": {
+                        "key": { "agent": "a", "command": "c", "args": [] },
+                        "worktree": false
+                    }
+                }
+            }),
+        )
+        .expect("configure");
+    teams.issue_session_token("i1", "/repo", "a", Some("s1"));
+    let team = teams
+        .ensure_team(
+            "i1",
+            "s1",
+            &nvim_ade_server::team::LeaderLaunch {
+                cwd: "/repo".to_string(),
+                key: nvim_ade_server::relay::InstanceKey {
+                    agent: "a".to_string(),
+                    command: "c".to_string(),
+                    args: vec![],
+                    cwd: "/repo".to_string(),
+                    capabilities: serde_json::Value::Null,
+                },
+                env: None,
+                launch: None,
+            },
+        )
+        .expect("team");
+
+    // A worker that never got an instance (its start failed before spawning).
+    let SpawnOutcome::Started(spawn) = teams
+        .request_spawn(&team, "dev", Some("w1"), None, None, None)
+        .expect("spawn")
+    else {
+        panic!("auto template starts");
+    };
+    let lifecycle = spawn.lifecycle;
+    teams.stop_worker(&team, "w1", true, false).expect("stop");
+    assert!(
+        teams.team(&team).unwrap().participants.contains_key("w1"),
+        "the start is not finished yet"
+    );
+    // The failed start completes the removal once.
+    teams.finish_worker_removal(&team, "w1");
+    assert!(
+        !teams.team(&team).unwrap().participants.contains_key("w1"),
+        "the removal completed"
+    );
+    let _ = lifecycle;
+
+    // A worker that already exited is removed by the next stop.
+    let SpawnOutcome::Started(spawn) = teams
+        .request_spawn(&team, "dev", Some("w2"), None, None, None)
+        .expect("spawn")
+    else {
+        panic!("auto template starts");
+    };
+    teams.worker_instance_set(&team, "w2", "w2-i");
+    teams.worker_session_set(&team, "w2", "w2-s");
+    teams.worker_started(&team, "w2");
+    teams.worker_exited("w2-i", "done");
+    let outcome = teams.stop_worker(&team, "w2", true, false).expect("stop");
+    assert_eq!(outcome.instance, None, "the instance exited already");
+    assert!(
+        !teams.team(&team).unwrap().participants.contains_key("w2"),
+        "an exited worker is removed at once"
+    );
+    let _ = spawn;
 }

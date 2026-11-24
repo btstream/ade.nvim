@@ -31,7 +31,7 @@ use crate::store::EventKind;
 
 mod teams;
 
-use teams::{inject_team_server, PendingWorktree, ServiceCall, TeamResult};
+use teams::{PendingWorktree, ServiceCall, TeamResult};
 
 /// How long a suspended team is kept (18.15); tests shorten it.
 fn team_ttl_ms() -> u64 {
@@ -413,14 +413,6 @@ type AttachOutcome = (Value, Replay);
 /// A method error: code and message.
 type MethodError = (i64, String);
 
-struct ReloadState {
-    conn: u64,
-    id: Value,
-    instance: String,
-    session: String,
-    token_id: String,
-}
-
 struct Instance {
     id: String,
     key: InstanceKey,
@@ -438,11 +430,6 @@ struct Instance {
     /// True once `agent.stop` was accepted; the instance stays reachable by id
     /// until the process exits (PROTOCOL.md 3.4).
     stopping: bool,
-    /// Fingerprint of the launch this instance runs (`team::launch_fingerprint`).
-    ///
-    /// It covers the key, the environment and the managed release, so two
-    /// instances that share an agent id but start differently are told apart.
-    fingerprint: String,
     /// Lease for a managed release this instance runs (PROTOCOL.md 16.4).
     #[cfg(unix)]
     _lease: Option<install_lock::ReleaseLease>,
@@ -539,17 +526,17 @@ pub struct Hub {
     pending_removals: HashMap<(String, String), (u64, Value)>,
     team_sender: mpsc::UnboundedSender<TeamResult>,
     team_results: mpsc::UnboundedReceiver<TeamResult>,
-    /// (instance, session) -> the `mcpServers` of its last session request
-    /// (20.5 in-place reload).
+    /// (instance, session) -> the user's `mcpServers` as last accepted by the
+    /// agent (the `ade-team` entry excluded).
     session_servers: HashMap<(String, String), Value>,
-    /// `session/new` requests whose token binds on the response, by
-    /// (instance, relay agent request id).
-    pending_session_new: HashMap<(String, u64), teams::PendingSessionNew>,
-    /// Agent request id of a `session.teams` reload -> what it answers. Its
-    /// replay is not relayed and not recorded (20.5).
-    reloading: HashMap<u64, ReloadState>,
-    /// Session-token MCP connections: connection -> (instance, session, agent).
-    injected_conns: HashMap<u64, (String, String, String)>,
+    /// Forwarded session requests, by (instance, relay agent request id), whose
+    /// token binds and whose servers commit only on a successful response.
+    pending_session: HashMap<(String, u64), teams::PendingSession>,
+    /// `(instance, session)` -> the front end asked for a one-shot forwarded
+    /// load rather than an emulated one (20.5).
+    forward_loads: HashSet<(String, String)>,
+    /// Session-token MCP connections: connection -> (instance, session).
+    injected_conns: HashMap<u64, (String, String)>,
     /// Participant token id -> its connection, for tokens that connect before
     /// they are bound.
     token_conns: HashMap<String, u64>,
@@ -618,8 +605,8 @@ impl Hub {
             team_sender,
             team_results,
             session_servers: HashMap::new(),
-            pending_session_new: HashMap::new(),
-            reloading: HashMap::new(),
+            pending_session: HashMap::new(),
+            forward_loads: HashSet::new(),
             injected_conns: HashMap::new(),
             token_conns: HashMap::new(),
         }
@@ -816,7 +803,7 @@ impl Hub {
             Command::Authenticated { conn, participant } => {
                 if let Some(token) = participant {
                     self.token_conns.insert(token.clone(), conn);
-                    if let Some((instance, session, agent)) =
+                    if let Some((instance, session, _)) =
                         self.teams
                             .session_auth(&token)
                             .map(|(instance, session, agent)| {
@@ -824,11 +811,8 @@ impl Hub {
                             })
                     {
                         self.injected_conns
-                            .insert(conn, (instance.clone(), session.clone(), agent.clone()));
-                        self.teams.session_connected(&instance, &session);
-                        let injected = self.teams.is_injected(&agent, &session);
-                        self.announce_switch(&instance, &session, &agent, injected);
-                        self.notify_tools_changed(&(instance, session));
+                            .insert(conn, (instance.clone(), session.clone()));
+                        self.session_state_changed(&instance, &session);
                     }
                     self.participant_conns.insert(conn, token);
                     self.frontend_conns.remove(&conn);
@@ -842,19 +826,17 @@ impl Hub {
                 if let Some(token) = self.participant_conns.remove(&conn) {
                     self.token_conns.remove(&token);
                 }
-                if let Some((instance, session, agent)) = self.injected_conns.remove(&conn) {
-                    self.teams.session_disconnected(&instance, &session);
-                    let injected = self.teams.is_injected(&agent, &session);
-                    self.announce_switch(&instance, &session, &agent, injected);
+                if let Some((instance, session)) = self.injected_conns.remove(&conn) {
+                    self.session_state_changed(&instance, &session);
                 }
                 let pending: Vec<(String, u64)> = self
-                    .pending_session_new
+                    .pending_session
                     .iter()
                     .filter(|(_, pending)| pending.conn == conn)
                     .map(|(key, _)| key.clone())
                     .collect();
                 for key in pending {
-                    if let Some(pending) = self.pending_session_new.remove(&key) {
+                    if let Some(pending) = self.pending_session.remove(&key) {
                         self.teams.revoke(&pending.token_id);
                     }
                 }
@@ -1724,10 +1706,6 @@ impl Hub {
                 key
             }
         };
-        #[cfg(unix)]
-        let fingerprint = crate::team::launch_fingerprint(&key, env.as_deref(), launch.as_ref());
-        #[cfg(not(unix))]
-        let fingerprint = crate::team::launch_fingerprint(&key, env.as_deref());
         self.instances.insert(
             instance_id.clone(),
             Instance {
@@ -1741,7 +1719,6 @@ impl Hub {
                 log_key,
                 attached: Vec::new(),
                 stopping: false,
-                fingerprint,
                 #[cfg(unix)]
                 _lease: lease,
                 env,
@@ -1900,7 +1877,7 @@ impl Hub {
             );
             return;
         };
-        let Some(mut message) = message else {
+        let Some(message) = message else {
             return;
         };
         let Some(handle) = self.instances.get(instance_id) else {
@@ -1990,10 +1967,6 @@ impl Hub {
                 }
             }
         }
-        // 20.2: a session request may get the session's team server. A
-        // `session/load` is decided later (it may be answered from the log);
-        // `session/new` binds its token on the response only.
-        let pending_new = self.prepare_session_request(conn, instance_id, &mut message);
         // Only a response that the relay actually forwarded closes the inbox
         // item. A watcher has no front-end request mapping, so its
         // `$/cancel_request` is dropped by the relay and must not answer an
@@ -2003,10 +1976,30 @@ impl Hub {
         } else {
             None
         };
-        let action = {
+        // 20.5: the front end asked for this session's load to reach the agent.
+        let force_forward = method.as_deref() == Some("session/load")
+            && session.as_ref().is_some_and(|session| {
+                self.forward_loads
+                    .contains(&(instance_id.to_string(), session.clone()))
+            });
+        let mut action = {
             let handle = self.instances.get_mut(instance_id).expect("checked above");
-            handle.relay.frontend_message(conn, &message)
+            if force_forward {
+                handle.relay.forward_request(conn, &message)
+            } else {
+                handle.relay.frontend_message(conn, &message)
+            }
         };
+        if force_forward {
+            if let Some(session) = &session {
+                self.forward_loads
+                    .remove(&(instance_id.to_string(), session.clone()));
+            }
+        }
+        // 20.2: a forwarded session request gets the session's team server; its
+        // token binds and its server list commits only on a successful
+        // response. An emulated load never reaches the agent and gets nothing.
+        let pending_session = self.inject_forwarded_session(instance_id, &mut action);
         // Turn-scoped policy sets bind to the prompt from the installing
         // connection; a forwarded cancel makes them cancelling (17.3). A frame
         // the relay drops never becomes an in-flight prompt, so it must not
@@ -2025,14 +2018,14 @@ impl Hub {
                 }
             }
         }
-        if let Some(pending) = pending_new {
+        if let Some(pending) = pending_session {
             match action
                 .forwarded()
                 .and_then(|frame| frame.get("id"))
                 .and_then(Value::as_u64)
             {
                 Some(agent_id) => {
-                    self.pending_session_new
+                    self.pending_session
                         .insert((instance_id.to_string(), agent_id), pending);
                 }
                 None => self.teams.revoke(&pending.token_id),
@@ -2044,7 +2037,6 @@ impl Hub {
         self.record_events(instance_id, events);
         match action {
             FrontendAction::Forward(frame) => {
-                let frame = self.forwarded_load_frame(instance_id, &method, frame);
                 self.send_to_agent(conn, instance_id, frame, message_id);
             }
             FrontendAction::ForwardWith {
@@ -2059,7 +2051,6 @@ impl Hub {
                 for retraction in &retractions {
                     self.send_cancel_request(instance_id, retraction);
                 }
-                let frame = self.forwarded_load_frame(instance_id, &method, frame);
                 self.send_to_agent(conn, instance_id, frame, message_id);
             }
             FrontendAction::LoadCandidate(candidate) => {
@@ -2196,80 +2187,33 @@ impl Hub {
         });
     }
 
-    /// A `session/load` the relay forwards (not emulated) gets the session
-    /// server before it reaches the agent (20.2).
-    fn forwarded_load_frame(
-        &mut self,
-        instance: &str,
-        method: &Option<String>,
-        frame: Value,
-    ) -> Value {
-        if method.as_deref() != Some("session/load") {
-            return frame;
-        }
-        let mut frame = frame;
-        self.inject_forwarded_load(instance, &mut frame);
-        frame
-    }
-
-    /// Inject the session team server into a load that really is forwarded.
-    fn inject_forwarded_load(&mut self, instance: &str, message: &mut Value) {
-        let Some(handle) = self.instances.get(instance) else {
-            return;
-        };
-        let cwd = handle.key.cwd.clone();
-        let agent = handle.key.agent.clone();
-        let Some(session) = message
-            .get("params")
-            .and_then(|params| params.get("sessionId"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-        else {
-            return;
-        };
-        self.teams.note_resume_candidate(instance, &session, &agent);
-        if !self.teams.has_config(&cwd) || !self.teams.config_for(&cwd).enabled {
-            return;
-        }
-        if !self.teams.enabled_for(&agent, &session, &cwd) {
-            return;
-        }
-        if let Some(servers) = message
-            .get("params")
-            .and_then(|params| params.get("mcpServers"))
-            .cloned()
-            .filter(|value| value.is_array())
-        {
-            self.session_servers
-                .insert((instance.to_string(), session.clone()), servers);
-        }
-        let (_token_id, token) =
-            self.teams
-                .issue_session_token(instance, &cwd, &agent, Some(&session));
-        if let Some(params) = message.get_mut("params") {
-            inject_team_server(params, &token);
-        }
-        self.refresh_session(instance, &session);
-        self.announce_switch(instance, &session, &agent, false);
-        self.notify_tools_changed(&(instance.to_string(), session));
-    }
-
     /// Forward a `session/load` to the agent (the emulation is not possible).
     fn forward_load(&mut self, conn: u64, instance_id: &str, frame: &Value) {
         if self.instances.get_mut(instance_id).is_none() {
             return;
         }
-        // A forwarded load reaches the agent, so it gets a token; an emulated
-        // load never does (20.2).
-        let mut frame = frame.clone();
-        self.inject_forwarded_load(instance_id, &mut frame);
-        let handle = self.instances.get_mut(instance_id).expect("checked above");
-        let action = handle.relay.forward_request(conn, &frame);
-        let Some(frame) = action.forwarded().cloned() else {
+        let mut action = {
+            let handle = self.instances.get_mut(instance_id).expect("checked above");
+            handle.relay.forward_request(conn, frame)
+        };
+        // The fallback really forwards the load, so it gets the injection.
+        let pending = self.inject_forwarded_session(instance_id, &mut action);
+        let Some(forwarded) = action.forwarded().cloned() else {
+            if let Some(pending) = pending {
+                self.teams.revoke(&pending.token_id);
+            }
             return;
         };
+        if let Some(pending) = pending {
+            if let Some(agent_id) = forwarded.get("id").and_then(Value::as_u64) {
+                self.pending_session
+                    .insert((instance_id.to_string(), agent_id), pending);
+            } else {
+                self.teams.revoke(&pending.token_id);
+            }
+        }
         if let Some(handle) = self.instances.get(instance_id) {
-            if !handle.control.send_frame(frame) {
+            if !handle.control.send_frame(forwarded) {
                 self.send_tunnel_error(
                     conn,
                     instance_id,
@@ -2508,36 +2452,10 @@ impl Hub {
             return;
         };
         let outcome = instance.relay.agent_message_full(&value, &attached);
-        // The replay of a `session.teams` reload is consumed (20.5): neither
-        // relayed nor recorded.
-        let reload_agent = match &outcome.action {
-            Some(AgentAction::ServiceResponse { agent_id, .. }) => Some(*agent_id),
-            _ => None,
-        };
-        let reload_state = reload_agent.and_then(|agent_id| self.reloading.remove(&agent_id));
-        let notified_session = value
-            .get("params")
-            .and_then(|params| params.get("sessionId"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let reloading = reload_state
-            .as_ref()
-            .map(|state| state.session.clone())
-            .or(notified_session)
-            .is_some_and(|session| {
-                reload_state.is_some()
-                    || self
-                        .reloading
-                        .values()
-                        .any(|state| state.instance == instance_id && state.session == session)
-            });
         // Record what the agent said before anything is delivered: the log is
         // the source of later replays (PROTOCOL.md 10).
         let had_prompt_finished = outcome.prompt_finished.is_some();
-        let mut events = outcome.events.clone();
-        if reloading {
-            events.clear();
-        }
+        let events = outcome.events.clone();
         self.record_events(instance_id, events);
 
         // Retractions come first: a front end must close the question before
@@ -2558,24 +2476,13 @@ impl Hub {
         match outcome.action {
             Some(AgentAction::Response { conn, seq, message }) => {
                 if let Some(request) = &outcome.frontend_request {
-                    self.finish_session_new(instance_id, request, &message);
-                    if matches!(request.method.as_str(), "session/load" | "session/resume") {
-                        if message.get("error").is_some() {
-                            self.teams
-                                .drop_resume_candidate(instance_id, &session_of(&message, request));
-                        } else {
-                            let session = session_of(&message, request);
-                            self.complete_resume(instance_id, &session);
-                        }
-                    }
+                    self.finish_session(instance_id, request, &message);
                 }
                 self.send_tunnel_recv(conn, instance_id, seq, &message);
             }
             Some(AgentAction::Notification { seq, message }) => {
-                if !reloading {
-                    for conn in attached {
-                        self.send_tunnel_recv(conn, instance_id, seq, &message);
-                    }
+                for conn in attached {
+                    self.send_tunnel_recv(conn, instance_id, seq, &message);
                 }
             }
             Some(AgentAction::Request {
@@ -2653,7 +2560,7 @@ impl Hub {
         }
 
         // Bus turns feed `bus.read` and the report fallback.
-        if value.get("method").and_then(Value::as_str) == Some("session/update") && !reloading {
+        if value.get("method").and_then(Value::as_str) == Some("session/update") {
             self.note_worker_chunk(instance_id, &value);
         }
         if value.get("method").and_then(Value::as_str) == Some("$/cancel_request") {
@@ -3137,10 +3044,6 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn session_of(_message: &Value, request: &crate::relay::FrontendRequest) -> String {
-    request.session_id.clone().unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3371,7 +3274,6 @@ mod tests {
             log_key: "i1".to_string(),
             attached: vec![1, 2],
             stopping: false,
-            fingerprint: "fp".to_string(),
             #[cfg(unix)]
             _lease: None,
             env: None,

@@ -3467,8 +3467,10 @@ fn reports_and_chunks_while_waiting_human_are_kept() {
     );
 }
 
+/// `team.close` degrades the session to the non-leader tools but keeps its
+/// token usable; the front end hears the state change (20.5/F).
 #[test]
-fn team_close_tells_connected_participants_and_revokes_new_handshakes() {
+fn team_close_degrades_the_leader_session_and_keeps_its_token() {
     let mut harness = Harness::new("team-close-token", json!({}), None);
     let mut participant = harness.server.connect();
     let hello = participant.hello_raw(json!({
@@ -3478,20 +3480,38 @@ fn team_close_tells_connected_participants_and_revokes_new_handshakes() {
         "api_version": nvim_ade_server::API_VERSION,
     }));
     assert_eq!(hello["result"]["participant"]["role"], "session");
+    assert!(
+        mcp_tools(&harness.server, &harness.token).contains(&"team_stop".to_string()),
+        "the leader set before close"
+    );
     let closed = harness
         .client
         .request(108, "team.close", json!({"team": harness.team}));
     assert!(closed["result"].is_object(), "{closed}");
+    // The same token still answers; the role is no longer the leader.
     let status = participant.request(1, "bus.status", json!({}));
-    assert_eq!(status["error"]["code"], -32064, "{status}");
-    assert!(
-        status["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("team closed")),
-        "{status}"
+    assert_eq!(
+        status["result"]["self"]["name"],
+        Value::Null,
+        "the closed session is not a leader: {status}"
     );
-    let new_handshake = mcp_call(&harness.server, &harness.token, "bus_status", json!({}));
-    assert_eq!(new_handshake["isError"], true, "{new_handshake}");
+    let tools = mcp_tools(&harness.server, &harness.token);
+    assert!(
+        tools.contains(&"team_spawn".to_string()) && !tools.contains(&"team_stop".to_string()),
+        "the non-leader set after close: {tools:?}"
+    );
+    // A leader-only tool is refused as a tool error, not `-32602`.
+    let refused = mcp_call(
+        &harness.server,
+        &harness.token,
+        "team_stop",
+        json!({"name": "w1"}),
+    );
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(
+        mcp_text(&refused).contains("does not lead"),
+        "the refusal names the role: {refused}"
+    );
 }
 
 #[test]
@@ -5132,8 +5152,10 @@ fn session_requests_get_a_fresh_ade_team_entry() {
     assert_eq!(init["capabilities"]["tools"]["listChanged"], true, "{init}");
 }
 
+/// `session.teams` with `enabled: true` only asks the front end to reload
+/// (20.5): the service marks one forwarded load and never sends one itself.
 #[test]
-fn the_switch_hides_the_session_tools_and_reloads_on_enable() {
+fn the_switch_hides_the_session_tools_and_asks_for_a_reload() {
     let mut harness = Harness::new(
         "session-switch",
         json!({"spawn_confirm": {"auto": ["dev"]}}),
@@ -5172,6 +5194,19 @@ fn the_switch_hides_the_session_tools_and_reloads_on_enable() {
     assert_eq!(refused["isError"], true, "{refused}");
     assert!(mcp_text(&refused).contains("teams are off"), "{refused}");
 
+    // `injected` is only true while an MCP process of the session is
+    // connected; the tool listings above spawn short-lived ones.
+    wait_for(
+        || {
+            let query = harness.client.request(
+                240,
+                "session.teams",
+                json!({"instance": harness.instance, "sessionId": session}),
+            );
+            (query["result"]["injected"] == json!(false)).then_some(())
+        },
+        "the session's MCP processes to disconnect",
+    );
     let on = harness.client.request(
         24,
         "session.teams",
@@ -5182,27 +5217,23 @@ fn the_switch_hides_the_session_tools_and_reloads_on_enable() {
         }),
     );
     assert_eq!(on["result"]["enabled"], true, "{on}");
-    // No MCP process was connected when the switch flipped: the service
-    // reloads the session with a fresh server entry (20.5).
-    let loaded = wait_for(
-        || {
-            harness.events().into_iter().find(|event| {
-                event["event"] == "session"
-                    && event["method"] == "session/load"
-                    && event["session"] == session
-            })
-        },
-        "the in-place session/load",
-    );
-    assert_eq!(loaded["mcp"], true, "{loaded}");
+    assert_eq!(on["result"]["reload"], true, "{on}");
+    // The service does not send a load of its own.
+    std::thread::sleep(Duration::from_millis(300));
     assert!(
-        mcp_tools(&harness.server, &token).contains(&"team_spawn".to_string()),
-        "the non-leader session tools are back"
+        !harness.events().iter().any(|event| {
+            event["event"] == "session"
+                && event["method"] == "session/load"
+                && event["session"] == session
+        }),
+        "the service must not send a reload itself"
     );
 }
 
+/// The front-end RPC keeps `ensure_team`'s structured `led_by` error and does
+/// not create an inbox item: only the MCP tool asks the person (20.4).
 #[test]
-fn a_second_session_spawns_through_ensure_team_and_is_told_about_the_leader() {
+fn a_frontend_spawn_from_another_chat_gets_the_structured_refusal() {
     let mut harness = Harness::new(
         "session-led-by",
         json!({"spawn_confirm": {"auto": ["dev"]}}),
@@ -5230,31 +5261,31 @@ fn a_second_session_spawns_through_ensure_team_and_is_told_about_the_leader() {
         }),
     );
     assert_eq!(spawn["error"]["code"], -32061, "{spawn}");
-    assert!(
-        spawn["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("hand")),
+    assert_eq!(spawn["error"]["data"]["reason"], "led_by", "{spawn}");
+    assert_eq!(spawn["error"]["data"]["team"], harness.team, "{spawn}");
+    assert_eq!(
+        spawn["error"]["data"]["leader"]["sessionId"], harness.session,
         "{spawn}"
     );
-    let item = wait_for(
-        || {
-            harness.team()["inbox"]
-                .as_array()?
-                .iter()
-                .find(|item| item["kind"] == "handover")
-                .cloned()
-        },
-        "the handover item",
+    assert!(
+        !harness.team()["inbox"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["kind"] == "handover")),
+        "a front-end request does not queue a handover: {}",
+        harness.team()["inbox"]
     );
-    assert_eq!(item["from"]["sessionId"], session, "{item}");
-    assert_eq!(item["leader"]["sessionId"], harness.session, "{item}");
 
-    // `move` makes the second chat the leader and the spawn then works.
-    harness.answer(item["id"].as_str().unwrap(), json!({"option": "move"}));
+    // The person still moves the team explicitly; the spawn then works.
+    let moved = harness.client.request(
+        27,
+        "team.set_leader",
+        json!({"team": harness.team, "instance": harness.instance, "sessionId": session}),
+    );
+    assert!(moved["result"].is_object(), "{moved}");
     let spawn = wait_for(
         || {
             let response = harness.client.request(
-                27,
+                28,
                 "team.spawn",
                 json!({
                     "instance": harness.instance,
@@ -5609,12 +5640,12 @@ fn the_mcp_process_pushes_tools_list_changed() {
     assert!(saw, "the MCP process must push tools/list_changed");
 }
 
-/// The `session.teams` reload replays the session but its replay must neither
-/// be relayed to the front end nor recorded (#8, #9).
+/// `session.teams` marks one forwarded load; that load reaches the agent and
+/// keeps the user's own server (20.5).
 #[test]
-fn a_session_reload_swallows_its_replay() {
+fn a_reload_request_forwards_the_next_load_with_the_user_servers() {
     let mut harness = Harness::new(
-        "session-reload-swallow",
+        "session-reload-forward",
         json!({"spawn_confirm": {"auto": ["dev"]}}),
         None,
     );
@@ -5632,17 +5663,29 @@ fn a_session_reload_swallows_its_replay() {
         .as_str()
         .expect("session id")
         .to_string();
-    let db = harness.server.dir().join("nvim_ade_server.events.sqlite3");
-    let count_events = |db: &std::path::Path| -> Option<i64> {
-        let conn = rusqlite::Connection::open(db).ok()?;
-        conn.query_row("SELECT count(*) FROM events", [], |row| row.get(0))
-            .ok()
-    };
-    // Let the session/new bookkeeping settle, then snapshot the log.
-    std::thread::sleep(Duration::from_millis(300));
-    let before = count_events(&db).expect("event log");
-    // Turn the switch off (no MCP process is connected) and on again: the
-    // service reloads the session.
+    // The injected session/new still carries the user's server (20.2).
+    let injected = wait_for(
+        || {
+            harness.events().into_iter().find(|event| {
+                event["event"] == "session"
+                    && event["session"] == session
+                    && event["method"] == "session/new"
+            })
+        },
+        "the injected session/new",
+    );
+    let mut names: Vec<&str> = injected["mcp_servers"]
+        .as_array()
+        .expect("servers")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec!["ade-team", "user-server"],
+        "the user server survives the injection: {injected}"
+    );
     let off = harness.client.request(
         118,
         "session.teams",
@@ -5654,8 +5697,23 @@ fn a_session_reload_swallows_its_replay() {
         "session.teams",
         json!({"instance": harness.instance, "sessionId": session, "enabled": true}),
     );
-    assert_eq!(on["result"]["enabled"], true, "{on}");
-    let loaded = wait_for(
+    assert_eq!(on["result"]["reload"], true, "{on}");
+    // The front end performs the reload through its normal load path.
+    let loaded = tunnel_call(
+        &mut harness.client,
+        &harness.instance,
+        120,
+        "session/load",
+        json!({
+            "sessionId": session,
+            "cwd": harness.work.to_string_lossy(),
+            "mcpServers": [
+                {"name": "user-server", "command": "/bin/true", "args": [], "env": []},
+            ],
+        }),
+    );
+    assert!(loaded["result"].is_object(), "{loaded}");
+    let forwarded = wait_for(
         || {
             harness.events().into_iter().find(|event| {
                 event["event"] == "session"
@@ -5663,41 +5721,69 @@ fn a_session_reload_swallows_its_replay() {
                     && event["session"] == session
             })
         },
-        "the in-place session/load",
+        "the forwarded session/load",
     );
-    // The user's own MCP server survives the reload (20.5).
-    assert_eq!(loaded["mcp"], true, "{loaded}");
-    // The replay the agent sent during the reload is not recorded: the event
-    // log gains nothing (the agent's replay is not a front-end turn).
+    let mut names: Vec<&str> = forwarded["mcp_servers"]
+        .as_array()
+        .expect("servers")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec!["ade-team", "user-server"],
+        "the load keeps the user server and adds ade-team: {forwarded}"
+    );
+    // A recorded turn makes the session complete, so a plain load can be
+    // answered from the log from now on.
+    let _ = tunnel_call(
+        &mut harness.client,
+        &harness.instance,
+        122,
+        "session/prompt",
+        json!({
+            "sessionId": session,
+            "prompt": [{"type": "text", "text": "hello"}],
+        }),
+    );
+    // The flag is one-shot: the next load of that session is emulated again.
+    let again = tunnel_call(
+        &mut harness.client,
+        &harness.instance,
+        121,
+        "session/load",
+        json!({
+            "sessionId": session,
+            "cwd": harness.work.to_string_lossy(),
+            "mcpServers": [],
+        }),
+    );
+    assert!(again["result"].is_object(), "{again}");
     std::thread::sleep(Duration::from_millis(300));
-    let after = count_events(&db).expect("event log");
-    let replayed = after - before;
-    assert_eq!(replayed, 0, "the reload replay must not be recorded");
-    // And it is not relayed either.
-    while let Some(frame) = harness
-        .client
-        .try_next_notification(Duration::from_millis(200))
-    {
-        if frame["method"] == "tunnel.recv" {
-            let message = &frame["params"]["message"];
-            assert_ne!(
-                harness.instance, frame["params"]["instance"],
-                "reload replay relayed: {message}"
-            );
-        }
-    }
+    let loads = harness
+        .events()
+        .into_iter()
+        .filter(|event| {
+            event["event"] == "session"
+                && event["method"] == "session/load"
+                && event["session"] == session
+        })
+        .count();
+
+    assert_eq!(loads, 1, "the second load is answered from the log");
 }
 
 /// `team.close` degrades the tools but keeps the session token valid (#12).
+/// `team.close` keeps the session token and only degrades the tools: the same
+/// chat may create a team again (20.5/F).
 #[test]
-fn closing_a_team_keeps_the_session_token() {
+fn closing_a_team_keeps_the_session_token_and_allows_a_new_team() {
     let mut harness = Harness::new("team-close-session-token", json!({}), None);
     let closed = harness
         .client
         .request(120, "team.close", json!({"team": harness.team}));
     assert!(closed["result"].is_object(), "{closed}");
-    // The token is still accepted: `team_spawn` answers "team closed" as an
-    // error (the MCP process turns it into `isError`), not "invalid token".
     let token = harness.token.clone();
     let hello = {
         let mut participant = harness.server.connect();
@@ -5714,14 +5800,27 @@ fn closing_a_team_keeps_the_session_token() {
             .is_some(),
         "the token stays valid after close: {hello}"
     );
-    let refused = mcp_call(
+    // The tool set is the non-leader one again, but the chat may lazily create
+    // the next team (20.4).
+    assert!(mcp_tools(&harness.server, &token).contains(&"team_spawn".to_string()));
+    let spawned = mcp_call(
         &harness.server,
         &token,
         "team_spawn",
-        json!({"template": "dev"}),
+        json!({"template": "dev", "name": "w1"}),
     );
-    assert_eq!(refused["isError"], true, "{refused}");
-    assert!(mcp_text(&refused).contains("team closed"), "{refused}");
+    assert_eq!(spawned["isError"], false, "{spawned}");
+    wait_for(
+        || {
+            let teams = harness.client.request(121, "team.list", json!({}));
+            teams["result"]["teams"]
+                .as_array()?
+                .iter()
+                .find(|team| team["leader"]["sessionId"] == harness.session.as_str())
+                .cloned()
+        },
+        "the re-created team",
+    );
 }
 
 /// `team.stop_worker` on a worker still waiting for its worktree stops it and
@@ -5806,4 +5905,262 @@ fn the_stop_tool_does_not_notify_itself() {
         },
         "the person's stop notice",
     );
+}
+
+// -- section 20 round 2 ----------------------------------------------------
+
+/// Read MCP frames until `id` arrives, collecting notifications seen first.
+fn mcp_frames_until(
+    reader: &mut BufReader<std::process::ChildStdout>,
+    id: u64,
+) -> (Value, Vec<Value>) {
+    let mut notes = Vec::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            return (Value::Null, notes);
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if value.get("method").is_some() {
+            notes.push(value);
+            continue;
+        }
+        if value.get("id").and_then(Value::as_u64) == Some(id) {
+            return (value, notes);
+        }
+    }
+}
+
+fn write_mcp(stdin: &mut std::process::ChildStdin, frame: Value) {
+    writeln!(stdin, "{frame}").expect("write mcp frame");
+    stdin.flush().expect("flush mcp frame");
+}
+
+/// `notifications/tools/list_changed` arrive for a team being created, a leader
+/// change in one instance and the team closing (20.3/#6).
+#[test]
+fn list_changed_follows_team_creation_handover_and_close() {
+    let mut harness = Harness::new(
+        "session-list-changed-events",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    harness
+        .client
+        .request(130, "team.close", json!({"team": harness.team}));
+    // A fresh session whose MCP process lives across the changes.
+    let second = tunnel_call(
+        &mut harness.client,
+        &harness.instance,
+        131,
+        "session/new",
+        json!({ "cwd": harness.work.to_string_lossy(), "mcpServers": [] }),
+    );
+    let second_session = second["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let mut child = Command::new(common::BINARY)
+        .arg("mcp")
+        .env("ADE_TEAM_TOKEN", harness_token(&harness, &second_session))
+        .env("NVIM_ADE_SERVER_DIR", harness.server.dir())
+        .env("HOME", harness.server.dir())
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let stdin = child.stdin.as_mut().expect("stdin");
+    write_mcp(
+        stdin,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test"}}}),
+    );
+    write_mcp(
+        stdin,
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    );
+    write_mcp(
+        stdin,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+    );
+    // Drain the handshake notifications (the connection's own list_changed)
+    // before the events under test.
+    let (first_tools, _) = mcp_frames_until(&mut reader, 2);
+    assert_eq!(first_tools["result"]["tools"][0]["name"], "team_spawn");
+
+    // 1. Creating the team for this session.
+    let created = harness.client.request(
+        132,
+        "team.start",
+        json!({
+            "instance": harness.instance,
+            "sessionId": second_session,
+            "workflow": "no-such-workflow",
+        }),
+    );
+    assert_eq!(created["error"]["code"], -32060, "{created}");
+    write_mcp(
+        stdin,
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}),
+    );
+    let (tools, notes) = mcp_frames_until(&mut reader, 3);
+    assert!(
+        notes
+            .iter()
+            .any(|note| note["method"] == "notifications/tools/list_changed"),
+        "a created team pushes list_changed: {notes:?}"
+    );
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(names.contains(&"team_stop"), "the leader set: {names:?}");
+
+    // 2. The team closes: the same session drops to the non-leader set.
+    let team = harness.list()["teams"][0]["id"]
+        .as_str()
+        .expect("team id")
+        .to_string();
+    let closed = harness
+        .client
+        .request(133, "team.close", json!({"team": team}));
+    assert!(closed["result"].is_object(), "{closed}");
+    write_mcp(
+        stdin,
+        json!({"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}),
+    );
+    let (tools, notes) = mcp_frames_until(&mut reader, 4);
+    assert!(
+        notes
+            .iter()
+            .any(|note| note["method"] == "notifications/tools/list_changed"),
+        "a closed team pushes list_changed: {notes:?}"
+    );
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"team_stop") && names.contains(&"team_spawn"),
+        "the non-leader set after close: {names:?}"
+    );
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+/// `bus_send`/`bus_ask_human`/`board_update` from a session that lost the lead
+/// answer as tool errors with the role reason, not `-32602` (#7).
+#[test]
+fn a_degraded_session_gets_tool_errors_with_the_role_reason() {
+    let mut harness = Harness::new(
+        "session-degraded-tools",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let second = tunnel_call(
+        &mut harness.client,
+        &harness.instance,
+        137,
+        "session/new",
+        json!({ "cwd": harness.work.to_string_lossy(), "mcpServers": [] }),
+    );
+    let session = second["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let token = harness_token(&harness, &session);
+    for tool in ["bus_send", "bus_ask_human", "board_update", "team_stop"] {
+        let refused = mcp_call(
+            &harness.server,
+            &token,
+            tool,
+            json!({"to": "leader", "kind": "report", "body": "x", "question": "q", "columns": []}),
+        );
+        assert_eq!(refused["isError"], true, "{tool}: {refused}");
+        assert!(
+            mcp_text(&refused).contains("does not lead"),
+            "{tool} names the role reason: {refused}"
+        );
+    }
+}
+
+/// `team.configure` that disables a cwd flips the session's tool set and pushes
+/// both notifications (20.3/E).
+#[test]
+fn a_disabling_configure_pushes_list_changed() {
+    let mut harness = Harness::new(
+        "session-configure-notify",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let mut child = Command::new(common::BINARY)
+        .arg("mcp")
+        .env("ADE_TEAM_TOKEN", harness.token.clone())
+        .env("NVIM_ADE_SERVER_DIR", harness.server.dir())
+        .env("HOME", harness.server.dir())
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let stdin = child.stdin.as_mut().expect("stdin");
+    write_mcp(
+        stdin,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test"}}}),
+    );
+    write_mcp(
+        stdin,
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    );
+    write_mcp(
+        stdin,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+    );
+    let (tools, _) = mcp_frames_until(&mut reader, 2);
+    assert!(!tools["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .is_empty());
+
+    let configured = harness.client.request(
+        140,
+        "team.configure",
+        json!({
+            "cwd": harness.work.to_string_lossy(),
+            "config": {"enabled": false, "templates": {"dev": {"key": {"agent": "a", "command": "c"}}}},
+        }),
+    );
+    assert!(configured["result"].is_object(), "{configured}");
+    write_mcp(
+        stdin,
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}),
+    );
+    let (tools, notes) = mcp_frames_until(&mut reader, 3);
+    assert!(
+        notes
+            .iter()
+            .any(|note| note["method"] == "notifications/tools/list_changed"),
+        "a configure pushes list_changed: {notes:?}"
+    );
+    assert!(
+        tools["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .is_empty(),
+        "the disabled cwd has no tools: {tools}"
+    );
+    drop(child.stdin.take());
+    let _ = child.wait();
 }

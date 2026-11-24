@@ -716,7 +716,7 @@ impl Mcp {
                 }
                 ("bus.workflow_delete", call)
             }
-            "bus_send" if leader || !session => (
+            "bus_send" => (
                 "bus.send",
                 json!({
                     "to": arguments.get("to"),
@@ -726,7 +726,7 @@ impl Mcp {
                     "refs": arguments.get("refs"),
                 }),
             ),
-            "bus_ask_human" if leader || !session => (
+            "bus_ask_human" => (
                 "bus.ask_human",
                 json!({
                     "question": arguments.get("question"),
@@ -745,7 +745,7 @@ impl Mcp {
             // Both board tools reach the service, which owns the role check and
             // returns the documented -32061. `tools/list` still hides the other
             // role's tool.
-            "board_update" if leader || !session => ("bus.board_update", arguments),
+            "board_update" => ("bus.board_update", arguments),
             // The hub owns the role check and returns the documented -32061.
             "card_update" => ("bus.card_update", arguments),
             "team_spawn" | "bus_read" | "workflow_save" | "workflow_get" | "workflow_delete"

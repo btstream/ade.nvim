@@ -386,17 +386,15 @@ fn spawn_connection(
     tokens: SharedTokens,
 ) {
     tokio::spawn(async move {
-        let counted = match handle_connection(
+        // The count is returned separately from the read result so an I/O
+        // error can never leak an `active` connection (idle exit).
+        let (counted, outcome) = handle_connection(
             conn, stream, &token, &shutdown, &hub, &events, event_log, &tokens,
         )
-        .await
-        {
-            Ok(counted) => counted,
-            Err(error) => {
-                crate::svc_log!("nvim_ade_server: connection error: {error}");
-                false
-            }
-        };
+        .await;
+        if let Err(error) = outcome {
+            crate::svc_log!("nvim_ade_server: connection error: {error}");
+        }
         let _ = hub.send(Command::Disconnected { conn }).await;
         let _ = events.send(ConnectionEvent::Closed { counted });
     });
@@ -412,7 +410,7 @@ async fn handle_connection(
     events: &mpsc::UnboundedSender<ConnectionEvent>,
     event_log: bool,
     tokens: &SharedTokens,
-) -> io::Result<bool> {
+) -> (bool, io::Result<()>) {
     let (reader, writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
 
@@ -586,7 +584,7 @@ async fn handle_connection(
     flush_outbox(&outbox).await;
     close_tx.send(true).ok();
     cancel_writer(writer_task).await;
-    result.map(|()| counted)
+    (counted, result)
 }
 
 /// Wait (briefly) until every queued frame was written.
