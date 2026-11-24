@@ -478,28 +478,6 @@ pub struct TeamConfig {
     /// `templates` was empty: one `worker` template is built from the leader
     /// instance at team creation (20.4).
     pub builtin_worker: bool,
-    /// The template a front end derived from its own leader's launch.
-    ///
-    /// Nothing in the configuration says which command owns it, so the front end
-    /// states the leader agent it was derived from. The service only hands this
-    /// configuration to a leader of exactly that agent, which is what keeps a
-    /// derived template from starting a different adapter than the session that
-    /// supplied it.
-    pub derived: Option<DerivedTemplate>,
-}
-
-/// `config.derived`: the template derived from a leader's own launch and the
-/// agent it belongs to.
-///
-/// The template itself describes that launch (`key`, `env`, `launch`), so the
-/// service derives the fingerprint from the configuration — never from a claim
-/// by the front end — and compares it with the fingerprint of the instance that
-/// binds. Two leaders may share an agent id yet run different commands,
-/// arguments, environments or managed releases; only the exact launch matches.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DerivedTemplate {
-    pub template: String,
-    pub agent: String,
 }
 
 impl Default for TeamConfig {
@@ -516,7 +494,6 @@ impl Default for TeamConfig {
             enabled: true,
             session_default: true,
             builtin_worker: false,
-            derived: None,
         }
     }
 }
@@ -589,6 +566,12 @@ pub struct Participant {
     /// The prompt id currently running for this participant (19.14).
     #[serde(skip)]
     pub prompt_seq: Option<u64>,
+    /// Identifies this start attempt across async worktree callbacks (20.6).
+    #[serde(skip)]
+    pub lifecycle: u64,
+    /// `team.stop_worker remove: true`: drop the participant once it exited.
+    #[serde(skip)]
+    pub remove_after_exit: bool,
 }
 
 impl Participant {
@@ -627,6 +610,8 @@ impl Participant {
             label: None,
             interrupting: None,
             prompt_seq: None,
+            lifecycle: 0,
+            remove_after_exit: false,
         }
     }
 
@@ -644,8 +629,6 @@ pub struct Team {
     /// Loaded from disk after a service restart and not resumed yet (18.15).
     pub suspended: bool,
     pub suspended_at: Option<u64>,
-    /// A leader bound while suspended but no configuration had arrived yet.
-    pub pending_resume: Option<(String, String)>,
     pub leader_instance: Option<String>,
     pub leader_session: Option<String>,
     /// The launch fingerprint of the leader instance while it lives.
@@ -678,6 +661,8 @@ pub struct Team {
     pub board_flush_at: Option<u64>,
     /// The spawn group of a prompt the leader is running (19.6).
     pub current_group: Option<String>,
+    /// Pending (not yet started) spawn names -> lifecycle id (20.6).
+    pub pending_lifecycles: HashMap<String, u64>,
 }
 
 impl Team {
@@ -715,24 +700,6 @@ impl Team {
 
     pub fn is_leader_instance(&self, instance: &str) -> bool {
         self.leader_instance.as_deref() == Some(instance)
-    }
-
-    /// Whether this team has done any work at all: a worker ever existed, a card
-    /// was written, an inbox item is open, or a workflow was started.
-    ///
-    /// A team a session creates by merely chatting has none of these. It is the
-    /// person's session state, not a team they use, so another session of the
-    /// same cwd may take it over instead of being told to close it.
-    pub fn has_activity(&self) -> bool {
-        self.participants
-            .values()
-            .any(|participant| participant.role == Role::Worker)
-            || self.board.rev > 0
-            || self.board.workflow_name.is_some()
-            || self
-                .inbox
-                .iter()
-                .any(|item| item.state == ItemState::Open || item.state == ItemState::Orphaned)
     }
 }
 
@@ -858,9 +825,6 @@ struct TokenRecord {
     session: Option<String>,
     /// The agent the instance ran when the token was issued (leaders only).
     agent: Option<String>,
-    /// Fingerprint of that instance's launch, so a bind never crosses over to
-    /// another instance that merely shares the agent id (leaders only).
-    instance_fingerprint: Option<String>,
     bound: bool,
 }
 
@@ -910,6 +874,16 @@ pub struct SpawnRequest {
     /// The spawn's role, appended to the template's role card (19.6).
     pub role: Option<String>,
     pub task: Option<String>,
+    /// The participant lifecycle this request starts (20.6).
+    pub lifecycle: u64,
+}
+
+#[derive(Debug)]
+pub struct StopOutcome {
+    pub instance: Option<String>,
+    /// Lifecycle of the start attempt that must not go on.
+    pub lifecycle: u64,
+    pub remove: bool,
 }
 
 #[derive(Debug)]
@@ -947,19 +921,10 @@ pub type GroupAnswers = Vec<(String, AnswerEffect)>;
 /// The items a group answer failed to answer, with their errors (19.6).
 pub type GroupFailures = Vec<(String, TeamError)>;
 
-#[derive(Debug)]
-pub enum BindOutcome {
-    /// A live team, or a new one.
-    Active(Value),
-    /// A suspended team whose first matching bind starts the resume.
-    Resume { team: String, entry: Value },
-}
-
 pub struct Teams {
     pub tokens: SharedTokens,
     token_records: HashMap<String, TokenRecord>,
     configs: HashMap<String, TeamConfig>,
-    /// cwd -> launch fingerprint -> the configuration derived from that launch.
     ///
     /// The agent id alone is not enough: two leaders may run the same agent id
     /// with different commands, arguments, environments or managed releases.
@@ -967,7 +932,6 @@ pub struct Teams {
     /// configuration itself describes, and each leader binds only the entry it
     /// supplied. One cwd still has one team (18.1), so the first bind wins and
     /// the other is refused by the existing "team already exists" rule.
-    derived_configs: HashMap<String, HashMap<String, TeamConfig>>,
     teams: HashMap<String, Team>,
     by_cwd: HashMap<String, String>,
     /// instance -> (team id, participant name); O(1) membership for every agent
@@ -980,6 +944,8 @@ pub struct Teams {
     events: Vec<TeamEvent>,
     /// The next spawn group number (19.6).
     next_group: u64,
+    /// The next participant lifecycle id (20.6).
+    next_lifecycle: u64,
     /// Stored (project and user) workflows (19.5).
     workflows: workflow::StoredWorkflows,
     /// cwd -> project key, so git runs at most once per cwd.
@@ -989,6 +955,14 @@ pub struct Teams {
     session_switches: HashMap<(String, String), bool>,
     /// (agent, sessionId) -> connected session-token MCP processes (20.5).
     injected: HashMap<(String, String), usize>,
+    /// (instance, session) -> stored team whose resume waits for an accepted
+    /// load/resume (20.7).
+    resume_candidates: HashMap<(String, String), String>,
+    /// Sessions whose handover was refused (20.4).
+    handover_refusals: HashSet<(String, String)>,
+    /// Sessions whose team was closed: their `bus.*` answers "team closed"
+    /// until they lead or join one again (18.11/20.5).
+    closed_sessions: HashSet<(String, String)>,
     /// Tests inspect the board of a closed team after it is removed.
     #[cfg(test)]
     closed_boards: HashMap<String, board::Board>,
@@ -1002,7 +976,6 @@ impl Teams {
             tokens,
             token_records: HashMap::new(),
             configs: HashMap::new(),
-            derived_configs: HashMap::new(),
             teams: HashMap::new(),
             by_cwd: HashMap::new(),
             by_instance: HashMap::new(),
@@ -1012,10 +985,14 @@ impl Teams {
             closed_teams: HashSet::new(),
             events: Vec::new(),
             next_group: 0,
+            next_lifecycle: 0,
             workflows: workflow::StoredWorkflows::new(),
             project_keys: HashMap::new(),
             session_switches: HashMap::new(),
             injected: HashMap::new(),
+            resume_candidates: HashMap::new(),
+            handover_refusals: HashSet::new(),
+            closed_sessions: HashSet::new(),
             #[cfg(test)]
             closed_boards: HashMap::new(),
             #[cfg(test)]
@@ -1103,81 +1080,12 @@ impl Teams {
 
     pub fn configure(&mut self, cwd: &str, config: Value) -> Result<(), TeamError> {
         let config = parse_config(&config)?;
-        if let Some(derived) = config.derived.clone() {
-            // A derived template belongs to the exact launch it was derived
-            // from. The template itself describes that launch, so the service
-            // derives the fingerprint here instead of trusting a claim by the
-            // front end. A second front end on the same cwd — even one running
-            // the same agent id with another command — cannot replace it.
-            let fingerprint = Self::derived_fingerprint(cwd, &config, &derived)?;
-            self.derived_configs
-                .entry(cwd.to_string())
-                .or_default()
-                .insert(fingerprint, config.clone());
-            // The plain configuration stays usable for readers that do not know
-            // the instance (workflow listing, pre-leader calls). It is the last
-            // writer, but `config_for_leader` never consults it for another
-            // instance while a derived entry exists.
-            self.configs.insert(cwd.to_string(), config);
-            return Ok(());
-        }
-        // An explicit configuration replaces everything, including derived
-        // entries: the person wrote it, so it is the one to use.
-        self.derived_configs.remove(cwd);
         self.configs.insert(cwd.to_string(), config);
         Ok(())
     }
 
-    /// The launch fingerprint that a derived configuration describes.
-    fn derived_fingerprint(
-        cwd: &str,
-        config: &TeamConfig,
-        derived: &DerivedTemplate,
-    ) -> Result<String, TeamError> {
-        let template = config.templates.get(&derived.template).ok_or_else(|| {
-            TeamError::invalid("derived.template must name a template of this configuration")
-        })?;
-        let mut key = template.key.clone();
-        // The wire template carries no cwd (it is the cwd of `team.configure`),
-        // and the service starts the leader in exactly that directory.
-        key.cwd = cwd.to_string();
-        Ok(launch_fingerprint(
-            &key,
-            template.env.as_deref(),
-            #[cfg(unix)]
-            template.launch.as_ref(),
-        ))
-    }
-
     pub fn config_for(&self, cwd: &str) -> TeamConfig {
         self.configs.get(cwd).cloned().unwrap_or_default()
-    }
-
-    /// The fingerprint of the launch a derived configuration for `cwd` describes.
-    ///
-    /// Exposed so a front end (and the integration tests) can learn which launch
-    /// a configuration belongs to; derived entries are keyed by it.
-    pub fn derived_fingerprint_for(&self, cwd: &str) -> Option<String> {
-        self.derived_configs.get(cwd)?.keys().next().cloned()
-    }
-
-    /// The configuration a leader instance may use for `cwd`.
-    ///
-    /// A derived configuration only serves the exact launch whose fingerprint
-    /// it describes. A leader of any other instance — another agent, or the
-    /// same agent id started with another command, environment or release — is
-    /// refused (`-32061`), never handed a template that would start someone
-    /// else's adapter.
-    pub fn config_for_leader(&self, cwd: &str, fingerprint: &str) -> Result<TeamConfig, TeamError> {
-        if let Some(entries) = self.derived_configs.get(cwd) {
-            if let Some(config) = entries.get(fingerprint) {
-                return Ok(config.clone());
-            }
-            return Err(TeamError::not_allowed(
-                "the team configuration for this cwd was derived from another leader launch",
-            ));
-        }
-        Ok(self.config_for(cwd))
     }
 
     // -- workflows (PROTOCOL.md 19.5) --------------------------------------
@@ -1441,7 +1349,6 @@ impl Teams {
         instance: Option<String>,
         cwd: Option<String>,
         agent: Option<String>,
-        fingerprint: Option<String>,
     ) -> (String, String) {
         self.next_token += 1;
         let token_id = format!("k{}", self.next_token);
@@ -1469,7 +1376,6 @@ impl Teams {
                 cwd,
                 session: None,
                 agent,
-                instance_fingerprint: fingerprint,
                 bound: false,
             },
         );
@@ -1484,6 +1390,27 @@ impl Teams {
             if let Some(auth) = map.get_mut(&record.hash) {
                 auth.team = record.team.clone();
                 auth.name = record.name.clone();
+            }
+        }
+    }
+
+    /// Revoke a token and keep the `injected` counter truthful when it was a
+    /// connected session token.
+    pub fn revoke_counting_injected(&mut self, token_id: &str) {
+        let key = self.token_records.get(token_id).and_then(|record| {
+            if record.role == Role::Session {
+                Some((record.agent.clone()?, record.session.clone()?))
+            } else {
+                None
+            }
+        });
+        self.revoke(token_id);
+        if let Some(key) = key {
+            if let Some(count) = self.injected.get_mut(&key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.injected.remove(&key);
+                }
             }
         }
     }
@@ -1503,6 +1430,7 @@ impl Teams {
             for record in self
                 .token_records
                 .values()
+                .filter(|record| record.role != Role::Session)
                 .filter(|record| record.team.as_deref() == Some(team))
             {
                 map.remove(&record.hash);
@@ -1626,7 +1554,6 @@ impl Teams {
             Some(instance.to_string()),
             Some(cwd.to_string()),
             Some(agent.to_string()),
-            None,
         );
         if let Some(record) = self.token_records.get_mut(&token_id) {
             record.session = session.map(str::to_string);
@@ -1723,6 +1650,11 @@ impl Teams {
             record.session.as_deref()?,
             record.agent.as_deref()?,
         ))
+    }
+
+    pub fn session_closed(&self, instance: &str, session: &str) -> bool {
+        self.closed_sessions
+            .contains(&(instance.to_string(), session.to_string()))
     }
 
     pub fn session_cwd(&self, token_id: &str) -> Option<String> {
@@ -1875,7 +1807,6 @@ impl Teams {
             closed: false,
             suspended: false,
             suspended_at: None,
-            pending_resume: None,
             leader_instance: Some(instance.to_string()),
             leader_session: Some(session.to_string()),
             leader_fingerprint: None,
@@ -1896,12 +1827,15 @@ impl Teams {
             board: board::Board::default(),
             board_flush_at: None,
             current_group: None,
+            pending_lifecycles: HashMap::new(),
         };
         let mut leader = Participant::new("leader", Role::Leader);
         leader.instance = Some(instance.to_string());
         leader.session = Some(session.to_string());
         leader.agent = Some(agent.to_string());
         team.participants.insert("leader".to_string(), leader);
+        self.closed_sessions
+            .remove(&(instance.to_string(), session.to_string()));
         self.by_cwd.insert(cwd.to_string(), id.clone());
         self.by_instance
             .insert(instance.to_string(), (id.clone(), "leader".to_string()));
@@ -1969,14 +1903,6 @@ impl Teams {
         Ok(self.create_team(instance, session, &agent, &cwd, config))
     }
 
-    /// Fill a stored team's built-in `worker` template from the leader the
-    /// resume brought (20.7).
-    pub fn fill_leader_template(&mut self, team_id: &str, launch: &LeaderLaunch) {
-        if let Some(team) = self.teams.get_mut(team_id) {
-            Self::fill_builtin_worker(&mut team.config, launch);
-        }
-    }
-
     /// Bind a session token to a live, leaderless or suspended team (20.4
     /// `team.set_leader`). `Err` as in [`Self::ensure_team`].
     pub fn set_leader(
@@ -1994,8 +1920,6 @@ impl Teams {
             return Err(TeamError::invalid("the session is not in the team's cwd"));
         }
         let previous = team.leader_instance.clone();
-        let closed = team.closed;
-        let suspended = team.suspended;
         let old_session = team.leader_session.clone();
         if let Some(previous) = &previous {
             if previous != instance
@@ -2011,9 +1935,6 @@ impl Teams {
         team.leader_instance = Some(instance.to_string());
         team.leader_session = Some(session.to_string());
         team.leaderless = false;
-        // A suspended team is resumed by the caller (18.15 with this session as
-        // leader); the remaining state change is the same.
-        team.pending_resume = None;
         let leader = team
             .participants
             .entry("leader".to_string())
@@ -2023,6 +1944,8 @@ impl Teams {
         leader.agent = Some(agent.clone());
         leader.set_state(ParticipantState::Idle);
         leader.reason = None;
+        self.closed_sessions
+            .remove(&(instance.to_string(), session.to_string()));
         self.by_instance.insert(
             instance.to_string(),
             (team_id.to_string(), "leader".to_string()),
@@ -2034,65 +1957,9 @@ impl Teams {
         }
         self.refresh_session_auth(instance, session);
         self.events.push(TeamEvent::Changed(team_id.to_string()));
-        if closed || suspended {
-            return Ok(());
-        }
         Ok(())
     }
 
-    pub fn leader_server(
-        &mut self,
-        instance: &str,
-        cwd: &str,
-        instance_cwd: &str,
-        agent: &str,
-        fingerprint: &str,
-    ) -> Result<(Value, String), TeamError> {
-        if cwd != instance_cwd {
-            return Err(TeamError::invalid("cwd must equal the instance's cwd"));
-        }
-        if let Some(team_id) = self.by_cwd.get(cwd) {
-            let team = self.teams.get(team_id).expect("cwd index");
-            if team.suspended {
-                // A suspended team accepts a leader server for any instance in
-                // its cwd; the bind decides whether the session, the agent and
-                // the launch match.
-            } else if team.leader_instance.as_deref() != Some(instance) {
-                // A team a session created by merely chatting has no work: it
-                // is that session's state, not a team the person uses, so
-                // another session of the same cwd may take it over. The bind
-                // performs the switch. Any real team still refuses outright.
-                if team.has_activity() {
-                    return Err(TeamError::not_allowed("a team already exists for this cwd"));
-                }
-            }
-        }
-        let (token_id, token) = self.create_token(
-            Role::Leader,
-            Some(instance.to_string()),
-            Some(cwd.to_string()),
-            Some(agent.to_string()),
-            Some(fingerprint.to_string()),
-        );
-        let command = std::env::current_exe()
-            .ok()
-            .and_then(|path| path.to_str().map(str::to_string))
-            .unwrap_or_else(|| "nvim_ade_server".to_string());
-        let server = json!({
-            "name": "ade-team",
-            "command": command,
-            "args": ["mcp"],
-            "env": [{ "name": "ADE_TEAM_TOKEN", "value": token }],
-        });
-        Ok((server, token_id))
-    }
-
-    /// Move a suspended team to active once; returns the entry to send. The
-    /// caller starts the participants and then calls `finish_resume`.
-    ///
-    /// `config` is the configuration of the agent that is resuming; the caller
-    /// obtained it through `config_for_leader`, so a team whose leader was a
-    /// different agent cannot be resumed with a template of the wrong adapter.
     pub fn start_resume_with_config(
         &mut self,
         team_id: &str,
@@ -2105,7 +1972,6 @@ impl Teams {
         if let Some(team) = self.teams.get_mut(team_id) {
             team.suspended = false;
             team.suspended_at = None;
-            team.pending_resume = None;
             team.leader_instance = Some(instance.to_string());
             team.leader_session = Some(session.to_string());
             team.leader_fingerprint = Some(fingerprint.to_string());
@@ -2119,6 +1985,11 @@ impl Teams {
                 leader.starting = false;
             }
         }
+        self.by_instance.insert(
+            instance.to_string(),
+            (team_id.to_string(), "leader".to_string()),
+        );
+        self.refresh_session_auth(instance, session);
         self.events.push(TeamEvent::Changed(team_id.to_string()));
         json!({ "team": team_entry(&self.teams[team_id]) })
     }
@@ -2147,49 +2018,10 @@ impl Teams {
 
     /// The token bound for a still-suspended team whose configure has just
     /// arrived.
-    pub fn config_resume(&self, cwd: &str) -> Option<(String, String, String)> {
-        let team_id = self.by_cwd.get(cwd)?.clone();
-        let team = self.teams.get(&team_id)?;
-        if !team.suspended || !self.configs.contains_key(cwd) {
-            return None;
-        }
-        let (instance, session) = team.pending_resume.clone()?;
-        if team.leader_session.as_deref() != Some(session.as_str()) {
-            return None;
-        }
-        Some((team_id, instance, session))
-    }
-
-    /// Whether a configuration for `cwd` was supplied by the leader instance
-    /// `fingerprint`.
-    ///
-    /// The hub asks this before resuming on a `team.configure`: a configure from
-    /// another instance must not resume a team whose derived template belongs to
-    /// a different launch.
-    pub fn configured_for(&self, cwd: &str, fingerprint: &str) -> bool {
-        match self.derived_configs.get(cwd) {
-            Some(entries) => entries.contains_key(fingerprint),
-            None => self.configs.contains_key(cwd),
-        }
-    }
-
-    pub fn clear_pending_resume(&mut self, team_id: &str) {
-        if let Some(team) = self.teams.get_mut(team_id) {
-            team.pending_resume = None;
-        }
-    }
-
     pub fn has_config(&self, cwd: &str) -> bool {
         self.configs.contains_key(cwd)
     }
 
-    pub fn set_pending_resume(&mut self, team_id: &str, instance: &str, session: &str) {
-        if let Some(team) = self.teams.get_mut(team_id) {
-            team.pending_resume = Some((instance.to_string(), session.to_string()));
-        }
-    }
-
-    /// The stored leader agent of a suspended team.
     pub fn stored_leader_agent(&self, team_id: &str) -> Option<String> {
         self.teams
             .get(team_id)?
@@ -2198,251 +2030,104 @@ impl Teams {
             .and_then(|leader| leader.agent.clone())
     }
 
-    pub fn clear_instance_pending(&mut self, instance: &str) {
-        for team in self.teams.values_mut() {
-            if team
-                .pending_resume
-                .as_ref()
-                .is_some_and(|(bound, _)| bound == instance)
-            {
-                team.pending_resume = None;
-            }
+    /// Remember that a session requested its stored leader session; the
+    /// resume starts only after the agent accepted the load/resume (20.7).
+    pub fn note_resume_candidate(&mut self, instance: &str, session: &str, agent: &str) -> bool {
+        let Some(team) = self
+            .teams
+            .values()
+            .find(|team| team.suspended && team.leader_session.as_deref() == Some(session))
+        else {
+            return false;
+        };
+        if self.stored_leader_agent(&team.id).as_deref() != Some(agent) {
+            return false;
         }
+        self.resume_candidates
+            .insert((instance.to_string(), session.to_string()), team.id.clone());
+        true
     }
 
-    pub fn bind_leader(
-        &mut self,
-        instance: &str,
-        session: &str,
-        token_id: &str,
-        agent: &str,
-        fingerprint: &str,
-    ) -> Result<BindOutcome, TeamError> {
-        let Some(record) = self.token_records.get(token_id) else {
-            return Err(TeamError::not_allowed("unknown leader token"));
-        };
-        if record.role != Role::Leader || record.instance.as_deref() != Some(instance) {
-            return Err(TeamError::not_allowed(
-                "leader token does not belong to this instance",
-            ));
-        }
-        // The token carries the agent the leader_server was asked for. If the
-        // instance now reports another one, its token and the configuration it
-        // would receive no longer agree: refuse rather than bind an adapter the
-        // derived template was not built for.
-        if let Some(issued) = record.agent.clone() {
-            if issued != agent {
-                return Err(TeamError::not_allowed(format!(
-                    "the leader token was issued for agent {issued}"
-                )));
-            }
-        }
-        // Two instances may share an agent id yet run different commands,
-        // arguments, environments or managed releases. The token's fingerprint
-        // pins the exact launch; a different one is a different instance for
-        // every purpose here.
-        if let Some(issued) = record.instance_fingerprint.clone() {
-            if issued != fingerprint {
-                return Err(TeamError::not_allowed(
-                    "the leader token was issued for another leader launch",
-                ));
-            }
-        }
-        let cwd = record
-            .cwd
-            .clone()
-            .ok_or_else(|| TeamError::not_allowed("leader token has no cwd"))?;
-        // A derived configuration serves only the instance that supplied it.
-        // Check before touching suspension state, so a mismatched bind leaves
-        // the team exactly as it was.
-        let config = self.config_for_leader(&cwd, fingerprint)?;
+    pub fn candidates_of_instance(&self, instance: &str) -> Vec<String> {
+        self.resume_candidates
+            .keys()
+            .filter(|(owner, _)| owner == instance)
+            .map(|(_, session)| session.clone())
+            .collect()
+    }
 
-        if let Some(team_id) = self.by_cwd.get(&cwd).cloned() {
-            let suspended = self.teams[&team_id].suspended;
-            if suspended {
-                if self.teams[&team_id].leader_session.as_deref() != Some(session) {
-                    return Err(TeamError::not_allowed(
-                        "the resumed session is not the team's leader session",
-                    ));
-                }
-                // A restored team stores the agent its leader ran (18.15). A
-                // bind of the same session id from a *different* agent is a
-                // different conversation that merely reused the id; resuming
-                // would hand the stored workers an adapter they never ran on.
-                if let Some(stored) = self.teams[&team_id]
-                    .participants
-                    .get("leader")
-                    .and_then(|leader| leader.agent.clone())
-                {
-                    if stored != agent {
-                        return Err(TeamError::not_allowed(format!(
-                            "the team was stored for agent {stored}"
-                        )));
-                    }
-                }
-                // The configuration must also be the resuming leader's own:
-                // a team stored for A never resumes with B's template. The
-                // binding above already checked the fingerprint, so reaching
-                // here means this instance owns the configuration; what remains
-                // is the stored team, checked just above against its leader
-                // agent.
-                if !self.configs.contains_key(&cwd) {
-                    // A bind before configure is accepted: the token is bound
-                    // and the team stays suspended until configure arrives.
-                    if let Some(team) = self.teams.get_mut(&team_id) {
-                        team.pending_resume = Some((instance.to_string(), session.to_string()));
-                    }
-                    if let Some(record) = self.token_records.get_mut(token_id) {
-                        record.bound = true;
-                        record.team = Some(team_id.clone());
-                        record.name = Some("leader".to_string());
-                    }
-                    self.token_entry(token_id);
-                    self.events.push(TeamEvent::Changed(team_id.clone()));
-                    return Ok(BindOutcome::Active(json!({
-                        "team": team_entry(&self.teams[&team_id])
-                    })));
-                }
-                let entry = self.start_resume_with_config(
-                    &team_id,
-                    instance,
-                    session,
-                    agent,
-                    fingerprint,
-                    config,
-                );
-                if let Some(record) = self.token_records.get_mut(token_id) {
-                    record.bound = true;
-                    record.team = Some(team_id.clone());
-                    record.name = Some("leader".to_string());
-                }
-                self.token_entry(token_id);
-                return Ok(BindOutcome::Resume {
-                    team: team_id,
-                    entry,
-                });
-            } else {
-                let team = self.teams.get(&team_id).expect("cwd index");
-                let same = team.leader_instance.as_deref() == Some(instance)
-                    && team.leader_session.as_deref() == Some(session);
-                if !same {
-                    // A team that never did any work is the by-product of the
-                    // session that created it by chatting. Another session of
-                    // the same cwd asking to lead it takes it over instead of
-                    // being told to close a team they never used. A team with a
-                    // worker, a card or an inbox item is a real team and stays
-                    // with its own leader.
-                    if team.has_activity() {
-                        return Err(TeamError::not_allowed(
-                            "the team already has a different leader session",
-                        ));
-                    }
-                    let previous = team.leader_instance.clone();
-                    if let Some(previous) = previous {
-                        self.by_instance.remove(&previous);
-                    }
-                    // The old session can still have a live MCP connection
-                    // (including when both sessions share an instance). Once
-                    // ownership moves, that connection must no longer act as
-                    // the leader of this team.
-                    let obsolete: Vec<String> = self
-                        .token_records
-                        .iter()
-                        .filter(|(id, record)| {
-                            id.as_str() != token_id
-                                && record.role == Role::Leader
-                                && record.team.as_deref() == Some(team_id.as_str())
-                        })
-                        .map(|(id, _)| id.clone())
-                        .collect();
-                    for id in obsolete {
-                        self.revoke(&id);
-                    }
-                    if let Some(team) = self.teams.get_mut(&team_id) {
-                        team.leader_instance = Some(instance.to_string());
-                        team.leader_session = Some(session.to_string());
-                        team.leader_fingerprint = Some(fingerprint.to_string());
-                        team.leaderless = false;
-                        team.config = config.clone();
-                    }
-                    self.by_instance.insert(
-                        instance.to_string(),
-                        (team_id.clone(), "leader".to_string()),
-                    );
-                    self.events.push(TeamEvent::Changed(team_id.clone()));
-                }
-            }
-            if let Some(leader) = self
-                .teams
-                .get_mut(&team_id)
-                .and_then(|team| team.participants.get_mut("leader"))
-            {
-                leader.agent = Some(agent.to_string());
-                leader.instance = Some(instance.to_string());
-                leader.session = Some(session.to_string());
-                leader.set_state(ParticipantState::Idle);
-                leader.reason = None;
-            }
-            if let Some(record) = self.token_records.get_mut(token_id) {
-                record.bound = true;
-                record.team = Some(team_id.clone());
-                record.name = Some("leader".to_string());
-            }
-            self.token_entry(token_id);
-            return Ok(BindOutcome::Active(
-                json!({ "team": team_entry(&self.teams[&team_id]) }),
-            ));
-        }
+    pub fn drop_resume_candidate(&mut self, instance: &str, session: &str) {
+        self.resume_candidates
+            .remove(&(instance.to_string(), session.to_string()));
+    }
 
-        self.next_team += 1;
-        let id = format!("t{}", self.next_team);
-        let mut team = Team {
-            id: id.clone(),
-            cwd: cwd.clone(),
-            leaderless: false,
-            closed: false,
-            suspended: false,
-            suspended_at: None,
-            pending_resume: None,
-            leader_instance: Some(instance.to_string()),
-            leader_session: Some(session.to_string()),
-            leader_fingerprint: Some(fingerprint.to_string()),
-            participants: HashMap::new(),
-            order: vec!["leader".to_string()],
-            reserved_names: HashSet::new(),
-            config,
-            inbox: Vec::new(),
-            messages: Vec::new(),
-            next_message: 0,
-            task_turns: HashMap::new(),
-            total_turns: 0,
-            total_limit_hit: false,
-            task_limit_hit: HashSet::new(),
-            watchers: HashMap::new(),
-            pending_items: HashMap::new(),
-            created_at: now_ms(),
-            board: board::Board::default(),
-            board_flush_at: None,
-            current_group: None,
-        };
-        let mut leader = Participant::new("leader", Role::Leader);
-        leader.instance = Some(instance.to_string());
-        leader.session = Some(session.to_string());
-        leader.agent = Some(agent.to_string());
-        team.participants.insert("leader".to_string(), leader);
-        let entry = team_entry(&team);
-        self.by_cwd.insert(cwd, id.clone());
-        self.by_instance
-            .insert(instance.to_string(), (id.clone(), "leader".to_string()));
-        self.teams.insert(id.clone(), team);
-        if let Some(record) = self.token_records.get_mut(token_id) {
-            record.bound = true;
-            record.team = Some(id.clone());
-            record.name = Some("leader".to_string());
+    /// Take the candidate of `(instance, session)` when it still names a
+    /// suspended team; returns the team id.
+    pub fn take_resume_candidate(&mut self, instance: &str, session: &str) -> Option<String> {
+        let team = self
+            .resume_candidates
+            .remove(&(instance.to_string(), session.to_string()))?;
+        self.teams
+            .get(&team)
+            .is_some_and(|entry| entry.suspended)
+            .then_some(team)
+    }
+
+    /// `(instance, session)` candidates whose team is in `cwd` (configure just
+    /// arrived).
+    pub fn resume_candidates_for_cwd(&self, cwd: &str) -> Vec<(String, String)> {
+        self.resume_candidates
+            .iter()
+            .filter(|(_, team)| {
+                self.teams
+                    .get(*team)
+                    .is_some_and(|entry| entry.cwd == cwd && entry.suspended)
+            })
+            .map(|((instance, session), _)| (instance.clone(), session.clone()))
+            .collect()
+    }
+
+    /// Cwd of the session token bound to `(instance, session)`.
+    pub fn session_token_cwd(&self, instance: &str, session: &str) -> Option<String> {
+        self.token_records
+            .values()
+            .find(|record| {
+                record.role == Role::Session
+                    && record.instance.as_deref() == Some(instance)
+                    && record.session.as_deref() == Some(session)
+            })
+            .and_then(|record| record.cwd.clone())
+    }
+
+    /// Fill an already loaded configuration's built-in template from an
+    /// instance launch.
+    pub fn fill_builtin_config(&self, config: &mut TeamConfig, launch: &LeaderLaunch) {
+        Self::fill_builtin_worker(config, launch);
+    }
+
+    /// Remove a participant once it exited (20.6 `remove: true`).
+    pub fn finish_worker_removal(&mut self, team_id: &str, name: &str) {
+        if let Some(team) = self.teams.get_mut(team_id) {
+            team.participants.remove(name);
+            team.order.retain(|entry| entry != name);
+            team.reserved_names.remove(name);
         }
-        self.token_entry(token_id);
-        self.events.push(TeamEvent::Changed(id));
-        Ok(BindOutcome::Active(json!({ "team": entry })))
+        self.events.push(TeamEvent::Changed(team_id.to_string()));
+        self.persist_removal(team_id, name);
+    }
+
+    fn persist_removal(&mut self, _team_id: &str, _name: &str) {}
+
+    /// The handover refusal of a session, if one is waiting.
+    pub fn take_handover_refusal(&mut self, instance: &str, session: &str) -> Option<String> {
+        self.handover_refusals
+            .remove(&(instance.to_string(), session.to_string()))
+            .then(|| "the previous handover request was refused".to_string())
+    }
+
+    pub fn set_handover_refusal(&mut self, instance: &str, session: &str) {
+        self.handover_refusals
+            .insert((instance.to_string(), session.to_string()));
     }
 
     // -- front-end methods -------------------------------------------------
@@ -2569,6 +2254,13 @@ impl Teams {
         // documented "team closed" answer instead of "unknown token"; the
         // worker instances are stopped and revoke their own tokens on exit.
         self.closed_teams.insert(id.clone());
+        if let (Some(instance), Some(session)) = (
+            entry["leader"]["instance"].as_str(),
+            entry["leader"]["sessionId"].as_str(),
+        ) {
+            self.closed_sessions
+                .insert((instance.to_string(), session.to_string()));
+        }
         self.revoke_team_hashes(&id);
         for item in orphaned {
             self.events.push(TeamEvent::InboxJson(item));
@@ -2870,13 +2562,8 @@ impl Teams {
         instance: &str,
     ) -> Option<(String, String)> {
         let cwd = self.teams.get(team_id)?.cwd.clone();
-        let (token_id, token) = self.create_token(
-            Role::Worker,
-            Some(instance.to_string()),
-            Some(cwd),
-            None,
-            None,
-        );
+        let (token_id, token) =
+            self.create_token(Role::Worker, Some(instance.to_string()), Some(cwd), None);
         if let Some(record) = self.token_records.get_mut(&token_id) {
             record.team = Some(team_id.to_string());
             record.name = Some(name.to_string());
@@ -3268,6 +2955,8 @@ impl Teams {
         }
         let group = self.next_spawn_group(team_id);
         let spawn_item_id = self.next_inbox_id();
+        self.next_lifecycle += 1;
+        let lifecycle = self.next_lifecycle;
         let team = self
             .teams
             .get_mut(team_id)
@@ -3280,9 +2969,10 @@ impl Teams {
         }
         validate_spawn_choice(team, template, model, role)?;
         let name = spawn_name(team, template, name, task)?;
+        team.pending_lifecycles.insert(name.clone(), lifecycle);
         let auto = team.config.spawn_auto.contains(template);
         if auto {
-            spawn_participant(team, &name, template, model, role, task, label)?;
+            spawn_participant(team, &name, template, model, role, task, label, lifecycle)?;
             team.order.push(name.clone());
             let team_id = team.id.clone();
             self.events.push(TeamEvent::Changed(team_id.clone()));
@@ -3293,6 +2983,7 @@ impl Teams {
                 model: model.map(str::to_string),
                 role: role.map(str::to_string),
                 task: task.map(str::to_string),
+                lifecycle,
             }));
         }
         let agent = team
@@ -3374,6 +3065,8 @@ impl Teams {
         if let Some(label) = label {
             validate_label(label)?;
         }
+        self.next_lifecycle += 1;
+        let lifecycle = self.next_lifecycle;
         let team = self
             .teams
             .get_mut(team_id)
@@ -3386,7 +3079,7 @@ impl Teams {
         }
         validate_spawn_choice(team, template, model, role)?;
         let name = spawn_name(team, template, name, task)?;
-        spawn_participant(team, &name, template, model, role, task, label)?;
+        spawn_participant(team, &name, template, model, role, task, label, lifecycle)?;
         team.order.push(name.clone());
         let team_id = team.id.clone();
         self.events.push(TeamEvent::Changed(team_id.clone()));
@@ -3397,6 +3090,7 @@ impl Teams {
             model: model.map(str::to_string),
             role: role.map(str::to_string),
             task: task.map(str::to_string),
+            lifecycle,
         })
     }
 
@@ -4235,6 +3929,7 @@ impl Teams {
                         refused_spawn = Some((name, "refused: worker limit".to_string()));
                         AnswerEffect::Ack
                     } else {
+                        let lifecycle = team.pending_lifecycles.remove(&name).unwrap_or_default();
                         spawn_participant(
                             team,
                             &name,
@@ -4243,6 +3938,7 @@ impl Teams {
                             role.as_deref(),
                             task.as_deref(),
                             item.label.as_deref(),
+                            lifecycle,
                         )?;
                         team.order.push(name.clone());
                         AnswerEffect::Spawn(SpawnRequest {
@@ -4252,6 +3948,7 @@ impl Teams {
                             model,
                             role,
                             task,
+                            lifecycle,
                         })
                     }
                 } else {
@@ -4557,6 +4254,11 @@ impl Teams {
         };
         self.by_instance.remove(instance);
         if participant.state == ParticipantState::Exited {
+            // A `stop_worker remove: true` waits for the real exit (20.6).
+            if participant.remove_after_exit {
+                let id = team.id.clone();
+                self.finish_worker_removal(&id, &name);
+            }
             return;
         }
         participant.set_state(ParticipantState::Exited);
@@ -4599,6 +4301,15 @@ impl Teams {
                 }
             }
         }
+        let remove = self
+            .teams
+            .values()
+            .find(|team| team.is_worker_instance(instance).is_some())
+            .and_then(|team| team.participants.get(&name))
+            .is_some_and(|participant| participant.remove_after_exit);
+        if remove {
+            self.finish_worker_removal(&team_id, &name);
+        }
         self.revoke_instance_unbound(instance);
         let ids: Vec<String> = self
             .token_records
@@ -4619,7 +4330,8 @@ impl Teams {
         team_id: &str,
         name: &str,
         remove: bool,
-    ) -> Result<Option<String>, TeamError> {
+        notify_leader: bool,
+    ) -> Result<StopOutcome, TeamError> {
         let Some(team) = self.teams.get_mut(team_id) else {
             return Err(TeamError::unknown("unknown team"));
         };
@@ -4633,9 +4345,8 @@ impl Teams {
             return Err(TeamError::invalid(format!("{name} is not a worker")));
         }
         let instance = participant.instance.clone();
-        if let Some(instance) = &instance {
-            self.by_instance.remove(instance);
-        }
+        let lifecycle = participant.lifecycle;
+        let starting = participant.starting;
         let closed = team.closed;
         if participant.state != ParticipantState::Exited {
             participant.set_state(ParticipantState::Exited);
@@ -4650,10 +4361,15 @@ impl Teams {
                 }
             }
         }
-        if remove {
+        participant.remove_after_exit = remove;
+        // Without an instance and without a start in flight the exit already
+        // happened: the participant can be dropped now.
+        let drop_now = remove && instance.is_none() && !starting;
+        if drop_now {
             team.participants.remove(name);
             team.order.retain(|entry| entry != name);
             team.reserved_names.remove(name);
+            team.pending_lifecycles.remove(name);
         }
         if let Some(instance) = &instance {
             let ids: Vec<String> = self
@@ -4666,7 +4382,7 @@ impl Teams {
                 self.revoke(&id);
             }
         }
-        if !closed {
+        if !closed && notify_leader {
             let _ = self.send_message(
                 team_id,
                 "human",
@@ -4678,7 +4394,11 @@ impl Teams {
             );
         }
         self.events.push(TeamEvent::Changed(team_id.to_string()));
-        Ok(instance)
+        Ok(StopOutcome {
+            instance,
+            lifecycle,
+            remove,
+        })
     }
 
     pub fn leader_exited(&mut self, instance: &str, reason: &str) {
@@ -4863,6 +4583,7 @@ fn validate_spawn_choice(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_participant(
     team: &mut Team,
     name: &str,
@@ -4871,6 +4592,7 @@ fn spawn_participant(
     role: Option<&str>,
     task: Option<&str>,
     label: Option<&str>,
+    lifecycle: u64,
 ) -> Result<(), TeamError> {
     validate_spawn_choice(team, template, model, role)?;
     let config = team
@@ -4879,6 +4601,7 @@ fn spawn_participant(
         .get(template)
         .ok_or_else(|| TeamError::not_allowed("unknown template"))?;
     let mut participant = Participant::new(name, Role::Worker);
+    participant.lifecycle = lifecycle;
     participant.template = Some(template.to_string());
     participant.role_card = Some(brief::role_card(
         name,
@@ -5577,7 +5300,6 @@ impl Teams {
                     // A derived template is rebuilt from the leader's launch by
                     // the front end that resumes the team; the stored snapshot
                     // never carries one (its command is not persisted either).
-                    derived: None,
                 }
             };
             let mut participants = HashMap::new();
@@ -5649,7 +5371,6 @@ impl Teams {
                 closed: false,
                 suspended: true,
                 suspended_at: Some(suspended_at),
-                pending_resume: None,
                 leader_instance: None,
                 leader_fingerprint: None,
                 leader_session: snapshot.leader_session.clone(),
@@ -5670,6 +5391,7 @@ impl Teams {
                 board: board::Board::default(),
                 board_flush_at: None,
                 current_group: None,
+                pending_lifecycles: HashMap::new(),
             };
             self.by_cwd.insert(team.cwd.clone(), team.id.clone());
             self.teams.insert(team.id.clone(), team);
@@ -5992,44 +5714,6 @@ fn parse_config(value: &Value) -> Result<TeamConfig, TeamError> {
             Some(root.to_string())
         }
     };
-    // The derived template is declared with the agent it belongs to, so the
-    // service can refuse to hand it to a leader of another agent. Both fields
-    // are required together and the template must exist in this configuration.
-    let derived = match object.get("derived") {
-        None | Some(Value::Null) => None,
-        Some(value) => {
-            let derived = value
-                .as_object()
-                .ok_or_else(|| TeamError::invalid("derived must be an object"))?;
-            let template = derived
-                .get("template")
-                .and_then(Value::as_str)
-                .ok_or_else(|| TeamError::invalid("derived.template must be a string"))?;
-            let agent = derived
-                .get("agent")
-                .and_then(Value::as_str)
-                .ok_or_else(|| TeamError::invalid("derived.agent must be a string"))?;
-            if !valid_name(template) || !templates.contains_key(template) {
-                return Err(TeamError::invalid(
-                    "derived.template must name a template of this configuration",
-                ));
-            }
-            if agent.trim().is_empty() {
-                return Err(TeamError::invalid("derived.agent must not be empty"));
-            }
-            // The template must be the one this agent really starts, or a
-            // derived declaration could describe somebody else's adapter.
-            if templates[template].key.agent != agent {
-                return Err(TeamError::invalid(
-                    "derived.agent must match the derived template's key.agent",
-                ));
-            }
-            Some(DerivedTemplate {
-                template: template.to_string(),
-                agent: agent.to_string(),
-            })
-        }
-    };
     Ok(TeamConfig {
         max_workers,
         spawn_auto,
@@ -6042,7 +5726,6 @@ fn parse_config(value: &Value) -> Result<TeamConfig, TeamError> {
         enabled,
         session_default,
         builtin_worker,
-        derived,
     })
 }
 
@@ -6255,14 +5938,10 @@ mod tests {
     fn fixture(extra: Value) -> (Teams, String) {
         let mut teams = Teams::new(new_shared_tokens());
         teams.configure("/p", config(extra)).expect("configure");
-        let (_server, token) = teams
-            .leader_server("i1", "/p", "/p", "opencode", "fp")
-            .expect("leader server");
-        teams
-            .bind_leader("i1", "s1", &token, "opencode", "fp")
-            .expect("bind leader");
-        let list = teams.list();
-        let id = list["teams"][0]["id"].as_str().unwrap().to_string();
+        session(&mut teams, "i1", "/p", "s1");
+        let id = teams
+            .ensure_team("i1", "s1", &launch("/p"))
+            .expect("ensure team");
         (teams, id)
     }
 
@@ -6652,14 +6331,12 @@ mod tests {
     #[test]
     fn tokens_are_random_hashes_and_resolve_their_role() {
         let mut teams = Teams::new(new_shared_tokens());
-        let (_server, token_id) = teams
-            .leader_server("i1", "/p", "/p", "opencode", "fp")
-            .unwrap();
+        let (token_id, _token) = teams.issue_session_token("i1", "/p", "opencode", None);
         assert_eq!(token_id, "k1");
         let tokens = teams.tokens.lock().unwrap();
         let raw = tokens.values().next().expect("token");
         assert_eq!(raw.token_id, "k1");
-        assert_eq!(raw.role, Role::Leader);
+        assert_eq!(raw.role, Role::Session);
         // The shared registry has no raw token field at all.
         let token = crate::token::generate();
         assert!(token.len() >= 32);
@@ -6742,35 +6419,6 @@ mod tests {
             .unwrap();
         assert_eq!(teams.config_for("/p").max_workers, 2);
         assert_eq!(teams.team(&team).unwrap().config.max_workers, 1);
-    }
-
-    #[test]
-    fn leader_errors_are_reported() {
-        let mut teams = Teams::new(new_shared_tokens());
-        teams.configure("/p", config(json!({}))).unwrap();
-        assert!(teams
-            .leader_server("i1", "/other", "/p", "opencode", "fp")
-            .is_err());
-        let (_server, first) = teams
-            .leader_server("i1", "/p", "/p", "opencode", "fp")
-            .unwrap();
-        teams
-            .bind_leader("i1", "s1", &first, "opencode", "fp")
-            .unwrap();
-        // A team with work keeps its leader: another instance is refused a
-        // server, and the leader's own instance cannot swap in a second
-        // session.
-        let id = teams.list()["teams"][0]["id"].as_str().unwrap().to_string();
-        add_worker(&mut teams, &id, "w1");
-        assert!(teams
-            .leader_server("i2", "/p", "/p", "opencode", "fp")
-            .is_err());
-        let (_server, second) = teams
-            .leader_server("i1", "/p", "/p", "opencode", "fp")
-            .unwrap();
-        assert!(teams
-            .bind_leader("i1", "s2", &second, "opencode", "fp")
-            .is_err());
     }
 
     #[test]
@@ -6858,378 +6506,11 @@ mod tests {
             ItemState::Open
         );
         // Ids continue after the highest ever stored.
-        let (_server, token) = restored
-            .leader_server("i9", "/new", "/new", "opencode", "fp")
-            .expect("leader");
-        let outcome = restored
-            .bind_leader("i9", "s9", &token, "opencode", "fp")
-            .expect("bind");
-        let BindOutcome::Active(value) = outcome else {
-            panic!("a new cwd team is not a resume");
-        };
-        assert_ne!(value["team"]["id"], team, "{value}");
-    }
-
-    #[test]
-    fn a_resume_starts_once_and_a_second_bind_only_adds_the_token() {
-        let (teams, team) = fixture(json!({}));
-        let json = teams.snapshot_team(&team).unwrap();
-        let (max_team, max_inbox) = teams.counters();
-        let mut restored = Teams::new(new_shared_tokens());
-        restored.configure("/p", config(json!({}))).unwrap();
-        restored.restore(
-            vec![(team.clone(), json)],
-            max_team,
-            max_inbox,
-            now_ms(),
-            None,
-        );
-        let (_server, token) = restored
-            .leader_server("i1", "/p", "/p", "opencode", "fp")
-            .unwrap();
-        let first = restored
-            .bind_leader("i1", "s1", &token, "opencode", "fp")
-            .unwrap();
-        assert!(matches!(first, BindOutcome::Resume { .. }), "{first:?}");
-        let second = restored
-            .bind_leader("i1", "s1", &token, "opencode", "fp")
-            .unwrap();
-        assert!(
-            matches!(second, BindOutcome::Active(_)),
-            "a second bind while resuming must not resume again: {second:?}"
-        );
-        assert!(!restored.team(&team).unwrap().suspended);
-    }
-    /// A configuration whose only template starts `agent` with `command`.
-    fn derived_config(agent: &str, command: &str, role: &str) -> Value {
-        config(json!({
-            "templates": {
-                "dev": {
-                    "key": { "agent": agent, "command": command, "args": [] },
-                    "role": role,
-                }
-            },
-            "derived": { "template": "dev", "agent": agent }
-        }))
-    }
-
-    /// The launch fingerprint `configure` computes for a derived configuration.
-    fn fingerprint_of(cwd: &str, agent: &str, command: &str) -> String {
-        let parsed = parse_config_for_tests(&derived_config(agent, command, "role"));
-        let derived = parsed.derived.clone().expect("derived");
-        Teams::derived_fingerprint(cwd, &parsed, &derived).expect("fingerprint")
-    }
-
-    #[test]
-    fn a_derived_template_serves_only_its_own_launch() {
-        let mut teams = Teams::new(new_shared_tokens());
-        teams
-            .configure("/p", derived_config("opencode", "opencode-acp", "role"))
-            .expect("configure");
-        let own = fingerprint_of("/p", "opencode", "opencode-acp");
-        let config = teams.config_for_leader("/p", &own).expect("its own launch");
-        assert!(config.templates.contains_key("dev"));
-
-        // Another agent on the same cwd must not receive it.
-        let other = fingerprint_of("/p", "pi", "pi-acp");
-        let error = teams
-            .config_for_leader("/p", &other)
-            .expect_err("another agent must not get the derived template");
-        assert_eq!(error.code, NOT_ALLOWED);
-
-        // Neither must the *same* agent id started with another command: the
-        // agent id alone is not the launch.
-        let same_agent = fingerprint_of("/p", "opencode", "/usr/local/bin/opencode-next");
-        assert_ne!(own, same_agent, "different commands are different launches");
-        let error = teams
-            .config_for_leader("/p", &same_agent)
-            .expect_err("the same agent id with another command is another launch");
-        assert_eq!(error.code, NOT_ALLOWED);
-    }
-
-    #[test]
-    fn a_derived_declaration_must_describe_its_own_template() {
-        let mut teams = Teams::new(new_shared_tokens());
-        let error = teams
-            .configure(
-                "/p",
-                config(json!({
-                    "derived": { "template": "dev", "agent": "pi" }
-                })),
-            )
-            .expect_err("the agent must match the template's key.agent");
-        assert_eq!(error.code, INVALID_TEAM_PARAM, "{error:?}");
-        assert!(error.message.contains("key.agent"), "{error:?}");
-
-        let error = teams
-            .configure(
-                "/p",
-                config(json!({"derived": {"template": "missing", "agent": "a"}})),
-            )
-            .expect_err("the derived template must exist");
-        assert!(error.message.contains("derived.template"), "{error:?}");
-
-        let error = teams
-            .configure("/p", config(json!({"derived": {"template": "dev"}})))
-            .expect_err("the agent is required");
-        assert!(error.message.contains("derived.agent"), "{error:?}");
-    }
-
-    #[test]
-    fn a_second_front_end_cannot_replace_a_derived_template() {
-        let mut teams = Teams::new(new_shared_tokens());
-        teams
-            .configure("/p", derived_config("opencode", "opencode-acp", "role"))
-            .expect("configure");
-        let opencode = fingerprint_of("/p", "opencode", "opencode-acp");
-
-        // A second front end runs the same agent id with another command and
-        // configures the template it derived from *its* launch. The first
-        // launch keeps its own entry.
-        teams
-            .configure(
-                "/p",
-                derived_config("opencode", "/opt/other/opencode", "other"),
-            )
-            .expect("second configure");
-        let other = fingerprint_of("/p", "opencode", "/opt/other/opencode");
-        assert_ne!(opencode, other);
-        assert!(teams.config_for_leader("/p", &opencode).is_ok());
-        assert!(teams.config_for_leader("/p", &other).is_ok());
-        // A third launch that never configured is refused.
-        let stranger = fingerprint_of("/p", "opencode", "/opt/third/opencode");
-        assert!(teams.config_for_leader("/p", &stranger).is_err());
-
-        // An explicit configuration replaces every derived entry: the person
-        // wrote it, so any launch may use it.
-        teams
-            .configure("/p", config(json!({ "max_workers": 2 })))
-            .expect("explicit configure");
-        assert!(teams.config_for_leader("/p", &opencode).is_ok());
-        assert!(teams.config_for_leader("/p", &stranger).is_ok());
-    }
-
-    #[test]
-    fn one_cwd_has_one_team_even_with_two_derived_configurations() {
-        let mut teams = Teams::new(new_shared_tokens());
-        teams
-            .configure("/p", derived_config("opencode", "opencode-acp", "role"))
-            .expect("configure A");
-        teams
-            .configure("/p", derived_config("pi", "pi-acp", "role"))
-            .expect("configure B");
-        let opencode = fingerprint_of("/p", "opencode", "opencode-acp");
-        let pi = fingerprint_of("/p", "pi", "pi-acp");
-
-        let (_server, opencode_token) = teams
-            .leader_server("i-open", "/p", "/p", "opencode", &opencode)
-            .unwrap();
-        let (_server, pi_token) = teams.leader_server("i-pi", "/p", "/p", "pi", &pi).unwrap();
-
-        let BindOutcome::Active(entry) = teams
-            .bind_leader("i-open", "s-open", &opencode_token, "opencode", &opencode)
-            .unwrap()
-        else {
-            panic!("a first bind is not a resume");
-        };
-        assert_eq!(entry["team"]["participants"][0]["agent"], "opencode");
-        teams.drain_events();
-        // The team has no worker and no card, so it is a chat by-product: the
-        // second session takes it over instead of being refused. One cwd keeps
-        // one team (18.1); the team now runs the new leader and its template.
-        let BindOutcome::Active(taken) = teams
-            .bind_leader("i-pi", "s-pi", &pi_token, "pi", &pi)
-            .unwrap()
-        else {
-            panic!("a take-over is not a resume");
-        };
-        assert_eq!(taken["team"]["id"], entry["team"]["id"], "the same team");
-        let live = teams.team(entry["team"]["id"].as_str().unwrap()).unwrap();
-        assert_eq!(
-            live.config.derived.as_ref().map(|d| d.agent.as_str()),
-            Some("pi")
-        );
-        assert_eq!(live.leader_fingerprint.as_deref(), Some(pi.as_str()));
-        assert_eq!(live.leader_instance.as_deref(), Some("i-pi"));
-        assert_eq!(live.leader_session.as_deref(), Some("s-pi"));
-        assert!(teams.role_for_token(&opencode_token).is_none());
-        assert_eq!(teams.role_for_token(&pi_token).unwrap().0, Role::Leader);
-        assert!(teams.drain_events().iter().any(|event| {
-            matches!(event, TeamEvent::Changed(id) if Some(id.as_str()) == taken["team"]["id"].as_str())
-        }));
-    }
-
-    #[test]
-    fn a_team_with_work_is_not_taken_over_by_another_session() {
-        let mut teams = Teams::new(new_shared_tokens());
-        teams.configure("/p", config(json!({}))).expect("configure");
-        let (_server, first) = teams
-            .leader_server("i1", "/p", "/p", "opencode", "fp")
-            .unwrap();
-        teams
-            .bind_leader("i1", "s1", &first, "opencode", "fp")
-            .unwrap();
-        let id = teams.list()["teams"][0]["id"].as_str().unwrap().to_string();
-        // One historical worker is enough: this is somebody's team.
-        add_worker(&mut teams, &id, "w1");
-        teams.worker_exited("w1-i", "done");
-        // Another instance is refused a server while the team is active, which
-        // is the first line of defence; the bind check is the second.
-        let refused = teams.leader_server("i2", "/p", "/p", "opencode", "fp");
-        assert!(refused.is_err(), "{refused:?}");
-        let (_server, second) = teams
-            .leader_server("i1", "/p", "/p", "opencode", "fp")
-            .unwrap();
-        let error = teams
-            .bind_leader("i1", "s2", &second, "opencode", "fp")
-            .expect_err("a team with work keeps its leader session");
-        assert_eq!(error.code, NOT_ALLOWED, "{error:?}");
-        let live = teams.team(&id).unwrap();
-        assert_eq!(live.leader_instance.as_deref(), Some("i1"));
-        assert_eq!(live.leader_session.as_deref(), Some("s1"));
-    }
-
-    #[test]
-    fn a_launch_that_never_configured_cannot_bind() {
-        let mut teams = Teams::new(new_shared_tokens());
-        teams
-            .configure("/p", derived_config("opencode", "opencode-acp", "role"))
-            .expect("configure");
-        let stranger = fingerprint_of("/p", "opencode", "/opt/third/opencode");
-        let (_server, token) = teams
-            .leader_server("i1", "/p", "/p", "opencode", &stranger)
-            .unwrap();
-        let error = teams
-            .bind_leader("i1", "s1", &token, "opencode", &stranger)
-            .expect_err("a launch that never configured gets no team");
-        assert_eq!(error.code, NOT_ALLOWED, "{error:?}");
-        assert!(teams.list()["teams"].as_array().unwrap().is_empty());
-    }
-
-    #[test]
-    fn a_bind_reports_a_launch_that_differs_from_its_token() {
-        let mut teams = Teams::new(new_shared_tokens());
-        teams.configure("/p", config(json!({}))).unwrap();
-        let (_server, token) = teams
-            .leader_server("i1", "/p", "/p", "opencode", "fp-one")
-            .unwrap();
-        let error = teams
-            .bind_leader("i1", "s1", &token, "opencode", "fp-two")
-            .expect_err("the token pins the launch");
-        assert_eq!(error.code, NOT_ALLOWED, "{error:?}");
-        assert!(teams.list()["teams"].as_array().unwrap().is_empty());
-    }
-
-    #[test]
-    fn a_resume_refuses_a_team_stored_for_another_agent() {
-        // The stored team ran opencode; the front end now brings pi and its own
-        // derived configuration under the *same* session id.
-        let (teams, team) = fixture(json!({}));
-        let json = teams.snapshot_team(&team).unwrap();
-        let (max_team, max_inbox) = teams.counters();
-        let mut restored = Teams::new(new_shared_tokens());
-        restored
-            .configure("/p", derived_config("pi", "pi-acp", "role"))
-            .expect("configure B");
-        restored.restore(
-            vec![(team.clone(), json)],
-            max_team,
-            max_inbox,
-            now_ms(),
-            None,
-        );
-        assert_eq!(restored.list()["teams"][0]["state"], "suspended");
-        let pi = fingerprint_of("/p", "pi", "pi-acp");
-        let (_server, token) = restored
-            .leader_server("i-pi", "/p", "/p", "pi", &pi)
-            .unwrap();
-        let error = restored
-            .bind_leader("i-pi", "s1", &token, "pi", &pi)
-            .expect_err("the team was stored for opencode");
-        assert_eq!(error.code, NOT_ALLOWED, "{error:?}");
-        assert!(error.message.contains("opencode"), "{error:?}");
-        assert!(
-            restored.team(&team).unwrap().suspended,
-            "the team must stay suspended"
-        );
-    }
-
-    #[test]
-    fn a_resume_with_the_same_agent_but_another_launch_is_refused() {
-        // Stored leader ran opencode; the resuming front end also says opencode
-        // but with a different command, and configures its own template.
-        let (teams, team) = fixture(json!({}));
-        let json = teams.snapshot_team(&team).unwrap();
-        let (max_team, max_inbox) = teams.counters();
-        let mut restored = Teams::new(new_shared_tokens());
-        restored
-            .configure(
-                "/p",
-                derived_config("opencode", "/opt/other/opencode", "role"),
-            )
-            .expect("configure B");
-        restored.restore(
-            vec![(team.clone(), json)],
-            max_team,
-            max_inbox,
-            now_ms(),
-            None,
-        );
-        let other = fingerprint_of("/p", "opencode", "/opt/other/opencode");
-        let (_server, token) = restored
-            .leader_server("i2", "/p", "/p", "opencode", &other)
-            .unwrap();
-        let outcome = restored
-            .bind_leader("i2", "s1", &token, "opencode", &other)
-            .expect("the stored agent matches");
-        // The session id and agent match, so the resume is accepted; what
-        // matters is that it was accepted *as its own* configuration and not
-        // with the stored leader's template.
-        assert!(matches!(outcome, BindOutcome::Resume { .. }), "{outcome:?}");
-        let live = restored.team(&team).unwrap();
-        assert_eq!(live.leader_fingerprint.as_deref(), Some(other.as_str()));
-        assert_eq!(
-            live.config.templates["dev"].key.command, "/opt/other/opencode",
-            "the resumed team takes the resuming launch's own template"
-        );
-    }
-
-    #[test]
-    fn a_configure_from_another_launch_does_not_count_for_this_leader() {
-        let (teams, team) = fixture(json!({}));
-        let json = teams.snapshot_team(&team).unwrap();
-        let (max_team, max_inbox) = teams.counters();
-        let mut restored = Teams::new(new_shared_tokens());
-        restored.restore(
-            vec![(team.clone(), json)],
-            max_team,
-            max_inbox,
-            now_ms(),
-            None,
-        );
-        let mine = fingerprint_of("/p", "opencode", "/opt/mine/opencode");
-        let stranger = fingerprint_of("/p", "opencode", "/opt/unrelated/opencode");
-        let (_server, token) = restored
-            .leader_server("i1", "/p", "/p", "opencode", &mine)
-            .unwrap();
-        // A bind before configure is accepted: the team stays pending.
-        let pending = restored
-            .bind_leader("i1", "s1", &token, "opencode", &mine)
-            .unwrap();
-        assert!(matches!(pending, BindOutcome::Active(_)), "{pending:?}");
-        // A launch that never configured does not count for anyone.
-        assert!(!restored.configured_for("/p", &stranger));
-        assert!(!restored.configured_for("/p", &mine));
-        // The right launch configures: now the resume may proceed and only its
-        // own fingerprint counts.
-        restored
-            .configure(
-                "/p",
-                derived_config("opencode", "/opt/mine/opencode", "role"),
-            )
-            .expect("configure");
-        assert!(restored.configured_for("/p", &mine));
-        assert!(!restored.configured_for("/p", &stranger));
+        session(&mut restored, "i9", "/new", "s9");
+        let id = restored
+            .ensure_team("i9", "s9", &launch("/new"))
+            .expect("a new cwd gets a new team");
+        assert_ne!(id, team);
     }
 
     #[test]
@@ -7320,83 +6601,6 @@ mod tests {
             restored.item(&team, "i9").unwrap().state,
             ItemState::Orphaned
         );
-    }
-
-    #[test]
-    fn a_derived_declaration_is_validated() {
-        let mut teams = Teams::new(new_shared_tokens());
-        let error = teams
-            .configure(
-                "/p",
-                config(json!({"derived": {"template": "missing", "agent": "opencode"}})),
-            )
-            .expect_err("the derived template must exist");
-        assert_eq!(error.code, INVALID_TEAM_PARAM, "{error:?}");
-        assert!(error.message.contains("derived.template"), "{error:?}");
-
-        let error = teams
-            .configure("/p", config(json!({"derived": {"template": "dev"}})))
-            .expect_err("the agent is required");
-        assert!(error.message.contains("derived.agent"), "{error:?}");
-
-        let error = teams
-            .configure(
-                "/p",
-                config(json!({"derived": {"template": "dev", "agent": " "}})),
-            )
-            .expect_err("an empty agent is refused");
-        assert!(error.message.contains("derived.agent"), "{error:?}");
-
-        teams
-            .configure(
-                "/p",
-                config(json!({
-                    "templates": {
-                        "dev": {
-                            "key": { "agent": "opencode", "command": "c", "args": [] },
-                            "role": "role",
-                        }
-                    },
-                    "derived": {"template": "dev", "agent": "opencode"},
-                })),
-            )
-            .expect("a complete declaration is accepted");
-        assert_eq!(
-            teams.config_for("/p").derived,
-            Some(DerivedTemplate {
-                template: "dev".to_string(),
-                agent: "opencode".to_string(),
-            })
-        );
-    }
-
-    #[test]
-    fn a_restored_team_drops_the_derived_declaration() {
-        // `derived` names a launch of the leader that supplied it; that launch
-        // is never stored, so a restored team must not claim one.
-        let mut teams = Teams::new(new_shared_tokens());
-        teams
-            .configure("/p", derived_config("opencode", "c", "role"))
-            .expect("configure");
-        let fingerprint = fingerprint_of("/p", "opencode", "c");
-        let (_server, token) = teams
-            .leader_server("i1", "/p", "/p", "opencode", &fingerprint)
-            .unwrap();
-        teams
-            .bind_leader("i1", "s1", &token, "opencode", &fingerprint)
-            .unwrap();
-        let id = teams.list()["teams"][0]["id"].as_str().unwrap().to_string();
-        let json = teams.snapshot_team(&id).unwrap();
-        let (max_team, max_inbox) = teams.counters();
-        let mut restored = Teams::new(new_shared_tokens());
-        restored.restore(
-            vec![(id.clone(), json)],
-            max_team,
-            max_inbox,
-            now_ms(),
-            None,
-        );
-        assert_eq!(restored.team(&id).unwrap().config.derived, None);
     }
 
     #[test]
@@ -8604,8 +7808,8 @@ mod tests {
     fn a_stopped_worker_can_be_removed_and_frees_its_name() {
         let (mut teams, team) = fixture(json!({}));
         let instance = add_worker(&mut teams, &team, "w1");
-        let returned = teams.stop_worker(&team, "w1", false).unwrap();
-        assert_eq!(returned.as_deref(), Some(instance.as_str()));
+        let returned = teams.stop_worker(&team, "w1", false, true).unwrap();
+        assert_eq!(returned.instance.as_deref(), Some(instance.as_str()));
         let worker = &teams.team(&team).unwrap().participants["w1"];
         assert_eq!(worker.state, ParticipantState::Exited);
         assert_eq!(worker.reason.as_deref(), Some("stopped"));
@@ -8618,16 +7822,20 @@ mod tests {
                 .is_some_and(|body| body.contains("w1 stopped by the person"))));
 
         let second = add_worker(&mut teams, &team, "w2");
-        teams.stop_worker(&team, "w2", true).unwrap();
+        let stopped = teams.stop_worker(&team, "w2", true, true).unwrap();
+        // `remove: true` drops the participant only once it really exited.
+        assert!(teams.team(&team).unwrap().participants.contains_key("w2"));
+        teams.worker_exited(&second, "stopped");
         assert!(!teams.team(&team).unwrap().participants.contains_key("w2"));
         assert!(!teams.team(&team).unwrap().order.contains(&"w2".to_string()));
         assert!(teams.token_role(&second).is_none());
+        assert_eq!(stopped.instance.as_deref(), Some(second.as_str()));
         // The name is free again: a new spawn may take it.
         assert!(teams
             .request_spawn(&team, "dev", Some("w2"), None, None, None)
             .is_ok());
-        assert!(teams.stop_worker(&team, "leader", false).is_err());
-        assert!(teams.stop_worker(&team, "nobody", false).is_err());
+        assert!(teams.stop_worker(&team, "leader", false, true).is_err());
+        assert!(teams.stop_worker(&team, "nobody", false, true).is_err());
     }
 
     #[test]

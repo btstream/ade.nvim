@@ -27,6 +27,26 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// The session token the service injected, from the agent side file.
+fn injected_token(server: &TestServer, session: &str) -> String {
+    let path = server.dir().join("session-tokens");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Some(token) = text.lines().rev().find_map(|line| {
+                let (known, token) = line.split_once(' ')?;
+                (known == session).then(|| token.to_string())
+            }) {
+                return token;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("no injected token for {session}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 fn agent() -> String {
     fixture("team_agent.py").to_string_lossy().to_string()
 }
@@ -99,6 +119,7 @@ fn child_env(server: &TestServer, log: &Path, gate: &Path) -> Value {
         "TEAM_AGENT_LOG": log.to_string_lossy(),
         "TEAM_AGENT_GATE": gate.to_string_lossy(),
         "TEAM_AGENT_TEMPLATE": "dev",
+        "TEAM_AGENT_TOKEN_FILE": server.dir().join("session-tokens").to_string_lossy(),
     })
 }
 
@@ -1484,26 +1505,12 @@ impl Harness {
             json!({ "cwd": cwd.to_string_lossy(), "config": config }),
         );
         assert!(configured["result"].is_object(), "configure: {configured}");
-        let leader = client.request(
-            3,
-            "team.leader_server",
-            json!({ "instance": instance, "cwd": cwd.to_string_lossy() }),
-        );
-        let server_entry = leader["result"]["server"].clone();
-        let token_id = leader["result"]["token_id"]
-            .as_str()
-            .expect("token id")
-            .to_string();
-        let token = server_entry["env"][0]["value"]
-            .as_str()
-            .expect("token")
-            .to_string();
         let session_response = tunnel_call(
             &mut client,
             &instance,
             11,
             "session/new",
-            json!({ "cwd": cwd.to_string_lossy(), "mcpServers": [server_entry] }),
+            json!({ "cwd": cwd.to_string_lossy(), "mcpServers": [] }),
         );
         let session = session_response["result"]["sessionId"]
             .as_str()
@@ -1512,15 +1519,23 @@ impl Harness {
         // `tunnel_call` polls with a short timeout; later requests may wait for
         // git, so restore the default.
         client.reset_read_timeout();
-        let bound = client.request(
-            4,
-            "team.bind_leader",
-            json!({ "instance": instance, "sessionId": session, "token_id": token_id }),
+        // v3: an unknown workflow creates the team and then fails (20.4).
+        let created = client.request(
+            3,
+            "team.start",
+            json!({
+                "instance": instance,
+                "sessionId": session,
+                "workflow": "no-such-workflow",
+            }),
         );
-        let team = bound["result"]["team"]["id"]
+        assert_eq!(created["error"]["code"], -32060, "{created}");
+        let listed = client.request(4, "team.list", json!({}));
+        let team = listed["result"]["teams"][0]["id"]
             .as_str()
-            .unwrap_or_else(|| panic!("bind: {bound}"))
+            .unwrap_or_else(|| panic!("no team: {listed}"))
             .to_string();
+        let token = injected_token(&server, &session);
         client.reset_read_timeout();
         Self {
             server,

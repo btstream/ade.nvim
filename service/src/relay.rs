@@ -497,6 +497,8 @@ pub struct FrontendRequest {
     pub conn: ConnId,
     pub frontend_id: Value,
     pub method: String,
+    pub agent_id: u64,
+    pub session_id: Option<String>,
 }
 
 impl AgentOutcome {
@@ -940,7 +942,7 @@ impl Relay {
                     .get("agentCapabilities")
                     .and_then(|caps| caps.get("sessionCapabilities"))
                     .and_then(|caps| caps.get("resume"))
-                    .and_then(Value::as_bool)
+                    .map(|resume| resume.as_bool() == Some(true) || resume.is_object())
                     .unwrap_or(false)
             })
             .unwrap_or(false)
@@ -1358,6 +1360,8 @@ impl Relay {
                     conn: *conn,
                     frontend_id: frontend_id.clone(),
                     method: outgoing.method.clone(),
+                    agent_id,
+                    session_id: outgoing.session_id.clone(),
                 }),
             ..AgentOutcome::default()
         };

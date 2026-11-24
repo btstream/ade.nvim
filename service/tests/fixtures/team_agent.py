@@ -549,8 +549,15 @@ def main():
                     "command": entry.get("command"),
                     "args": entry.get("args"),
                     "env_names": [item.get("name") for item in entry.get("env") or []],
-                    "env": entry.get("env"),
                 }
+                # The token must never reach the agent log: write it to a
+                # side file the tests read back.
+                token_path = os.environ.get("TEAM_AGENT_TOKEN_FILE")
+                if token_path:
+                    for item in entry.get("env") or []:
+                        if item.get("name") == "ADE_TEAM_TOKEN":
+                            with open(token_path, "a") as handle:
+                                handle.write(f"{session} {item.get('value')}\n")
             log({
                 "event": "session",
                 "method": method,

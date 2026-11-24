@@ -73,6 +73,7 @@ fn child_env(server: &TestServer, log: &Path, gate: &Path) -> Value {
         "TEAM_AGENT_LOG": log.to_string_lossy(),
         "TEAM_AGENT_GATE": gate.to_string_lossy(),
         "TEAM_AGENT_TEMPLATE": "dev",
+        "TEAM_AGENT_TOKEN_FILE": server.dir().join("session-tokens").to_string_lossy(),
     })
 }
 
@@ -132,14 +133,28 @@ impl Fixture {
         assert!(configured["result"].is_object(), "configure: {configured}");
     }
 
-    /// Attach a leader and bind it. `existing_session` loads that id (a
-    /// resumed leader); otherwise a new session is created.
+    /// Attach a leader and create (or resume) its team through the v3 session
+    /// path (20.2/20.7). Returns (instance, session, token, team entry).
     fn attach_leader(
         &self,
         server: &TestServer,
         client: &mut Client,
         cwd: &Path,
         existing_session: Option<&str>,
+    ) -> (String, String, String, Value) {
+        self.attach_leader_with(server, client, cwd, existing_session, true)
+    }
+
+    /// `attach_leader`, optionally without waiting for a resume: the v3 path
+    /// records the candidate and resumes only once the cwd is configured
+    /// (20.7).
+    fn attach_leader_with(
+        &self,
+        server: &TestServer,
+        client: &mut Client,
+        cwd: &Path,
+        existing_session: Option<&str>,
+        wait_resume: bool,
     ) -> (String, String, String, Value) {
         let attached = client.request(
             1,
@@ -166,45 +181,111 @@ impl Fixture {
             "initialize",
             json!({"protocolVersion": 1, "clientCapabilities": {}}),
         );
-        let leader = client.request(
-            3,
-            "team.leader_server",
-            json!({"instance": instance, "cwd": cwd.to_string_lossy()}),
-        );
-        let entry = leader["result"]["server"].clone();
-        let token_id = leader["result"]["token_id"]
-            .as_str()
-            .expect("token id")
-            .to_string();
-        let token = entry["env"][0]["value"]
-            .as_str()
-            .expect("token")
-            .to_string();
         let (method, params) = match existing_session {
             Some(session) => (
                 "session/load",
                 json!({
                     "sessionId": session,
                     "cwd": cwd.to_string_lossy(),
-                    "mcpServers": [entry],
+                    "mcpServers": [],
                 }),
             ),
             None => (
                 "session/new",
-                json!({"cwd": cwd.to_string_lossy(), "mcpServers": [entry]}),
+                json!({"cwd": cwd.to_string_lossy(), "mcpServers": []}),
             ),
         };
         let session_response = tunnel_call(client, &instance, 11, method, params);
         let session = session_response["result"]["sessionId"]
             .as_str()
-            .expect("session id")
+            .unwrap_or_else(|| panic!("session: {session_response}"))
             .to_string();
-        let bound = client.request(
+        // A forwarded load gets a fresh token on the response, so for a resume
+        // the token is read after the team turned active.
+        let token = match existing_session {
+            Some(_) => String::new(),
+            None => self.token_of(&session),
+        };
+        // The v3 service resumes on an accepted load; a new session creates the
+        // team lazily (20.4).
+        if let Some(existing) = existing_session {
+            let entry = if wait_resume {
+                wait_for(
+                    || {
+                        let entry = list(client)["teams"]
+                            .as_array()?
+                            .iter()
+                            .find(|team| team["state"] == "active")
+                            .cloned()?;
+                        Some(entry)
+                    },
+                    "the resumed team",
+                )
+            } else {
+                list(client)["teams"]
+                    .as_array()
+                    .and_then(|teams| teams.first().cloned())
+                    .unwrap_or(Value::Null)
+            };
+            let _ = existing;
+            let token = self.token_of(&session);
+            return (
+                instance,
+                session,
+                token,
+                json!({ "result": { "team": entry } }),
+            );
+        }
+        let created = client.request(
             4,
-            "team.bind_leader",
-            json!({"instance": instance, "sessionId": session, "token_id": token_id}),
+            "team.start",
+            json!({
+                "instance": instance,
+                "sessionId": session,
+                "workflow": "no-such-workflow",
+            }),
         );
-        (instance, session, token, bound)
+        // The failed start still created the team (20.4 creates it before the
+        // workflow is resolved); a refusal before that (another leader) leaves
+        // none and is returned as the error.
+        let entry = list(client)["teams"]
+            .as_array()
+            .and_then(|teams| teams.first().cloned())
+            .unwrap_or(Value::Null);
+        let refused = created["error"]["code"]
+            .as_i64()
+            .is_some_and(|code| code != -32060);
+        if refused {
+            return (
+                instance,
+                session,
+                token,
+                json!({ "error": created["error"].clone() }),
+            );
+        }
+        let token = self.token_of(&session);
+        (
+            instance,
+            session,
+            token,
+            json!({ "result": { "team": entry } }),
+        )
+    }
+
+    /// The session token the service injected, from the agent's side file.
+    fn token_of(&self, session: &str) -> String {
+        let path = self.dir.path().join("session-tokens");
+        wait_for(
+            || {
+                let text = std::fs::read_to_string(&path).ok()?;
+                // The file is appended across restarts: the newest token wins.
+                text.lines().rev().find_map(|line| {
+                    let (known, token) = line.split_once(' ')?;
+                    (known == session).then(|| token.to_string())
+                })
+            },
+            "the injected session token",
+        )
     }
 
     fn connect(&self, server: &TestServer) -> Client {
@@ -408,6 +489,17 @@ fn resume(
     wait_active(client, team)
 }
 
+fn fixture_token(path: &Path, session: &str) -> String {
+    let text = std::fs::read_to_string(path).expect("session tokens");
+    text.lines()
+        .rev()
+        .find_map(|line| {
+            let (known, token) = line.split_once(' ')?;
+            (known == session).then(|| token.to_string())
+        })
+        .unwrap_or_else(|| panic!("no token for {session}"))
+}
+
 fn mcp_call(server: &TestServer, token: &str, tool: &str, arguments: Value) -> Value {
     use std::io::Write;
     let frames = [
@@ -602,7 +694,12 @@ fn board_restart_scenario(label: &str, sigkill: bool) {
     assert_eq!(bound["result"]["team"]["id"], team, "{bound}");
     wait_active(&mut second, &team);
     let status = mcp_call(&restarted, &token, "bus_status", json!({}));
-    let status: Value = serde_json::from_str(&mcp_text(&status)).expect("bus.status JSON");
+    let status: Value = serde_json::from_str(&mcp_text(&status)).unwrap_or_else(|error| {
+        panic!(
+            "bus.status JSON: {error}: {status}; tokens={:?}",
+            std::fs::read_to_string(fixture.dir.path().join("session-tokens"))
+        )
+    });
     assert_eq!(status["board"]["rev"], rev, "{status}");
     assert_eq!(status["board"]["workflow_name"], "default", "{status}");
     assert_eq!(
@@ -686,7 +783,12 @@ fn an_unreadable_board_row_stays_untouched_and_refuses_writes() {
     wait_active(&mut second, &team);
 
     let status = mcp_call(&restarted, &token, "bus_status", json!({}));
-    let status: Value = serde_json::from_str(&mcp_text(&status)).expect("bus.status JSON");
+    let status: Value = serde_json::from_str(&mcp_text(&status)).unwrap_or_else(|error| {
+        panic!(
+            "bus.status JSON: {error}: {status}; tokens={:?}",
+            std::fs::read_to_string(fixture.dir.path().join("session-tokens"))
+        )
+    });
     assert_eq!(status["board"]["unavailable"], true, "{status}");
 
     let refused = mcp_call(
@@ -798,6 +900,24 @@ fn a_bound_session_token_resumes_the_stored_leader_without_a_bind() {
         team_entry(&mut client, &team)["leader"]["sessionId"],
         leader_session
     );
+    // The session is a real leader for the hub, not just a team field: the MCP
+    // tool set is the leader one and `session.teams` says so (#10).
+    let tokens = fixture.dir.path().join("session-tokens");
+    let status = mcp_call(
+        &server,
+        &fixture_token(&tokens, &leader_session),
+        "bus_status",
+        json!({}),
+    );
+    assert_eq!(status["isError"], false, "{status}");
+    let status: Value = serde_json::from_str(&mcp_text(&status)).expect("status");
+    assert_eq!(status["board"]["rev"], 0, "the leader result: {status}");
+    let switch = client.request(
+        130,
+        "session.teams",
+        json!({"instance": instance, "sessionId": leader_session}),
+    );
+    assert!(switch["result"]["leader"].is_object(), "{switch}");
 }
 
 #[test]
@@ -1478,15 +1598,18 @@ fn configure_after_bind_starts_the_resume() {
     let mut restarted = fixture.start("b", &[]);
     let mut second = fixture.connect(&restarted);
     wait_suspended(&mut second, &team);
-    // Bind before any configure: the team stays suspended and gets the token.
-    let (_instance, _session, _token, bound) = fixture.attach_leader(
+    // The session request comes first, before any configure: the service keeps
+    // the stored team suspended and remembers the candidate (20.7).
+    let (_instance, _session, _token, bound) = fixture.attach_leader_with(
         &restarted,
         &mut second,
         &fixture.work,
         Some(&leader_session),
+        false,
     );
     assert_eq!(bound["result"]["team"]["state"], "suspended", "{bound}");
     assert_eq!((&team_entry(&mut second, &team))["state"], "suspended");
+    // The configure that follows resumes it.
     fixture.configure(&mut second, &fixture.work, &restarted, true);
     wait_active(&mut second, &team);
     wait_worker_session(&mut second, &team);
@@ -1507,11 +1630,12 @@ fn configure_does_not_resume_after_the_bound_instance_exited() {
     let mut restarted = fixture.start("b", &[]);
     let mut second = fixture.connect(&restarted);
     wait_suspended(&mut second, &team);
-    let (instance, _session, _token, bound) = fixture.attach_leader(
+    let (instance, _session, _token, bound) = fixture.attach_leader_with(
         &restarted,
         &mut second,
         &fixture.work,
         Some(&leader_session),
+        false,
     );
     assert_eq!(bound["result"]["team"]["state"], "suspended", "{bound}");
     let stopped = second.request(

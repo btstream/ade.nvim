@@ -275,11 +275,20 @@ pub async fn serve(options: ServeOptions) -> Result<ServeStatus> {
             }
 
             event = events_rx.recv() => {
-                if let Some(ConnectionEvent::Closed) = event {
-                    active = active.saturating_sub(1);
-                    if active == 0 {
-                        idle_since = Some(tokio::time::Instant::now());
+                match event {
+                    Some(ConnectionEvent::Closed { counted: true }) => {
+                        active = active.saturating_sub(1);
+                        if active == 0 {
+                            idle_since = Some(tokio::time::Instant::now());
+                        }
                     }
+                    Some(ConnectionEvent::Participant) => {
+                        active = active.saturating_sub(1);
+                        if active == 0 && !busy {
+                            idle_since = Some(tokio::time::Instant::now());
+                        }
+                    }
+                    _ => {}
                 }
             }
 
@@ -377,13 +386,19 @@ fn spawn_connection(
     tokens: SharedTokens,
 ) {
     tokio::spawn(async move {
-        if let Err(error) =
-            handle_connection(conn, stream, &token, &shutdown, &hub, event_log, &tokens).await
+        let counted = match handle_connection(
+            conn, stream, &token, &shutdown, &hub, &events, event_log, &tokens,
+        )
+        .await
         {
-            crate::svc_log!("nvim_ade_server: connection error: {error}");
-        }
+            Ok(counted) => counted,
+            Err(error) => {
+                crate::svc_log!("nvim_ade_server: connection error: {error}");
+                false
+            }
+        };
         let _ = hub.send(Command::Disconnected { conn }).await;
-        let _ = events.send(ConnectionEvent::Closed);
+        let _ = events.send(ConnectionEvent::Closed { counted });
     });
 }
 
@@ -394,9 +409,10 @@ async fn handle_connection(
     token: &str,
     shutdown: &Notify,
     hub: &mpsc::Sender<Command>,
+    events: &mpsc::UnboundedSender<ConnectionEvent>,
     event_log: bool,
     tokens: &SharedTokens,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let (reader, writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
 
@@ -418,6 +434,7 @@ async fn handle_connection(
 
     let mut handshake = protocol::Handshake::default();
     let mut reported: Option<Option<String>> = None;
+    let mut counted = true;
     let _ = hub
         .send(Command::Register {
             conn,
@@ -501,6 +518,10 @@ async fn handle_connection(
                         .map(|participant| participant.token_id.clone());
                     if reported.as_ref() != Some(&current) {
                         reported = Some(current.clone());
+                        if current.is_some() && counted {
+                            counted = false;
+                            let _ = events.send(ConnectionEvent::Participant);
+                        }
                         let _ = hub
                             .send(Command::Authenticated {
                                 conn,
@@ -539,6 +560,10 @@ async fn handle_connection(
                         .map(|participant| participant.token_id.clone());
                     if reported.as_ref() != Some(&current) {
                         reported = Some(current.clone());
+                        if current.is_some() && counted {
+                            counted = false;
+                            let _ = events.send(ConnectionEvent::Participant);
+                        }
                         let _ = hub
                             .send(Command::Authenticated {
                                 conn,
@@ -561,7 +586,7 @@ async fn handle_connection(
     flush_outbox(&outbox).await;
     close_tx.send(true).ok();
     cancel_writer(writer_task).await;
-    result
+    result.map(|()| counted)
 }
 
 /// Wait (briefly) until every queued frame was written.
@@ -732,7 +757,12 @@ fn announce_ready(socket: &str) -> Result<()> {
 }
 
 enum ConnectionEvent {
-    Closed,
+    /// The connection authenticated as a participant (MCP): an ordinary chat's
+    /// MCP socket must not keep the service from idle-exiting (20.1).
+    Participant,
+    Closed {
+        counted: bool,
+    },
 }
 
 #[cfg(test)]

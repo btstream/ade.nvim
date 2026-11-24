@@ -35,6 +35,7 @@ pub(crate) struct PendingWorktree {
     pub spawn: SpawnRequest,
     pub plan: SpawnPlan,
     pub opts: StartOptions,
+    pub cancelled: bool,
 }
 
 pub(crate) enum StartResult {
@@ -42,6 +43,16 @@ pub(crate) enum StartResult {
     Deferred,
     /// The failure was reported and the spawn must not reply again.
     Replied,
+}
+
+/// A `session/new` whose token binds only if the agent answers successfully.
+#[derive(Debug)]
+pub(crate) struct PendingSessionNew {
+    pub token_id: String,
+    pub cwd: String,
+    pub agent: String,
+    pub servers: Value,
+    pub conn: u64,
 }
 
 #[derive(Debug)]
@@ -117,6 +128,12 @@ pub(crate) enum DeferredTeam {
         team: String,
         name: String,
     },
+    SessionStatus {
+        conn: u64,
+        id: Value,
+        token_id: String,
+        team: String,
+    },
     Workflows {
         cwd: String,
     },
@@ -180,23 +197,15 @@ impl Hub {
         conn: u64,
         instance: &str,
         message: &mut Value,
-    ) {
-        let Some(method) = message
-            .get("method")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-        else {
-            return;
-        };
+    ) -> Option<PendingSessionNew> {
+        let method = message.get("method").and_then(Value::as_str)?.to_string();
         if !matches!(
             method.as_str(),
             "session/new" | "session/load" | "session/resume"
         ) {
-            return;
+            return None;
         }
-        let Some(handle) = self.instances.get(instance) else {
-            return;
-        };
+        let handle = self.instances.get(instance)?;
         let cwd = handle.key.cwd.clone();
         let agent = handle.key.agent.clone();
         let session = message
@@ -211,47 +220,50 @@ impl Hub {
             .filter(|value| value.is_array())
             .unwrap_or_else(|| json!([]));
         if let Some(session) = &session {
+            // The agent accepts or rejects this request later; only then may a
+            // stored team resume (20.7).
+            self.teams.note_resume_candidate(instance, session, &agent);
             self.session_servers
-                .insert((instance.to_string(), session.clone()), servers);
+                .insert((instance.to_string(), session.clone()), servers.clone());
+        }
+        // A `session/load` may be answered from the log without reaching the
+        // agent; it gets its token only when it is really forwarded (20.2).
+        if method == "session/load" {
+            return None;
         }
         let config = self.teams.config_for(&cwd);
         if !self.teams.has_config(&cwd) || !config.enabled {
-            return;
+            return None;
         }
         let enabled = match &session {
             Some(session) => self.teams.enabled_for(&agent, session, &cwd),
             None => config.session_default,
         };
         if !enabled {
-            return;
+            return None;
         }
         let (token_id, token) =
             self.teams
                 .issue_session_token(instance, &cwd, &agent, session.as_deref());
+        if let Some(params) = message.get_mut("params") {
+            inject_team_server(params, &token);
+        }
         match &session {
             Some(session) => {
                 self.remember_switch(&agent, session, enabled);
                 self.refresh_session(instance, session);
                 self.announce_switch(instance, session, &agent, false);
                 self.notify_tools_changed(&(instance.to_string(), session.clone()));
-                self.maybe_resume_session(instance, session, &agent, &cwd);
+                None
             }
-            None => {
-                if let Some(params) = message.get_mut("params") {
-                    inject_team_server(params, &token);
-                }
-                let id = message.get("id").cloned().unwrap_or(Value::Null);
-                self.pending_session_new.insert(
-                    (conn, crate::relay::id_key(&id)),
-                    (token_id, instance.to_string(), cwd, agent),
-                );
-                return;
-            }
+            None => Some(PendingSessionNew {
+                token_id,
+                cwd,
+                agent,
+                servers,
+                conn,
+            }),
         }
-        if let Some(params) = message.get_mut("params") {
-            inject_team_server(params, &token);
-        }
-        let _ = token_id;
     }
 
     /// The switch row is persisted and, being a change, announced (20.5).
@@ -265,32 +277,44 @@ impl Hub {
     /// on failure (20.2).
     pub(crate) fn finish_session_new(
         &mut self,
+        instance: &str,
         request: &crate::relay::FrontendRequest,
         message: &Value,
     ) {
-        let Some((token_id, instance, cwd, agent)) = self
+        let Some(pending) = self
             .pending_session_new
-            .remove(&(request.conn, crate::relay::id_key(&request.frontend_id)))
+            .remove(&(instance.to_string(), request.agent_id))
         else {
             return;
         };
+        let PendingSessionNew {
+            token_id,
+            cwd,
+            agent,
+            servers,
+            ..
+        } = pending;
         let session = message
             .get("result")
             .and_then(|result| result.get("sessionId"))
             .and_then(Value::as_str)
             .map(str::to_string);
+        let failed_session = session.clone().unwrap_or_default();
         let Some(session) = session.filter(|_| message.get("error").is_none()) else {
             self.teams.revoke(&token_id);
+            self.teams.drop_resume_candidate(instance, &failed_session);
             return;
         };
+        self.session_servers
+            .insert((instance.to_string(), session.clone()), servers);
         if self
             .teams
-            .bind_session_token(&instance, &session, &token_id, &agent)
+            .bind_session_token(instance, &session, &token_id, &agent)
             .is_ok()
         {
-            self.refresh_session(&instance, &session);
-            self.notify_tools_changed(&(instance.clone(), session.clone()));
-            self.maybe_resume_session(&instance, &session, &agent, &cwd);
+            self.refresh_session(instance, &session);
+            self.notify_tools_changed(&(instance.to_string(), session.clone()));
+            self.maybe_resume_session(instance, &session, &agent, &cwd);
         }
     }
 
@@ -317,6 +341,9 @@ impl Hub {
 
     /// Resume a stored team led by this session when its cwd is configured
     /// (20.7).
+    /// Record a stored-leader candidate and resume it right away when the cwd
+    /// is configured (20.7). Used after the agent accepted a load/resume and by
+    /// `session.teams`.
     pub(crate) fn maybe_resume_session(
         &mut self,
         instance: &str,
@@ -324,48 +351,59 @@ impl Hub {
         agent: &str,
         cwd: &str,
     ) {
-        let Some(team) = self.teams.team_for_cwd(cwd) else {
+        self.teams.note_resume_candidate(instance, session, agent);
+        if self.teams.has_config(cwd) {
+            self.complete_resume(instance, session);
+        }
+    }
+
+    /// Complete a recorded resume after the agent accepted the session request.
+    pub(crate) fn complete_resume(&mut self, instance: &str, session: &str) {
+        let Some(team_id) = self.teams.take_resume_candidate(instance, session) else {
             return;
         };
-        if !team.suspended || team.leader_session.as_deref() != Some(session) {
+        let Some(handle) = self.instances.get(instance) else {
+            return;
+        };
+        let cwd = handle.key.cwd.clone();
+        if !self.teams.has_config(&cwd) {
+            self.teams
+                .note_resume_candidate(instance, session, &handle.key.agent);
             return;
         }
-        let team_id = team.id.clone();
-        if self.teams.stored_leader_agent(&team_id).as_deref() != Some(agent) {
-            return;
-        }
-        if self.teams.switch(agent, session) == Some(false) {
-            return;
-        }
-        if !self.teams.has_config(cwd) {
-            self.teams.set_pending_resume(&team_id, instance, session);
-            return;
-        }
-        if let Some(handle) = self.instances.get(instance) {
-            let launch = crate::team::LeaderLaunch {
-                cwd: handle.key.cwd.clone(),
-                key: handle.key.clone(),
-                env: handle.env.clone(),
-                #[cfg(unix)]
-                launch: handle.launch.clone(),
-            };
-            self.teams.fill_leader_template(&team_id, &launch);
-        }
-        let fingerprint = self
-            .instances
-            .get(instance)
-            .map(|handle| handle.fingerprint.clone())
-            .unwrap_or_default();
-        let config = self.teams.config_for(cwd);
+        let agent = handle.key.agent.clone();
+        let launch = crate::team::LeaderLaunch {
+            cwd: cwd.clone(),
+            key: handle.key.clone(),
+            env: handle.env.clone(),
+            #[cfg(unix)]
+            launch: handle.launch.clone(),
+        };
+        let fingerprint = handle.fingerprint.clone();
+        let mut config = self.teams.config_for(&cwd);
+        self.teams.fill_builtin_config(&mut config, &launch);
         self.teams.start_resume_with_config(
             &team_id,
             instance,
             session,
-            agent,
+            &agent,
             &fingerprint,
             config,
         );
+        self.refresh_session(instance, session);
+        self.notify_tools_changed(&(instance.to_string(), session.to_string()));
+        self.announce_switch(instance, session, &agent, false);
         self.resume_team(&team_id);
+    }
+
+    /// A configure arrived: resume every candidate of that cwd.
+    pub(crate) fn complete_resume_candidates(&mut self, cwd: &str) {
+        if !self.teams.has_config(cwd) {
+            return;
+        }
+        for (instance, session) in self.teams.resume_candidates_for_cwd(cwd) {
+            self.complete_resume(&instance, &session);
+        }
     }
 
     /// Tell a session's MCP process its tool set changed (20.3).
@@ -437,6 +475,9 @@ impl Hub {
             return (false, false, None, Some("off".to_string()));
         }
         let (role, team) = self.teams.session_role(token_id);
+        if role.is_none() && self.teams.session_closed(instance, session) {
+            return (true, false, None, Some("closed".to_string()));
+        }
         (true, role.as_deref() == Some("leader"), team, None)
     }
 
@@ -595,9 +636,34 @@ impl Hub {
         }
         let (enabled, leader, team, reason) = self.session_tool_state(token_id);
         let refused = |hub: &Self, why: &str| {
-            hub.send_to(conn, &error_tool_result(id, why));
+            hub.send_error(conn, id, &TeamError::not_allowed(why));
         };
+        if reason.as_deref() == Some("closed") {
+            self.send_error(conn, id, &TeamError::unknown("team closed"));
+            return;
+        }
         if method == "bus.status" {
+            if enabled && leader {
+                if let Some(team) = team.clone() {
+                    let cwd = self
+                        .teams
+                        .team(&team)
+                        .map(|entry| entry.cwd.clone())
+                        .unwrap_or_default();
+                    self.run_or_defer(
+                        conn,
+                        id,
+                        &cwd,
+                        DeferredTeam::SessionStatus {
+                            conn,
+                            id: id.clone(),
+                            token_id: token_id.to_string(),
+                            team,
+                        },
+                    );
+                    return;
+                }
+            }
             self.send_to(
                 conn,
                 &success(id, self.session_status(token_id, enabled, leader)),
@@ -609,15 +675,15 @@ impl Hub {
             return;
         }
         if let Some(reason) = &reason {
-            refused(self, reason_text(reason));
+            if reason == "closed" {
+                self.send_error(conn, id, &TeamError::unknown("team closed"));
+            } else {
+                refused(self, reason_text(reason));
+            }
             return;
         }
         if method == "bus.spawn" {
-            let Some(team) = team else {
-                refused(self, "teams are not available for this chat");
-                return;
-            };
-            self.session_spawn(conn, id, token_id, &team, params);
+            self.session_spawn(conn, id, token_id, params);
             return;
         }
         if matches!(
@@ -639,6 +705,7 @@ impl Hub {
             "bus.send" => self.bus_send(conn, &team, "leader", params),
             "bus.ask_human" => self.bus_ask_human(&team, "leader", params),
             "bus.board_update" => self.bus_board_update(&team, params),
+            "bus.card_update" => Err(TeamError::not_allowed("card_update is worker only")),
             "bus.read" => self.bus_read(&team, params),
             _ => Err(TeamError::new(METHOD_NOT_FOUND, "method not found")),
         };
@@ -658,12 +725,64 @@ impl Hub {
                 }
                 self.send_to(conn, &success(id, value));
             }
-            Err(error) => self.send_tool_error(conn, id, &error),
+            Err(error) => self.send_error(conn, id, &error),
+        }
+    }
+
+    /// `ensure_team` for a session token; `led_by` queues the handover item
+    /// and turns into the documented tool error (20.4).
+    fn ensure_session_team(&mut self, token_id: &str) -> Result<String, TeamError> {
+        let Some((instance, session, agent)) = self.teams.session_auth(token_id) else {
+            let mut error = TeamError::not_allowed("teams are not available for this chat");
+            error.data = Some(json!({ "reason": "no_tools" }));
+            return Err(error);
+        };
+        let instance = instance.to_string();
+        let session = session.to_string();
+        let agent = agent.to_string();
+        let handle = self
+            .instances
+            .get(&instance)
+            .ok_or_else(|| TeamError::new(UNKNOWN_INSTANCE, "unknown instance"))?;
+        let launch = crate::team::LeaderLaunch {
+            cwd: handle.key.cwd.clone(),
+            key: handle.key.clone(),
+            env: handle.env.clone(),
+            #[cfg(unix)]
+            launch: handle.launch.clone(),
+        };
+        match self.teams.ensure_team(&instance, &session, &launch) {
+            Ok(team) => {
+                self.refresh_session(&instance, &session);
+                self.notify_tools_changed(&(instance.clone(), session.clone()));
+                let injected = self.teams.is_injected(&agent, &session);
+                self.announce_switch(&instance, &session, &agent, injected);
+                Ok(team)
+            }
+            Err(error)
+                if error.data.as_ref().and_then(|data| data.get("reason"))
+                    == Some(&json!("led_by")) =>
+            {
+                let team = error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("team"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.teams.create_handover(&team, &instance, &session);
+                self.drain_team_events();
+                self.notify_tools_changed(&(instance.to_string(), session.to_string()));
+                Err(TeamError::not_allowed(
+                    "the team is led by another chat; the person was asked to hand it over",
+                ))
+            }
+            Err(error) => Err(error),
         }
     }
 
     fn session_status(&self, token_id: &str, enabled: bool, leader: bool) -> Value {
-        let (team, name) = self.teams.session_role(token_id);
+        let (name, team) = self.teams.session_role(token_id);
         let mut out = json!({
             "self": {
                 "role": "session",
@@ -686,7 +805,37 @@ impl Hub {
     }
 
     /// `bus.spawn` from a session: `ensure_team` first (20.4).
-    fn session_spawn(&mut self, conn: u64, id: &Value, token_id: &str, team: &str, params: &Value) {
+    fn session_spawn(&mut self, conn: u64, id: &Value, token_id: &str, params: &Value) {
+        let identity = self
+            .teams
+            .session_auth(token_id)
+            .map(|(instance, session, _)| (instance.to_string(), session.to_string()));
+        // A refused handover is reported on this chat's next spawn (20.4/#14):
+        // the requesting chat is not a participant, so no bus notice reaches it.
+        if let Some((instance, session)) = identity.clone() {
+            if self
+                .teams
+                .take_handover_refusal(&instance, &session)
+                .is_some()
+            {
+                self.send_tool_error(
+                    conn,
+                    id,
+                    &TeamError::not_allowed(
+                        "the previous handover request was refused; ask the person again",
+                    ),
+                );
+                return;
+            }
+        }
+        let team = match self.ensure_session_team(token_id) {
+            Ok(team) => team,
+            Err(error) => {
+                self.send_tool_error(conn, id, &error);
+                return;
+            }
+        };
+        let team = &team;
         let template = match required_team_string(params, "template") {
             Ok(value) => value,
             Err(error) => {
@@ -746,7 +895,14 @@ impl Hub {
                     self.team_deliveries();
                     self.send_to(
                         conn,
-                        &success(id, json!({ "status": "started", "name": spawn.name })),
+                        &success(
+                            id,
+                            json!({
+                                "status": "started",
+                                "name": spawn.name,
+                                "team": self.teams.entry(team),
+                            }),
+                        ),
                     );
                 }
             }
@@ -758,11 +914,34 @@ impl Hub {
     fn bus_stop_worker(&mut self, team: &str, params: &Value) -> Result<(Value, bool), TeamError> {
         let name = required_team_string(params, "name")?;
         let remove = optional_bool(params, "remove")?.unwrap_or(false);
-        let instance = self.teams.stop_worker(team, &name, remove)?;
-        if let Some(instance) = instance {
-            self.stop_worker_instance(&instance);
-        }
+        let outcome = self.teams.stop_worker(team, &name, remove, false)?;
+        self.apply_stop(team, &name, &outcome);
         Ok((json!({}), true))
+    }
+
+    /// Cancel a start in flight and stop the instance when there is one (20.6).
+    pub(crate) fn apply_stop(
+        &mut self,
+        team: &str,
+        name: &str,
+        outcome: &crate::team::StopOutcome,
+    ) {
+        let reply = self
+            .pending_worktrees
+            .get_mut(&(team.to_string(), name.to_string()))
+            .and_then(|pending| {
+                (pending.spawn.lifecycle == outcome.lifecycle).then(|| {
+                    pending.cancelled = true;
+                    pending.opts.reply.clone()
+                })
+            })
+            .flatten();
+        if let Some((conn, id, _)) = reply {
+            self.send_error(conn, &id, &TeamError::not_allowed("the worker was stopped"));
+        }
+        if let Some(instance) = &outcome.instance {
+            self.stop_worker_instance(instance);
+        }
     }
 
     /// A workflow tool from a session token: no team needed, the cwd's
@@ -818,23 +997,14 @@ impl Hub {
         }
     }
 
+    /// Session-token tool answers are ordinary JSON-RPC results/errors; the
+    /// MCP process turns an error into `isError: true` (20.3).
     fn send_tool_success(&self, conn: u64, id: &Value, value: Value) {
-        self.send_to(
-            conn,
-            &success(
-                id,
-                json!({
-                    "content": [{ "type": "text", "text": value.to_string() }],
-                    "isError": false,
-                }),
-            ),
-        );
+        self.send_to(conn, &success(id, value));
     }
 
     fn send_tool_error(&self, conn: u64, id: &Value, error: &TeamError) {
-        let _ = self;
-        let _ = error.data;
-        self.send_to(conn, &error_tool_result(id, &error.message));
+        self.send_error(conn, id, error);
     }
 
     /// `team` or `{instance, sessionId}` (exactly one) to a team id; the second
@@ -852,40 +1022,11 @@ impl Hub {
             (None, true) => {
                 let instance = required_team_string(params, "instance")?;
                 let session = required_team_string(params, "sessionId")?;
-                let handle = self
-                    .instances
-                    .get(&instance)
-                    .ok_or_else(|| TeamError::new(UNKNOWN_INSTANCE, "unknown instance"))?;
-                let launch = crate::team::LeaderLaunch {
-                    cwd: handle.key.cwd.clone(),
-                    key: handle.key.clone(),
-                    env: handle.env.clone(),
-                    #[cfg(unix)]
-                    launch: handle.launch.clone(),
-                };
-                match self.teams.ensure_team(&instance, &session, &launch) {
-                    Ok(team) => Ok(team),
-                    Err(error)
-                        if error.data.as_ref().and_then(|data| data.get("reason"))
-                            == Some(&json!("led_by")) =>
-                    {
-                        let team = error
-                            .data
-                            .as_ref()
-                            .and_then(|data| data.get("team"))
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        self.teams.create_handover(&team, &instance, &session);
-                        self.drain_team_events();
-                        self.notify_tools_changed(&(instance, session));
-                        Err(TeamError::new(
-                            error.code,
-                            "the team is led by another chat; the person was asked to hand it over",
-                        ))
-                    }
-                    Err(error) => Err(error),
-                }
+                let token = self
+                    .teams
+                    .token_id_connected(&instance, &session)
+                    .ok_or_else(|| TeamError::not_allowed("no session token for this session"))?;
+                self.ensure_session_team(&token)
             }
         }
     }
@@ -906,10 +1047,9 @@ impl Hub {
                 let team = required_team_string(params, "team")?;
                 let name = required_team_string(params, "name")?;
                 let remove = optional_bool(params, "remove")?.unwrap_or(false);
-                let instance = self.teams.stop_worker(&team, &name, remove)?;
-                if let Some(instance) = instance {
-                    self.stop_worker_instance(&instance);
-                }
+                let outcome = self.teams.stop_worker(&team, &name, remove, true)?;
+                self.apply_stop(&team, &name, &outcome);
+                let _ = outcome;
                 Ok(json!({}))
             })();
             match result {
@@ -941,8 +1081,6 @@ impl Hub {
         }
         let result = match method {
             "team.configure" => self.team_configure(params).map(|value| (value, false)),
-            "team.leader_server" => self.team_leader_server(params).map(|value| (value, false)),
-            "team.bind_leader" => self.team_bind_leader(params).map(|value| (value, true)),
             "team.list" => Ok((self.teams.list(), false)),
             "team.send" => self.team_send(params),
             "team.read" => self.team_read(params).map(|value| (value, false)),
@@ -984,33 +1122,7 @@ impl Hub {
             .ok_or_else(|| TeamError::invalid("config is required"))?;
         self.teams.configure(&cwd, config)?;
         self.announce_configured(&cwd);
-        if let Some((team, instance, session)) = self.teams.config_resume(&cwd) {
-            if let Some(handle) = self.instances.get(&instance) {
-                let agent = handle.key.agent.clone();
-                let launch = crate::team::LeaderLaunch {
-                    cwd: handle.key.cwd.clone(),
-                    key: handle.key.clone(),
-                    env: handle.env.clone(),
-                    #[cfg(unix)]
-                    launch: handle.launch.clone(),
-                };
-                self.teams.fill_leader_template(&team, &launch);
-                let config = self.teams.config_for(&cwd);
-                self.teams.start_resume_with_config(
-                    &team,
-                    &instance,
-                    &session,
-                    &agent,
-                    &handle.fingerprint,
-                    config,
-                );
-                self.resume_team(&team);
-            } else {
-                // The instance that bound before configure is gone; stay
-                // suspended and wait for a new bind.
-                self.teams.clear_pending_resume(&team);
-            }
-        }
+        self.complete_resume_candidates(&cwd);
         Ok(json!({}))
     }
 
@@ -1115,6 +1227,12 @@ impl Hub {
                 });
                 participant.instance = None;
             }
+            let lifecycle = self
+                .teams
+                .team(team_id)
+                .and_then(|team| team.participants.get(&name))
+                .map(|participant| participant.lifecycle)
+                .unwrap_or_default();
             let spawn = SpawnRequest {
                 team: team_id.to_string(),
                 name: name.clone(),
@@ -1122,6 +1240,7 @@ impl Hub {
                 model: resume_model,
                 role: resume_role,
                 task: None,
+                lifecycle,
             };
             let opts = StartOptions {
                 resume: resume_session,
@@ -1147,50 +1266,6 @@ impl Hub {
         );
         self.drain_team_events();
         self.team_deliveries();
-    }
-
-    /// Legacy (pre-v3) leader token issue; kept for tests and old front ends.
-    fn team_leader_server(&mut self, params: &Value) -> Result<Value, TeamError> {
-        let instance = required_team_string(params, "instance")?;
-        let cwd = required_team_string(params, "cwd")?;
-        let Some(handle) = self.instances.get(&instance) else {
-            return Err(TeamError::new(UNKNOWN_INSTANCE, "unknown instance"));
-        };
-        let instance_cwd = handle.key.cwd.clone();
-        let agent = handle.key.agent.clone();
-        let fingerprint = handle.fingerprint.clone();
-        let (server, token_id) =
-            self.teams
-                .leader_server(&instance, &cwd, &instance_cwd, &agent, &fingerprint)?;
-        Ok(json!({ "server": server, "token_id": token_id }))
-    }
-
-    /// Legacy leader bind; v3 sessions bind through their session token.
-    fn team_bind_leader(&mut self, params: &Value) -> Result<Value, TeamError> {
-        let instance = required_team_string(params, "instance")?;
-        let Some(handle) = self.instances.get(&instance) else {
-            return Err(TeamError::new(UNKNOWN_INSTANCE, "unknown instance"));
-        };
-        let agent = handle.key.agent.clone();
-        let fingerprint = handle.fingerprint.clone();
-        let session = required_team_string(params, "sessionId")?;
-        let token_id = required_team_string(params, "token_id")?;
-        match self
-            .teams
-            .bind_leader(&instance, &session, &token_id, &agent, &fingerprint)?
-        {
-            crate::team::BindOutcome::Active(entry) => {
-                self.refresh_session(&instance, &session);
-                self.notify_tools_changed(&(instance, session));
-                Ok(entry)
-            }
-            crate::team::BindOutcome::Resume { team, entry } => {
-                self.resume_team(&team);
-                self.refresh_session(&instance, &session);
-                self.notify_tools_changed(&(instance, session));
-                Ok(entry)
-            }
-        }
     }
 
     /// `team.set_leader` (20.4): deferred because the notice needs the status
@@ -1224,34 +1299,56 @@ impl Hub {
         }
     }
 
-    fn run_set_leader(&mut self, conn: u64, id: &Value, team: &str, instance: &str, session: &str) {
-        let result = (|| -> Result<(), TeamError> {
-            let suspended = self.teams.is_suspended(team);
-            self.teams.set_leader(team, instance, session)?;
-            self.refresh_session(instance, session);
-            self.notify_tools_changed(&(instance.to_string(), session.to_string()));
-            if suspended {
-                if let Some(handle) = self.instances.get(instance) {
-                    let launch = crate::team::LeaderLaunch {
-                        cwd: handle.key.cwd.clone(),
-                        key: handle.key.clone(),
-                        env: handle.env.clone(),
-                        #[cfg(unix)]
-                        launch: handle.launch.clone(),
-                    };
-                    self.teams.fill_leader_template(team, &launch);
-                }
-                let cwd = self
-                    .teams
-                    .team(team)
-                    .map(|team| team.cwd.clone())
-                    .unwrap_or_default();
-                let config = self.teams.config_for(&cwd);
-                let (agent, fingerprint) = self
+    /// Move leadership, resuming a suspended team and filling its built-in
+    /// template. Sends the one documented notice to the new leader.
+    pub(crate) fn apply_set_leader(
+        &mut self,
+        team: &str,
+        instance: &str,
+        session: &str,
+    ) -> Result<(), TeamError> {
+        let previous = self.teams.team(team).and_then(|entry| {
+            entry
+                .leader_instance
+                .clone()
+                .zip(entry.leader_session.clone())
+        });
+        let suspended = self.teams.is_suspended(team);
+        self.teams.set_leader(team, instance, session)?;
+        if let Some((old_instance, old_session)) = previous.clone() {
+            if old_instance != instance {
+                self.refresh_session(&old_instance, &old_session);
+                self.notify_tools_changed(&(old_instance.clone(), old_session.clone()));
+                let agent = self
                     .instances
-                    .get(instance)
-                    .map(|handle| (handle.key.agent.clone(), handle.fingerprint.clone()))
+                    .get(&old_instance)
+                    .map(|handle| handle.key.agent.clone())
                     .unwrap_or_default();
+                let injected = self.teams.is_injected(&agent, &old_session);
+                self.announce_switch(&old_instance, &old_session, &agent, injected);
+            }
+        }
+        self.refresh_session(instance, session);
+        self.notify_tools_changed(&(instance.to_string(), session.to_string()));
+        let agent = self
+            .instances
+            .get(instance)
+            .map(|handle| handle.key.agent.clone())
+            .unwrap_or_default();
+        let injected = self.teams.is_injected(&agent, session);
+        self.announce_switch(instance, session, &agent, injected);
+        if suspended {
+            if let Some(handle) = self.instances.get(instance) {
+                let launch = crate::team::LeaderLaunch {
+                    cwd: handle.key.cwd.clone(),
+                    key: handle.key.clone(),
+                    env: handle.env.clone(),
+                    #[cfg(unix)]
+                    launch: handle.launch.clone(),
+                };
+                let mut config = self.teams.config_for(&handle.key.cwd);
+                self.teams.fill_builtin_config(&mut config, &launch);
+                let fingerprint = handle.fingerprint.clone();
                 self.teams.start_resume_with_config(
                     team,
                     instance,
@@ -1262,11 +1359,14 @@ impl Hub {
                 );
                 self.resume_team(team);
             }
-            Ok(())
-        })();
-        match result {
+        }
+        self.send_leader_notice(team, instance, session);
+        Ok(())
+    }
+
+    fn run_set_leader(&mut self, conn: u64, id: &Value, team: &str, instance: &str, session: &str) {
+        match self.apply_set_leader(team, instance, session) {
             Ok(()) => {
-                self.send_leader_notice(team, instance, session);
                 self.drain_team_events();
                 self.team_deliveries();
                 self.send_to(conn, &success(id, json!({})));
@@ -1360,10 +1460,13 @@ impl Hub {
             // A reload answers on its own (the response is sent there); an
             // error here is answered now.
             Ok(value) => {
-                if !self.reloading.contains(&(
-                    required_team_string(params, "instance").unwrap_or_default(),
-                    required_team_string(params, "sessionId").unwrap_or_default(),
-                )) {
+                let instance = required_team_string(params, "instance").unwrap_or_default();
+                let session = required_team_string(params, "sessionId").unwrap_or_default();
+                if !self
+                    .reloading
+                    .values()
+                    .any(|state| state.instance == instance && state.session == session)
+                {
                     self.send_to(conn, &success(id, value));
                 }
             }
@@ -1382,6 +1485,15 @@ impl Hub {
         agent: &str,
         cwd: &str,
     ) -> Result<(), TeamError> {
+        if self
+            .reloading
+            .values()
+            .any(|state| state.instance == instance && state.session == session)
+        {
+            let mut error = TeamError::not_allowed("a reload is already in progress");
+            error.data = Some(json!({ "reason": "reload_in_progress" }));
+            return Err(error);
+        }
         let method = {
             let handle = self
                 .instances
@@ -1397,6 +1509,7 @@ impl Hub {
                 return Err(error);
             }
         };
+        self.teams.note_resume_candidate(instance, session, agent);
         let (token_id, token) = self
             .teams
             .issue_session_token(instance, cwd, agent, Some(session));
@@ -1413,20 +1526,28 @@ impl Hub {
             "cwd": cwd,
             "mcpServers": servers,
         });
-        self.reloading
-            .insert((instance.to_string(), session.to_string()));
         let call = ServiceCall::Reload {
             instance: instance.to_string(),
             session: session.to_string(),
             conn,
             id: id.clone(),
-            token_id,
+            token_id: token_id.clone(),
         };
-        if !self.send_service_request(instance, method, params, call) {
-            self.reloading
-                .remove(&(instance.to_string(), session.to_string()));
+        let Some(agent_id) = self.send_service_request_id(instance, method, params, call) else {
+            self.teams.revoke_counting_injected(&token_id);
+            self.teams.drop_resume_candidate(instance, session);
             return Err(TeamError::not_allowed("agent is not accepting messages"));
-        }
+        };
+        self.reloading.insert(
+            agent_id,
+            ReloadState {
+                conn,
+                id: id.clone(),
+                instance: instance.to_string(),
+                session: session.to_string(),
+                token_id,
+            },
+        );
         Ok(())
     }
 
@@ -1441,11 +1562,10 @@ impl Hub {
         token_id: &str,
         message: &Value,
     ) {
-        self.reloading
-            .remove(&(instance.to_string(), session.to_string()));
         let failed = message.get("error").is_some();
         if failed {
-            self.teams.revoke(token_id);
+            self.teams.revoke_counting_injected(token_id);
+            self.teams.drop_resume_candidate(instance, session);
             let reason = message
                 .get("error")
                 .map(error_message)
@@ -1703,6 +1823,13 @@ impl Hub {
         if let Some((instance, session)) = leader {
             self.refresh_session(&instance, &session);
             self.notify_tools_changed(&(instance.clone(), session.clone()));
+            let agent = self
+                .instances
+                .get(&instance)
+                .map(|handle| handle.key.agent.clone())
+                .unwrap_or_default();
+            let injected = self.teams.is_injected(&agent, &session);
+            self.announce_switch(&instance, &session, &agent, injected);
             let running = self
                 .instances
                 .get(&instance)
@@ -2332,6 +2459,27 @@ impl Hub {
 
     fn run_deferred(&mut self, conn: u64, id: &Value, call: DeferredTeam, project: &str) {
         match call {
+            DeferredTeam::SessionStatus {
+                conn,
+                id,
+                token_id,
+                team,
+            } => {
+                let (agent, session) = self
+                    .teams
+                    .session_auth(&token_id)
+                    .map(|(_, session, agent)| (agent.to_string(), session.to_string()))
+                    .unwrap_or_default();
+                match self.teams.status(&team, "leader", project) {
+                    Ok(mut value) => {
+                        value["enabled"] = json!(true);
+                        value["leader"] = json!(true);
+                        value["injected"] = json!(self.teams.is_injected(&agent, &session));
+                        self.send_tool_success(conn, &id, value);
+                    }
+                    Err(error) => self.send_tool_error(conn, &id, &error),
+                }
+            }
             DeferredTeam::Status { team, name } => match self.teams.status(&team, &name, project) {
                 Ok(value) => self.send_to(conn, &success(id, value)),
                 Err(error) => self.send_error(conn, id, &error),
@@ -2760,29 +2908,29 @@ impl Hub {
                 session,
                 hand_over,
             } => {
-                let body = if hand_over {
-                    match self.teams.set_leader(&team, &instance, &session) {
-                        Ok(()) => {
-                            self.refresh_session(&instance, &session);
-                            self.notify_tools_changed(&(instance.clone(), session.clone()));
-                            self.send_leader_notice(&team, &instance, &session);
-                            "the team was handed over to this chat".to_string()
-                        }
-                        Err(error) => format!("handover failed: {}", error.message),
+                if hand_over {
+                    if let Err(error) = self.apply_set_leader(&team, &instance, &session) {
+                        let _ = self.teams.send_message(
+                            &team,
+                            "human",
+                            "leader",
+                            Kind::Notice,
+                            &format!("handover failed: {}", error.message),
+                            None,
+                            vec![],
+                        );
                     }
                 } else {
-                    "the handover was refused".to_string()
-                };
-                let _ = self.teams.send_message(
-                    &team,
-                    "human",
-                    "leader",
-                    Kind::Notice,
-                    &body,
-                    None,
-                    vec![],
-                );
-                self.notify_tools_changed(&(instance, session));
+                    self.teams.set_handover_refusal(&instance, &session);
+                    let agent = self
+                        .instances
+                        .get(&instance)
+                        .map(|handle| handle.key.agent.clone())
+                        .unwrap_or_default();
+                    let injected = self.teams.is_injected(&agent, &session);
+                    self.announce_switch(&instance, &session, &agent, injected);
+                    self.notify_tools_changed(&(instance, session));
+                }
                 false
             }
         }
@@ -2840,6 +2988,7 @@ impl Hub {
                     spawn: spawn.clone(),
                     plan: plan.clone(),
                     opts,
+                    cancelled: false,
                 },
             );
             let cwd = plan.cwd.clone();
@@ -3031,6 +3180,49 @@ impl Hub {
                 else {
                     return;
                 };
+                let stale = self
+                    .teams
+                    .team(team)
+                    .and_then(|entry| entry.participants.get(participant))
+                    .is_none_or(|worker| {
+                        worker.lifecycle != pending.spawn.lifecycle
+                            || worker.state == crate::team::ParticipantState::Exited
+                    });
+                if pending.cancelled || stale {
+                    let team_gone = self.teams.team(team).is_none();
+                    if let Ok(info) = result {
+                        let remove = self
+                            .teams
+                            .team(team)
+                            .and_then(|entry| entry.participants.get(participant))
+                            .is_some_and(|worker| {
+                                worker.lifecycle == pending.spawn.lifecycle
+                                    && worker.remove_after_exit
+                            });
+                        if remove {
+                            self.teams.finish_worker_removal(team, participant);
+                        }
+                        let discarded = info.clone();
+                        tokio::spawn(async move {
+                            worktree::discard(
+                                &discarded.toplevel,
+                                &discarded.path,
+                                &discarded.branch,
+                            )
+                            .await;
+                        });
+                    }
+                    if let Some((conn, id, _)) = &pending.opts.reply {
+                        let error = if team_gone {
+                            TeamError::unknown("team closed")
+                        } else {
+                            TeamError::not_allowed("the worker was stopped")
+                        };
+                        self.send_error(*conn, id, &error);
+                    }
+                    self.drain_team_events();
+                    return;
+                }
                 match result {
                     Ok(info) => {
                         self.teams
@@ -3078,8 +3270,11 @@ impl Hub {
                         ) {
                             self.announce_start(&pending.spawn, &pending.opts, Some(&info));
                             if let Some((conn, id, kind)) = &pending.opts.reply {
-                                let value =
+                                let mut value =
                                     Self::spawn_value(&pending.spawn.name, *kind, Some(&info));
+                                if let Some(entry) = self.teams.entry(&pending.spawn.team) {
+                                    value["team"] = entry;
+                                }
                                 self.send_to(*conn, &success(id, value));
                             }
                         }
@@ -3138,15 +3333,24 @@ impl Hub {
         params: Value,
         call: ServiceCall,
     ) -> bool {
-        let Some(handle) = self.instances.get_mut(instance) else {
-            return false;
-        };
+        self.send_service_request_id(instance, method, params, call)
+            .is_some()
+    }
+
+    fn send_service_request_id(
+        &mut self,
+        instance: &str,
+        method: &str,
+        params: Value,
+        call: ServiceCall,
+    ) -> Option<u64> {
+        let handle = self.instances.get_mut(instance)?;
         let (agent_id, frame) = handle.relay.service_request(method, params);
         if !handle.control.send_frame(frame) {
-            return false;
+            return None;
         }
         self.driver.insert((instance.to_string(), agent_id), call);
-        true
+        Some(agent_id)
     }
 
     pub(crate) fn handle_service_response(
@@ -3738,6 +3942,41 @@ impl Hub {
         }
     }
 
+    /// Drop `session/new` bindings and resume candidates of a dying instance.
+    pub(crate) fn cleanup_instance_pending(&mut self, instance: &str) {
+        let reloads: Vec<u64> = self
+            .reloading
+            .iter()
+            .filter(|(_, state)| state.instance == instance)
+            .map(|(agent_id, _)| *agent_id)
+            .collect();
+        for agent_id in reloads {
+            if let Some(state) = self.reloading.remove(&agent_id) {
+                self.teams.revoke_counting_injected(&state.token_id);
+                self.send_error(
+                    state.conn,
+                    &state.id,
+                    &TeamError::not_allowed("the agent exited during the reload"),
+                );
+            }
+        }
+        let keys: Vec<(String, u64)> = self
+            .pending_session_new
+            .keys()
+            .filter(|(owner, _)| owner == instance)
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(pending) = self.pending_session_new.remove(&key) {
+                self.teams.revoke(&pending.token_id);
+            }
+        }
+        let sessions = self.teams.candidates_of_instance(instance);
+        for session in sessions {
+            self.teams.drop_resume_candidate(instance, &session);
+        }
+    }
+
     pub(crate) fn fail_held_prompts(&mut self, instance: &str) {
         let keys: Vec<(String, String)> = self
             .held_prompts
@@ -4091,7 +4330,7 @@ impl Hub {
 
 /// Put an `ade-team` server entry into a `session/*` params object's
 /// `mcpServers`, replacing one of the same name (20.2).
-fn inject_team_server(params: &mut Value, token: &str) {
+pub(crate) fn inject_team_server(params: &mut Value, token: &str) {
     if let Some(servers) = params.get_mut("mcpServers") {
         inject_team_server_value(servers, token);
     } else if let Some(object) = params.as_object_mut() {
@@ -4181,17 +4420,6 @@ fn team_refs(params: &Value) -> Result<Vec<String>, TeamError> {
         }
         Some(_) => Err(TeamError::invalid("refs must be an array")),
     }
-}
-
-/// A `tools/call` result the MCP proxy answers with `isError` (20.3).
-fn error_tool_result(id: &Value, message: &str) -> Value {
-    success(
-        id,
-        json!({
-            "content": [{ "type": "text", "text": message }],
-            "isError": true,
-        }),
-    )
 }
 
 fn reason_text(reason: &str) -> &'static str {
