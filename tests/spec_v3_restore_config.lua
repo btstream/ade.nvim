@@ -253,6 +253,38 @@ return function(t)
       t.eq("direct", config.templates.worker.tool_style)
     end)
 
+    t.it("sends the configuration before the session request it configures", function()
+      local service, dir = start_service(t, "configure-order")
+      -- Record how many `team.configure` requests had been processed when each
+      -- ACP frame was handed to the relay: PROTOCOL.md 20.2 needs the config in
+      -- place *before* the session request, so the count must be non-zero.
+      local configured_at_send = {}
+      local raw_send = service.on_tunnel_send
+      service.on_tunnel_send = function(self, params, client)
+        local method = type(params) == "table" and type(params.message) == "table" and params.message.method or nil
+        if method then
+          local n = 0
+          for _, call in ipairs(self.calls) do
+            if call.method == "team.configure" then
+              n = n + 1
+            end
+          end
+          configured_at_send[method] = configured_at_send[method] or n
+        end
+        return raw_send(self, params, client)
+      end
+      t.cleanup(function()
+        service.on_tunnel_send = raw_send
+      end)
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #sent_frames(service, "session/new") == 1
+      end, 10000, "the session request")
+      t.truthy((configured_at_send["session/new"] or 0) >= 1, "team.configure preceded session/new")
+    end)
+
     t.it("treats an all-unresolvable template set as unavailable and says why once", function()
       local service, dir = start_service(t, "all-skipped")
       setup(t, dir, {

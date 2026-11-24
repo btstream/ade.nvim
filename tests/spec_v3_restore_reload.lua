@@ -437,6 +437,210 @@ return function(t)
       t.eq(1, #calls.starts)
       t.eq("go", calls.starts[1].task)
     end)
+
+    -- PRODUCTION BUG (review round 2, blocker 3): a legal
+    -- `teams.session_default = false` configuration cannot complete a handover.
+    -- The replacement session is created under the same configuration, so
+    -- `session/new` injects nothing and `handover`'s enable answers
+    -- `reload_unsupported` — the flow stops and the summary is never sent
+    -- (`lua/ade/app/team_start.lua:330–338,398–425,468–488`).
+    t.pending(
+      "hands a summary to a replacement session created with session_default = false",
+      "lua/ade/app/team_start.lua:468–488: the handover's enable answers reload_unsupported and the summary is dropped",
+      function()
+        local cwd = base_cwd("reload-default-off")
+        local session = { id = "s1", cwd = cwd, instance = "i1", blocks = { { kind = "user", text = "fix it" } } }
+        local submitted = {}
+        local created = { id = "s2", cwd = cwd, instance = "i1", blocks = {} }
+        local fake_team = {
+          available = function()
+            return true
+          end,
+        }
+        -- The switch is off for every session, and enabling it always needs a
+        -- reload the agent cannot do.
+        function fake_team:workflows(_, cb)
+          cb(true, { workflows = { { name = "default", summary = "the flow", team = {} } } })
+        end
+        function fake_team:session_teams()
+          return nil
+        end
+        function fake_team:query_session_teams(_, _, _, cb)
+          cb(true, { enabled = false, injected = false })
+        end
+        function fake_team:set_session_teams(_, _, _, _, cb)
+          cb(false, { code = -32061, data = { reason = "reload_unsupported" } })
+        end
+        function fake_team:reload_session()
+          error("this agent cannot reload")
+        end
+        function fake_team:start_session()
+          error("a start without tools is a production bug, not a test path")
+        end
+        local S = { view = { team = fake_team }, sess = { current = session, all = { s1 = session, s2 = created } } }
+        local flow = TeamStart.new({
+          state = function()
+            return S
+          end,
+          config = function()
+            return {
+              backend = "service",
+              cwd = cwd,
+              teams = { enabled = true, default = "default", session_default = false },
+            }
+          end,
+          notify = function() end,
+          resolve_cwd = function()
+            return cwd
+          end,
+          open = function() end,
+          new_session = function(opts)
+            S.sess.current = created
+            if opts and opts.on_created then
+              opts.on_created(created)
+            end
+          end,
+          connect = function() end,
+          pick_agent = function() end,
+          options = function()
+            return nil
+          end,
+          client = function()
+            return { proc = { instance = "i1" } }
+          end,
+          generation = function()
+            return 0
+          end,
+          report_error = function(value)
+            return type(value) == "table" and tostring(value.data and value.data.reason or value.message or value.code)
+              or tostring(value)
+          end,
+          choices = function()
+            return nil
+          end,
+          find_session = function(id)
+            return S.sess.all[id]
+          end,
+          select_session = function() end,
+          submit = function(text, target)
+            submitted[#submitted + 1] = { text = text, id = target and target.id }
+          end,
+        })
+        local original_select, original_input = vim.ui.select, vim.ui.input
+        vim.ui.select = function(items, _, cb)
+          cb(items[1])
+        end
+        vim.ui.input = function(_, cb)
+          cb("")
+        end
+        t.cleanup(function()
+          vim.ui.select, vim.ui.input = original_select, original_input
+        end)
+        flow:start("default")
+        wait_idle(flow)
+        t.truthy(#submitted > 0, "the summary reaches the replacement session")
+        t.eq("s2", submitted[1].id)
+        t.match("fix it", submitted[1].text)
+      end
+    )
+
+    -- The leader-model write is addressed to the start target and the client
+    -- that served it (review round 2, item 12). The production `Options:apply`
+    -- still refuses a session object that is no longer `current`
+    -- (`lua/ade/app/options.lua:38–46,73–77`), which is what makes an in-place
+    -- reload lose the write; that part is reported, not pinned here.
+    t.it("applies the leader model to the session the workflow started in", function()
+      local cwd = base_cwd("leader-model")
+      local session = { id = "s1", cwd = cwd, instance = "i1", blocks = {}, controls = nil }
+      function session:refresh_controls()
+        self.controls = { model = { id = "model", kind = "select", options = { { value = "m2", label = "m2" } } } }
+      end
+      local applied = {}
+      local fake_team = {
+        available = function()
+          return true
+        end,
+      }
+      function fake_team:workflows(_, cb)
+        cb(true, {
+          workflows = { { name = "default", summary = "the flow", team = {}, leader = { model = "m2" } } },
+        })
+      end
+      function fake_team:session_teams()
+        return { enabled = true, injected = true }
+      end
+      function fake_team:query_session_teams(_, _, _, cb)
+        cb(true, { enabled = true, injected = true })
+      end
+      function fake_team:set_session_teams(_, _, _, _, cb)
+        cb(true, { enabled = true, injected = true })
+      end
+      function fake_team:start_session(_, _, _, _, cb)
+        cb(true, { workflow = "default" })
+      end
+      local S = { view = { team = fake_team }, sess = { current = session, all = { s1 = session } } }
+      local options = {
+        apply = function(_, control, model, client, generation, target)
+          applied[#applied + 1] = {
+            control = control and control.id,
+            model = model,
+            client = client,
+            generation = generation,
+            target = target and target.id,
+          }
+        end,
+      }
+      local flow = TeamStart.new({
+        state = function()
+          return S
+        end,
+        config = function()
+          return { backend = "service", cwd = cwd, teams = { enabled = true, default = "default" } }
+        end,
+        notify = function() end,
+        resolve_cwd = function()
+          return cwd
+        end,
+        open = function() end,
+        new_session = function() end,
+        connect = function() end,
+        pick_agent = function() end,
+        options = function()
+          return options
+        end,
+        client = function()
+          return { proc = { instance = "i1" } }
+        end,
+        generation = function()
+          return 3
+        end,
+        report_error = tostring,
+        choices = function()
+          return nil
+        end,
+        find_session = function(id)
+          return S.sess.all[id]
+        end,
+        select_session = function() end,
+        submit = function() end,
+      })
+      local original_select, original_input = vim.ui.select, vim.ui.input
+      vim.ui.select = function(items, _, cb)
+        cb(items[1])
+      end
+      vim.ui.input = function(_, cb)
+        cb("")
+      end
+      t.cleanup(function()
+        vim.ui.select, vim.ui.input = original_select, original_input
+      end)
+      flow:start("default")
+      wait_idle(flow)
+      t.eq(1, #applied, "the model write reaches the options layer")
+      t.eq("model", applied[1].control)
+      t.eq("m2", applied[1].model)
+      t.eq("s1", applied[1].target, "the write is addressed to the start target")
+    end)
   end)
 
   -- Keep the helper honest: the flow must be namespaced so no other spec leaks.
