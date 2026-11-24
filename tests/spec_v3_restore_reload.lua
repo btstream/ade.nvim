@@ -27,7 +27,8 @@ return function(t)
   end
 
   ---A stand-in service with a real agent child, so the capabilities (and thus
-  ---`session/close`) are the agent's own.
+  ---`session/close`) are the agent's own. A canned service is left alone: its
+  ---reply table is the whole agent.
   local function start_service(t, tag, opts)
     local dir = tmpdir(tag)
     local service = fake.new(vim.tbl_extend("force", {
@@ -35,36 +36,38 @@ return function(t)
       features = { "tunnel", "log", "teams" },
     }, opts or {}))
     local jobs = {}
-    service.spawn_agent = function(instance)
-      local decoder = Framing.new_decoder()
-      local job = vim.fn.jobstart({ "python3", root .. "tests/mock_agent.py" }, {
-        stdin = "pipe",
-        env = instance.env,
-        stdout_buffered = false,
-        on_stdout = function(_, data)
-          for _, chunk in ipairs(data or {}) do
-            if chunk ~= "" then
-              decoder:feed(chunk .. "\n", function(line)
-                if line == "" then
-                  return
-                end
-                local ok, message = pcall(vim.json.decode, line)
-                if ok and type(message) == "table" then
-                  service:deliver(instance, message)
-                end
-              end)
+    if not service.canned_agent then
+      service.spawn_agent = function(instance)
+        local decoder = Framing.new_decoder()
+        local job = vim.fn.jobstart({ "python3", root .. "tests/mock_agent.py" }, {
+          stdin = "pipe",
+          env = instance.env,
+          stdout_buffered = false,
+          on_stdout = function(_, data)
+            for _, chunk in ipairs(data or {}) do
+              if chunk ~= "" then
+                decoder:feed(chunk .. "\n", function(line)
+                  if line == "" then
+                    return
+                  end
+                  local ok, message = pcall(vim.json.decode, line)
+                  if ok and type(message) == "table" then
+                    service:deliver(instance, message)
+                  end
+                end)
+              end
             end
-          end
-        end,
-      })
-      jobs[#jobs + 1] = job
-      instance.handler = function(message)
-        pcall(vim.fn.chansend, job, vim.json.encode(message) .. "\n")
+          end,
+        })
+        jobs[#jobs + 1] = job
+        instance.handler = function(message)
+          pcall(vim.fn.chansend, job, vim.json.encode(message) .. "\n")
+        end
+        instance.stop_agent = function()
+          pcall(vim.fn.jobstop, job)
+        end
+        return job > 0
       end
-      instance.stop_agent = function()
-        pcall(vim.fn.jobstop, job)
-      end
-      return job > 0
     end
     assert(service:listen(), "the stand-in service could not listen")
     t.cleanup(function()
@@ -180,8 +183,17 @@ return function(t)
   end
 
   t.describe("teams v3 reload", function()
+    -- The canned agent already advertises `close`, so the reload round trip
+    -- (and the close that may follow it) is exercised for real.
+    local function start_canned(t, tag)
+      return start_service(t, tag, {
+        canned_agent = true,
+        canned_capabilities = { loadSession = true, sessionCapabilities = { close = {}, resume = {} } },
+      })
+    end
+
     t.it(":Ade team on runs the real load after a reload: true answer", function()
-      local service, dir = start_service(t, "on-reload")
+      local service, dir = start_canned(t, "on-reload")
       setup(t, dir)
       controller.connect()
       wait_ready()
@@ -199,10 +211,20 @@ return function(t)
       end, 15000, "the success notice")
       -- The transcript is visible again afterwards (the load re-rendered it).
       t.eq(true, state().sess.current ~= nil)
+      -- PROTOCOL.md 20.5: the forwarded load injects the tools, and the cache
+      -- ends up saying so instead of keeping the pre-load answer.
+      local key = own_instance() .. "\0sess_mock"
+      wait(function()
+        local cached = state().view.team:session_teams(own_instance(), "sess_mock")
+        return service.session_switches[key] ~= nil
+          and service.session_switches[key].injected == true
+          and cached ~= nil
+          and cached.injected == true
+      end, 15000, "the injected switch after the reload")
     end)
 
     t.it(":Ade team on does not load when the tools are already injected", function()
-      local service, dir = start_service(t, "on-injected")
+      local service, dir = start_canned(t, "on-injected")
       setup(t, dir)
       controller.connect()
       wait_ready()
@@ -226,7 +248,7 @@ return function(t)
       "does not close the session it just reloaded",
       "lua/ade/app/window.lua:40–58 + sessions.lua:572–584: an in-place reload replaces the projection, so select_session closes the same session id",
       function()
-        local service, dir = start_service(t, "on-close")
+        local service, dir = start_canned(t, "on-close")
         setup(t, dir)
         controller.connect()
         wait_ready()
@@ -243,7 +265,7 @@ return function(t)
     )
 
     t.it("reports a failed reload and leaves the session usable", function()
-      local service, dir = start_service(t, "on-reload-broken")
+      local service, dir = start_canned(t, "on-reload-broken")
       setup(t, dir)
       controller.connect()
       wait_ready()
