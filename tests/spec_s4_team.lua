@@ -407,8 +407,11 @@ return function(t)
       t.eq("sess_mock", calls_of(service, "team.set_leader")[1].params.sessionId)
     end)
 
-    t.it("runs the front-end reload when session.teams answers reload: true", function()
-      local service, dir = start_service(t, "reload-true")
+    t.it("reloads in place without closing the session, even with close-capable agents", function()
+      local service, dir = start_service(t, "reload-true", {
+        -- If the guard is wrong, the agent really would receive session/close.
+        agent_capabilities = { sessionCapabilities = { close = {}, resume = {} } },
+      })
       setup(t, dir)
       controller.connect()
       wait_ready()
@@ -440,15 +443,50 @@ return function(t)
         return reloaded ~= nil
       end, 5000, "the reload to settle")
       t.eq(true, reloaded)
-      -- Loading the session in place replaces the transcript projection of the
-      -- same logical session; that is not "leaving" it, so no session/close may
-      -- follow (it would revoke the token the load just injected).
+      -- Loading in place replaces the transcript projection of the same logical
+      -- session; that is not "leaving" it, so no ACP session/close may follow
+      -- (it would revoke the token the load just injected).
       vim.wait(200)
-      t.eq(0, #calls_of(service, "session/close"), "an in-place reload must not close the session")
+      t.eq(0, #sent_frames(service, "session/close"), "an in-place reload must not close the session")
       wait(function()
         local state = team():session_teams(inst, "sess_mock")
         return state ~= nil and state.injected == true
       end, 5000, "the switch to show the injected tools")
+    end)
+
+    t.it("never closes a session restored onto a different instance", function()
+      local service, dir = start_service(t, "reload-new-instance", {
+        agent_capabilities = { sessionCapabilities = { close = {}, resume = {} } },
+      })
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #calls_of(service, "session.teams") >= 1
+      end, 5000, "the switch")
+      local State = require("ade.session.state")
+      local S = state()
+      local live = instance()
+      local old = S.sess.current
+      -- After an agent restart the runtime keeps the old object (old instance,
+      -- needs_load); the restore commits a fresh projection of the same id.
+      old.instance = "inst-from-before-the-restart"
+      old.status = "idle"
+      old.queue = {}
+      local restored = State.new(old.id, old.cwd)
+      restored.instance = live
+      S.sess.service.activate(restored)
+      vim.wait(300)
+      t.eq(old.id, S.sess.current.id, "the restored projection is on screen")
+      t.eq(0, #sent_frames(service, "session/close"), "a session restored onto a new instance is never closed")
+      -- Control: a genuine switch-away of a close-capable idle session does
+      -- send session/close, so the assertion above can actually fail.
+      local other = State.new("sess-other", old.cwd)
+      other.instance = live
+      S.sess.service.activate(other)
+      wait(function()
+        return #sent_frames(service, "session/close") >= 1
+      end, 5000, "the real close of a left-behind idle session")
     end)
 
     t.it("auto-starts once on an empty team list and again when tools appear", function()
@@ -888,6 +926,7 @@ return function(t)
       end)
 
       t.it("never marks a row online without a live client", function()
+        local notices = {}
         local service, dir = start_service(t, "tree-no-live")
         setup(t, dir)
         controller.connect()
@@ -896,16 +935,26 @@ return function(t)
           return #calls_of(service, "session.teams") >= 1
         end, 5000, "the switch")
         local ui = state().view.team_ui
-        -- Pretend the connection is gone while the team snapshot still names a
-        -- leader: no row may look online, and `t` must refuse instead of
-        -- guessing an instance.
-        local real_instance = ui.instance_of
-        ui.instance_of = function()
-          return nil
-        end
-        t.cleanup(function()
-          ui.instance_of = real_instance
-        end)
+        -- A real disconnect (service still up) leaves the cached team snapshot
+        -- behind; no row may look online while the client is gone, and `t` must
+        -- refuse instead of guessing an instance.
+        local inst = instance()
+        service.teams.t1 = {
+          id = "t1",
+          cwd = dir,
+          state = "active",
+          leader = { instance = inst, sessionId = "sess_mock" },
+          participants = { { name = "leader", state = "idle" } },
+          inbox = {},
+        }
+        team():refresh()
+        wait(function()
+          return team():team_for_cwd(dir) ~= nil
+        end, 5000, "the team before disconnecting")
+        ade.disconnect()
+        wait(function()
+          return state().conn.phase ~= "ready"
+        end, 5000, "the agent to disconnect")
         local groups = ui:tree_groups()
         for _, group in ipairs(groups) do
           for _, entry in ipairs(group.sessions) do
@@ -920,6 +969,22 @@ return function(t)
             ","
           )
           :find(dir, 1, true))
+        -- A tree row action for that row is refused (no live instance).
+        ui.notify_fn = function(message)
+          notices[#notices + 1] = tostring(message)
+        end
+        local meta = {
+          kind = "tree_session",
+          session = state().sess.current,
+          cwd = dir,
+          instance = inst,
+          online = false,
+          team = team():team_for_cwd(dir),
+        }
+        local before = #service.calls
+        t.eq(true, ui:handle_tree_key("L", meta))
+        t.eq(before, #service.calls, "an offline row sends no RPC")
+        t.truthy(table.concat(notices, "\n"):match("instance"))
       end)
 
       t.it("b opens the board of the row's team", function()
@@ -1022,6 +1087,88 @@ return function(t)
         return #calls_of(service, "team.stop_worker") == 1
       end, 5000, "the leading-bang stop")
       t.eq(true, calls_of(service, "team.stop_worker")[1].params.remove)
+    end)
+
+    t.it("public ade.start_team starts in the given session without changing the UI selection", function()
+      local service, dir = start_service(t, "public-start")
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #calls_of(service, "session.teams") >= 1
+      end, 5000, "the switch")
+      local S = state()
+      local current = S.sess.current
+      local current_instance = instance()
+      -- A second session of the same project, never shown.
+      local State = require("ade.session.state")
+      local other = State.new("sess_other", dir)
+      other.instance = current_instance
+      other.blocks = {}
+      S.sess.all.sess_other = other
+      local original_input = vim.ui.input
+      vim.ui.input = function(_, cb)
+        cb("")
+      end
+      local original_select = vim.ui.select
+      vim.ui.select = function(items, _, cb)
+        cb(items[1])
+      end
+      t.cleanup(function()
+        vim.ui.input = original_input
+        vim.ui.select = original_select
+      end)
+      -- The selection must not move: the flow addresses the target by pair.
+      ade.start_team("default", other)
+      wait(function()
+        return #calls_of(service, "team.start") == 1
+      end, 8000, "the explicit start")
+      t.eq(current, S.sess.current, "the current chat is untouched")
+      local call = calls_of(service, "team.start")[1].params
+      t.eq("sess_other", call.sessionId)
+      t.eq(current_instance, call.instance)
+    end)
+
+    t.it("a tree query is a pure read and never auto-starts", function()
+      local service, dir = start_service(t, "tree-pure", { session_injected_default = false })
+      service.teams = {}
+      setup(t, dir, {
+        teams = {
+          auto_start = true,
+          max_workers = 3,
+          spawn_confirm = { auto = {} },
+          limits = { max_turns_per_task = 30, max_turns_total = 200 },
+        },
+      })
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #calls_of(service, "session.teams") >= 1
+      end, 5000, "the switch")
+      local inst = instance()
+      service.session_switches[tostring(inst) .. "\0sess_mock"] = { enabled = true, injected = true }
+      -- Let the connection-time refresh and its own auto-start decision settle
+      -- first, so the only caller left is the tree's read below.
+      wait(function()
+        return team().list_ready == true
+      end, 8000, "the team list to be ready")
+      vim.wait(500)
+      local before = #calls_of(service, "team.start")
+      -- Forget what the session event cached, then let the tree's own read be
+      -- the first to see `injected: true`. A pure read may cache it but must not
+      -- start a team, even though the person opted into auto-start.
+      team().session_states = {}
+      team().auto_started = {}
+      local read
+      team():query_session_teams(inst, "sess_mock", dir, function(ok)
+        read = ok
+      end, { source = "tree" })
+      wait(function()
+        local known = team():session_teams(inst, "sess_mock")
+        return read and known ~= nil and known.injected == true
+      end, 8000, "the tree read to cache the switch")
+      vim.wait(300)
+      t.eq(before, #calls_of(service, "team.start"), "a tree read never starts a team")
     end)
 
     t.it("closes a led team through :Ade team off and :Ade team close", function()

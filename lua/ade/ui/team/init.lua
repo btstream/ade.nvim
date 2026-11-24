@@ -36,7 +36,7 @@ end
 ---  find_session: (fun(id: string): table|nil)|nil, instance: (fun(): string|nil)|nil,
 ---  start_team: (fun(workflow: string, session: table|nil)|nil)|nil, select_session: (fun(session: table)|nil)|nil,
 ---  open_session: (fun(session: table, opts: table|nil)|nil)|nil, sessions: (fun(): table|nil)|nil,
----  connection_generation: (fun(): any)|nil}
+---  connection_generation: (fun(): any)|nil, live_instance: (fun(): string|nil)|nil}
 ---@return table
 function M.dashboard(opts)
   local self = setmetatable({
@@ -51,6 +51,7 @@ function M.dashboard(opts)
     open_session = opts.open_session,
     sessions = opts.sessions,
     instance_of = opts.instance,
+    live_instance_of = opts.live_instance,
     connection_generation = opts.connection_generation,
     panel = opts.panel,
     start_team = opts.start_team,
@@ -329,7 +330,8 @@ end
 ---@return table[]
 function Dashboard:tree_groups()
   local sessions = (self.sessions and self.sessions()) or {}
-  local live = self.instance_of and self.instance_of() or nil
+  -- Only a ready client certifies liveness; never a cached binding.
+  local live = self.live_instance_of and self.live_instance_of() or nil
   local by_cwd = {}
   local order = {}
   for _, session in pairs(sessions) do
@@ -412,7 +414,7 @@ function Dashboard:render_tree()
             self.switch_queried[key] = true
           end
           self:schedule_refresh()
-        end)
+        end, { source = "tree" })
       end
     end
   end
@@ -596,10 +598,20 @@ end
 ---Open or focus one pane. `nil` means the members pane (compat entry).
 ---@param kind string|nil "tree", "members", "board" or "all"
 ---@return boolean
-function Dashboard:open(kind)
+---Open or focus one pane.
+---
+---`opts.team` names an exact team for the board pane; only the tree's `b` passes
+---it. Every other entry (`:Ade team board`) follows the project cwd and leaves
+---no pin behind.
+---@param kind string|nil "tree", "members", "board" or "all"
+---@param opts {team: string|nil}|nil
+---@return boolean
+function Dashboard:open(kind, opts)
   kind = kind or "members"
-  if kind ~= "board" then
-    -- `:Ade team board` follows the cwd again; only `b` pins a team.
+  opts = opts or {}
+  if kind == "board" then
+    self.open_board_target = opts.team or nil
+  else
     self.open_board_target = nil
   end
   self.resolved_cwd = self.team.resolve_cwd and self.team.resolve_cwd() or nil
@@ -980,12 +992,10 @@ function Dashboard:handle_tree_key(key, info)
   end
   if key == "b" then
     -- The board of the row's team, not whichever project the editor cwd (or a
-    -- previous selection) points at. `:Ade team board` keeps following the cwd.
-    if info.team then
-      self.board_selected_id = info.team.id
-      self.open_board_target = info.team.id
-    end
-    self:open("board")
+    -- previous selection) points at. The target is passed explicitly, so the
+    -- pin cannot leak into `:Ade team board`.
+    local team_id = info.team_row and info.team_row.id or (type(info.team) == "table" and info.team.id) or nil
+    self:open("board", { team = team_id })
     return true
   end
   if key == "<CR>" or key == "cr" then
@@ -1085,7 +1095,7 @@ function Dashboard:handle_tree_key(key, info)
         else
           self:set_teams_on(session, instance)
         end
-      end)
+      end, { source = "tree" })
       return true
     end
     if state.enabled == false then

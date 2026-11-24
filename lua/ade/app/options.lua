@@ -161,6 +161,19 @@ function Options:drain(session, queue)
 end
 
 function Options:write(control, value, change, session, on_finally)
+  -- A queued write can be cancelled by a reload of the same session or by a
+  -- reconnect; the scoped task then ends without `on_error`, so the caller must
+  -- still be settled here (`on_finally` runs for every ending).
+  local settled = false
+  local function settle(ok, err)
+    if settled then
+      return
+    end
+    settled = true
+    if change.cb then
+      pcall(change.cb, ok, err)
+    end
+  end
   self.run("control:" .. session.id, change.client, session, function(task)
     local ok, result
     if control.source == "modes" then
@@ -171,9 +184,7 @@ function Options:write(control, value, change, session, on_finally)
     if not ok then
       task.status = "failed"
       local message = type(result) == "table" and (result.message or vim.inspect(result)) or tostring(result)
-      if change.cb then
-        pcall(change.cb, false, message)
-      end
+      settle(false, message)
       self.notify("unable to change " .. (control.name or control.id) .. ": " .. message, vim.log.levels.ERROR)
       return
     end
@@ -194,15 +205,19 @@ function Options:write(control, value, change, session, on_finally)
     end
     session._toolbar_labels = nil
     self.on_changed()
-    if change.cb then
-      pcall(change.cb, true, nil)
-    end
+    settle(true, nil)
   end, function(err)
-    if change.cb then
-      pcall(change.cb, false, err)
-    end
+    settle(false, err)
     self.notify("unable to change " .. (control.name or control.id) .. ": " .. tostring(err), vim.log.levels.ERROR)
-  end, on_finally)
+  end, function()
+    -- Cancelled (reload/reconnect) or superseded: no error callback fires, so
+    -- report the failure here rather than leaving the caller waiting. The
+    -- queue continuation still runs for every ending.
+    settle(false, "the change was cancelled")
+    if on_finally then
+      on_finally()
+    end
+  end)
 end
 
 ---Toggle a boolean control.

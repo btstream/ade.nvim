@@ -362,11 +362,11 @@ end
 ---@param workflow string|nil
 ---@param session table|nil start in that session instead of the current one
 function M.start_team(workflow, session)
-  if session and S.sess.service then
-    S.sess.service:activate(session)
-  end
+  -- A named session is the *target* of the start, not a new UI selection: the
+  -- flow addresses it by (instance, sessionId) and the person may keep reading
+  -- another chat while it runs.
   if S.view.team_commands then
-    S.view.team_commands:start(workflow)
+    S.view.team_commands:start(workflow, session)
   end
 end
 

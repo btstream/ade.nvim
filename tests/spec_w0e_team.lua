@@ -370,6 +370,8 @@ return function(t)
         end,
       }
       local notices = {}
+      local controls = { model = { id = "model", options = { { value = "big" } } } }
+      local h_all_target = { id = "s1", instance = "i1", controls = controls }
       local h = harness(t, {
         tag = "model-target",
         options = options,
@@ -385,10 +387,6 @@ return function(t)
           return h_all_target
         end,
       })
-      local h_all_target -- defined below for the closure above
-      local controls = { model = { id = "model", options = { { value = "big" } } } }
-      local target = { id = "s1", instance = "i1", controls = controls }
-      h_all_target = target
       h.session.controls = controls
       h.flow.deps.notify = function(message)
         notices[#notices + 1] = tostring(message)

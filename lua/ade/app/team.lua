@@ -81,6 +81,9 @@ function M.new(opts)
     notified = {},
     -- session key -> true once auto_start asked for a team there.
     auto_started = {},
+    -- session key -> true when the current session itself learned its switch
+    -- (a session event), not merely from a tree read. Auto-start needs this.
+    auto_eligible = {},
     -- team id -> {board, inflight, again, seq} for the board cache (19.2).
     boards = {},
     -- team id -> the board_rev whose fetch was already attempted (19.2): a
@@ -193,6 +196,7 @@ function Team:forget_connection()
   self.sent_config = {}
   self.session_states = {}
   self.session_queries = {}
+  self.auto_eligible = {}
   self.bound = {}
   self.list_ready = false
   -- A board request that was in flight when the connection died may still
@@ -732,6 +736,10 @@ function Team:apply_session_teams(instance, session_id, value, seq, opts)
   -- once the authoritative team snapshot is in. A tree query passes
   -- `evaluate = false`, so merely browsing never starts anything.
   if not opts or opts.evaluate ~= false then
+    -- Only a session event that itself reports the tools injected may enable
+    -- auto-start. A tree read (or a session event that still says "not
+    -- injected") must never become the trigger, not even via a later refresh.
+    self.auto_eligible[key] = state.enabled == true and state.injected == true
     self:_maybe_auto_start(instance, session_id)
   end
   self:changed()
@@ -771,13 +779,17 @@ function Team:next_session_seq(key)
   return self.session_seq[key]
 end
 
----Query the switch and leadership of one session. Pure read: it never starts a
----team, so browsing the tree cannot create one in the background.
+---Query the switch and leadership of one session.
+---
+---`opts.source` says who asked: `"tree"` is a pure read (browsing), and only a
+---current-session event (`"session"`, the default) may evaluate auto-start. The
+---source is fixed at request time, never inferred from the reply.
 ---@param instance string|nil
 ---@param session_id string|nil
 ---@param cwd string|nil known cwd, for the error text only
 ---@param cb fun(ok: boolean, value: any)|nil
-function Team:query_session_teams(instance, session_id, cwd, cb)
+---@param opts {source: string|nil}|nil
+function Team:query_session_teams(instance, session_id, cwd, cb, opts)
   cb = cb or function() end
   local key = session_key(instance, session_id)
   if not key or not self:available() then
@@ -800,9 +812,11 @@ function Team:query_session_teams(instance, session_id, cwd, cb)
   self:_call("session.teams", { instance = instance, sessionId = session_id }, function(ok, value)
     query.inflight = false
     if ok and type(value) == "table" then
-      -- A query never starts a team for a background session, but the session
-      -- on screen may auto-start once it learns its tools are injected.
-      self:apply_session_teams(instance, session_id, value, seq, { evaluate = self:is_current(instance, session_id) })
+      -- A pure read (the tree) never evaluates auto-start. A session event may,
+      -- for the session on screen only.
+      local source = type(opts) == "table" and opts.source or "session"
+      local evaluate = source ~= "tree" and self:is_current(instance, session_id)
+      self:apply_session_teams(instance, session_id, value, seq, { evaluate = evaluate })
     elseif self.session_queries[key] == query then
       -- A failed query must not poison the cache: a later attempt may retry.
       self.session_queries[key] = nil
@@ -815,7 +829,7 @@ function Team:query_session_teams(instance, session_id, cwd, cb)
     local again = query.again
     query.again = false
     if again and self.session_queries[key] == query then
-      self:query_session_teams(instance, session_id, cwd, function() end)
+      self:query_session_teams(instance, session_id, cwd, function() end, opts)
     end
   end)
 end
@@ -883,12 +897,31 @@ function Team:reload_session(instance, session_id, cb)
     cb(false, "this front end cannot reload a session")
     return
   end
-  self.reload_seq = (self.reload_seq or 0) + 1
-  local seq = self.reload_seq
+  -- A reload that the loader refuses (busy session, another replay) never
+  -- occupies the pair: bumping its generation would wrongly cancel the valid
+  -- load already running for the same session.
+  local key = session_key(instance, session_id)
+  local reloads = self.reload_attempts or {}
+  local attempt = (reloads[key] or 0) + 1
+  local claimed = false
   local ok, err = pcall(self.reload_session_fn, instance, session_id, function(reloaded, value)
-    if seq ~= self.reload_seq or not self:available() then
-      -- The connection or a newer reload superseded this one: never report a
-      -- stale success, and settle the caller.
+    if claimed and (reloads[key] or 0) ~= attempt then
+      -- A newer reload of the same pair owns the outcome now.
+      cb(false, "the reload was superseded")
+      return
+    end
+    if not claimed then
+      if not reloaded then
+        -- Rejected before it could run: this attempt is over and must not have
+        -- invalidated anything.
+        cb(false, value)
+        return
+      end
+      claimed = true
+      reloads[key] = attempt
+      self.reload_attempts = reloads
+    end
+    if not self:available() then
       cb(false, "the reload was cancelled")
       return
     end
@@ -995,7 +1028,7 @@ function Team:_maybe_auto_start(instance, session_id)
   if not state or state.enabled ~= true or state.injected ~= true or state.leader ~= nil then
     return
   end
-  if not key or self.auto_started[key] then
+  if not key or self.auto_started[key] or not self.auto_eligible[key] then
     return
   end
   local cwd = session.cwd

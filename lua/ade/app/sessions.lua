@@ -118,6 +118,14 @@ function Sessions:open(session, opts)
     return false
   end
   local wanted = opts.instance or own
+  if wanted and not live then
+    -- A row names an instance but no ready client backs it: loading it through
+    -- whatever client exists would target the wrong agent (or a dead one).
+    if opts.on_failed then
+      pcall(opts.on_failed, "that session's service instance is not connected here")
+    end
+    return false
+  end
   if wanted and live and wanted ~= live then
     if opts.on_failed then
       pcall(opts.on_failed, "that session's service instance is not connected here")

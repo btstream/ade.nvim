@@ -1128,19 +1128,29 @@ function M.build(ctx, opts, action)
       end
     end,
     instance = function()
+      -- The router's cached fallback: after a reconnect it needs to know which
+      -- instance this editor used before the agent client re-attached.
       local client = S.conn.client
       local instance = client and client.proc and client.proc.instance or nil
       if instance then
         return instance
       end
-      -- Before an agent client attaches (or in a restored window), the team
-      -- module's recorded binding (or the team leader) names our instance.
       local cwd = ctx.resolve_cwd()
       local bound = cwd and S.view.team and S.view.team.bound and S.view.team.bound[cwd] or nil
       if bound and bound.instance then
         return bound.instance
       end
       return cwd and S.view.team and S.view.team:leader_instance(cwd) or nil
+    end,
+    live_instance = function()
+      -- Strict: only a ready client's instance may certify a row as online or
+      -- receive a row's action. Cached bindings are a display/route hint, never
+      -- a liveness signal.
+      if S.conn.phase ~= "ready" then
+        return nil
+      end
+      local client = S.conn.client
+      return client and client.proc and client.proc.instance or nil
     end,
     start_team = function(workflow, session)
       if S.view.team_commands then

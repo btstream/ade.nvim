@@ -44,6 +44,17 @@ local function same_session(a, b)
   return a.instance == nil or b.instance == nil or a.instance == b.instance
 end
 
+---The instance of the live, ready agent client, or nil.
+---@return string|nil
+function M:live_instance()
+  local S = self:state()
+  if S.conn.phase ~= "ready" then
+    return nil
+  end
+  local client = S.conn.client
+  return client and client.proc and client.proc.instance or nil
+end
+
 ---Make `session` the one on screen.
 ---
 ---Switching away leaves the previous session active on the agent side. Ask it to
@@ -67,8 +78,19 @@ function M:select_session(session)
       last_sessions.set(cfg.agent, session.cwd, session.id)
     end
   end
+  -- An idle close is only safe when the old session belongs to the instance
+  -- that is connected right now: a session restored onto a new instance (`same
+  -- id`, new owner) or one left behind by a dead instance must never be closed
+  -- through the new client, which would release the freshly restored token.
+  local live = self:live_instance()
+  local owner = type(previous) == "table" and previous.instance or nil
+  -- A session that recorded an instance may only be closed while exactly that
+  -- instance is the ready client's. A session without an instance id (the
+  -- direct backend never has one) is owned by whatever client is live.
+  local owned = owner == nil or (live ~= nil and owner == live)
   if
     previous
+    and owned
     and not same_session(previous, session)
     and previous.status == "idle"
     and #(previous.queue or {}) == 0
