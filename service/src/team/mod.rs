@@ -764,6 +764,9 @@ struct TokenRecord {
     /// The agent the instance ran when the token was issued (leaders only).
     agent: Option<String>,
     bound: bool,
+    /// The token was presented in a successful `hello`: its MCP process has
+    /// connected at least once (20.5).
+    handshaked: bool,
 }
 
 #[derive(Debug)]
@@ -878,6 +881,10 @@ pub struct Teams {
     events: Vec<TeamEvent>,
     /// The next spawn group number (19.6).
     next_group: u64,
+    /// The spawn group of each leader session's currently running front-end
+    /// prompt, keyed by `(instance, session)`. It exists before a team does, so
+    /// a team created mid-turn inherits the turn's group (19.6).
+    session_groups: HashMap<(String, String), String>,
     /// The next participant lifecycle id (20.6).
     next_lifecycle: u64,
     /// Stored (project and user) workflows (19.5).
@@ -911,6 +918,7 @@ impl Teams {
             closed_teams: HashSet::new(),
             events: Vec::new(),
             next_group: 0,
+            session_groups: HashMap::new(),
             next_lifecycle: 0,
             workflows: workflow::StoredWorkflows::new(),
             project_keys: HashMap::new(),
@@ -1254,9 +1262,48 @@ impl Teams {
         }
     }
 
-    /// The group a new spawn item belongs to (19.6): the leader's running
-    /// prompt's group, or a fresh one for an item created outside a prompt.
+    /// The group a new spawn item belongs to (19.6): the leader session's
+    /// current turn group — which exists even before the team does — else the
+    /// team's group (a bus prompt), else a fresh one.
     fn next_spawn_group(&mut self, team_id: &str) -> Option<String> {
+        let team = self.teams.get(team_id)?;
+        let leader = match (team.leader_instance.clone(), team.leader_session.clone()) {
+            (Some(instance), Some(session)) => Some((instance, session)),
+            _ => None,
+        };
+        if let Some((instance, session)) = leader {
+            // A turn is open for the leader session (even if it spawned
+            // nothing yet): its group is allocated now and shared by the rest
+            // of the turn (19.6).
+            let key = (instance.clone(), session.clone());
+            if self.session_groups.contains_key(&key) {
+                if let Some(group) = self
+                    .session_groups
+                    .get(&key)
+                    .filter(|group| !group.is_empty())
+                    .cloned()
+                {
+                    return Some(group);
+                }
+                // A team that already existed when the turn started has its
+                // group (19.6); the turn adopts it.
+                let existing = self
+                    .teams
+                    .get(team_id)
+                    .and_then(|team| team.current_group.clone());
+                let group = match existing {
+                    Some(group) => group,
+                    None => self.new_group(),
+                };
+                self.session_groups.insert(key, group.clone());
+                if let Some(team) = self.teams.get_mut(team_id) {
+                    if team.current_group.is_none() {
+                        team.current_group = Some(group.clone());
+                    }
+                }
+                return Some(group);
+            }
+        }
         let current = self.teams.get(team_id)?.current_group.clone();
         match current {
             Some(group) => Some(group),
@@ -1300,6 +1347,7 @@ impl Teams {
                 session: None,
                 agent,
                 bound: false,
+                handshaked: false,
             },
         );
         (token_id, token)
@@ -1552,6 +1600,46 @@ impl Teams {
             .map(|(id, _)| id.clone())
     }
 
+    /// A bound session token of `(instance, session)` when no token of that
+    /// session's MCP process has ever connected: enabling teams for it is worth
+    /// waiting for (20.5). Tokens that already handshook once prove the agent
+    /// wires the injected server; their later disconnects are real.
+    pub fn unconnected_session_token(&self, instance: &str, session: &str) -> Option<String> {
+        let mut candidate = None;
+        let mut any_handshaked = false;
+        for (id, record) in &self.token_records {
+            if record.role != Role::Session
+                || !record.bound
+                || record.instance.as_deref() != Some(instance)
+                || record.session.as_deref() != Some(session)
+            {
+                continue;
+            }
+            if record.handshaked {
+                any_handshaked = true;
+                break;
+            }
+            candidate = Some(id.clone());
+        }
+        if any_handshaked {
+            None
+        } else {
+            candidate
+        }
+    }
+
+    /// Record that a token's MCP process connected at least once. Returns
+    /// whether this was the first handshake.
+    pub fn note_handshake(&mut self, token_id: &str) -> bool {
+        match self.token_records.get_mut(token_id) {
+            Some(record) if !record.handshaked => {
+                record.handshaked = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The team entry the session leads, if any (`session.teams.leader`).
     pub fn session_team_entry(&self, instance: &str, session: &str) -> Value {
         let Some((team, _)) = self.by_instance.get(instance) else {
@@ -1649,6 +1737,14 @@ impl Teams {
     ) -> String {
         self.next_team += 1;
         let id = format!("t{}", self.next_team);
+        // A team created in the middle of a leader prompt inherits that turn's
+        // spawn group, so every spawn of the turn shares it (19.6). A turn that
+        // has not spawned yet has no group; the first spawn allocates it.
+        let current_group = self
+            .session_groups
+            .get(&(instance.to_string(), session.to_string()))
+            .filter(|group| !group.is_empty())
+            .cloned();
         let mut team = Team {
             id: id.clone(),
             cwd: cwd.to_string(),
@@ -1674,7 +1770,7 @@ impl Teams {
             created_at: now_ms(),
             board: board::Board::default(),
             board_flush_at: None,
-            current_group: None,
+            current_group,
             pending_lifecycles: HashMap::new(),
         };
         let mut leader = Participant::new("leader", Role::Leader);
@@ -2993,7 +3089,12 @@ impl Teams {
 
     /// A front-end prompt on a team member starts/ends; this is only the
     /// visible state (deliveries already use the relay's turn count).
-    pub fn frontend_prompt_started(&mut self, instance: &str) {
+    pub fn frontend_prompt_started(&mut self, instance: &str, session: &str) {
+        // A prompt opens the turn of its session; the spawn group itself is
+        // only allocated when the turn really spawns (19.6).
+        self.session_groups
+            .entry((instance.to_string(), session.to_string()))
+            .or_default();
         let Some((team_id, name)) = self.by_instance.get(instance).cloned() else {
             return;
         };
@@ -3013,7 +3114,34 @@ impl Teams {
         }
     }
 
-    pub fn frontend_prompt_finished(&mut self, instance: &str) {
+    fn finish_session_group(&mut self, instance: &str, session: &str) {
+        self.session_groups
+            .remove(&(instance.to_string(), session.to_string()));
+        let Some((team_id, name)) = self.by_instance.get(instance).cloned() else {
+            return;
+        };
+        if name != "leader" {
+            return;
+        }
+        if let Some(team) = self.teams.get_mut(&team_id) {
+            team.current_group = None;
+        }
+    }
+
+    /// Forget the open turns of an instance: its prompts can never finish (a
+    /// new instance with the same key must not inherit them).
+    pub fn forget_session_groups(&mut self, instance: &str) {
+        self.session_groups.retain(|key, _| key.0 != instance);
+    }
+
+    /// Forget one session's open turn (the session closed).
+    pub fn forget_session_group(&mut self, instance: &str, session: &str) {
+        self.session_groups
+            .remove(&(instance.to_string(), session.to_string()));
+    }
+
+    pub fn frontend_prompt_finished(&mut self, instance: &str, session: &str) {
+        self.finish_session_group(instance, session);
         let Some((team_id, name)) = self.by_instance.get(instance).cloned() else {
             return;
         };
@@ -6630,15 +6758,58 @@ mod tests {
             .request_spawn(&team, "dev", Some("w1"), None, None, None)
             .unwrap();
         let before = spawn_item_group(&teams, &team, "w1");
-        teams.frontend_prompt_started("i1");
+        teams.frontend_prompt_started("i1", "s1");
         let group = teams.team(&team).unwrap().current_group.clone();
         assert!(group.is_some() && group != before);
         teams
             .request_spawn(&team, "dev", Some("w2"), None, None, None)
             .unwrap();
         assert_eq!(spawn_item_group(&teams, &team, "w2"), group);
-        teams.frontend_prompt_finished("i1");
+        teams.frontend_prompt_finished("i1", "s1");
         assert!(teams.team(&team).unwrap().current_group.is_none());
+    }
+
+    /// The first front-end prompt of a new chat arrives before any team exists
+    /// (v3 creates teams lazily). Spawns of that same turn must still share one
+    /// group, so the panel can approve them together (19.6).
+    #[test]
+    fn a_team_created_mid_turn_inherits_the_turns_spawn_group() {
+        let mut teams = Teams::new(new_shared_tokens());
+        teams
+            .configure("/p", config(json!({"spawn_confirm": {"auto": []}})))
+            .expect("configure");
+        let (token_id, _) = teams.issue_session_token("i1", "/p", "opencode", Some("s1"));
+        assert!(
+            teams.session_auth(&token_id).is_some(),
+            "bound session token"
+        );
+        // The prompt starts before `ensure_team` ran: no team exists yet.
+        teams.frontend_prompt_started("i1", "s1");
+        assert!(teams.is_empty(), "no team was created by the prompt");
+        let team = teams
+            .ensure_team("i1", "s1", &launch("/p"))
+            .expect("ensure team mid-turn");
+        let mut groups = Vec::new();
+        for name in ["w1", "w2"] {
+            let SpawnOutcome::Awaiting { request, .. } = teams
+                .request_spawn(&team, "dev", Some(name), None, None, None)
+                .expect("spawn")
+            else {
+                panic!("expected approval");
+            };
+            groups.push(teams.item(&team, &request).unwrap().group);
+        }
+        assert!(groups[0].is_some(), "{groups:?}");
+        assert_eq!(groups[0], groups[1], "both spawns share one group");
+        teams.frontend_prompt_finished("i1", "s1");
+        let SpawnOutcome::Awaiting { request, .. } = teams
+            .request_spawn(&team, "dev", Some("w3"), None, None, None)
+            .expect("spawn")
+        else {
+            panic!("expected approval");
+        };
+        let after = teams.item(&team, &request).unwrap().group;
+        assert_ne!(after, groups[0], "the next turn gets its own group");
     }
 
     #[test]

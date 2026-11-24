@@ -38,11 +38,55 @@ pub(crate) struct PendingWorktree {
     pub cancelled: bool,
 }
 
+/// `session.teams {enabled: true}` waiting for a bound token's MCP process to
+/// connect: it answers on connect, on timeout, or as soon as the state it
+/// depends on goes away (20.5).
+#[derive(Debug)]
+pub(crate) struct PendingEnable {
+    pub conn: u64,
+    pub id: Value,
+    pub instance: String,
+    pub session: String,
+    pub agent: String,
+    pub cwd: String,
+    /// The bound token whose MCP process is awaited.
+    pub token_id: String,
+    /// Whether the agent can reload a session: the timeout falls back to
+    /// `reload: true` only when it can, else to `reload_unsupported`.
+    pub can_reload: bool,
+}
+
 pub(crate) enum StartResult {
     Started,
     Deferred,
     /// The failure was reported and the spawn must not reply again.
     Replied,
+}
+
+/// How a held `session.teams {enabled: true}` decides its answer (20.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnableDecision {
+    /// The bound token's MCP process connected: no reload.
+    Connected,
+    /// The wait expired with no connection: mark the one-shot reload.
+    TimedOut,
+    /// The state the wait depended on went away (token revoked, instance
+    /// exit, session closed, switch off): answer with the state now, no mark.
+    Changed,
+}
+
+/// `session.teams` either answers at once or holds the reply until a bound
+/// token's MCP process connects or the wait expires (20.5).
+enum SessionTeamsOutcome {
+    Answer(Value),
+    Pending {
+        instance: String,
+        session: String,
+        agent: String,
+        cwd: String,
+        token_id: String,
+        can_reload: bool,
+    },
 }
 
 /// The effective per-session state whose change is published (20.3/20.5).
@@ -1521,102 +1565,373 @@ impl Hub {
 
     /// `session.teams` (20.5).
     fn session_teams(&mut self, conn: u64, id: &Value, params: &Value) {
-        let result = (|| -> Result<Value, TeamError> {
+        let result = (|| -> Result<SessionTeamsOutcome, TeamError> {
             let instance = required_team_string(params, "instance")?;
             let session = required_team_string(params, "sessionId")?;
-            let (agent, cwd, can_reload) = {
-                let handle = self
-                    .instances
-                    .get(&instance)
-                    .ok_or_else(|| TeamError::new(UNKNOWN_INSTANCE, "unknown instance"))?;
-                (
-                    handle.key.agent.clone(),
-                    handle.key.cwd.clone(),
-                    handle.relay.agent_reloads_sessions(),
-                )
-            };
+            let (agent, cwd, can_reload) = self.session_teams_context(&instance)?;
             let enabled = self.teams.enabled_for(&agent, &session, &cwd);
             let injected = self.session_injected(&instance, &session);
             let leader = self.teams.session_team_entry(&instance, &session);
             let asked = optional_bool(params, "enabled")?;
             if asked.is_none() {
-                return Ok(json!({
+                // A read-only query never waits, but says when a bound token's
+                // MCP process has not connected yet (20.5).
+                let pending = !injected
+                    && self
+                        .teams
+                        .unconnected_session_token(&instance, &session)
+                        .is_some();
+                return Ok(SessionTeamsOutcome::Answer(json!({
                     "enabled": enabled,
                     "injected": injected,
                     "leader": leader,
-                }));
+                    "pending": pending,
+                })));
             }
             let wanted = asked.unwrap_or(enabled);
             if !wanted {
-                let leads = !leader.is_null();
-                if leads {
-                    let close = optional_bool(params, "close")?.unwrap_or(false);
-                    if !close {
-                        let mut error = TeamError::not_allowed("the session leads a team");
-                        error.data = Some(json!({ "reason": "leads_team" }));
-                        return Err(error);
-                    }
-                }
-                let close_team = leads.then(|| {
-                    leader
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string()
-                });
-                let identity = (instance.clone(), session.clone());
-                return self.with_session_changes(vec![identity], |hub| {
-                    if let Some(team) = close_team {
-                        hub.close_team(&team)?;
-                    }
-                    hub.remember_switch(&agent, &session, false);
-                    hub.forward_loads
-                        .remove(&(instance.clone(), session.clone()));
-                    Ok(json!({
-                        "enabled": false,
-                        "injected": injected,
-                        "leader": Value::Null,
-                    }))
-                });
+                return Ok(SessionTeamsOutcome::Answer(self.disable_session_teams(
+                    &instance, &session, &agent, injected, leader, params,
+                )?));
             }
-            // Validate before persisting or marking (20.5): a disabled cwd
-            // changes nothing, whether or not an MCP process is connected.
+            // Validate before persisting, marking or waiting (20.5): a disabled
+            // cwd changes nothing, whether or not an MCP process is connected.
             if !self.teams.has_config(&cwd) || !self.teams.config_for(&cwd).enabled {
                 let mut error = TeamError::not_allowed("teams are disabled for this cwd");
                 error.data = Some(json!({ "reason": "off" }));
                 return Err(error);
             }
-            let mut reload = false;
-            if !injected {
-                if !can_reload {
-                    let mut error = TeamError::not_allowed("the agent cannot reload a session");
-                    error.data = Some(json!({ "reason": "reload_unsupported" }));
-                    return Err(error);
-                }
-                reload = true;
+            if injected {
+                return Ok(SessionTeamsOutcome::Answer(
+                    self.enable_session_teams(&instance, &session, &agent, &cwd, false),
+                ));
             }
-            let identity = (instance.clone(), session.clone());
-            self.with_session_changes(vec![identity], |hub| {
-                hub.remember_switch(&agent, &session, true);
-                if reload {
-                    hub.forward_loads
-                        .insert((instance.clone(), session.clone()));
-                }
-                let leader = hub.teams.session_team_entry(&instance, &session);
-                let injected = hub.session_injected(&instance, &session);
-                let enabled = hub.teams.enabled_for(&agent, &session, &cwd);
-                Ok(json!({
-                    "enabled": enabled,
-                    "injected": injected,
-                    "leader": leader,
-                    "reload": reload,
-                }))
-            })
+            // A bound token whose MCP process has never connected may be about
+            // to: hold the answer until it does (no reload needed) or the wait
+            // expires (20.5). This runs before the reload-capability check: a
+            // connection needs no reload at all.
+            if let Some(token_id) = self.teams.unconnected_session_token(&instance, &session) {
+                return Ok(SessionTeamsOutcome::Pending {
+                    instance,
+                    session,
+                    agent,
+                    cwd,
+                    token_id,
+                    can_reload,
+                });
+            }
+            if !can_reload {
+                let mut error = TeamError::not_allowed("the agent cannot reload a session");
+                error.data = Some(json!({ "reason": "reload_unsupported" }));
+                return Err(error);
+            }
+            Ok(SessionTeamsOutcome::Answer(self.enable_session_teams(
+                &instance, &session, &agent, &cwd, true,
+            )))
         })();
         match result {
-            Ok(value) => self.send_to(conn, &success(id, value)),
+            Ok(SessionTeamsOutcome::Answer(value)) => self.send_to(conn, &success(id, value)),
+            Ok(SessionTeamsOutcome::Pending {
+                instance,
+                session,
+                agent,
+                cwd,
+                token_id,
+                can_reload,
+            }) => self.hold_session_enable(
+                conn, id, instance, session, agent, cwd, token_id, can_reload,
+            ),
             Err(error) => self.send_error(conn, id, &error),
         }
+    }
+
+    /// The instance facts `session.teams` needs: agent, cwd and whether the
+    /// agent can reload a session.
+    fn session_teams_context(&self, instance: &str) -> Result<(String, String, bool), TeamError> {
+        let handle = self
+            .instances
+            .get(instance)
+            .ok_or_else(|| TeamError::new(UNKNOWN_INSTANCE, "unknown instance"))?;
+        Ok((
+            handle.key.agent.clone(),
+            handle.key.cwd.clone(),
+            handle.relay.agent_reloads_sessions(),
+        ))
+    }
+
+    /// `session.teams {enabled: false}`: close the led team when allowed, then
+    /// store the switch and drop any unused one-shot mark (20.5).
+    fn disable_session_teams(
+        &mut self,
+        instance: &str,
+        session: &str,
+        agent: &str,
+        injected: bool,
+        leader: Value,
+        params: &Value,
+    ) -> Result<Value, TeamError> {
+        let leads = !leader.is_null();
+        if leads {
+            let close = optional_bool(params, "close")?.unwrap_or(false);
+            if !close {
+                let mut error = TeamError::not_allowed("the session leads a team");
+                error.data = Some(json!({ "reason": "leads_team" }));
+                return Err(error);
+            }
+        }
+        let close_team = leads.then(|| {
+            leader
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        });
+        let identity = (instance.to_string(), session.to_string());
+        let agent = agent.to_string();
+        let session = session.to_string();
+        let value = self.with_session_changes(vec![identity.clone()], |hub| {
+            if let Some(team) = close_team {
+                hub.close_team(&team)?;
+            }
+            hub.remember_switch(&agent, &session, false);
+            hub.forward_loads.remove(&identity);
+            Ok(json!({
+                "enabled": false,
+                "injected": injected,
+                "leader": Value::Null,
+            }))
+        });
+        // Turning the switch off ends any held enable of this session: it
+        // answers with the state as it is now (20.5).
+        self.release_pending_enable(instance, &session);
+        value
+    }
+
+    /// `session.teams {enabled: true}` with a decision: store the switch and
+    /// mark the one-shot reload when `reload` is set (20.5).
+    fn enable_session_teams(
+        &mut self,
+        instance: &str,
+        session: &str,
+        agent: &str,
+        cwd: &str,
+        reload: bool,
+    ) -> Value {
+        let identity = (instance.to_string(), session.to_string());
+        let agent = agent.to_string();
+        let session = session.to_string();
+        let cwd = cwd.to_string();
+        self.with_session_changes(vec![identity.clone()], |hub| {
+            hub.remember_switch(&agent, &session, true);
+            if reload {
+                hub.forward_loads.insert(identity.clone());
+            }
+            let leader = hub.teams.session_team_entry(&identity.0, &identity.1);
+            let injected = hub.session_injected(&identity.0, &identity.1);
+            let enabled = hub.teams.enabled_for(&agent, &session, &cwd);
+            json!({
+                "enabled": enabled,
+                "injected": injected,
+                "leader": leader,
+                "reload": reload,
+            })
+        })
+    }
+
+    /// Hold `session.teams {enabled: true}` until the bound token's MCP process
+    /// connects, the wait expires, or the state it waits on goes away (20.5).
+    #[allow(clippy::too_many_arguments)]
+    fn hold_session_enable(
+        &mut self,
+        conn: u64,
+        id: &Value,
+        instance: String,
+        session: String,
+        agent: String,
+        cwd: String,
+        token_id: String,
+        can_reload: bool,
+    ) {
+        self.next_pending_enable += 1;
+        let generation = self.next_pending_enable;
+        let deadline_instance = instance.clone();
+        let deadline_session = session.clone();
+        self.pending_enables.insert(
+            generation,
+            PendingEnable {
+                conn,
+                id: id.clone(),
+                instance,
+                session,
+                agent,
+                cwd,
+                token_id,
+                can_reload,
+            },
+        );
+        let sender = self.command_sender.clone();
+        let timeout = team_inject_wait_ms();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(timeout)).await;
+            let _ = sender
+                .send(Command::SessionEnableDeadline {
+                    instance: deadline_instance,
+                    session: deadline_session,
+                    generation,
+                })
+                .await;
+        });
+    }
+
+    /// Answer a held `session.teams` and forget its record. `decision` is what
+    /// the wait ended with (20.5).
+    fn answer_pending_enable(&mut self, pending: PendingEnable, decision: EnableDecision) {
+        if !self.conns.contains_key(&pending.conn) {
+            return;
+        }
+        match decision {
+            EnableDecision::Connected => {
+                let value = self.enable_session_teams(
+                    &pending.instance,
+                    &pending.session,
+                    &pending.agent,
+                    &pending.cwd,
+                    false,
+                );
+                self.send_to(pending.conn, &success(&pending.id, value));
+            }
+            EnableDecision::TimedOut => {
+                if !self.teams.has_config(&pending.cwd)
+                    || !self.teams.config_for(&pending.cwd).enabled
+                {
+                    let mut error = TeamError::not_allowed("teams are disabled for this cwd");
+                    error.data = Some(json!({ "reason": "off" }));
+                    self.send_error(pending.conn, &pending.id, &error);
+                    return;
+                }
+                // The wait ran out with no connection: fall back to the
+                // documented answer, which needs a reload the agent must
+                // support (20.5).
+                if !pending.can_reload {
+                    let mut error = TeamError::not_allowed("the agent cannot reload a session");
+                    error.data = Some(json!({ "reason": "reload_unsupported" }));
+                    self.send_error(pending.conn, &pending.id, &error);
+                    return;
+                }
+                let value = self.enable_session_teams(
+                    &pending.instance,
+                    &pending.session,
+                    &pending.agent,
+                    &pending.cwd,
+                    true,
+                );
+                self.send_to(pending.conn, &success(&pending.id, value));
+            }
+            EnableDecision::Changed => {
+                // The premise of the wait went away (the token was revoked, the
+                // instance exited, the session closed or the switch was turned
+                // off): answer with the state as it is now, without touching
+                // the switch and without marking a reload (20.5).
+                let leader = self
+                    .teams
+                    .session_team_entry(&pending.instance, &pending.session);
+                let injected = self.session_injected(&pending.instance, &pending.session);
+                let enabled =
+                    self.teams
+                        .enabled_for(&pending.agent, &pending.session, &pending.cwd);
+                self.send_to(
+                    pending.conn,
+                    &success(
+                        &pending.id,
+                        json!({
+                            "enabled": enabled,
+                            "injected": injected,
+                            "leader": leader,
+                            "reload": false,
+                        }),
+                    ),
+                );
+            }
+        }
+    }
+
+    /// A held enable's wait expired: decide by the state now (20.5).
+    pub(crate) fn session_enable_deadline(
+        &mut self,
+        instance: &str,
+        session: &str,
+        generation: u64,
+    ) {
+        let Some(pending) = self.pending_enables.remove(&generation) else {
+            return;
+        };
+        if pending.instance != instance || pending.session != session {
+            // Stale deadline of a superseded wait; keep the live one.
+            self.pending_enables.insert(generation, pending);
+            return;
+        }
+        let injected = self.session_injected(&pending.instance, &pending.session);
+        let decision = if injected {
+            EnableDecision::Connected
+        } else {
+            EnableDecision::TimedOut
+        };
+        self.answer_pending_enable(pending, decision);
+    }
+
+    /// The token of a held enable handshaked: answer without a reload (20.5).
+    pub(crate) fn note_session_handshake(&mut self, token_id: &str) {
+        let waiting: Vec<u64> = self
+            .pending_enables
+            .iter()
+            .filter(|(_, pending)| pending.token_id == token_id)
+            .map(|(generation, _)| *generation)
+            .collect();
+        for generation in waiting {
+            let Some(pending) = self.pending_enables.remove(&generation) else {
+                continue;
+            };
+            self.answer_pending_enable(pending, EnableDecision::Connected);
+        }
+    }
+
+    /// The state a held enable depends on changed (token revoked, instance
+    /// exit, session closed, switch off): answer with the state as it is now.
+    pub(crate) fn release_pending_enable(&mut self, instance: &str, session: &str) {
+        let waiting: Vec<u64> = self
+            .pending_enables
+            .iter()
+            .filter(|(_, pending)| pending.instance == instance && pending.session == session)
+            .map(|(generation, _)| *generation)
+            .collect();
+        for generation in waiting {
+            let Some(pending) = self.pending_enables.remove(&generation) else {
+                continue;
+            };
+            self.answer_pending_enable(pending, EnableDecision::Changed);
+        }
+    }
+
+    /// Every held enable of an instance (its exit revokes the tokens).
+    pub(crate) fn release_pending_enables_of(&mut self, instance: &str) {
+        let keys: Vec<(String, String)> = self
+            .pending_enables
+            .values()
+            .filter(|pending| pending.instance == instance)
+            .map(|pending| (pending.instance.clone(), pending.session.clone()))
+            .collect();
+        let mut seen = HashSet::new();
+        for key in keys {
+            if seen.insert(key.clone()) {
+                self.release_pending_enable(&key.0, &key.1);
+            }
+        }
+    }
+
+    /// A front-end connection left: its held replies are dropped (20.5).
+    pub(crate) fn drop_pending_enables_of(&mut self, conn: u64) {
+        self.pending_enables
+            .retain(|_, pending| pending.conn != conn);
     }
 
     /// Resume a stored team when a forwarded load/resume of its stored leader
@@ -4055,8 +4370,12 @@ impl Hub {
         let before = self.session_states(std::slice::from_ref(&identity));
         self.teams.leader_session_closed(instance, session);
         self.teams.revoke_session_tokens(instance, session);
+        // The session's open turn is over; its spawn group dies with it (19.6).
+        self.teams.forget_session_group(instance, session);
         // A closed session consumes its unused one-shot mark (20.5).
         self.forward_loads.remove(&identity);
+        // A held enable answers now: its token is gone (20.5).
+        self.release_pending_enable(instance, session);
         if let Some(agent) = agent {
             self.recorder.delete_session_switch(&agent, session);
         }

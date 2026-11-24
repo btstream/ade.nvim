@@ -41,6 +41,15 @@ fn team_ttl_ms() -> u64 {
         .unwrap_or(7 * 24 * 60 * 60 * 1000)
 }
 
+/// How long `session.teams {enabled: true}` waits for a bound token's MCP
+/// process to connect before it decides on a reload (20.5); tests shorten it.
+fn team_inject_wait_ms() -> u64 {
+    std::env::var("NVIM_ADE_SERVER_TEAM_INJECT_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(10_000)
+}
+
 /// How often expired teams and pending boards are checked (18.15); tests
 /// shorten it so the expiry tick can be exercised.
 fn team_expiry_tick_ms() -> u64 {
@@ -234,6 +243,13 @@ pub enum Command {
     TeamInterruptDeadline {
         team: String,
         participant: String,
+        generation: u64,
+    },
+    /// A held `session.teams {enabled: true}` waited its 10 s for the bound
+    /// token's MCP process to connect (20.5).
+    SessionEnableDeadline {
+        instance: String,
+        session: String,
         generation: u64,
     },
     /// Stop every instance. The hub notifies [`Hub::stopped`] when done.
@@ -543,6 +559,10 @@ pub struct Hub {
     /// and the token id it authenticated with. A token's *current* binding
     /// decides which session (if any) it counts for.
     conn_tokens: HashMap<u64, String>,
+    /// `session.teams {enabled: true}` replies held for a bound token's MCP
+    /// process to connect, by wait generation (20.5).
+    pending_enables: HashMap<u64, teams::PendingEnable>,
+    next_pending_enable: u64,
 }
 
 impl Hub {
@@ -609,6 +629,8 @@ impl Hub {
             pending_session: HashMap::new(),
             forward_loads: HashSet::new(),
             conn_tokens: HashMap::new(),
+            pending_enables: HashMap::new(),
+            next_pending_enable: 0,
         }
     }
 
@@ -820,6 +842,14 @@ impl Hub {
                 self.worker_interrupt_deadline(&team, &participant, generation);
                 self.update_busy();
             }
+            Command::SessionEnableDeadline {
+                instance,
+                session,
+                generation,
+            } => {
+                self.session_enable_deadline(&instance, &session, generation);
+                self.update_busy();
+            }
             Command::Authenticated { conn, participant } => {
                 if let Some(token) = participant {
                     // The connection holds a token id; its binding is looked up
@@ -829,12 +859,18 @@ impl Hub {
                         Some(identity) => {
                             let before = self.session_states(std::slice::from_ref(&identity));
                             self.conn_tokens.insert(conn, token.clone());
+                            self.teams.note_handshake(&token);
                             self.publish_session_changes(before);
+                            // A held `session.teams` waited for exactly this
+                            // connection (20.5).
+                            self.note_session_handshake(&token);
                         }
                         // An early handshake has no identity yet; the binding
                         // publishes it once the session exists.
                         None => {
                             self.conn_tokens.insert(conn, token.clone());
+                            self.teams.note_handshake(&token);
+                            self.note_session_handshake(&token);
                         }
                     }
                     self.frontend_conns.remove(&conn);
@@ -845,6 +881,7 @@ impl Hub {
             }
             Command::Disconnected { conn } => {
                 self.conns.remove(&conn);
+                self.drop_pending_enables_of(conn);
                 if let Some(token) = self.conn_tokens.get(&conn).cloned() {
                     if let Some(identity) = self.teams.session_identity(&token) {
                         let before = self.session_states(std::slice::from_ref(&identity));
@@ -2051,7 +2088,7 @@ impl Hub {
                 match method.as_deref() {
                     Some("session/prompt") => {
                         self.policy.on_prompt(conn, instance_id, session, &agent);
-                        self.teams.frontend_prompt_started(instance_id);
+                        self.teams.frontend_prompt_started(instance_id, session);
                         self.drain_team_events();
                     }
                     Some("session/cancel") => self.policy.on_cancel(session),
@@ -2707,7 +2744,10 @@ impl Hub {
         if had_prompt_finished {
             // A human prompt on the leader ended: bus messages that queued
             // behind it may now be delivered (18.4).
-            self.teams.frontend_prompt_finished(instance_id);
+            if let Some(finished) = &outcome.prompt_finished {
+                self.teams
+                    .frontend_prompt_finished(instance_id, &finished.session_id);
+            }
             self.drain_team_events();
             self.team_deliveries();
         }
@@ -2785,6 +2825,10 @@ impl Hub {
         // the team cleanup above handles active teams, this covers a team that
         // was already closed or a start failure.
         self.teams.revoke_instance_tokens(instance_id);
+        // An exited instance's prompts never finish; its open turns go too.
+        self.teams.forget_session_groups(instance_id);
+        // Held `session.teams` replies answer now: their token is gone (20.5).
+        self.release_pending_enables_of(instance_id);
         // Publish once, comparing the pre-exit snapshot with the state after the
         // whole cleanup: a session that was injected hears `injected:false` and
         // a leader change (20.5/A).

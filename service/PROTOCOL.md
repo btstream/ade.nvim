@@ -1676,7 +1676,14 @@ for an archived card or a card without history; `-32060` for an unknown card.
 the service). Items created during one prompt of the leader's session (from
 the request to its response, whether the prompt came from the bus or from a
 front end) share a group; an item created while no prompt of the leader runs
-gets a group of its own. `team.answer_group {group, allow}` `<- {answered:
+gets a group of its own. The service tracks that turn per `(instance,
+sessionId)` **before** any team exists, so v3's lazy team creation (20.4)
+inherits it: when the first front-end prompt of a new chat arrives there is no
+team yet, and the `team_spawn` tools of that turn create the team mid-turn. A
+team created during a turn adopts the turn's group, so every spawn of that
+turn still shares one group. The turn ends with the prompt's response (or the
+session closing or the instance exiting), which also ends the group.
+`team.answer_group {group, allow}` `<- {answered:
 [item ids], failed: [{id, code, message}]}` answers every **open** item of the
 group as `team.answer` would, in creation order. An item whose answer fails is
 skipped (it stays open and is listed in `failed`); the others take effect.
@@ -1980,6 +1987,25 @@ The switch defaults to `config.session_default`, is stored per
 `(agent, sessionId)` in the service database, and survives restarts. Every
 change sends `session.teams_changed {instance, sessionId, enabled, injected,
 leader}` to every connection.
+
+A read-only query (no `enabled`) never waits. It gains `pending: true` when
+the session holds a bound token whose MCP process has never connected: the
+server was injected, the agent's MCP process is simply not up yet. The next
+`session.teams {enabled: true}` for such a session does not answer at once:
+it is **held** until that token's MCP process connects (the reply then has
+`injected: true` and no `reload`, so the front end does not reload), or for
+at most 10 s (`NVIM_ADE_SERVER_TEAM_INJECT_TIMEOUT_MS` shortens it in tests),
+after which it decides as before: still no connection means the one-shot
+forward mark and `reload: true`. This is the normal case of a brand-new chat:
+`session/new` just returned and the agent is still starting its MCP process,
+so enabling teams for the first time does not cost a reload.
+
+While a reply is held, a change to what it waits on answers it immediately
+with the state as it is then: the token is revoked, the instance exits, or
+the session is closed/deleted/switched off. A front end that disconnects
+simply loses its held reply (nothing is sent to a closed connection). An
+enable request that arrives while another one is held is held separately, so
+each request gets exactly one answer.
 
 ### 20.6 Stopping one worker
 
