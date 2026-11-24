@@ -111,7 +111,7 @@ require("ade").setup({})
 | `:Ade permission` | 重新打开待确认的权限请求 |
 | `:Ade file` | 附加当前文件 |
 | `:Ade diagnostics` | 附加当前 buffer 的诊断 |
-| `:Ade team` | 团队面板；`:Ade team start [流程]` / `:Ade team close`（见下文） |
+| `:Ade team` | 项目/会话团队树；`:Ade team start [流程]` / `:Ade team on|off` / `:Ade team close`（见下文） |
 | `:Ade workflows` | 列出 / 查看 / 删除命名流程 |
 | `:AdeLog` | 打开日志 |
 | `:AdeDebug` | 打印控制器状态 |
@@ -762,20 +762,24 @@ require("ade").setup({
 
 ## 团队、看板与流程（teams，实验性）
 
-服务声明 `teams` 能力（服务 **0.7.1+**，api_version **6**）时，可以把工作交给一个小
-团队：你正在聊天的会话就是 **leader**，它按需启动 **worker**（独立的 agent 会话，
-可以在各自的 git worktree 里工作），worker 之间通过服务总线（bus）传消息，你通过
-**选择组件**审批和回答问题。团队和看板存在服务的 SQLite 事件日志里，Neovim 退出后
-继续运行；服务重启后未关闭的团队变为挂起，恢复 leader 会话后继续。
+服务声明 `teams` 能力（api_version **7**）时，可以把工作交给一个小团队。每个聊天都可以
+自己开一个团队，但团队只有在你（或 leader）要求时才创建；你正在聊天的会话成为该目录
+团队的 **leader**，它按需启动 **worker**（独立的 agent 会话，可以在各自的 git worktree
+里工作），worker 之间通过服务总线（bus）传消息，你通过**选择组件**审批和回答问题。
+一个目录同时只有一个团队。团队和看板存在服务的 SQLite 事件日志里，Neovim 退出后继续
+运行；服务重启后未关闭的团队变为挂起，恢复 leader 会话后继续。
 
-使用支持团队的服务后端时，团队功能默认开启，不需要写 `teams` 配置。直接让 leader
-分工并组队，或用 `:Ade team start`，即使还没连服务也可以执行。没有自定义模板时，
-内置 `worker` 模板使用 leader 同类
-Agent 的启动配置，启动独立会话，并要求当前目录是有提交的 Git 仓库，以便创建
-独立 worktree。不能创建 worktree 时不会回退到共享目录。普通聊天和打开面板都
-不会启动 worker；聊天里发起的启动申请默认仍需批准。
-可以用 `teams.enabled = false` 关闭团队功能。以前用 `teams.enabled = true` 启用
-自动启动流程的配置，改用 `teams.auto_start = true`。
+服务现在自己给会话注入 `ade-team` MCP server：普通会话不再由前端塞 `mcpServers`，只
+在有配置的目录里由服务追加。直接让 leader 分工并组队，或用 `:Ade team start`，即使还
+没连服务也可以执行。不写 `teams.templates` 时，服务用 leader 实例自己的启动配置造一个
+内置 `worker` 模板，并要求当前目录是有提交的 Git 仓库，以便创建独立 worktree。不能创建
+worktree 时不会回退到共享目录。普通聊天和打开面板都不会启动 worker；聊天里发起的启动
+申请默认仍需批准。
+
+`teams.enabled = false` 是全局开关。每个会话另有一个开关（新会话的初值取
+`teams.session_default`，默认开）：关掉后该会话没有 team 工具，已经开始领导的团队会在
+确认后关闭。以前用 `teams.enabled = true` 启用自动启动流程的配置，改用
+`teams.auto_start = true`；旧键 `teams.spawn_from_chat` 已删除，配置里出现时 setup 报错。
 
 团队有一块**看板**（列、卡片、负责人、阶段）：leader 管结构（列、建卡/删卡、挪列、
 指派负责人），worker 只写自己负责卡片的正文和键值。卡片是给你看的，不是 agent 之间
@@ -809,7 +813,7 @@ teams = {
       },
     },
   },
-  spawn_from_chat = true,      -- 允许 leader 从聊天里组队
+  session_default = true,      -- 新会话的团队开关初值；false = 新会话默认关
   max_workers = 3,             -- 每个团队最多 3 个 worker（1..8）
   spawn_confirm = { auto = {} }, -- 列出的模板无需人工确认
   limits = { max_turns_per_task = 30, max_turns_total = 200 },
@@ -827,7 +831,8 @@ teams = {
 ```
 
 旧的 `teams.definitions` 和 `teams.workflow` 已删除：配置里出现时 setup 直接报错（错误
-里给出新写法），不做迁移。预定义团队改用 `teams.workflows`（原来的 `workers` 列表对应
+里给出新写法），不做迁移。旧键 `teams.spawn_from_chat` 也删除了：全局开关是
+`teams.enabled`，会话初值是 `teams.session_default`。预定义团队改用 `teams.workflows`（原来的 `workers` 列表对应
 流程里的 `team`），替换默认流程正文改用 `teams.workflows.default`。流程必须有
 `summary` 或 `text` 之一：只写 `text` 时 `summary` 取正文第一行；只列成员、两者都不写
 时 setup 报错。所以旧写法改名时通常要补一行 `summary`：
@@ -854,31 +859,40 @@ teams = {
 |---|---|
 | 对话 | 直接告诉 leader 要做什么；它复述计划、你确认后组队，每次 spawn 在选择组件里确认（可一次全部批准） |
 | `:Ade team start [流程]` | 没给名字时用 `teams.default`（默认 `default`）；显式流程中预设的成员不用逐个确认，已存在的名字跳过 |
-| `teams.auto_start = true` | leader 建团队且还没有 worker 时，前端调用一次 `team.start` 启动默认流程；重连不会重复 |
+| `teams.auto_start = true` | 会话开关开、且该目录还没有团队时，对该会话调用一次 `team.start` 启动默认流程；每个会话只一次 |
 
 命令：
 
 | 命令 | 作用 |
 |---|---|
-| `:Ade team` / `:Ade team agents` | 打开或聚焦成员面板；没有团队时显示可用流程（`S` 启动，`<CR>` 看全文） |
+| `:Ade team` | 打开项目/会话树：按项目分组，leader 标 `[leader]`，关掉的会话标 `[team off]`，leader 下列出 worker |
+| `:Ade team agents` | 打开或聚焦成员面板；没有团队时显示可用流程（`S` 启动，`<CR>` 看全文） |
 | `:Ade team board` | 打开或聚焦当前项目的看板；卡片上按 `<CR>` 看详情 |
-| `:Ade team start [流程]` | 按流程启动团队 |
+| `:Ade team start [流程]` | 在当前会话上按流程启动团队；不给流程时先选（默认流程排第一） |
+| `:Ade team on` / `:Ade team off` | 打开/关闭当前会话的团队开关；off 时若该会话领导团队，确认后连团队一起关闭 |
+| `:Ade team stop[!] <worker>` | 停止一个 worker；`!` 表示停止后也从团队移除（worktree 保留） |
+| `:Ade team leader` | 把当前项目的团队领导权移交给当前会话 |
 | `:Ade team close` | 确认后结束当前 cwd 的团队 |
 | `:Ade team answer [名字]` | 显示待处理的选项；带名字时用输入框回答该成员的无选项提问 |
 | `:Ade workflows` | 列出/查看/删除命名流程（`<CR>` 全文，`d` 删除，`q` 关闭） |
 
-补全：`:Ade team <Tab>` 补全 `agents` / `board` / `start` / `close` / `answer`；`:Ade team start <Tab>` 补全配置里的
-流程名、已知的服务流程名和 `default`。
+补全：`:Ade team <Tab>` 补全 `agents` / `board` / `start` / `close` / `answer` / `on` /
+`off` / `stop` / `leader`；`:Ade team start <Tab>` 补全配置里的流程名、已知的服务流程名和
+`default`；`:Ade team stop <Tab>` 补全当前团队的 worker 名。
 
-`:Ade team start` 依次：按需连服务 → 确定流程 → 是否切换 leader agent → 已有团队怎么处理 → 输入任务
-→ 确保 leader 会话 → `team.start` → 打开面板。取消任务输入时什么都不动：不关团队、
-不切换 agent、不新建会话。旧服务（api_version 5）上没有 team.start、看板和流程接口：
-前端提示“服务版本过旧；空闲后会自动更新，或用 `:Ade service stop` 手动重启”，不会
-反复重试看板。
+`:Ade team start` 依次：确定流程 → 读当前会话的开关（未知时先查询；关着或工具未注入时先
+用 `session.teams {enabled:true}` 原地重载）→ 输入任务 → 在当前会话上调用
+`team.start {instance, sessionId, workflow, task?}`。agent 不支持原地重载时，确认后新建
+会话，并把上一段对话的摘要作为首条消息交接。目录已被别的会话领导时，用选择卡片给出
+“跳到 leader 会话 / 移交到本会话（`team.set_leader`）/ 取消”。取消任务输入时什么都不动。
+旧服务（api_version 5/6）上没有新接口：前端提示“服务版本过旧；空闲后会自动更新，或用
+`:Ade service stop` 手动重启”，不会反复重试看板。
 
-成员面板和看板都留在当前 Tab，各自打开和关闭。宽屏（`teams.dashboard.wide`，默认
-160）使用分栏；窄屏使用浮窗，只显示请求的面板。成员栏宽度由
-`teams.dashboard.members_width`（默认 32，16..120）决定。按键作用于光标下的对象：
+会话树、成员面板和看板都留在当前 Tab，各自打开和关闭。宽屏（`teams.dashboard.wide`，默认
+160）使用分栏；窄屏使用浮窗，只显示请求的面板。会话树按键：`<CR>` 打开会话（worker 行
+打开它的对话）、`t` 切换该会话的团队开关、`x` 停止 worker 或关闭团队（leader 行，确认）、
+`L` 把领导权交给光标会话、`S` 为光标会话选流程启动、`b` 打开看板。成员栏宽度由
+`teams.dashboard.members_width`（默认 32，16..120）决定。成员面板按键作用于光标下的对象：
 成员上 `<CR>` / `w` 在普通聊天面板查看或联系成员，卡片上 `<CR>` 打开详情浮窗，
 `m` 给成员发消息/就卡片给 leader 发消息，`H` 看卡片历史版本，`a` 回答成员提问，
 `!` 打开待处理的选择（提问、spawn、权限、回合上限），
@@ -905,7 +919,8 @@ Space 多选，Enter 确认，Esc 稍后（团队权限也是稍后；只有 age
 命名流程写入服务的事件日志数据库（权限 0600）；看板与卡片历史随团队删除，命名流程
 不随团队删除。模板的 `key`/`env`/`launch` 不落盘，恢复时要由前端重新提供配置。
 挂起超过 7 天的团队会被删除（worktree/分支保留）。恢复出的会话不是存储的 leader
-时，团队保持挂起，在面板按 `x` 关闭；leader 注入不会被挂起团队阻塞。`--event-log off` 时 `teams` 特性
+时，团队保持挂起，在树或成员面板按 `x` 关闭；没有团队的会话照常聊天，不会因为挂起
+团队而被阻塞。`--event-log off` 时 `teams` 特性
 不声明、`team.*` 返回 `-32601`，团队/看板/流程都不落盘也不恢复。
 
 `worktree = true` 的模板由服务在 `stdpath("data")/ade/worktrees/` 下创建 worktree
@@ -913,11 +928,11 @@ Space 多选，Enter 确认，Esc 稍后（团队权限也是稍后；只有 age
 改动时提示 `dirty_tree`，worker 从最后一次提交开始。worker 退出或团队关闭后 worktree
 与分支都保留，用面板 `D` 删除（可选 force；未合并分支保留）。
 
-直连模式、旧服务或 `spawn_from_chat = false` 时不注入 team MCP server，单 agent 体验
-不变。leader 的说明分两层：基础说明在每个可当 leader 的会话建立时随 MCP `initialize`
-的 `instructions` 下发（最多 2 KiB，约 300 token；claude/opencode 会放进上下文、可被
-提示缓存，pi 需要自己调 `mcp({instructions=…})` 且工具走 `mcp` 代理），不组队也有这份
-固定开销；流程全文、成员和任务只在组队时通过一条 notice 发一次。
+直连模式或全局 `teams.enabled = false` 时服务不注入 team MCP server，单 agent 体验
+不变；`session_default = false` 只让新会话的开关默认关着。基础说明发给每个会话 token 的
+MCP `initialize`（最多 2 KiB，约 300 token；claude/opencode 会放进上下文、可被提示缓存，
+pi 需要自己调 `mcp({instructions=…})` 且工具走 `mcp` 代理），不组队也有这份固定开销；
+流程全文、成员和任务只在组队时通过一条 notice 发一次。
 
 细节见 `:help ade-teams`。
 

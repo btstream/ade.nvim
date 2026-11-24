@@ -44,8 +44,8 @@ ade.nvim 是一个 Neovim 原生的 Agent Client Protocol 客户端。
     files        从项目索引选择文件，插入 @引用，不打开文件或发送消息
     image        读取剪贴板图像并附加；带路径时附加该文件
     diagnostics  把当前 buffer 的诊断附加到输入区
-    team         团队成员；:Ade team board / :Ade team start [流程]
-                 （见 |ade-teams|）
+    team         项目/会话团队树；:Ade team board / :Ade team start [流程]
+                 / on|off（见 |ade-teams|）
     workflows    列出、查看、删除命名流程
 
 :AdeLog                                                      *:AdeLog*
@@ -1072,26 +1072,32 @@ follow_cursor = false 让输入框停在打开时的位置。审查内容随窗�
 ==============================================================================
 23b. 团队、看板与流程（teams，实验性）                             *ade-teams*
 
-服务声明 teams 能力（服务 0.7.1+，api_version 6）。你正在聊天的会话就是
+服务声明 teams 能力（api_version 7）。每个聊天都可以开自己的团队，但团队
+只有在你（或 leader）要求时才创建；你正在聊天的会话会成为该目录团队的
 leader，它可以按需启动 worker（各自是一个独立的 agent 会话，可以在自己的
 git worktree 里工作），worker 之间通过服务总线（bus）传消息；团队和看板
-保存在服务里，Neovim 退出后继续运行。
+保存在服务里，Neovim 退出后继续运行。一个目录同时只有一个团队。
 
-团队功能默认开启。直接在聊天里要求 leader 分工，或使用 :Ade team start，
-不需要预先连接服务。不写 teams.templates 时，内置 worker 模板使用 leader
-同类 agent 的启动配置，要求当前 Git 仓库已有提交以创建独立 worktree。
-无法创建时不会回退到共享目录。普通聊天和打开面板都不启动 worker；
-从聊天发起的启动申请默认仍需批准。
-teams.enabled = false 关闭团队；原先用 teams.enabled = true 启用自动启动
-流程的配置，改用 teams.auto_start = true。
+服务自己把 ade-team MCP server 追加到会话请求里，前端不再负责注入。直接
+在聊天里要求 leader 分工，或使用 :Ade team start，不需要预先连接服务。
+不写 teams.templates 时，服务用 leader 实例自己的启动配置造一个内置 worker
+模板，要求当前 Git 仓库已有提交以创建独立 worktree。无法创建时不会回退到
+共享目录。普通聊天和打开面板都不启动 worker；从聊天发起的启动申请默认仍需
+批准。
+
+teams.enabled = false 是全局开关。每个会话另有一个开关，新会话初值取
+teams.session_default（默认开）；关掉后该会话没有 team 工具，正在领导团队
+时会确认后连团队一起关闭。原先用 teams.enabled = true 启用自动启动流程的
+配置，改用 teams.auto_start = true；旧键 teams.spawn_from_chat 已删除。
 
 服务里没有流程状态机：流程只是一段 leader 遵循的约定，服务只负责校验、
 保存、转发和提取。看板同理：服务保存结构，不解释列名或字段的含义。
 
 概念 ~
                                                           *ade-teams-concepts*
-leader      你正在聊天的会话。一个工作目录只有一个 leader；换 leader 要先
-            结束团队。leader 的 agent 和模型就是那个会话本身的。
+leader      你正在聊天的会话。一个工作目录只有一个 leader；别的会话可以用
+            :Ade team leader、选择卡片或 team.set_leader 接手，不必结束团队。
+            leader 的 agent 和模型就是那个会话本身的。
 worker      服务按模板启动的参与者，名字形如 w1、reviewer（匹配
             [a-z0-9][a-z0-9_-]*，最多 32 字符，不能叫 leader 或 human）。
             它用总线工具（bus_send、bus_ask_human、bus_status、
@@ -1238,7 +1244,7 @@ leader 保存流程时，只有你在对话里明确提到 leader 的 agent、�
                                                             *ade-teams-config*
     teams = {
       enabled = true,          -- false: 关闭团队功能
-      auto_start = false,      -- true: 绑定 leader 后自动启动默认流程
+      auto_start = false,      -- true: 开关开且目录无团队时自动启动默认流程
       default = "dev",         -- 默认流程名（或 "default"）
       workflows = {            -- 命名流程；同名时覆盖内置的 default
         dev = {
@@ -1263,7 +1269,7 @@ leader 保存流程时，只有你在对话里明确提到 leader 的 agent、�
           },
         },
       },
-      spawn_from_chat = true,  -- 允许 leader 从聊天里组队
+      session_default = true,  -- 新会话开关初值；false = 默认关
       max_workers = 3,         -- 每个团队最多 3 个 worker（1..8）
       spawn_confirm = { auto = {} }, -- 列出的模板无需人工确认
       limits = { max_turns_per_task = 30, max_turns_total = 200 },
@@ -1283,7 +1289,8 @@ leader 保存流程时，只有你在对话里明确提到 leader 的 agent、�
     }
 
 注意：旧的 teams.definitions 和 teams.workflow 已删除，配置里出现时 setup
-直接报错（错误里给出新写法），不做迁移。流程必须有 summary 或 text 之一：
+直接报错（错误里给出新写法），不做迁移。旧键 teams.spawn_from_chat 也删除
+了：全局开关是 teams.enabled，会话初值是 teams.session_default。流程必须有 summary 或 text 之一：
 只写 text 时 summary 取正文第一行；只列成员、两者都不写会报错。每个流程的
 team 人数不能超过 max_workers，否则 setup 报错（写明流程名和两个数字）。
 如需修改内置 worker 模板的角色等参数，可显式配置单个模板
@@ -1321,67 +1328,88 @@ teams.templates = { worker = { agent = "inherit", worktree = true } }。
 对话          直接对 leader 说要做的事。leader 按上面的约定组队；每次
               spawn 都要你在选择组件里确认，可以逐个批准或一次全部批准。
 命令          :Ade team start [流程]。已有命名流程时最快；不用逐个确认。
-自动          teams.auto_start = true 时，leader 建好团队、且团队还没有
-              worker，前端调用一次 team.start {default 流程}；重连或
-              第二个前端不会重复。
+自动          teams.auto_start = true 时，会话开关开、且该目录还没有团队时，
+              对该会话调用一次 team.start {default 流程}；每个会话只一次。
 
 :Ade team start [流程] 的步骤：
 
-1. 按需连接服务。没给流程名时，使用 teams.default（默认是 default）。
-2. 流程要求别的 leader.agent 而当前会话不是时，问你是“另开该 agent 的
-   会话（有团队时先结束）”还是“忽略，用当前 leader”。
-3. 当前 cwd 已有带 worker 的团队时问你：“结束后重新开始”“只补流程里缺
-   的成员”或“取消”。
-4. 输入这次的任务（可留空）。取消输入时不关团队、不切换 agent、不新建会话。
-5. 确保 leader 会话：没有会话时打开聊天并新建，等待 leader 绑定。
-6. 调 team.start：服务按流程逐个启动成员（已在团队里的名字跳过），再给
-   leader 发一条 notice：基础说明、任务、流程名和正文、成员（名字、模
-   板、agent、模型、角色）、看板列。leader 收到后建看板、分派任务。
-7. 成功后自动打开团队面板（:Ade team）。
+1. 没给流程名时先选一个，默认流程排在第一。
+2. 读当前会话的开关；未知时先查询。开关关着或工具未注入时先调
+   session.teams {enabled: true}，由服务原地重载会话工具。
+3. 输入这次的任务（可留空）。取消输入时什么都不动。
+4. 在当前会话上调用 team.start {instance, sessionId, workflow, task}。
+   会话已经在领导该目录的团队或目录还没有团队时，服务直接创建/返回团队。
+5. 目录已被别的会话领导时，用选择卡片给出“跳到 leader 会话”“移交到本会
+   话（team.set_leader）”“取消”。
+6. agent 不支持原地重载（reload_unsupported）时，确认后新建会话，把上一
+   段对话的摘要作为首条消息交接，然后在新会话上重试。
+7. 成功后由服务逐个启动成员并给 leader 发一条 notice：基础说明、任务、流
+   程名和正文、成员（名字、模板、agent、模型、角色）、看板列。前端随后打
+   开团队树。
 
 流程的 leader.model 存在时，前端在当前 agent 提供该模型时切过去并提示；不
 提供只提示。团队被挂起（等待 leader 会话恢复）时 :Ade team start 会提示先
-恢复；当前 cwd 没有 leader 会话或团队不属于本前端时会提示，不会去抢别的
-会话的团队。
+恢复；当前会话没有连接或团队不属于本前端时会提示，不会去抢别的会话的团队。
 
-旧服务（api_version 5）上没有 team.start/看板/流程接口：前端提示“服务版本
-过旧；空闲后会自动更新，或用 :Ade service stop 手动重启”，不会反复重试看
-板。
+旧服务（api_version 5/6）上没有新接口：前端提示“服务版本过旧；空闲后会自动
+更新，或用 :Ade service stop 手动重启”，不会反复重试看板。
 
 命令 ~
                                                           *ade-teams-commands*
 :Ade team                                                          *:Ade-team*
-    打开或聚焦成员面板；没有团队时显示可用流程（按 S 启动，<CR> 看全文）。
+    打开项目/会话团队树：按项目分组，leader 标 [leader]，关掉团队开关的
+    会话标 [team off]，leader 下挂 worker 及其状态/label/活动。
 
 :Ade team agents                                            *:Ade-team-agents*
-    与 :Ade team 相同；不同于用于管理 agent 安装和配置的 :Ade agents。
+    打开或聚焦成员面板；没有团队时显示可用流程（按 S 启动，<CR> 看全文）。
 
 :Ade team board                                              *:Ade-team-board*
     打开或聚焦当前项目的看板。当前项目没有团队时显示空状态。
 
 :Ade team start [流程]                                       *:Ade-team-start*
-    按流程启动团队，见上。
+    在当前会话上按流程启动团队，见上。
+
+:Ade team on                                                   *:Ade-team-on*
+    打开当前会话的团队开关（session.teams {enabled: true}）。
+
+:Ade team off                                                 *:Ade-team-off*
+    关闭当前会话的团队开关；该会话领导团队时先确认，再带 close: true 关
+    闭团队。
+
+:Ade team stop[!] <worker>                                   *:Ade-team-stop*
+    停止一个 worker（team.stop_worker）；! 表示停止后也从团队移除，worktree
+    保留。参数补全当前团队的 worker 名。
+
+:Ade team leader                                           *:Ade-team-leader*
+    把当前项目的团队领导权移交给当前会话（team.set_leader）。
 
 :Ade team close                                              *:Ade-team-close*
     结束当前 cwd 的团队（确认后 team.close）。当前 cwd 没有团队时提示，
     不会关闭别的目录的团队。
 
 :Ade team answer [名字]                                 *:Ade-team-answer*
-    显示待处理的选项（提问、spawn、权限、上限）；带名字时用输入框回答该
-    成员没有选项的提问。
+    显示待处理的选项（提问、spawn、权限、上限、移交）；带名字时用输入框回
+    答该成员没有选项的提问。
 
 :Ade workflows                                                *:Ade-workflows*
     列出命名流程：名字、范围、一行说明、成员。<CR> 看全文，d 删除（只限
     project 和 user；config/builtin 提示不能删），q 关闭。
 
-补全：:Ade team <Tab> 补全 agents/board/start/close/answer；
-:Ade team start <Tab> 补全配置里的、已知的服务流程名和 default。
+补全：:Ade team <Tab> 补全 agents/board/start/close/answer/on/off/stop/leader；
+:Ade team start <Tab> 补全配置里的、已知的服务流程名和 default；
+:Ade team stop <Tab> 补全当前团队的 worker 名。
 
 面板 ~
                                                              *ade-teams-panel*
-成员面板和看板都在当前 tabpage 内独立打开、聚焦和关闭。宽屏（列数 >=
+会话树、成员面板和看板都在当前 tabpage 内独立打开、聚焦和关闭。宽屏（列数 >=
 teams.dashboard.wide，默认 160）使用分栏；窄屏只显示请求的浮窗。q 关闭
 所在面板，不关闭另一个面板、聊天窗口或团队。
+
+树      按项目分组，每个会话一行；leader 标 [leader] 并强调，开关关掉的会话
+        标 [team off]，leader 下挂 worker（状态、label、最近活动）。
+        <CR> 打开会话（worker 行打开它的对话）、t 切换该会话的团队开关、
+        x 停止 worker 或关闭团队（leader 行，确认）、L 把领导权交给光标会
+        话、S 为光标会话选流程启动、b 打开看板。
 
 标题    窗口标题显示团队、状态、worker 数、回合数、流程和待处理请求。
 成员    leader 在最上面（★、强调色），下面是 workers N/max。每个 worker
@@ -1511,8 +1539,8 @@ leader 的 token；leader 收到的汇报里应当包含做决定需要的细节
 里。挂起期间可以 m 发消息（排队）、回答 question/message/limit、R 重置回
 合上限、D 删除已退出 worker 的 worktree、x 关闭团队；w/s/p/r/c 提示团队
 已挂起。挂起超过 7 天的团队会在服务启动或每小时检查时删除（worktree 与分支
-保留）。如果恢复出的会话不是存储的 leader，团队保持挂起，并提示在面板按 x
-关闭；leader 注入不会被挂起团队阻塞。
+保留）。如果恢复出的会话不是存储的 leader，团队保持挂起，并提示在树或成员
+面板按 x 关闭；没有团队的会话照常聊天，不会被挂起团队阻塞。
 
 --event-log off 时不声明 teams 特性，team.* 返回 -32601，团队、看板和命名
 流程都不会落盘或恢复；此时 workflow_save 返回 -32061（no database）。
@@ -1526,8 +1554,8 @@ worktree 和 ade/<team>-<stamp>/<name> 分支。worktree 只含已提交内容�
 或团队关闭后 worktree 与分支都保留；面板 D 删除（可 force），未合并的分支
 会保留。
 
-直连模式、旧服务或 spawn_from_chat = false 时不注入 team MCP server，单
-agent 行为不变。
+直连模式或全局 teams.enabled = false 时服务不注入 team MCP server，单
+agent 行为不变；session_default = false 只让新会话的开关默认关着。
 
 ==============================================================================
 
