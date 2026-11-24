@@ -27,6 +27,26 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// The session token the service injected, from the agent side file.
+fn injected_token(server: &TestServer, session: &str) -> String {
+    let path = server.dir().join("session-tokens");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Some(token) = text.lines().rev().find_map(|line| {
+                let (known, token) = line.split_once(' ')?;
+                (known == session).then(|| token.to_string())
+            }) {
+                return token;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("no injected token for {session}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 fn agent() -> String {
     fixture("team_agent.py").to_string_lossy().to_string()
 }
@@ -99,6 +119,7 @@ fn child_env(server: &TestServer, log: &Path, gate: &Path) -> Value {
         "TEAM_AGENT_LOG": log.to_string_lossy(),
         "TEAM_AGENT_GATE": gate.to_string_lossy(),
         "TEAM_AGENT_TEMPLATE": "dev",
+        "TEAM_AGENT_TOKEN_FILE": server.dir().join("session-tokens").to_string_lossy(),
     })
 }
 
@@ -1484,26 +1505,12 @@ impl Harness {
             json!({ "cwd": cwd.to_string_lossy(), "config": config }),
         );
         assert!(configured["result"].is_object(), "configure: {configured}");
-        let leader = client.request(
-            3,
-            "team.leader_server",
-            json!({ "instance": instance, "cwd": cwd.to_string_lossy() }),
-        );
-        let server_entry = leader["result"]["server"].clone();
-        let token_id = leader["result"]["token_id"]
-            .as_str()
-            .expect("token id")
-            .to_string();
-        let token = server_entry["env"][0]["value"]
-            .as_str()
-            .expect("token")
-            .to_string();
         let session_response = tunnel_call(
             &mut client,
             &instance,
             11,
             "session/new",
-            json!({ "cwd": cwd.to_string_lossy(), "mcpServers": [server_entry] }),
+            json!({ "cwd": cwd.to_string_lossy(), "mcpServers": [] }),
         );
         let session = session_response["result"]["sessionId"]
             .as_str()
@@ -1512,15 +1519,23 @@ impl Harness {
         // `tunnel_call` polls with a short timeout; later requests may wait for
         // git, so restore the default.
         client.reset_read_timeout();
-        let bound = client.request(
-            4,
-            "team.bind_leader",
-            json!({ "instance": instance, "sessionId": session, "token_id": token_id }),
+        // v3: an unknown workflow creates the team and then fails (20.4).
+        let created = client.request(
+            3,
+            "team.start",
+            json!({
+                "instance": instance,
+                "sessionId": session,
+                "workflow": "no-such-workflow",
+            }),
         );
-        let team = bound["result"]["team"]["id"]
+        assert_eq!(created["error"]["code"], -32060, "{created}");
+        let listed = client.request(4, "team.list", json!({}));
+        let team = listed["result"]["teams"][0]["id"]
             .as_str()
-            .unwrap_or_else(|| panic!("bind: {bound}"))
+            .unwrap_or_else(|| panic!("no team: {listed}"))
             .to_string();
+        let token = injected_token(&server, &session);
         client.reset_read_timeout();
         Self {
             server,
@@ -1531,4 +1546,180 @@ impl Harness {
             log,
         }
     }
+}
+
+/// A failing `git worktree add` completes a pending `remove: true` and the name
+/// becomes usable again (20.6/#7).
+#[test]
+fn a_failed_worktree_start_completes_a_pending_removal() {
+    if skip("a_failed_worktree_start_completes_a_pending_removal") {
+        return;
+    }
+    let real = Command::new("sh")
+        .arg("-c")
+        .arg("command -v git")
+        .output()
+        .expect("find git");
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    static FAIL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = FAIL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let wrapper =
+        std::env::temp_dir().join(format!("ade-fail-git-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(&wrapper).expect("wrapper dir");
+    let script = wrapper.join("git");
+    // Only `worktree add` fails; everything else runs the real git.
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *\"worktree add\"*) echo 'boom' >&2 ; exit 1 ;;\nesac\nexec {real} \"$@\"\n"
+        ),
+    )
+    .expect("fake git");
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("chmod");
+    let path = format!(
+        "{}:{}",
+        wrapper.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut harness = Harness::with_worktree_env("wt-fail-remove", &[("PATH", &path)], |work| {
+        init_repo(work);
+        work.to_path_buf()
+    });
+    let mut probe = harness.server.connect();
+    let hello = probe.hello(&harness.server.token(), nvim_ade_server::API_VERSION);
+    assert!(hello["result"].is_object(), "{hello}");
+    let start = std::time::Instant::now();
+    probe.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 40,
+        "method": "team.spawn",
+        "params": {"team": harness.team, "template": "dev", "name": "w1", "task": "work"},
+    }));
+    // The participant exists before the worktree job runs; waiting for it keeps
+    // this test deterministic when tests run in parallel.
+    harness.wait_participant("w1", |_| true);
+    // Stop it while git is failing, asking for the removal too.
+    let stopped = harness.client.request(
+        41,
+        "team.stop_worker",
+        json!({"team": harness.team, "name": "w1", "remove": true}),
+    );
+    assert!(stopped["result"].is_object(), "{stopped}");
+    let reply = wait_for(
+        || loop {
+            let value = probe.recv()?;
+            if value["id"] == 40 {
+                return Some(value);
+            }
+        },
+        "the spawn reply for the failed start",
+    );
+    assert!(
+        reply.get("error").is_some() || reply["result"]["isError"] == json!(true),
+        "the failed start is reported: {reply}"
+    );
+    // The name is free again and the team no longer lists w1 as running.
+    wait_for(
+        || {
+            harness.team()["participants"]
+                .as_array()
+                .map(|participants| {
+                    participants
+                        .iter()
+                        .all(|participant| participant["name"] != "w1")
+                        .then_some(())
+                })?
+        },
+        "w1 removed after the failed start",
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(20),
+        "the removal did not wait for a worker that never started"
+    );
+    std::fs::remove_file(&script).ok();
+}
+
+/// A cancelled-but-still-running worktree job keeps the name taken; a same-name
+/// spawn waits for it and the old callback never takes over the new worker
+/// (20.6/E).
+#[test]
+fn a_cancelled_worktree_job_keeps_its_name_until_it_returns() {
+    if skip("a_cancelled_worktree_job_keeps_its_name_until_it_returns") {
+        return;
+    }
+    let real = Command::new("sh")
+        .arg("-c")
+        .arg("command -v git")
+        .output()
+        .expect("find git");
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    static SLOW_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = SLOW_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let wrapper = std::env::temp_dir().join(format!("ade-slow-wt-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(&wrapper).expect("wrapper dir");
+    let marker = std::env::temp_dir().join(format!(
+        "ade-slow-wt-marker-{}-{unique}",
+        std::process::id()
+    ));
+    let script = wrapper.join("git");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *\"worktree add\"*) touch \"{}\" ; sleep 1 ;;\nesac\nexec {real} \"$@\"\n",
+            marker.display()
+        ),
+    )
+    .expect("fake git");
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("chmod");
+    let path = format!(
+        "{}:{}",
+        wrapper.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut harness = Harness::with_worktree_env("wt-cancel-name", &[("PATH", &path)], |work| {
+        init_repo(work);
+        work.to_path_buf()
+    });
+    let mut probe = harness.server.connect();
+    let hello = probe.hello(&harness.server.token(), nvim_ade_server::API_VERSION);
+    assert!(hello["result"].is_object(), "{hello}");
+    probe.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 50,
+        "method": "team.spawn",
+        "params": {"team": harness.team, "template": "dev", "name": "w1", "task": "work"},
+    }));
+    wait_for(|| marker.exists().then_some(()), "the slow git to start");
+    // Cancel (and remove) while git is still running.
+    let stopped = harness.client.request(
+        51,
+        "team.stop_worker",
+        json!({"team": harness.team, "name": "w1", "remove": true}),
+    );
+    assert!(stopped["result"].is_object(), "{stopped}");
+    // A same-name spawn right away is refused while the job still runs.
+    let again = harness.client.request(
+        52,
+        "team.spawn",
+        json!({"team": harness.team, "template": "dev", "name": "w1", "task": "work again"}),
+    );
+    assert!(
+        again.get("error").is_some() || again["result"]["name"] != json!("w1"),
+        "the name is not freed while the job runs: {again}"
+    );
+    // The cancelled job's callback returns and only cleans up after itself.
+    std::fs::remove_file(&marker).ok();
+    let reply = wait_for(
+        || loop {
+            let value = probe.recv()?;
+            if value["id"] == 50 {
+                return Some(value);
+            }
+        },
+        "the cancelled spawn's reply",
+    );
+    assert!(reply.get("error").is_some(), "{reply}");
+    std::fs::remove_file(&script).ok();
 }

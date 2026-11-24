@@ -528,10 +528,7 @@ def main():
                 },
             )
         elif method in ("session/new", "session/load", "session/resume"):
-            if method == "session/load" and os.environ.get("TEAM_AGENT_LOAD_FAIL") == "1":
-                log({"event": "load-failed", "session": params.get("sessionId")})
-                error(ident, "load failed")
-                continue
+            fails = method == "session/load" and os.environ.get("TEAM_AGENT_LOAD_FAIL") == "1"
             if method == "session/new":
                 COUNT[0] += 1
                 session = f"team_sess_{os.getpid()}_{COUNT[0]}"
@@ -550,6 +547,14 @@ def main():
                     "args": entry.get("args"),
                     "env_names": [item.get("name") for item in entry.get("env") or []],
                 }
+                # The token must never reach the agent log: write it to a
+                # side file the tests read back.
+                token_path = os.environ.get("TEAM_AGENT_TOKEN_FILE")
+                if token_path:
+                    for item in entry.get("env") or []:
+                        if item.get("name") == "ADE_TEAM_TOKEN":
+                            with open(token_path, "a") as handle:
+                                handle.write(f"{session} {item.get('value')}\n")
             log({
                 "event": "session",
                 "method": method,
@@ -557,9 +562,41 @@ def main():
                 "mcp": bool(entry),
                 "cwd": params.get("cwd"),
                 "mcp_entry": safe_entry,
+                "mcp_servers": [
+                    item.get("name") for item in params.get("mcpServers") or []
+                ],
             })
+            load_delay = os.environ.get("TEAM_AGENT_LOAD_DELAY")
+            if load_delay and method in ("session/load", "session/resume"):
+                # A slow load lets the tests change the session state or
+                # handshake the token while the request is in flight.
+                time.sleep(float(load_delay))
+            if fails:
+                # The token was written above, so the service can have issued
+                # and even handshaked it before this refusal.
+                log({"event": "load-failed", "session": params.get("sessionId")})
+                error(ident, "load failed")
+                continue
+            new_delay = os.environ.get("TEAM_AGENT_NEW_DELAY")
+            if new_delay and method == "session/new":
+                # The token was written above: answer late so the MCP process can
+                # handshake before the session is bound.
+                time.sleep(float(new_delay))
             if MCP.get(session):
                 mcp_list(session)
+            if method == "session/load":
+                # A distinguishable replay the tests can look for.
+                send({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "replayed-history"},
+                        },
+                    },
+                })
             result(
                 ident,
                 {

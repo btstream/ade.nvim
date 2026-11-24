@@ -27,7 +27,7 @@ pub fn run() -> ExitCode {
 
 #[cfg(unix)]
 struct Socket {
-    reader: BufReader<std::os::unix::net::UnixStream>,
+    responses: std::sync::mpsc::Receiver<Value>,
     writer: std::os::unix::net::UnixStream,
     next_id: u64,
     connected: bool,
@@ -40,8 +40,26 @@ impl Socket {
         let stream = std::os::unix::net::UnixStream::connect(paths.socket())
             .map_err(|error| format!("cannot reach the service: {error}"))?;
         let writer = stream.try_clone().map_err(|error| error.to_string())?;
+        // A dedicated reader forwards pushed notifications to stdout at once
+        // (`notifications/tools/list_changed`, 20.3); responses go to the
+        // request that is waiting for them.
+        let (sender, responses) = std::sync::mpsc::channel::<Value>();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stream);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                let Ok(value) = serde_json::from_str::<Value>(line.trim_end()) else {
+                    continue;
+                };
+                if value.get("method").is_some() {
+                    forward(&value);
+                } else if sender.send(value).is_err() {
+                    break;
+                }
+            }
+        });
         let mut socket = Self {
-            reader: BufReader::new(stream),
+            responses,
             writer,
             next_id: 9000,
             connected: true,
@@ -81,20 +99,16 @@ impl Socket {
             return Err(format!("the service connection is closed: {error}"));
         }
         loop {
-            let mut response = String::new();
-            match self.reader.read_line(&mut response) {
-                Ok(0) => {
+            let value = match self
+                .responses
+                .recv_timeout(std::time::Duration::from_millis(50))
+            {
+                Ok(value) => value,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     self.connected = false;
                     return Err("the service connection is closed".to_string());
                 }
-                Ok(_) => {}
-                Err(error) => {
-                    self.connected = false;
-                    return Err(format!("the service connection is closed: {error}"));
-                }
-            }
-            let Ok(value) = serde_json::from_str::<Value>(response.trim_end()) else {
-                continue;
             };
             if value.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
@@ -113,6 +127,15 @@ impl Socket {
             }
             return Ok(value.get("result").cloned().unwrap_or(Value::Null));
         }
+    }
+}
+
+#[cfg(unix)]
+fn forward(value: &Value) {
+    let mut stdout = std::io::stdout().lock();
+    if serde_json::to_writer(&mut stdout, value).is_ok() {
+        let _ = stdout.write_all(b"\n");
+        let _ = stdout.flush();
     }
 }
 
@@ -154,6 +177,16 @@ impl Mcp {
             match reader.read_line(&mut line) {
                 Ok(0) => return,
                 Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    // stdin itself is blocking; this only happens on a spurious
+                    // wakeup. Keep serving.
+                    continue;
+                }
                 Err(_) => return,
             }
             let line = line.trim_end();
@@ -208,15 +241,15 @@ impl Mcp {
                 };
                 let mut result = json!({
                     "protocolVersion": version,
-                    "capabilities": { "tools": {} },
+                    "capabilities": { "tools": { "listChanged": true } },
                     "serverInfo": {
                         "name": "nvim_ade_server",
                         "version": crate::SERVER_VERSION,
                     },
                 });
-                if self.role() == "leader" {
-                    // 19.8: only a leader gets the base instructions; they are
-                    // the same text `team.start`'s notice repeats.
+                if matches!(self.role(), "leader" | "session") {
+                    // 19.8/20.3: a leader and every session token get the base
+                    // instructions; workers get none.
                     result["instructions"] = json!(crate::team::brief::leader_instructions());
                 }
                 Ok(result)
@@ -259,6 +292,39 @@ impl Mcp {
         self.role.as_deref().unwrap_or("worker")
     }
 
+    /// The session's current (enabled, leader) state, re-read for every
+    /// `tools/list` and `tools/call` (20.3).
+    fn session_state(&mut self) -> (bool, bool) {
+        let raw = self
+            .socket
+            .as_mut()
+            .and_then(|socket| socket.request("bus.status", json!({})).ok());
+        // The hub answers tools with the MCP result envelope; the state is the
+        // JSON text inside it.
+        let value = raw.and_then(|value| match value.get("content") {
+            Some(content) => content
+                .as_array()?
+                .first()?
+                .get("text")?
+                .as_str()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok()),
+            None => Some(value),
+        });
+        match value {
+            Some(value) => (
+                value
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                value
+                    .get("leader")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            ),
+            None => (true, false),
+        }
+    }
+
     fn templates(&mut self) -> Vec<Value> {
         self.socket
             .as_mut()
@@ -279,9 +345,17 @@ impl Mcp {
     }
 
     fn tools_list(&mut self) -> Value {
-        let leader = self.role() == "leader";
+        let session = self.role() == "session";
+        let (enabled, leader) = if session {
+            self.session_state()
+        } else {
+            (true, self.role() == "leader")
+        };
+        if session && !enabled {
+            return json!({ "tools": [] });
+        }
         let mut tools = Vec::new();
-        if leader {
+        if leader || session {
             let templates = self.templates();
             let mut schema = json!({
                 "type": "object",
@@ -317,22 +391,23 @@ impl Mcp {
         if leader {
             kinds.push("control");
         }
-        tools.push(json!({
-            "name": "bus_send",
-            "description": "Send a bus message to the leader, another worker or human.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "to": { "type": "string" },
-                    "kind": { "type": "string", "enum": kinds },
-                    "body": { "type": "string" },
-                    "task": { "type": "string" },
-                    "refs": { "type": "array", "items": { "type": "string" } },
+        if leader || !session {
+            tools.push(json!({
+                "name": "bus_send",
+                "description": "Send a bus message to the leader, another worker or human.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "to": { "type": "string" },
+                        "kind": { "type": "string", "enum": kinds },
+                        "body": { "type": "string" },
+                        "task": { "type": "string" },
+                        "refs": { "type": "array", "items": { "type": "string" } },
+                    },
+                    "required": ["to", "kind", "body"],
                 },
-                "required": ["to", "kind", "body"],
-            },
-        }));
-        tools.push(json!({
+            }));
+            tools.push(json!({
             "name": "bus_ask_human",
             "description": "Ask the person one question, or up to four questions at once with `questions`.",
             "inputSchema": {
@@ -373,6 +448,7 @@ impl Mcp {
                 },
             },
         }));
+        }
         tools.push(json!({
             "name": "bus_status",
             "description": "List the team's members, states and current tasks.",
@@ -535,7 +611,20 @@ impl Mcp {
                     "required": ["name"],
                 },
             }));
-        } else {
+            tools.push(json!({
+                "name": "team_stop",
+                "description": "Stop one worker (optionally drop it from the team after it exited).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "remove": { "type": "boolean" },
+                    },
+                    "required": ["name"],
+                },
+            }));
+        }
+        if !session {
             tools.push(json!({
                 "name": "card_update",
                 "description": "Update your own card's body and fields, or archive it.",
@@ -576,9 +665,27 @@ impl Mcp {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
-        let leader = self.role() == "leader";
+        let session = self.role() == "session";
+        let (enabled, leader) = if session {
+            self.session_state()
+        } else {
+            (true, self.role() == "leader")
+        };
+        if session && !enabled {
+            return Ok(error_result("teams are off for this chat"));
+        }
+        let can_session = session && enabled;
+        let can_spawn = leader || can_session;
+        let can_workflow = leader || can_session;
         let (method, call) = match name {
-            "team_spawn" if leader => (
+            "team_stop" if leader => (
+                "bus.stop_worker",
+                json!({
+                    "name": arguments.get("name"),
+                    "remove": arguments.get("remove"),
+                }),
+            ),
+            "team_spawn" if can_spawn => (
                 "bus.spawn",
                 json!({
                     "template": arguments.get("template"),
@@ -589,7 +696,7 @@ impl Mcp {
                     "task": arguments.get("task"),
                 }),
             ),
-            "workflow_save" if leader => {
+            "workflow_save" if can_workflow => {
                 let mut call = json!({
                     "workflow": arguments.get("workflow"),
                     "replace": arguments.get("replace"),
@@ -599,10 +706,10 @@ impl Mcp {
                 }
                 ("bus.workflow_save", call)
             }
-            "workflow_get" if leader => {
+            "workflow_get" if can_workflow => {
                 ("bus.workflow_get", json!({ "name": arguments.get("name") }))
             }
-            "workflow_delete" if leader => {
+            "workflow_delete" if can_workflow => {
                 let mut call = json!({ "name": arguments.get("name") });
                 if let Some(scope) = arguments.get("scope") {
                     call["scope"] = scope.clone();
@@ -639,10 +746,10 @@ impl Mcp {
             // returns the documented -32061. `tools/list` still hides the other
             // role's tool.
             "board_update" => ("bus.board_update", arguments),
+            // The hub owns the role check and returns the documented -32061.
             "card_update" => ("bus.card_update", arguments),
-            "team_spawn" | "bus_read" | "workflow_save" | "workflow_get" | "workflow_delete" => {
-                return Ok(error_result("this tool is only available to the leader"))
-            }
+            "team_spawn" | "bus_read" | "workflow_save" | "workflow_get" | "workflow_delete"
+            | "team_stop" => return Ok(error_result("this chat does not lead the team")),
             _ => return Err((-32602, format!("unknown tool {name}"))),
         };
         let Some(socket) = self.socket.as_mut() else {
@@ -654,6 +761,10 @@ impl Mcp {
             return Ok(error_result(reason));
         };
         match socket.request(method, call) {
+            // Hub-side tool errors already carry the MCP result shape.
+            Ok(value) if value.get("isError").is_some() && value.get("content").is_some() => {
+                Ok(value)
+            }
             Ok(value) => Ok(json!({
                 "content": [{ "type": "text", "text": value.to_string() }],
                 "isError": false,
