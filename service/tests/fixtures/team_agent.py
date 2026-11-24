@@ -582,7 +582,7 @@ def main():
                 # The token was written above: answer late so the MCP process can
                 # handshake before the session is bound.
                 time.sleep(float(new_delay))
-            if MCP.get(session):
+            if MCP.get(session) and os.environ.get("TEAM_AGENT_SKIP_MCP_LIST") != "1":
                 mcp_list(session)
             if method == "session/load":
                 # A distinguishable replay the tests can look for.
