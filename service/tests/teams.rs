@@ -6,6 +6,7 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -52,6 +53,8 @@ struct Harness {
     token: String,
     log: PathBuf,
     env: Value,
+    /// Every `session.teams_changed` params seen, per session.
+    session_changes: HashMap<String, Vec<Value>>,
 }
 
 impl Harness {
@@ -173,7 +176,42 @@ impl Harness {
             token,
             log,
             env,
+            session_changes: HashMap::new(),
         }
+    }
+
+    /// Poll the connection and return the first `session.teams_changed` of that
+    /// session matching `wanted`.
+    fn session_change_matching(
+        &mut self,
+        session: &str,
+        wanted: impl Fn(&Value) -> bool,
+    ) -> Option<Value> {
+        if let Some(found) = self
+            .session_changes
+            .get(session)
+            .and_then(|changes| changes.iter().find(|change| wanted(change)))
+        {
+            return Some(found.clone());
+        }
+        while let Some(frame) = self
+            .client
+            .try_next_notification(Duration::from_millis(100))
+        {
+            if frame["method"] != "session.teams_changed" || frame["params"]["sessionId"] != session
+            {
+                continue;
+            }
+            let params = frame["params"].clone();
+            self.session_changes
+                .entry(session.to_string())
+                .or_default()
+                .push(params.clone());
+            if wanted(&params) {
+                return Some(params);
+            }
+        }
+        None
     }
 
     fn list(&mut self) -> Value {
@@ -6207,6 +6245,7 @@ fn a_disabling_configure_pushes_list_changed() {
         .expect("spawn mcp");
     let stdout = child.stdout.take().expect("stdout");
     let mut reader = BufReader::new(stdout);
+    let _ = &child;
     let stdin = child.stdin.as_mut().expect("stdin");
     write_mcp(
         stdin,
@@ -6762,27 +6801,19 @@ fn a_failed_load_publishes_the_state_back() {
     );
 }
 
-/// An instance exiting mid-load revokes the pending request's token and lets
-/// the front end know the session is no longer injected (20.5/A).
+/// An instance exiting tells the front end its sessions are no longer injected
+/// and lose the lead, while those sessions' MCP sockets are still open
+/// (20.5/A).
 #[test]
-fn an_instance_exit_during_a_load_undoes_the_request() {
+fn an_instance_exit_publishes_the_state_while_the_mcp_socket_is_open() {
     let mut harness = Harness::new(
-        "session-exit-during-load",
+        "session-exit-publishes",
         json!({"spawn_confirm": {"auto": ["dev"]}}),
         None,
     );
-    let second = tunnel_call(
-        &mut harness.client,
-        &harness.instance,
-        170,
-        "session/new",
-        json!({ "cwd": harness.work.to_string_lossy(), "mcpServers": [] }),
-    );
-    let session = second["result"]["sessionId"]
-        .as_str()
-        .expect("session id")
-        .to_string();
-    let token = harness_token(&harness, &session);
+    // The fixture's leader session is the team's leader.
+    let leader_session = harness.session.clone();
+    let token = harness.token.clone();
     let mut child = Command::new(common::BINARY)
         .arg("mcp")
         .env("ADE_TEAM_TOKEN", token)
@@ -6804,51 +6835,35 @@ fn an_instance_exit_during_a_load_undoes_the_request() {
     wait_for(
         || {
             let query = harness.client.request(
-                171,
+                175,
                 "session.teams",
-                json!({"instance": harness.instance, "sessionId": session}),
+                json!({"instance": harness.instance, "sessionId": leader_session}),
             );
             (query["result"]["injected"] == json!(true)).then_some(())
         },
-        "the session is injected",
+        "the leader's MCP process is counted",
     );
-    // The instance dies while the MCP socket stays open: the front end must be
-    // told the session is no longer injected *before* the socket closes.
     let stopped = harness.client.request(
-        172,
+        176,
         "agent.stop",
         json!({"instance": harness.instance, "force": true}),
     );
-    // Under load the notification and the exit race; accept the state already
-    // being false as well.
-    let already = {
-        let query = harness.client.request(
-            173,
-            "session.teams",
-            json!({"instance": harness.instance, "sessionId": session}),
-        );
-        query.get("error").is_some() || query["result"]["injected"] == json!(false)
-    };
-    if already {
-        drop(child.stdin.take());
-        let _ = child.wait();
-        return;
-    }
-    assert!(stopped.get("result").is_some() || stopped.get("error").is_some());
-    let changed = wait_for(
+    assert!(stopped.get("result").is_some(), "{stopped}");
+    // The socket is still open here: the notifications must already have come.
+    let injected = wait_for(
         || {
-            harness
-                .client
-                .try_next_notification(Duration::from_millis(100))
-                .filter(|frame| {
-                    frame["method"] == "session.teams_changed"
-                        && frame["params"]["sessionId"] == session.as_str()
-                        && frame["params"]["injected"] == json!(false)
-                })
+            harness.session_change_matching(&leader_session, |change| {
+                change["injected"] == json!(false)
+            })
         },
-        "the session's injected state fell back",
+        "the session is no longer injected",
     );
-    assert_eq!(changed["params"]["injected"], false, "{changed}");
+    assert_eq!(injected["injected"], false, "{injected}");
+    let leaderless = wait_for(
+        || harness.session_change_matching(&leader_session, |change| change["leader"].is_null()),
+        "the session lost the lead",
+    );
+    assert!(leaderless["leader"].is_null(), "{leaderless}");
     drop(child.stdin.take());
     let _ = child.wait();
 }
@@ -7115,26 +7130,53 @@ fn a_failed_forced_load_does_not_mark_the_log_incomplete() {
     );
     assert!(failed.get("error").is_some(), "{failed}");
     // The forced load failed, so history was not duplicated: the session's log
-    // stays complete (a later load of a complete session may be emulated).
+    // stays complete, and no log-only record is left behind. A later load is
+    // judged normally (no stuck "forced in flight").
     std::thread::sleep(Duration::from_millis(200));
     let db = server.dir().join("nvim_ade_server.events.sqlite3");
-    let incomplete = std::fs::read_to_string(&db)
-        .map(|_| {
-            let conn = rusqlite::Connection::open(&db).expect("db");
-            let count: i64 = conn
-                .query_row(
-                    "SELECT count(*) FROM sessions WHERE session_id = ?1 AND incomplete = 1",
-                    [&session],
-                    |row| row.get(0),
-                )
-                .expect("incomplete count");
-            count
-        })
-        .unwrap_or(0);
-    assert_eq!(
-        incomplete, 0,
-        "a failed forced load must not mark the log incomplete"
+    {
+        let conn = rusqlite::Connection::open(&db).expect("open the event log");
+        let incomplete: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sessions WHERE session_id = ?1 AND incomplete = 1",
+                [&session],
+                |row| row.get(0),
+            )
+            .expect("incomplete count");
+        assert_eq!(
+            incomplete, 0,
+            "a failed forced load must not mark the log incomplete"
+        );
+    }
+    // A second load is no longer treated as a forced one: the agent sees it only
+    // if the log cannot answer, and the agent fails loads here either way, so
+    // the observable part is that it is not kept as an in-flight record.
+    let again = tunnel_call(
+        &mut client,
+        &instance,
+        16,
+        "session/load",
+        json!({"sessionId": session, "cwd": work.to_string_lossy(), "mcpServers": []}),
     );
+    assert!(
+        again.get("error").is_some() || again["result"].is_object(),
+        "{again}"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    {
+        let conn = rusqlite::Connection::open(&db).expect("open the event log");
+        let incomplete: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sessions WHERE session_id = ?1 AND incomplete = 1",
+                [&session],
+                |row| row.get(0),
+            )
+            .expect("incomplete count");
+        assert_eq!(
+            incomplete, 0,
+            "a rejected forced load leaves no stuck in-flight record"
+        );
+    }
 }
 
 /// A forced load that reached the agent still marks the log when its front end
@@ -7211,7 +7253,6 @@ fn a_forced_load_outliving_its_front_end_still_restarts_the_log() {
         json!({"instance": instance, "sessionId": session, "enabled": true}),
     );
     assert_eq!(on["result"]["reload"], true, "{on}");
-    eprintln!("DBG on={on}");
     client.notify(
         "tunnel.send",
         json!({
@@ -7235,7 +7276,31 @@ fn a_forced_load_outliving_its_front_end_still_restarts_the_log() {
     );
     client.disconnect();
     // The agent answers after the front end left; the log must be restarted so
-    // no later replay duplicates the history.
+    // no later replay duplicates the history. The refused token must be gone
+    // and a second front end's load must be forwarded, not replayed.
+    let token = std::fs::read_to_string(server.dir().join("session-tokens"))
+        .unwrap_or_default()
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let (known, token) = line.split_once(' ')?;
+            (known == session).then(|| token.to_string())
+        })
+        .expect("the forced load's token");
+    wait_for(
+        || {
+            let mut probe = server.connect();
+            let hello = probe.hello_raw(json!({
+                "participant_token": token,
+                "client": "mcp",
+                "client_version": "test",
+                "api_version": nvim_ade_server::API_VERSION,
+            }));
+            probe.disconnect();
+            hello.get("error").is_some().then_some(())
+        },
+        "the orphaned request's token is revoked",
+    );
     let db = server.dir().join("nvim_ade_server.events.sqlite3");
     wait_for(
         || {
@@ -7247,25 +7312,6 @@ fn a_forced_load_outliving_its_front_end_still_restarts_the_log() {
                     |row| row.get(0),
                 )
                 .ok()?;
-            if count == 0 {
-                eprintln!(
-                    "DBG agent-tail={:?}",
-                    read_log(&log)
-                        .into_iter()
-                        .filter(|e| e["event"] == "session" || e["event"] == "load-failed")
-                        .collect::<Vec<_>>()
-                );
-                let rows: Vec<(String, i64)> = conn
-                    .prepare("SELECT session_id, incomplete FROM sessions")
-                    .ok()?
-                    .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                    })
-                    .ok()?
-                    .filter_map(std::result::Result::ok)
-                    .collect();
-                eprintln!("DBG sessions={rows:?} want={session}");
-            }
             (count > 0).then_some(())
         },
         "the orphaned forced load restarted the log",
@@ -7285,12 +7331,39 @@ fn stop_remove_waits_for_the_real_exit_and_answers_once() {
     let mut probe = harness.server.connect();
     let hello = probe.hello(&harness.server.token(), nvim_ade_server::API_VERSION);
     assert!(hello["result"].is_object(), "{hello}");
-    let spawn = mcp_call(
-        &harness.server,
-        &harness.token,
-        "team_spawn",
-        json!({"template": "dev", "name": "w1", "task": "work"}),
-    );
+    // A long-lived MCP process so a second reply to the same request would be
+    // visible.
+    let mut child = Command::new(common::BINARY)
+        .arg("mcp")
+        .env("ADE_TEAM_TOKEN", harness.token.clone())
+        .env("NVIM_ADE_SERVER_DIR", harness.server.dir())
+        .env("HOME", harness.server.dir())
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let _ = &child;
+    {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        write_mcp(
+            stdin,
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test"}}}),
+        );
+        write_mcp(
+            stdin,
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        );
+        write_mcp(
+            stdin,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"team_spawn","arguments":{"template":"dev","name":"w1","task":"work"}}}),
+        );
+    }
+    let (spawn, _) = mcp_frames_until(&mut reader, 2);
+    let spawn = spawn["result"].clone();
     assert_eq!(spawn["isError"], false, "{spawn}");
     harness.wait_participant("w1", |entry| entry["sessionId"].is_string());
     let worker = harness.wait_participant("w1", |entry| entry["instance"].is_string());
@@ -7303,6 +7376,8 @@ fn stop_remove_waits_for_the_real_exit_and_answers_once() {
         json!({"team": harness.team, "name": "w1", "remove": true}),
     );
     assert!(stopped["result"].is_object(), "{stopped}");
+    // The process may already be gone: then the participant is gone with it.
+    // Either way it must never be running after the stop.
     let listed = harness.list();
     let entry = listed["teams"][0]["participants"]
         .as_array()
@@ -7310,8 +7385,8 @@ fn stop_remove_waits_for_the_real_exit_and_answers_once() {
         .iter()
         .find(|participant| participant["name"] == "w1");
     assert!(
-        entry.is_some_and(|entry| entry["state"] == "exited"),
-        "the worker is shown as exited until it really exits: {listed}"
+        entry.is_none_or(|entry| entry["state"] == "exited"),
+        "a stopped worker is exited or removed, never running: {listed}"
     );
     // After the real exit the name is gone.
     wait_for(
@@ -7340,4 +7415,22 @@ fn stop_remove_waits_for_the_real_exit_and_answers_once() {
         },
         "the stopped worker process exited",
     );
+    // The original `team_spawn` got exactly one answer: closing stdin ends the
+    // MCP process, and no second frame with that id may follow.
+    drop(child.stdin.take());
+    let mut extra = 0;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if value.get("id").and_then(Value::as_u64) == Some(2) {
+            extra += 1;
+        }
+    }
+    let _ = child.wait();
+    assert_eq!(extra, 0, "the spawn request must be answered exactly once");
 }

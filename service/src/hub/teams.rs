@@ -297,10 +297,19 @@ impl Hub {
             .or_else(|| pending.session.clone())
             .or_else(|| request.session_id.clone());
         if failed || session.is_none() {
-            // One undo path: revoke this request's token, drop the record and
-            // leave the previous binding untouched. A session that had been
-            // published as injected must hear that it no longer is.
-            self.undo_pending_session(&key);
+            // The agent answered (with an error): this pending is over. Revoke
+            // whatever token it still holds, delete the record — never keep a
+            // log-only one, which would make later loads look forced forever.
+            if let Some(pending) = self.pending_session.remove(&key) {
+                let before = pending
+                    .session
+                    .as_ref()
+                    .map(|session| self.session_states(&[(instance.to_string(), session.clone())]));
+                self.drop_pending_session_value(pending);
+                if let Some(before) = before {
+                    self.publish_session_changes(before);
+                }
+            }
             return;
         }
         let session = session.expect("checked above");
@@ -323,7 +332,10 @@ impl Hub {
             .bind_session_token(instance, &session, &pending.token_id, &pending.agent)
             .is_err()
         {
-            self.undo_pending_session(&key);
+            if let Some(pending) = self.pending_session.remove(&key) {
+                self.drop_pending_session_value(pending);
+                self.publish_session_changes(before);
+            }
             return;
         }
         self.pending_session.remove(&key);
@@ -372,8 +384,11 @@ impl Hub {
             .as_ref()
             .map(|session| self.session_states(&[(key.0.clone(), session.clone())]));
         if pending.delivered && pending.forced {
-            // Keep the answer path: bind nothing, resume nothing, but mark the
-            // log if the agent's forced replay succeeds.
+            // The front end left while the agent is still working: revoke the
+            // token for real (it must not authenticate or authorize again), then
+            // keep a log-only record so a late success still restarts the log
+            // (20.5/B).
+            self.drop_pending_session_value(pending.clone());
             pending.conn = 0;
             pending.token_id.clear();
             self.pending_session.insert(key.clone(), pending);
@@ -986,7 +1001,7 @@ impl Hub {
 
     /// Complete a `remove: true` whose start ended without a live worker: the
     /// participant is dropped once and only once (20.6).
-    fn finish_stopped_start(&mut self, team: &str, participant: &str, lifecycle: u64) {
+    pub(crate) fn finish_stopped_start(&mut self, team: &str, participant: &str, lifecycle: u64) {
         let remove = self
             .teams
             .team(team)
@@ -3070,10 +3085,9 @@ impl Hub {
                     });
                 if pending.cancelled || stale {
                     let team_gone = self.teams.team(team).is_none();
-                    // The start ended before the worker ran: a removal waiting
-                    // for this lifecycle completes here, whether git worked or
-                    // not (20.6).
-                    self.finish_stopped_start(team, participant, pending.spawn.lifecycle);
+                    // A removal waiting for this lifecycle completes only once
+                    // the directory is really gone; without a git result there is
+                    // nothing to discard and the hand is over now (20.6).
                     // Only the request that is still waiting gets the reply; a
                     // stop already answered it and took the reply away.
                     let reply = pending.opts.reply.clone();
@@ -3100,14 +3114,19 @@ impl Hub {
                                     .send(Command::WorktreeDiscarded {
                                         team: team_owner,
                                         participant: name_owner,
+                                        lifecycle,
                                     })
                                     .await;
                             }
                         });
                     }
                     if hold {
-                        // Keep the record until the discard reports back.
+                        // Keep the record until the discard reports back; the
+                        // participant and its name stay until then too.
                         self.pending_worktrees.insert(key.clone(), pending);
+                    } else {
+                        // No directory was created: the removal completes now.
+                        self.finish_stopped_start(team, participant, lifecycle);
                     }
                     if let Some((conn, id, _)) = reply {
                         let error = if team_gone {
@@ -3874,7 +3893,12 @@ impl Hub {
             .cloned()
             .collect();
         for key in keys {
-            self.drop_pending_session(&key);
+            // The instance is gone: revoke and delete, without publishing per
+            // request (the caller publishes one exit diff) and without keeping a
+            // log-only record (20.2/20.5).
+            if let Some(pending) = self.pending_session.remove(&key) {
+                self.drop_pending_session_value(pending);
+            }
         }
         self.forward_loads.retain(|(owner, _)| owner != instance);
     }

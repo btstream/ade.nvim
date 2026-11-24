@@ -222,6 +222,7 @@ pub enum Command {
     WorktreeDiscarded {
         team: String,
         participant: String,
+        lifecycle: u64,
     },
     /// The 30 s grace period after cancelling a bus prompt ended (18.11).
     TeamDeadline {
@@ -784,9 +785,22 @@ impl Hub {
                 self.team_worktree(&team, &participant, lifecycle, outcome);
                 self.update_busy();
             }
-            Command::WorktreeDiscarded { team, participant } => {
-                self.pending_worktrees
-                    .remove(&(team.clone(), participant.clone()));
+            Command::WorktreeDiscarded {
+                team,
+                participant,
+                lifecycle,
+            } => {
+                // Only the job that owns this lifecycle may finish its removal:
+                // a newer same-name worker has its own record.
+                let ours = self
+                    .pending_worktrees
+                    .get(&(team.clone(), participant.clone()))
+                    .is_some_and(|pending| pending.spawn.lifecycle == lifecycle);
+                if ours {
+                    self.pending_worktrees
+                        .remove(&(team.clone(), participant.clone()));
+                    self.finish_stopped_start(&team, &participant, lifecycle);
+                }
                 self.drain_team_events();
                 self.update_busy();
             }
@@ -2312,6 +2326,34 @@ impl Hub {
                 frontend_id,
                 session_id,
             } => {
+                // A forced reload of the same instance and session may have
+                // reached the agent while this replay was being read: replaying
+                // the old log now would splice two histories, so forward instead
+                // (20.5/Minor 4).
+                let forced_in_flight = self.pending_session.iter().any(|((owner, _), pending)| {
+                    owner == &instance
+                        && pending.forced
+                        && pending.session.as_deref() == Some(session_id.as_str())
+                });
+                if forced_in_flight {
+                    self.release_gate(conn);
+                    let frame = json!({
+                        "jsonrpc": "2.0",
+                        "id": frontend_id,
+                        "method": "session/load",
+                        "params": {
+                            "sessionId": session_id,
+                            "cwd": self
+                                .instances
+                                .get(&instance)
+                                .map(|handle| handle.key.cwd.clone())
+                                .unwrap_or_default(),
+                            "mcpServers": [],
+                        },
+                    });
+                    self.forward_load(conn, &instance, &frame);
+                    return;
+                }
                 for (seq, message) in &messages {
                     self.send_tunnel_recv(conn, &instance, *seq, message);
                 }
@@ -2683,9 +2725,10 @@ impl Hub {
 
     fn instance_exited(&mut self, instance_id: &str) {
         let delivery = self.delivery_conns(instance_id);
-        // The pre-state of every session this instance can affect, taken before
+        // The full state of every session this instance can affect, taken before
         // anything is revoked: tokens, leadership and connections (20.5/A).
         let exiting_sessions = self.instance_sessions(instance_id);
+        let before = self.session_states(&exiting_sessions);
         self.fail_held_prompts(instance_id);
         self.cleanup_instance_pending(instance_id);
         let Some(instance) = self.instances.remove(instance_id) else {
@@ -2742,10 +2785,10 @@ impl Hub {
         // the team cleanup above handles active teams, this covers a team that
         // was already closed or a start failure.
         self.teams.revoke_instance_tokens(instance_id);
-        // Publish once, after the tokens and leadership are gone: a session
-        // that was injected hears `injected:false` and a leader change
-        // (20.5/A).
-        self.publish_session_changes(self.session_states(&exiting_sessions));
+        // Publish once, comparing the pre-exit snapshot with the state after the
+        // whole cleanup: a session that was injected hears `injected:false` and
+        // a leader change (20.5/A).
+        self.publish_session_changes(before);
     }
 
     fn update_busy(&mut self) {

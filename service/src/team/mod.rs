@@ -1560,7 +1560,10 @@ impl Teams {
         let Some(entry) = self.teams.get(team) else {
             return Value::Null;
         };
-        if entry.leader_session.as_deref() == Some(session) {
+        if entry.leader_session.as_deref() == Some(session)
+            && entry.leader_instance.as_deref() == Some(instance)
+            && !entry.closed
+        {
             team_entry(entry)
         } else {
             Value::Null
