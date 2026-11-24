@@ -1162,7 +1162,7 @@ return function(t)
       ui.watcher:close()
     end)
 
-    t.it("does not inject anything when no template is configured", function()
+    t.it("derives one built-in template when no template is configured", function()
       local service, dir = start_service(t, "no-templates")
       setup(t, "no-templates", service, dir, {
         teams = { spawn_from_chat = true, templates = {} },
@@ -1170,16 +1170,209 @@ return function(t)
       -- Deep-merging overrides keeps the default template; clear it so the
       -- "no templates" shape is the one under test.
       state().config.teams.templates = {}
+      local notices = capture(t)
       controller.connect()
       wait_ready()
-      local n = 0
-      for _, call in ipairs(service.calls) do
-        if type(call.method) == "string" and call.method:sub(1, 5) == "team." then
-          n = n + 1
-        end
+      wait(function()
+        return #calls_of(service, "team.bind_leader") == 1
+      end, 5000, "the leader bound with the default template")
+      local configured = calls_of(service, "team.configure")[1].params.config
+      local builtin = configured.templates.worker
+      t.truthy(builtin, "the built-in worker template is configured")
+      t.eq("opencode", builtin.key.agent, "it runs the leader's own agent")
+      t.eq({ root .. "tests/mock_agent.py" }, builtin.key.args, "with the leader's own resolved launch")
+      t.eq(true, builtin.worktree, "workers never share the leader's directory")
+      t.truthy(type(builtin.role) == "string" and #builtin.role > 0)
+      local count = 0
+      for _ in pairs(configured.templates) do
+        count = count + 1
       end
-      t.eq(0, n, "no template means no team requests")
-      t.eq(0, #sent_frames(service, "session/new")[1].params.mcpServers)
+      t.eq(1, count, "exactly one derived template")
+      -- The safety boundary is unchanged by the derived template: nobody is
+      -- auto-approved and the worker limit is the configured one.
+      t.eq({}, configured.spawn_confirm.auto, "spawns still wait for approval")
+      t.eq(3, configured.max_workers, "the derived template does not raise the limit")
+      for _, note in ipairs(notices) do
+        t.falsy(note.message:find("team template skipped", 1, true), "the default configuration is not an error")
+      end
+      t.eq(1, #sent_frames(service, "session/new")[1].params.mcpServers)
+      -- Zero config still starts nobody: binding the leader is the whole
+      -- interaction until the person or the leader asks for a worker.
+      t.eq(0, #calls_of(service, "team.spawn"), "no worker starts on its own")
+      t.eq(0, #calls_of(service, "team.start"), "the default workflow is opt-in (teams.enabled)")
+    end)
+
+    t.it("starts the built-in default workflow when teams.enabled is set", function()
+      local service, dir = start_service(t, "enabled-default")
+      setup(t, "enabled-default", service, dir, {
+        teams = { spawn_from_chat = true, enabled = true, templates = {} },
+      })
+      state().config.teams.templates = {}
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #service.team_starts == 1
+      end, 5000, "the built-in default workflow")
+      t.eq("default", service.team_starts[1].workflow, "the built-in default flow, not a named one")
+      local configured = calls_of(service, "team.configure")[1].params.config
+      t.eq(nil, configured.default_workflow, "no workflow name is invented by the front end")
+      t.truthy(configured.templates.worker, "the leader can spawn the derived template")
+    end)
+
+    t.it("lets explicit templates replace the derived one", function()
+      local service, dir = start_service(t, "explicit-wins")
+      setup(t, "explicit-wins", service, dir, {
+        agents = {
+          opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } },
+          pi = { command = "pi-acp" },
+        },
+      })
+      -- Deep-merging overrides keeps the helper's template; replace the set so
+      -- only an explicit one is under test.
+      state().config.teams.templates = { reviewer = { agent = "pi", role = "You review." } }
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #calls_of(service, "team.configure") == 1
+      end, 5000, "the explicit configuration")
+      local configured = calls_of(service, "team.configure")[1].params.config
+      t.truthy(configured.templates.reviewer, "the configured template is sent")
+      t.eq("pi", configured.templates.reviewer.key.agent)
+      t.eq(nil, configured.templates.worker, "no derived template next to explicit ones")
+    end)
+
+    t.it("re-sends the derived template after a reconnect without warning", function()
+      local service, dir = start_service(t, "reconnect-default")
+      setup(t, "reconnect-default", service, dir, {
+        teams = { spawn_from_chat = true, templates = {} },
+      })
+      state().config.teams.templates = {}
+      local notices = capture(t)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #calls_of(service, "team.configure") == 1
+      end, 5000, "the first configuration")
+      -- A service restart or a lead change re-runs hello: the same derived
+      -- template must be sent again, and the default must not warn.
+      team():on_hello()
+      wait(function()
+        return #calls_of(service, "team.configure") == 2
+      end, 5000, "the configuration after hello")
+      local first = calls_of(service, "team.configure")[1].params.config
+      local second = calls_of(service, "team.configure")[2].params.config
+      t.eq(first.templates.worker.key, second.templates.worker.key)
+      for _, note in ipairs(notices) do
+        t.falsy(note.message:find("team template skipped", 1, true), "a reconnect is not a template error")
+      end
+    end)
+
+    t.it("keeps the built-in template in step with the leader agent", function()
+      local dir = tmpdir("leader-switch")
+      local cfg = Config.validate(vim.tbl_deep_extend("force", Config.defaults, {
+        agent = "opencode",
+        agents = {
+          opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } },
+          pi = { command = "pi-acp" },
+        },
+        teams = { spawn_from_chat = true, templates = {} },
+      }))
+      local team = require("ade.app.team").new({
+        config = function()
+          return cfg
+        end,
+        connection = function()
+          return nil
+        end,
+        resolve_cwd = function()
+          return dir
+        end,
+        notify = function() end,
+        on_changed = function() end,
+      })
+      local first = team:service_config(dir)
+      t.eq("opencode", first.templates.worker.key.agent)
+      t.eq("direct", first.templates.worker.tool_style)
+      -- Switching the leader agent (pick_agent rebuilds the controller) changes
+      -- the resolved config, so the next reconcile re-sends a template that
+      -- starts the new leader's own command — never the old agent.
+      cfg.agent = "pi"
+      local second = team:service_config(dir)
+      t.eq("pi", second.templates.worker.key.agent)
+      t.eq("pi-acp", second.templates.worker.key.command)
+      t.eq("mcp_proxy", second.templates.worker.tool_style, "the derived template follows the pi profile")
+      t.falsy(vim.deep_equal(first, second), "a leader switch is a configuration change")
+    end)
+
+    t.it("reports a broken leader launch instead of waiting for a leader", function()
+      local dir = tmpdir("broken-leader")
+      local cfg = Config.validate(vim.tbl_deep_extend("force", Config.defaults, {
+        agent = "broken",
+        agents = {
+          opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } },
+          broken = { command = "broken", source = "managed" },
+        },
+        teams = { spawn_from_chat = true, templates = {} },
+      }))
+      local team = require("ade.app.team").new({
+        config = function()
+          return cfg
+        end,
+        connection = function()
+          return nil
+        end,
+        resolve_cwd = function()
+          return dir
+        end,
+        notify = function() end,
+        on_changed = function() end,
+      })
+      t.eq(false, team:has_usable_templates(dir), "a leader that cannot launch leaves no template")
+      t.match("broken", tostring(team:template_error(dir)), "the reason names the agent")
+      -- The name is still offered (a picker must not silently hide the only
+      -- template); starting it is where the launch error surfaces.
+      t.eq({ "worker" }, team:template_names())
+
+      -- The start flow is an explicit request: it says what is wrong instead of
+      -- waiting for a leader session that can never create a team.
+      local notices = {}
+      local TeamStart = require("ade.app.team_start")
+      -- The connection is up (`available`), but the only, derived template
+      -- cannot resolve: exactly the zero-config failure shape.
+      local bridged = {
+        available = function()
+          return true
+        end,
+        has_usable_templates = function(_, cwd)
+          return team:has_usable_templates(cwd)
+        end,
+        template_error = function(_, cwd)
+          return team:template_error(cwd)
+        end,
+      }
+      local flow = TeamStart.new({
+        state = function()
+          return { view = { team = bridged } }
+        end,
+        config = function()
+          return cfg
+        end,
+        notify = function(message)
+          notices[#notices + 1] = tostring(message)
+        end,
+        resolve_cwd = function()
+          return dir
+        end,
+        open = function() end,
+        new_session = function() end,
+        connect = function() end,
+        report_error = function(value)
+          return type(value) == "table" and (value.message or value.code) or tostring(value)
+        end,
+      })
+      flow:start("default")
+      t.match("broken", table.concat(notices, "\n"), "the message names the agent that cannot start")
+      t.eq(false, TeamStart.active(dir), "the flow did not start")
     end)
 
     t.it("treats an all-unresolvable template set as unavailable", function()

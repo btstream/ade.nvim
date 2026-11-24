@@ -98,7 +98,34 @@ function Team:_raw()
   return raw
 end
 
+---The name of the worker template teams use when `teams.templates` is empty.
+---
+---It is not a configuration key: the front end derives the entry itself from
+---the leader's own launch, so nothing a person writes (or a tool argument
+---names) can point a worker at another command.
+M.BUILTIN_TEMPLATE = "worker"
+
+---Whether any template can be offered: explicit ones, or the built-in default.
+---@param cfg table
+---@param teams table
+---@return boolean
+local function templates_possible(cfg, teams)
+  if next(teams.templates or {}) ~= nil then
+    return true
+  end
+  -- Without `teams.templates` the built-in worker template is derived from the
+  -- current leader agent (see `builtin_template`), so teams stay available.
+  -- Whether it actually resolves is decided by `has_usable_templates`.
+  local agent = cfg.agent
+  return type(agent) == "string" and type(cfg.agents) == "table" and type(cfg.agents[agent]) == "table"
+end
+
 ---Whether this editor should use service teams at all.
+---
+---This is the cheap configuration/connection gate; it does not resolve an
+---agent, and the built-in default template only needs `cfg.agent` to be a
+---configured agent. A launch that cannot be resolved still suppresses the
+---leader injection through `has_usable_templates`.
 ---@return boolean
 function Team:available()
   local cfg = self.config() or {}
@@ -106,9 +133,7 @@ function Team:available()
   if cfg.backend == "direct" or teams.spawn_from_chat == false then
     return false
   end
-  -- A team needs at least one template; without one nothing is injected and
-  -- the single-agent experience is untouched.
-  if next(teams.templates or {}) == nil then
+  if not templates_possible(cfg, teams) then
     return false
   end
   local raw = self:_raw()
@@ -226,6 +251,50 @@ function Team:is_stale(team_id)
   return type(team) == "table" and team.stale == true
 end
 
+---The role card text of the built-in worker template.
+---
+---It describes the worker's job, never a command: the command is whatever
+---started the leader, resolved by the same code that starts the leader.
+M.BUILTIN_ROLE = table.concat({
+  "你是团队的 worker，在自己的独立 git worktree 里工作。",
+  "只做 leader 交给你的任务，不要启动其他 agent、不要改主工作区的文件。",
+  '完成后用 bus_send(kind="report") 汇报改了什么、测试结果和遗留问题；卡住时同样汇报。',
+  "更新你负责的看板卡片的正文和字段，但不要改看板结构。",
+}, "\n")
+
+---The worker template used when `teams.templates` is empty.
+---
+---The entry is derived from the leader's own resolved launch: a template only
+---names an entry, and the service may only start what the person could have
+---started from Neovim. It is never read from configuration, so no template
+---name, tool argument or stored workflow can supply a different command.
+---`worktree = true` keeps workers from writing into the leader's tree: when
+---the cwd is not a git work tree the spawn fails and says so, rather than
+---silently sharing the directory.
+---@param cfg table
+---@param store table|nil
+---@return table|nil template `teams.templates` shape: `agent`, `role`, `worktree`
+---@return table|nil launch the resolved launch this template runs
+---@return string|nil err
+function M.builtin_template(cfg, store)
+  local agent_id = cfg.agent
+  if type(agent_id) ~= "string" or agent_id == "" then
+    return nil, nil, "no agent is configured for the current session"
+  end
+  if type(cfg.agents) ~= "table" or type(cfg.agents[agent_id]) ~= "table" then
+    return nil, nil, "agent " .. tostring(agent_id) .. " is not configured"
+  end
+  local launch, err = Resolve.resolve(cfg, agent_id, cfg.launch_origin, store)
+  if not launch then
+    return nil, nil, string.format("the built-in worker template cannot start agent %s: %s", agent_id, tostring(err))
+  end
+  return {
+    agent = agent_id,
+    role = M.BUILTIN_ROLE,
+    worktree = true,
+  }, launch
+end
+
 ---The absolute directory the service creates worker worktrees under (18.12).
 ---@return string
 function M.worktree_root()
@@ -237,7 +306,45 @@ function M.worktree_root()
   return path
 end
 
+---Turn one resolved template into the wire entry of `team.configure` (19.1).
+---@param cfg table
+---@param agent_id string
+---@param launch table result of `Resolve.resolve`
+---@param template table `{model?, models?, role?, worktree?}`
+---@return table
+local function wire_template(cfg, agent_id, launch, template)
+  local agents = require("ade.agents")
+  local models = template.models
+  if type(models) == "table" and #models == 0 then
+    models = nil
+  end
+  local profile = agents.get(cfg.agents and cfg.agents[agent_id] or nil, agent_id)
+  local entry = {
+    key = { agent = agent_id, command = launch.command, args = launch.args or {} },
+    env = transport.child_env(launch.env or (cfg.agents[agent_id] or {}).env),
+    model = template.model,
+    role = template.role or "",
+    models = models,
+    -- pi reaches MCP tools through its own `mcp` proxy (19.6).
+    tool_style = profile and profile.name == "pi" and "mcp_proxy" or "direct",
+    worktree = template.worktree == true,
+  }
+  if launch.source == "managed" and launch.install_id then
+    entry.launch = {
+      root = Resolve.manager_root(cfg),
+      agent = agent_id,
+      installId = launch.install_id,
+    }
+  end
+  return entry
+end
+
 ---Resolve the configuration the service expects (18.2, 19.1).
+---
+---With no `teams.templates`, exactly one built-in template named
+---`M.BUILTIN_TEMPLATE` is derived from the current leader agent. It is added
+---here and nowhere else, so the same resolved command starts the leader and
+---its workers.
 ---@param cwd string
 ---@return table|nil config
 ---@return table|nil skipped
@@ -245,40 +352,37 @@ function Team:service_config(cwd)
   local cfg = self.config() or {}
   local teams = type(cfg.teams) == "table" and cfg.teams or {}
   local store = self.store and self.store() or nil
-  local agents = require("ade.agents")
-  local templates, skipped = {}, {}
+  local templates = {}
+  -- Problems that keep a template from starting, in the order they were found.
+  -- `builtin` marks the derived default template, so its message can explain
+  -- what the person can do instead of naming a template they never wrote.
+  local skipped = {}
   for name, template in pairs(teams.templates or {}) do
     local launch, err = Resolve.resolve(cfg, template.agent, cfg.launch_origin, store)
     if not launch then
-      skipped[#skipped + 1] = string.format("%s: %s", name, tostring(err))
+      skipped[#skipped + 1] = { name = name, text = string.format("%s: %s", name, tostring(err)) }
     else
-      local key = { agent = template.agent, command = launch.command, args = launch.args or {} }
-      local models = template.models
-      if type(models) == "table" and #models == 0 then
-        models = nil
-      end
-      local profile = agents.get(cfg.agents and cfg.agents[template.agent] or nil, template.agent)
-      local entry = {
-        key = key,
-        env = transport.child_env(launch.env or (cfg.agents[template.agent] or {}).env),
-        model = template.model,
-        role = template.role or "",
-        models = models,
-        -- pi reaches MCP tools through its own `mcp` proxy (19.6).
-        tool_style = profile and profile.name == "pi" and "mcp_proxy" or "direct",
-        worktree = template.worktree == true,
+      templates[name] = wire_template(cfg, template.agent, launch, template)
+    end
+  end
+  if next(teams.templates or {}) == nil then
+    -- Zero-config teams: one template, fixed name, derived from the leader's own
+    -- launch. A failure here is a real problem (the person cannot run the
+    -- configured agent at all), so it is reported like a broken explicit
+    -- template instead of being hidden.
+    local template, launch, err = M.builtin_template(cfg, store)
+    if not template then
+      skipped[#skipped + 1] = {
+        name = M.BUILTIN_TEMPLATE,
+        builtin = true,
+        text = tostring(err),
       }
-      if launch.source == "managed" and launch.install_id then
-        entry.launch = {
-          root = Resolve.manager_root(cfg),
-          agent = template.agent,
-          installId = launch.install_id,
-        }
-      end
-      templates[name] = entry
+    else
+      templates[M.BUILTIN_TEMPLATE] = wire_template(cfg, template.agent, launch, template)
     end
   end
   local confirm = type(teams.spawn_confirm) == "table" and teams.spawn_confirm or {}
+
   local limits = type(teams.limits) == "table" and teams.limits or {}
   local workflows = {}
   for name, workflow in pairs(teams.workflows or {}) do
@@ -324,6 +428,54 @@ function Team:has_usable_templates(cwd)
   return config ~= nil and next(config.templates or {}) ~= nil
 end
 
+---Names of the templates this editor can start, for pickers and completion.
+---
+---With no `teams.templates` this is the single built-in name, so a UI can offer
+---it without knowing the fallback rule. It never resolves an agent: a template
+---whose agent is broken still appears here and fails with its own error when
+---started.
+---@return string[]
+function Team:template_names()
+  local cfg = self.config() or {}
+  local teams = type(cfg.teams) == "table" and cfg.teams or {}
+  local names, seen = {}, {}
+  for name in pairs(teams.templates or {}) do
+    if type(name) == "string" and not seen[name] then
+      seen[name] = true
+      names[#names + 1] = name
+    end
+  end
+  if #names == 0 and templates_possible(cfg, teams) then
+    names[1] = M.BUILTIN_TEMPLATE
+  end
+  table.sort(names)
+  return names
+end
+
+---Why no template can be started, for a request that must explain a failure.
+---
+---The same strings `configure` warns about, joined; nil when at least one
+---template resolved.
+---@param cwd string
+---@return string|nil
+function Team:template_error(cwd)
+  local config, skipped = self:service_config(cwd)
+  if config == nil then
+    return nil
+  end
+  if next(config.templates or {}) ~= nil then
+    return nil
+  end
+  if type(skipped) == "table" and #skipped > 0 then
+    local parts = {}
+    for _, problem in ipairs(skipped) do
+      parts[#parts + 1] = tostring(problem.text or problem)
+    end
+    return table.concat(parts, "; ")
+  end
+  return "no template is configured"
+end
+
 local function pending_key(instance, cwd)
   return tostring(instance) .. "\0" .. tostring(cwd)
 end
@@ -347,11 +499,18 @@ function Team:configure(cwd, force, cb)
   end
   local warned = self.warned_skipped[cwd] or {}
   for _, problem in ipairs(skipped or {}) do
-    -- The same name+error is announced once per configuration, not on every
-    -- hello/reconcile pass.
-    if not warned[problem] then
-      warned[problem] = true
-      self.notify("team template skipped: " .. problem, vim.log.levels.WARN)
+    -- A zero-config editor has no template the person wrote: an unresolvable
+    -- leader launch is already visible from the session failing, so the derived
+    -- template stays quiet here. An explicit `:Ade team start` still reports it
+    -- (`template_error`), because there the person asked for a team.
+    if not problem.builtin then
+      -- The same name+error is announced once per configuration, not on every
+      -- hello/reconcile pass.
+      local key = tostring(problem.text)
+      if not warned[key] then
+        warned[key] = true
+        self.notify("team template skipped: " .. key, vim.log.levels.WARN)
+      end
     end
   end
   self.warned_skipped[cwd] = warned

@@ -97,6 +97,41 @@ function Flow:available()
   return team ~= nil and team:available()
 end
 
+---Whether teams exist but the built-in template cannot start right now.
+---
+---Only a zero-config editor is reported here: with explicit templates the
+---service answers per template when a start needs one (`unknown template x`),
+---and a workflow with no members does not need any. Without `teams.templates`
+---the worker template is derived from the leader's own launch, so a broken
+---launch would otherwise surface only as a timeout waiting for the leader;
+---`:Ade team start` is an explicit request and says what is wrong instead.
+---@param cwd string
+---@return string|nil problem
+function Flow:template_problem(cwd)
+  local cfg = self:config()
+  local teams = type(cfg.teams) == "table" and cfg.teams or {}
+  if next(teams.templates or {}) ~= nil then
+    return nil
+  end
+  local team = self:team()
+  if not team or type(team.has_usable_templates) ~= "function" then
+    return nil
+  end
+  local ok, usable = pcall(team.has_usable_templates, team, cwd)
+  if not ok or usable then
+    return nil
+  end
+  local detail
+  if type(team.template_error) == "function" then
+    local got, message = pcall(team.template_error, team, cwd)
+    if got and type(message) == "string" and message ~= "" then
+      detail = message
+    end
+  end
+  return "cannot start a team: the built-in worker template cannot be started"
+    .. (detail and (": " .. detail) or " (fix the leader agent's launch or configure teams.templates)")
+end
+
 ---The team the service owns for this cwd, in any state but closed.
 ---@param cwd string
 ---@return table|nil
@@ -208,6 +243,14 @@ function Flow:start(name)
   -- extra start while that Team is not available yet must not kill it.
   if not self:available() then
     self:notify("teams are not available: connect to the service and configure a template", vim.log.levels.WARN)
+    return
+  end
+  local problem = self:template_problem(cwd)
+  if problem then
+    -- An explicit request must name the concrete failure instead of waiting for
+    -- a leader that will never create a team. An already running flow is left
+    -- alone: this request never took over, so it cannot end the other one.
+    self:notify(problem, vim.log.levels.WARN)
     return
   end
   local previous = running[cwd]
