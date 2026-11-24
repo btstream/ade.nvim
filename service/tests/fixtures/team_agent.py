@@ -7,6 +7,15 @@ the `mcpServers` entry from `session/new`, and can call the real
 choose the behavior; every prompt, request and MCP result is appended to
 TEAM_AGENT_LOG as one JSON line.
 
+With `ADE_FIXTURE_PERSISTENT_MCP=1` the agent behaves like a real agent about
+the injected `ade-team` server: after `session/new`, `session/load` or
+`session/resume` it starts one long-lived `nvim_ade_server mcp` process for
+that session (from the injected entry) and keeps its stdin open until the
+session is loaded again, the agent exits, or the process dies. Real agents do
+that; one-shot tool calls per prompt would make the service see the server
+disconnect after every handshake. Off by default so existing tests keep the
+old behavior.
+
 Leader prompts (sent by the front end in the tests) may start with:
 
   spawn            call team_spawn (TEAM_AGENT_TEMPLATE, TEAM_AGENT_NAME)
@@ -22,8 +31,10 @@ Worker task bodies may contain:
   [cancel]         wait for session/cancel, then end cancelled
 """
 
+import atexit
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -34,6 +45,8 @@ PID = os.getpid()
 GATE = os.environ.get("TEAM_AGENT_GATE")
 TEMPLATE = os.environ.get("TEAM_AGENT_TEMPLATE", "dev")
 NAME = os.environ.get("TEAM_AGENT_NAME")
+# A real agent keeps the injected MCP server alive for the whole session.
+PERSISTENT_MCP = os.environ.get("ADE_FIXTURE_PERSISTENT_MCP") == "1"
 # session id -> Event, set by `session/cancel` for that session only. A front
 # end prompt after a cancelled bus prompt starts with a fresh event.
 CANCEL = {}
@@ -43,6 +56,9 @@ LOCK = threading.Lock()
 SESSIONS = {}
 MCP = {}
 COUNT = [0]
+# session id -> running `nvim_ade_server mcp` child (see PERSISTENT_MCP).
+PERSISTENT = {}
+PERSISTENT_LOCK = threading.Lock()
 
 
 def log(event):
@@ -100,16 +116,192 @@ def wait_gate_ignore_cancel(timeout=20):
         time.sleep(0.02)
 
 
+class Persistent:
+    """One long-lived `nvim_ade_server mcp` child for a session.
+
+    A real agent starts the injected server once and keeps it for the whole
+    session; the service counts `injected` from that live connection (20.5).
+    The child exits by itself when its stdin closes (the agent exits, or the
+    session is loaded again and the old process is replaced).
+    """
+
+    def __init__(self, process, session):
+        self.process = process
+        self.session = session
+        self.write_lock = threading.Lock()
+        self.waiters = {}
+        self.waiters_lock = threading.Lock()
+        self.next_id = [10]
+        self.closed = False
+        threading.Thread(target=self._read, args=(session,), daemon=True).start()
+
+    def _read(self, session):
+        try:
+            for line in self.process.stdout:
+                try:
+                    value = json.loads(line)
+                except ValueError:
+                    continue
+                if value.get("method") is not None:
+                    continue
+                ident = value.get("id")
+                with self.waiters_lock:
+                    slot = self.waiters.pop(ident, None)
+                if slot is not None:
+                    slot["response"] = value
+                    slot["event"].set()
+        except Exception:  # noqa: BLE001 - a dying child is the normal end
+            pass
+        finally:
+            self.closed = True
+            log({"event": "mcp-exit", "session": session})
+            with self.waiters_lock:
+                pending = list(self.waiters.values())
+                self.waiters.clear()
+            for slot in pending:
+                slot["event"].set()
+
+    def request(self, method, params, timeout=20):
+        with self.waiters_lock:
+            if self.closed:
+                return None
+            self.next_id[0] += 1
+            ident = self.next_id[0]
+            slot = {"event": threading.Event(), "response": None}
+            self.waiters[ident] = slot
+        frame = {"jsonrpc": "2.0", "id": ident, "method": method, "params": params}
+        try:
+            with self.write_lock:
+                self.process.stdin.write(json.dumps(frame) + "\n")
+                self.process.stdin.flush()
+        except (BrokenPipeError, ValueError, OSError):
+            return None
+        slot["event"].wait(timeout)
+        return slot["response"]
+
+    def notify(self, method, params=None):
+        frame = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            frame["params"] = params
+        try:
+            with self.write_lock:
+                self.process.stdin.write(json.dumps(frame) + "\n")
+                self.process.stdin.flush()
+        except (BrokenPipeError, ValueError, OSError):
+            pass
+
+    def stop(self, patience=2.0):
+        """Close stdin so the server exits on EOF, then reap it."""
+        try:
+            self.process.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            self.process.wait(timeout=patience)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            try:
+                self.process.wait(timeout=patience)
+            except subprocess.TimeoutExpired:
+                pass
+
+
+def mcp_command(entry):
+    env = dict(os.environ)
+    for item in entry.get("env") or []:
+        if isinstance(item, dict) and "name" in item:
+            env[item["name"]] = item.get("value", "")
+    return [entry["command"], *(entry.get("args") or [])], env
+
+
+def persistent_for(session):
+    with PERSISTENT_LOCK:
+        return PERSISTENT.get(session)
+
+
+def start_persistent(session):
+    """Start (or replace) the session's long-lived MCP child and log its tools."""
+    stop_persistent(session)
+    entry = MCP.get(session)
+    if not entry:
+        return None
+    command, env = mcp_command(entry)
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=env,
+        )
+    except OSError as problem:
+        log({"event": "mcp-error", "session": session, "message": repr(problem)})
+        return None
+    child = Persistent(process, session)
+    with PERSISTENT_LOCK:
+        PERSISTENT[session] = child
+    init = child.request(
+        "initialize",
+        {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "team-test"},
+        },
+    )
+    child.notify("notifications/initialized")
+    listed = child.request("tools/list", {})
+    names = [
+        tool.get("name")
+        for tool in (listed or {}).get("result", {}).get("tools") or []
+    ]
+    log({
+        "event": "tools",
+        "session": session,
+        "names": names,
+        "instructions": (init or {}).get("result", {}).get("instructions"),
+        "persistent": True,
+    })
+    log({"event": "mcp-persistent", "session": session, "pid": process.pid})
+    return child
+
+
+def stop_persistent(session):
+    with PERSISTENT_LOCK:
+        child = PERSISTENT.pop(session, None)
+    if child is not None:
+        child.stop()
+    return child is not None
+
+
+def stop_all_persistent():
+    with PERSISTENT_LOCK:
+        children = list(PERSISTENT.values())
+        PERSISTENT.clear()
+    for child in children:
+        child.stop()
+
+
+atexit.register(stop_all_persistent)
+
+
 def mcp_call(session, tool, arguments):
     entry = MCP.get(session)
     if not entry:
         log({"event": "mcp-missing", "session": session})
         return {"isError": True, "content": [{"type": "text", "text": "no mcp server"}]}
-    env = dict(os.environ)
-    for item in entry.get("env") or []:
-        if isinstance(item, dict) and "name" in item:
-            env[item["name"]] = item.get("value", "")
-    command = [entry["command"], *(entry.get("args") or [])]
+    if PERSISTENT_MCP:
+        child = persistent_for(session) or start_persistent(session)
+        if child is not None:
+            value = child.request(
+                "tools/call",
+                {"name": tool, "arguments": arguments},
+            )
+            log({"event": "mcp", "tool": tool, "arguments": arguments, "response": value})
+            if value is None:
+                return {"isError": True, "content": [{"type": "text", "text": "no mcp response"}]}
+            return value.get("result") or {"isError": True, "content": value.get("error")}
+    command, env = mcp_command(entry)
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
@@ -156,12 +348,12 @@ def mcp_list(session):
     entry = MCP.get(session)
     if not entry:
         return []
-    env = dict(os.environ)
-    for item in entry.get("env") or []:
-        if isinstance(item, dict) and "name" in item:
-            env[item["name"]] = item.get("value", "")
+    if PERSISTENT_MCP:
+        # The long-lived child listed its tools when it started.
+        return []
+    command, env = mcp_command(entry)
     process = subprocess.Popen(
-        [entry["command"], *(entry.get("args") or [])],
+        command,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -502,6 +694,24 @@ def run_prompt(ident, text, session):
 
 def main():
     log({"event": "start", "gate": bool(GATE), "log": bool(LOG), "template": TEMPLATE})
+
+    def shutdown(_signum, _frame):
+        # Like a real agent, take the session's MCP process down with us.
+        stop_all_persistent()
+        os._exit(0)
+
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(signum, shutdown)
+        except (ValueError, OSError):
+            pass
+    try:
+        serve()
+    finally:
+        stop_all_persistent()
+
+
+def serve():
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -606,6 +816,11 @@ def main():
                     ],
                 },
             )
+            if PERSISTENT_MCP and MCP.get(session):
+                # A real agent starts the injected server after the session
+                # exists and keeps it: the service counts `injected` from that
+                # process (20.5). A re-load/resume replaces the previous one.
+                start_persistent(session)
         elif method == "session/prompt":
             session = params.get("sessionId", "")
             CANCEL[session] = threading.Event()

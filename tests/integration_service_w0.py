@@ -45,6 +45,9 @@ class W0Editor(base.Editor):
             "TEAM_AGENT_LOG": str(self.case.agent_log),
             "TEAM_AGENT_GATE": str(self.case.gate),
             "TEAM_AGENT_TEMPLATE": "coder",
+            # A real agent keeps the injected `ade-team` MCP process for the
+            # whole session (20.5).
+            "ADE_FIXTURE_PERSISTENT_MCP": "1",
         }
         agent_env.update(self.agent_env)
         teams = {
