@@ -673,20 +673,28 @@ class Editor:
             local st = require("ade.controller").state()
             local ui = st.view.team_ui
             if not ui or not ui:is_open() then return false end
+            -- Every pane keeps its own keymaps: take them from the pane buffer
+            -- under the cursor (or the requested pane), never a shared one.
             local win = vim.api.nvim_get_current_win()
-            local is_panel = false
-            local impl = ui._impl
-            if impl and impl.tab and impl.tab.panels then
-              for _, panel in pairs(impl.tab.panels) do
-                if panel == win then is_panel = true end
+            local layout = ui.layout
+            local function pane_of(candidate)
+              for _, name in ipairs({ "tree", "members", "board" }) do
+                if layout:win(name) == candidate then return name end
               end
-            elseif impl and impl.win == win then
-              is_panel = true
+              return nil
             end
-            if not is_panel and ui.win and vim.api.nvim_win_is_valid(ui.win) then
-              vim.api.nvim_set_current_win(ui.win)
+            local pane = pane_of(win)
+            if not pane then
+              pane = layout:name_of() or "members"
+              local target = layout:win(pane)
+              if target then
+                vim.api.nvim_set_current_win(target)
+                win = target
+              end
             end
-            for _, map in ipairs(vim.api.nvim_buf_get_keymap(ui.buf, "n")) do
+            local buf = layout:buf(pane)
+            if not buf then return false end
+            for _, map in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
               if map.lhs == lhs and type(map.callback) == "function" then
                 map.callback()
                 return true

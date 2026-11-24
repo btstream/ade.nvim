@@ -576,7 +576,7 @@ return function(t)
       t.eq(0, #service.team_starts, "an existing leader keeps its own team")
     end)
 
-    t.it("a tree query stays a pure read and never starts a team", function()
+    t.it("a tree read of the current row never starts, even racing session_opened", function()
       local service, dir = start_service(t, "tree-pure")
       setup(t, dir, { teams = auto_teams })
       controller.connect()
@@ -584,35 +584,59 @@ return function(t)
       wait(function()
         return #calls_of(service, "session.teams") >= 1
       end, 5000, "the session's switch")
-      -- The opt-in session's own switch event legitimately auto-starts once;
-      -- let that settle so the baseline below covers only the tree's read.
+      -- Baseline: the current session's own switch event legitimately starts the
+      -- workflow once. Everything below must not add a second start.
       wait(function()
         return #service.team_starts >= 1
       end, 15000, "the session's own auto-start")
       vim.wait(200)
       local starts = #service.team_starts
-      -- Browsing the tree of another instance's session reads its switch and
-      -- must not create a team or start a workflow.
-      local before = #calls_of(service, "team.start")
+      local model = state().view.team
+      local instance = own_instance()
+      local id = state().sess.current.id
+
+      -- The earlier start created a team for this cwd; drop it (and the grant it
+      -- recorded) so the cwd is a fresh "no team yet" project again and only the
+      -- calls below can decide anything.
+      service.teams = {}
+      model:refresh()
+      wait(function()
+        return team():team_for_cwd(dir) == nil
+      end, 5000, "the cleared team")
+      model.auto_eligible[instance .. "\0" .. id] = nil
+      model.session_states[instance .. "\0" .. id] = nil
+      model.auto_started[instance .. "\0" .. id] = nil
+
+      -- A tree read of the *current* row, tagged `source = "tree"`, answers
+      -- `injected: true` and must still not start anything.
       local seen
-      state().view.team:query_session_teams("inst-other", "s-other", dir, function(ok, value)
-        seen = { ok = ok, value = value }
-      end)
+      model:query_session_teams(instance, id, dir, function(ok)
+        seen = ok
+      end, { source = "tree" })
       wait(function()
         return seen ~= nil
-      end, 5000, "the foreign query")
-      t.eq(true, seen.ok)
+      end, 5000, "the tree read of the current row")
       vim.wait(300)
-      t.eq(starts, #service.team_starts, "a read never starts another workflow")
-      t.eq(before, #calls_of(service, "team.start"))
-      for _, start in ipairs(service.team_starts) do
-        t.truthy(start.sessionId ~= "s-other", "the read session is never the start target")
-      end
-      -- A `session.teams_changed` for a session that is not on screen is also a
-      -- read: it must not auto-start anything.
-      service:emit_session_teams("inst-other", "s-other")
-      vim.wait(300)
-      t.eq(starts, #service.team_starts)
+      t.eq(starts, #service.team_starts, "a pure read of the current row never starts")
+
+      -- Now the interleaving the review calls out: a tree read is in flight when
+      -- the real session event (`session_opened`) joins it. The merged request
+      -- must remember that non-tree source and evaluate auto-start on the
+      -- re-sent query.
+      model.session_states[instance .. "\0" .. id] = nil
+      local first
+      model:query_session_teams(instance, id, dir, function(ok)
+        first = ok
+      end, { source = "tree" })
+      model:session_opened(instance, id, dir)
+      wait(function()
+        return first ~= nil
+      end, 5000, "the merged query")
+      wait(function()
+        return #service.team_starts > starts
+      end, 5000, "the session event that joined the tree read to start the workflow")
+      t.eq(starts + 1, #service.team_starts, "the merged session event starts once")
+      t.eq(id, service.team_starts[starts + 1].sessionId)
     end)
   end)
 end

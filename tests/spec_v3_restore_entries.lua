@@ -347,6 +347,107 @@ return function(t)
       t.eq(current, state().sess.current, "starting elsewhere does not switch the chat")
     end)
 
+    t.it("the public API reloads a background target without switching the chat", function()
+      local service, dir = start_service(t, "api-start-reload", {
+        canned_agent = true,
+        canned_capabilities = { loadSession = true, sessionCapabilities = { close = {}, resume = {} } },
+      })
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      local current = state().sess.current
+      local inst = own_instance()
+      local other = add_session("s-other", dir, inst)
+      other.needs_load = false
+      other.status = "idle"
+      service.session_switches[tostring(inst) .. "\0s-other"] = { enabled = true, injected = false }
+      state().view.team.session_states[tostring(inst) .. "\0s-other"] = nil
+      local original_select, original_input = vim.ui.select, vim.ui.input
+      t.cleanup(function()
+        vim.ui.select, vim.ui.input = original_select, original_input
+      end)
+      vim.ui.select = function(items, _, cb)
+        cb(items[1])
+      end
+      local prompted = false
+      vim.ui.input = function(_, cb)
+        prompted = true
+        cb(nil)
+      end
+      local before_load = #sent_frames(service, "session/load")
+      local before_close = #sent_frames(service, "session/close")
+      ade.start_team("default", other)
+      wait(function()
+        return #sent_frames(service, "session/load") > before_load
+      end, 15000, "the public start's background reload")
+      wait(function()
+        return prompted
+      end, 15000, "the task prompt after the reload")
+      vim.wait(200)
+      t.eq(current, state().sess.current, "the public start leaves the chat on screen")
+      t.eq(before_close, #sent_frames(service, "session/close"), "and closes nothing")
+    end)
+
+    -- Review round 4, major: a start in a *background* session may need the
+    -- in-place reload (`session.teams` → `reload: true`). That load must commit
+    -- the target's new projection without taking the screen: the current chat
+    -- stays current and is never closed.
+    t.it("a background reload for the tree's `S` never switches or closes the current chat", function()
+      local service, dir = start_service(t, "tree-start-reload", {
+        canned_agent = true,
+        canned_capabilities = { loadSession = true, sessionCapabilities = { close = {}, resume = {} } },
+      })
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      local current = state().sess.current
+      local inst = own_instance()
+      -- A second chat of the same project whose team tools are not injected.
+      local other = add_session("s-other", dir, inst)
+      other.needs_load = false
+      other.status = "idle"
+      service.session_switches[tostring(inst) .. "\0s-other"] = { enabled = true, injected = false }
+      state().view.team.session_states[tostring(inst) .. "\0s-other"] = nil
+      local UI = open_tree()
+      cursor_on("s-other")
+      local original_select, original_input = vim.ui.select, vim.ui.input
+      t.cleanup(function()
+        vim.ui.select, vim.ui.input = original_select, original_input
+      end)
+      vim.ui.select = function(items, _, cb)
+        cb(items[1])
+      end
+      local prompted = false
+      vim.ui.input = function(_, cb)
+        prompted = true
+        -- Cancelling the task prompt must leave the background reload commit
+        -- as the only change: no switch, no close.
+        cb(nil)
+      end
+      local before_load = #sent_frames(service, "session/load")
+      local before_close = #sent_frames(service, "session/close")
+      UI:handle_key("S")
+      wait(function()
+        return #sent_frames(service, "session/load") > before_load
+      end, 15000, "the background reload's session/load")
+      local load = sent_frames(service, "session/load")[#sent_frames(service, "session/load")]
+      t.eq("s-other", load.params.sessionId)
+      wait(function()
+        return prompted
+      end, 15000, "the task prompt after the reload")
+      wait(function()
+        local committed = state().sess.all["s-other"]
+        return committed ~= nil and committed.needs_load == false
+      end, 15000, "the reloaded projection to be committed")
+      vim.wait(200)
+      t.eq(current, state().sess.current, "the background reload leaves the chat on screen")
+      t.eq(
+        before_close,
+        #sent_frames(service, "session/close"),
+        "the current chat is never closed by a background reload"
+      )
+    end)
+
     -- PRODUCTION BUG (review round 2, "树查询重新连接仍不可靠"): the renderer
     -- queries every row that has an instance and no cached switch, without
     -- checking `entry.online` (`lua/ade/ui/team/init.lua:373–395`). Opening the
