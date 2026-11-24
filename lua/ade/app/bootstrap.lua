@@ -440,6 +440,9 @@ function M.build(ctx, opts, action)
     current = ctx.current,
     session_label = ctx.session_label,
     waiting = ctx.waiting_permission,
+    team_target = function()
+      return S.view.team_ui and S.view.team_ui.chat_target and S.view.team_ui:chat_target() or nil
+    end,
     chat = function()
       return S.view.chat
     end,
@@ -999,13 +1002,16 @@ function M.build(ctx, opts, action)
     panel = function()
       return S.view.panel
     end,
-    -- The watch view reuses the leader's existing chat; it never creates a
-    -- second Chat or a second input area.
+    -- Selecting the leader or a worker reuses the ordinary chat/input pair:
+    -- there is no second Chat and no dedicated worker window.
     leader_chat = function()
       return S.view.chat
     end,
     leader_input = function()
       return S.view.input
+    end,
+    current_session = function()
+      return S.sess.current
     end,
     start_team = function(workflow)
       if S.view.team_commands then
@@ -1055,9 +1061,18 @@ function M.build(ctx, opts, action)
   S.view.input = Input.new({
     config = merged,
     on_submit = function(text, attachments)
+      local ui = S.view.team_ui
+      if ui and ui.route_submit and ui:route_submit(text, attachments) then
+        return
+      end
       ctx.submit(text, attachments)
     end,
     on_cancel = function()
+      local ui = S.view.team_ui
+      if ui and ui.is_worker_target and ui:is_worker_target() then
+        ui:cancel_target()
+        return
+      end
       ctx.cancel()
     end,
   })

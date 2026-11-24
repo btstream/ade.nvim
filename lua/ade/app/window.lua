@@ -32,6 +32,11 @@ end
 function M:select_session(session)
   local S = self:state()
   local previous = S.sess.current
+  -- A team worker transcript is only a view of a worker session; switching the
+  -- real session must never leave the composer pointed at a former target.
+  if S.view.team_ui and S.view.team_ui.detach then
+    pcall(S.view.team_ui.detach, S.view.team_ui)
+  end
   S.sess.current = session
   S.sess.runtime:select(session)
   if session and not session.needs_load and S.conn.client and S.conn.client.created ~= nil then

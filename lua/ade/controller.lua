@@ -346,13 +346,15 @@ function M.manage_agents()
   end
 end
 
----Open the team panel. With no team this shows nothing (18.5).
+---Open the team panes. `kind` is "members" (default), "board" or "all".
+---With no team the pane shows its empty state (18.5).
+---@param kind string|nil
 ---@return boolean opened
-function M.open_team()
+function M.open_team(kind)
   if not S.view.team_ui then
     return false
   end
-  return S.view.team_ui:open()
+  return S.view.team_ui:open(kind)
 end
 
 ---Start a named workflow (`:Ade team start`); nil picks one (19.7).

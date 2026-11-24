@@ -114,6 +114,8 @@ function Input:apply_winbar()
   end
   -- Set once: the expression re-renders on every redraw with the real window
   -- width, so resizes and layout managers can never leave a stale bar behind.
+  -- A team worker target swaps the content inside the expression rather than
+  -- the expression itself, so the window keeps one stable winbar.
   if vim.api.nvim_get_option_value("winbar", { win = win }) ~= "%{%v:lua.AdeComposerBar()%}" then
     return pcall(vim.api.nvim_set_option_value, "winbar", "%{%v:lua.AdeComposerBar()%}", { win = win })
   end

@@ -25,10 +25,12 @@ function M.manage_agents()
   ensure().manage_agents()
 end
 
----Open the team panel. With no team this shows nothing.
+---Open the team pane. `kind` is "members" (default), "board" or "all";
+---with no team the pane shows its empty state.
+---@param kind string|nil
 ---@return boolean opened
-function M.open_team()
-  return ensure().open_team()
+function M.open_team(kind)
+  return ensure().open_team(kind)
 end
 
 ---Start a named team workflow (`:Ade team start [workflow]`).

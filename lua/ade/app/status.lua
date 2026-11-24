@@ -75,6 +75,10 @@ end
 ---@param win integer|nil defaults to the current window
 ---@return string
 function M:composer_bar_for(win)
+  local ui = self.deps.state().view.team_ui
+  if ui and ui.is_worker_target and ui:is_worker_target() then
+    return ui:worker_bar(win)
+  end
   local chrome = self:chrome()
   if not chrome then
     return ""

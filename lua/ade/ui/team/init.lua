@@ -1,15 +1,21 @@
--- The unified team dashboard (`:Ade team`, W0f).
+-- The team panes (`:Ade team`, `:Ade team agents`, `:Ade team board`).
 --
--- One controller drives two layouts: a wide tabpage with members and board and
--- the narrow centred float. Card details are popups, not a permanent pane.
-local Float = require("ade.ui.team.layout_float")
-local Tab = require("ade.ui.team.layout_tab")
-local Watch = require("ade.ui.team.watch")
+-- Members and board are two independent panes inside the *current* tabpage:
+-- each command opens or focuses only its own pane, and closing one leaves the
+-- other, the ordinary chat panel and the running team untouched. Wide
+-- terminals get native splits; narrow ones get a float for the pane that was
+-- actually asked for.
+--
+-- Selecting the leader or a worker does not open a dedicated worker window:
+-- the router reuses the single ordinary `ade_chat`/`ade_input` pair.
+local Pane = require("ade.ui.team.layout_pane")
+local Router = require("ade.ui.team.router")
 local Members = require("ade.ui.team.members")
 local Board = require("ade.ui.team.board")
 local Roles = require("ade.ui.team.roles")
 local Detail = require("ade.ui.team.detail")
 local History = require("ade.ui.team.history")
+local Text = require("ade.ui.team.text")
 
 local M = {}
 
@@ -23,8 +29,9 @@ local function one_line(text)
 end
 
 ---@param opts {team: table, config: fun(): table, notify: fun(message: string, level: integer|nil)|nil,
----  leader_chat: (fun(): table|nil)|nil, leader_input: (fun(): table|nil)|nil,
----  start_team: (fun(workflow: string)|nil)|nil, workflows: (fun(): table[]|nil)|nil}
+---  panel: (fun(): table|nil)|nil, leader_chat: (fun(): table|nil)|nil,
+---  leader_input: (fun(): table|nil)|nil, current_session: (fun(): table|nil)|nil,
+---  start_team: (fun(workflow: string)|nil)|nil, select_session: (fun(session: table)|nil)|nil}
 ---@return table
 function M.dashboard(opts)
   local self = setmetatable({
@@ -33,35 +40,40 @@ function M.dashboard(opts)
     notify_fn = opts.notify,
     leader_chat = opts.leader_chat,
     leader_input = opts.leader_input,
+    current_session = opts.current_session,
+    select_session = opts.select_session,
     panel = opts.panel,
     start_team = opts.start_team,
     layout = nil,
-    float = nil,
-    tab = nil,
-    watcher = nil,
     index = 1,
     selected_id = nil,
     help = false,
-    replies = {},
     cwd = nil,
     refresh_timer = nil,
     pending = false,
-    link_ns = vim.api.nvim_create_namespace("ade-team-link"),
+    requested = {},
   }, Dashboard)
-  self.watcher = Watch.new({
+  self.layout = Pane.new(self)
+  self.router = Router.new({
     team = opts.team,
     config = opts.config,
-    notify = function(message)
-      self:notify(message)
+    notify = function(message, level)
+      self:notify(message, level)
     end,
+    panel = opts.panel,
     leader_chat = opts.leader_chat,
-    on_change = function(watch)
-      self.watch_win, self.watch_buf = watch.win, watch.buf
+    leader_input = opts.leader_input,
+    current_session = opts.current_session,
+    on_change = function()
+      self:update_headers()
+      self:sync_aliases()
+      self:refresh()
     end,
   })
+  -- The old name still appears in `:Ade debug` mirrors and third-party hooks.
+  self.watcher = self.router
   return self
 end
-
 function Dashboard:notify(message, level)
   if self.notify_fn then
     self.notify_fn(tostring(message), level)
@@ -82,19 +94,46 @@ function Dashboard:report(ok, value)
   return false
 end
 
-function Dashboard:is_open()
-  if self.tab then
-    return self.tab:is_open()
+---@param kind string|nil "members", "board", "all" or nil (members)
+---@return boolean
+function Dashboard:is_open(kind)
+  if kind == "all" then
+    return self.layout:is_open()
   end
-  return self.float ~= nil and self.float:is_open()
+  if kind then
+    return self.layout:is_open_pane(kind)
+  end
+  return self.layout:is_open()
 end
 
 function Dashboard:has_content()
   return #self.team:list_rows() > 0
 end
 
-function Dashboard:current_team()
+---Rows to paint.
+---
+---`team.list` can transiently come back empty (a lost connection, a racing
+---refresh). Keep the last known rows on screen, marked stale, until a later
+---refresh returns real data or the team is explicitly closed — otherwise the
+---panel would blink through a misleading "no team" state.
+---@return table[]
+function Dashboard:paint_rows()
   local rows = self.team:list_rows()
+  if #rows > 0 then
+    self.snapshot = rows
+    return rows
+  end
+  if self.snapshot then
+    for _, row in ipairs(self.snapshot) do
+      row.stale = true
+    end
+    return self.snapshot
+  end
+  return rows
+end
+
+function Dashboard:current_team()
+  local rows = self:paint_rows()
   if #rows == 0 then
     return nil
   end
@@ -111,6 +150,87 @@ function Dashboard:current_team()
   return rows[self.index]
 end
 
+---The project these panes belong to.
+---@return string|nil
+function Dashboard:project_cwd()
+  local ok, cwd = pcall(function()
+    return self.team.resolve_cwd and self.team.resolve_cwd() or nil
+  end)
+  if ok and type(cwd) == "string" and cwd ~= "" then
+    return cwd
+  end
+  return self.resolved_cwd
+end
+
+---The team whose board the board pane shows.
+---
+---`:Ade team board` means *this project's* board: the team of the resolved
+---cwd, never whichever team happens to be first in the service list. When the
+---cwd has no team the pane shows its empty state instead of another project's
+---cards.
+---@return table|nil
+function Dashboard:board_team()
+  local rows = self:paint_rows()
+  if #rows == 0 then
+    return nil
+  end
+  local cwd = self:project_cwd()
+  if cwd then
+    -- Resolve by cwd every time: the board pane follows the project, so a cwd
+    -- change must not keep a previously cached team from another project.
+    for _, row in ipairs(rows) do
+      if row.cwd == cwd and row.state ~= "closed" then
+        self.board_selected_id = row.id
+        return row
+      end
+    end
+    -- No team for this project: do not borrow another cwd's cards.
+    self.board_selected_id = nil
+    return nil
+  end
+  if self.board_selected_id then
+    for _, row in ipairs(rows) do
+      if row.id == self.board_selected_id then
+        return row
+      end
+    end
+    self.board_selected_id = nil
+  end
+  local row = self:current_team()
+  self.board_selected_id = row and row.id or nil
+  return row
+end
+
+---The team a pane's keys act on.
+---@param pane string|nil
+---@return table|nil
+function Dashboard:pane_team(pane)
+  if pane == "board" then
+    return self:board_team()
+  end
+  return self:current_team()
+end
+
+---@param id string
+---@return table|nil
+function Dashboard:visible_team(id)
+  for _, row in ipairs(self:paint_rows()) do
+    if row.id == id then
+      return row
+    end
+  end
+end
+
+---@param team table|nil
+---@return table|nil
+function Dashboard:board(team)
+  local row = team
+  if type(team) == "string" then
+    row = self:visible_team(team)
+  end
+  return row and self.team:board(row.id) or nil
+end
+
 function Dashboard:team_by_id(id)
   for _, team in ipairs(self.team:list_rows()) do
     if team.id == id then
@@ -119,7 +239,7 @@ function Dashboard:team_by_id(id)
   end
 end
 
----The inline choice queue, built by bootstrap (worker2's component).
+---The inline choice queue, built by bootstrap.
 ---@return table|nil
 function Dashboard:choices()
   local ok, controller = pcall(require, "ade.controller")
@@ -149,10 +269,6 @@ function Dashboard:states(team)
   return out
 end
 
-function Dashboard:board(team)
-  return team and self.team:board(team.id) or nil
-end
-
 function Dashboard:expanded(team_id)
   self.expanded_stages = self.expanded_stages or {}
   self.expanded_stages[team_id] = self.expanded_stages[team_id] or {}
@@ -165,38 +281,43 @@ function Dashboard:scroll(team_id)
   return self.scrolls[team_id]
 end
 
-function Dashboard:render_tab(tab)
+---@param name string
+---@return string[] lines, table<integer, string> ids, table<integer, table> meta, table[] marks
+function Dashboard:render_pane(name)
+  if name == "board" then
+    return self:render_board()
+  end
+  return self:render_members()
+end
+
+function Dashboard:render_members()
+  local lines, ids, meta, marks = {}, {}, {}, {}
   local team = self:current_team()
-  local rendered = { members = {}, board = {}, meta = {}, ids = {}, marks = {} }
+  local width = 40
+  local win = self.layout:win("members")
+  if win then
+    width = math.max(8, vim.api.nvim_win_get_width(win) - 1)
+  end
   if not team then
-    rendered.members = { " ade.nvim · team", "", " 还没有团队" }
-    rendered.meta.members = { {}, {}, {} }
-    rendered.ids.members = {}
+    lines[#lines + 1] = " 还没有团队"
+    lines[#lines + 1] = ""
     local workflows = self.team.workflows_list
     if workflows == nil then
-      rendered.members[#rendered.members + 1] = " 正在读取可用流程…"
-      rendered.meta.members[#rendered.members] = {}
+      lines[#lines + 1] = " 正在读取可用流程…"
       self:load_workflows()
       workflows = {}
     end
     if #workflows == 0 then
-      rendered.members[#rendered.members + 1] = " 没有可用流程"
-      rendered.meta.members[#rendered.members] = {}
-    else
-      rendered.members[#rendered.members + 1] = " 可用流程（S 启动，<CR> 看全文）"
-      rendered.meta.members[#rendered.members] = {}
-      for _, workflow in ipairs(workflows) do
-        rendered.members[#rendered.members + 1] =
-          string.format("   %-20s %s", tostring(workflow.name), one_line(workflow.summary or ""))
-        rendered.meta.members[#rendered.members] = { kind = "workflow", workflow = workflow }
-        rendered.ids.members[#rendered.members] = "workflow:" .. tostring(workflow.name)
-      end
+      lines[#lines + 1] = " 没有可用流程；在普通对话里让 leader 组队即可"
+      return lines, ids, meta, marks
     end
-    return rendered
-  end
-  local members_width = 32
-  if tab.panels.members and vim.api.nvim_win_is_valid(tab.panels.members) then
-    members_width = vim.api.nvim_win_get_width(tab.panels.members)
+    lines[#lines + 1] = " 可用流程（S 启动，<CR> 看全文）"
+    for _, workflow in ipairs(workflows) do
+      lines[#lines + 1] = string.format("   %-20s %s", tostring(workflow.name), one_line(workflow.summary or ""))
+      meta[#lines] = { kind = "workflow", workflow = workflow }
+      ids[#lines] = "workflow:" .. tostring(workflow.name)
+    end
+    return lines, ids, meta, marks
   end
   local messages = {}
   for _, item in pairs(self.team.inbox) do
@@ -206,103 +327,77 @@ function Dashboard:render_tab(tab)
   end
   local cfg = self.config() or {}
   local workers_max = tonumber((type(cfg.teams) == "table" and cfg.teams.max_workers) or 3) or 3
-  local lines, ids, meta, marks = Members.lines(team, math.max(8, members_width - 1), {
-    messages = messages,
-    max_workers = workers_max,
-  })
-  rendered.members = lines
-  rendered.meta.members = meta
-  rendered.ids.members = ids
-  rendered.marks = (rendered.marks or {})
-  for _, mark in ipairs(marks or {}) do
-    rendered.marks[#rendered.marks + 1] = {
-      line = mark.line,
+  -- A team row first so the team-level keys (`s`, `x`, `R`) have a target and
+  -- a suspended or stale team explains itself before any member does.
+  lines[#lines + 1] = string.format(" %s  %s  [%s]", tostring(team.id), tostring(team.cwd), tostring(team.state))
+  ids[#lines] = "team:" .. tostring(team.id)
+  meta[#lines] = { kind = "team", team = team.id }
+  if team.stale or self.team:is_stale(team.id) then
+    lines[#lines + 1] = "   connection lost; waiting for the service to reconnect"
+    meta[#lines] = { kind = "team_hint", team = team.id }
+  end
+  if team.state == "suspended" then
+    local at = tonumber(team.suspended_at)
+    local when = at and os.date("%Y-%m-%d %H:%M:%S", math.floor(at / 1000)) or "unknown"
+    lines[#lines + 1] = "   suspended since "
+      .. when
+      .. "; waiting for the leader session to resume or press x to close"
+    meta[#lines] = { kind = "team_hint", team = team.id }
+  end
+  local member_lines, member_ids, member_meta, member_marks =
+    Members.lines(team, width, { messages = messages, max_workers = workers_max })
+  local offset = #lines
+  for index, text in ipairs(member_lines) do
+    lines[offset + index] = text
+    ids[offset + index] = member_ids[index]
+    meta[offset + index] = member_meta[index]
+  end
+  for _, mark in ipairs(member_marks or {}) do
+    marks[#marks + 1] = {
+      line = offset + mark.line,
       start = mark.start,
       stop = mark.stop,
       group = mark.group,
-      panel = "members",
     }
   end
-  local board_width = 60
-  if tab.panels.board and vim.api.nvim_win_is_valid(tab.panels.board) then
-    board_width = math.max(24, vim.api.nvim_win_get_width(tab.panels.board))
+  return lines, ids, meta, marks
+end
+
+function Dashboard:render_board()
+  local lines, ids, meta, marks = {}, {}, {}, {}
+  local team = self:board_team()
+  if not team then
+    lines[#lines + 1] = " 暂无团队任务"
+    lines[#lines + 1] = ""
+    if #self:paint_rows() > 0 then
+      lines[#lines + 1] = " 当前项目没有团队；团队面板（:Ade team agents）可看别的项目。"
+    else
+      lines[#lines + 1] = " leader 组队后，这里的看板会显示任务。"
+    end
+    return lines, ids, meta, marks
+  end
+  local width = 60
+  local win = self.layout:win("board")
+  if win then
+    width = math.max(24, vim.api.nvim_win_get_width(win))
   end
   local board = self:board(team)
   local board_lines, board_meta, board_ids, board_marks = Board.lines(board, self:states(team), {
     scroll = self:scroll(team.id),
     expanded = self:expanded(team.id),
-    width = board_width,
+    width = width,
     team = team,
   })
-  rendered.board = board_lines
-  rendered.meta.board = board_meta
-  rendered.ids.board = board_ids
-  for _, mark in ipairs(board_marks or {}) do
-    rendered.marks[#rendered.marks + 1] =
-      { line = mark.line, start = mark.start, stop = mark.stop, group = mark.group, panel = "board" }
-  end
-  self:update_tabline()
-  return rendered
+  return board_lines, board_ids, board_meta, board_marks or {}
 end
 
----No permanent detail window in v2: refresh the board cursor highlight only.
-function Dashboard:update_detail()
-  self:update_board_cursor()
-end
-
-function Dashboard:layout_current()
-  if self.tab and self.tab:is_open() then
-    return self.tab:current()
-  end
-  if self.float and self.float.current then
-    return self.float:current()
-  end
-  return nil
-end
-
-function Dashboard:update_board_cursor()
-  if not (self.tab and self.tab:is_open()) then
-    return
-  end
-  local buf = self.tab.buffers.board
-  if not buf or not vim.api.nvim_buf_is_valid(buf) then
-    return
-  end
-  vim.api.nvim_buf_clear_namespace(buf, self.tab.cursor_ns, 0, -1)
-  local kind, _, card = self:layout_current()
-  if kind ~= "card" or type(card) ~= "table" then
-    return
-  end
-  local meta = self.tab.meta.board or {}
-  for line, info in pairs(meta) do
-    for _, cell in ipairs(info.cells or {}) do
-      if cell.card == card then
-        pcall(vim.api.nvim_buf_set_extmark, buf, self.tab.cursor_ns, line - 1, cell.start, {
-          end_row = line - 1,
-          end_col = cell.stop,
-          hl_group = "AdeBoardCardCursor",
-          priority = 120,
-        })
-      end
-    end
-  end
-end
-
-function Dashboard:tabline_prefix()
-  return " ade.nvim · team "
-end
-
-function Dashboard:tabline_text()
-  local team = self:current_team()
+---The one-line summary for a pane's winbar.
+---@param pane string|nil
+---@return string
+function Dashboard:summary(pane)
+  local team = self:pane_team(pane)
   if not team then
-    return " ade.nvim · team"
-  end
-  local rows = self.team:list_rows()
-  local index = 1
-  for position, row in ipairs(rows) do
-    if row.id == team.id then
-      index = position
-    end
+    return ""
   end
   local cfg = self.config() or {}
   local teams_cfg = type(cfg.teams) == "table" and cfg.teams or {}
@@ -313,132 +408,321 @@ function Dashboard:tabline_text()
     end
   end
   local limits = team.limits or {}
-  local state = self.team:is_stale(team.id) and "stale" or tostring(team.state)
+  local state = (team.stale or self.team:is_stale(team.id)) and "stale" or tostring(team.state)
   local flow = team.workflow_name and tostring(team.workflow_name) or "default"
   local progress = Board.stage_progress(team.stages) or ""
   local queue = self:choices()
   local counts = queue and queue:pending_counts(team.id) or {}
   local q = tonumber(counts.question) or 0
   local a = tonumber(counts.approval) or 0
-  local suffix = ""
-  if #rows > 1 then
-    suffix = string.format(" [%d/%d]", index, #rows)
+  return string.format(
+    " %s · %s · workers %d/%d · turns %s/%s · 流程 %s%s · ? %d ⚑ %d ",
+    tostring(team.id),
+    state,
+    workers,
+    max_workers,
+    tostring(limits.turns_total or 0),
+    tostring(limits.max_turns_total or "?"),
+    flow,
+    progress ~= "" and (" · " .. progress) or "",
+    q,
+    a
+  )
+end
+
+function Dashboard:update_headers()
+  if not self.layout:is_open() then
+    return
   end
-  local function head_for(cwd)
-    return string.format(
-      " ade.nvim · team %s · %s%s · %s · workers %d/%d · turns %s/%s │ 流程 %s%s",
-      tostring(team.id),
-      cwd,
-      suffix,
-      state,
-      workers,
-      max_workers,
-      tostring(limits.turns_total or 0),
-      tostring(limits.max_turns_total or "?"),
-      flow,
-      progress ~= "" and (" · " .. progress) or ""
-    )
+  for _, name in ipairs(Pane.PANES) do
+    local win = self.layout:win(name)
+    if win then
+      local title = Pane.TITLES[name] or ""
+      local text = title .. "│" .. self:summary(name)
+      local width = vim.api.nvim_win_get_width(win)
+      pcall(vim.api.nvim_set_option_value, "winbar", Text.truncate(text, math.max(1, width)), { win = win })
+    end
   end
-  local Text = require("ade.ui.team.text")
-  local full_cwd = vim.fn.fnamemodify(tostring(team.cwd), ":~")
-  local head = head_for(full_cwd)
-  local glyph = require("ade.ui.icons").glyph
-  local count_text =
-    string.format("%s 待回答 %d  %s 待批准 %d ", glyph("team_question"), q, glyph("team_approval"), a)
-  local narrow = vim.o.columns < 140
-  if narrow then
-    -- Measure what is actually left after the counts and the fixed parts of
-    -- the head; the old constant estimate was too small (N8).
-    local fixed = vim.fn.strdisplaywidth(head) - vim.fn.strdisplaywidth(full_cwd)
-    local budget = math.max(6, vim.o.columns - vim.fn.strdisplaywidth(count_text) - 1 - fixed)
-    local cwd = full_cwd
-    if vim.fn.strdisplaywidth(cwd) > budget then
-      local tail = cwd:match("([^/]+/[^/]+)$") or vim.fn.fnamemodify(cwd, ":t")
-      cwd = "…/" .. vim.fn.fnamemodify(tail, ":t")
-      if vim.fn.strdisplaywidth(cwd) > budget then
-        cwd = "…" .. vim.fn.fnamemodify(cwd, ":t")
+end
+
+---Open or focus one pane. `nil` means the members pane (compat entry).
+---@param kind string|nil "members", "board" or "all"
+---@return boolean
+function Dashboard:open(kind)
+  kind = kind or "members"
+  self.resolved_cwd = self.team.resolve_cwd and self.team.resolve_cwd() or nil
+  if not self.selected_id then
+    local rows = self.team:list_rows()
+    if #rows > 0 then
+      self.selected_id = rows[1].id
+    end
+  end
+  if #self.team:list_rows() == 0 then
+    self:load_workflows()
+  end
+  if kind == "all" then
+    for _, name in ipairs(Pane.PANES) do
+      if not self.layout:show(name) then
+        return false
       end
-      cwd = Text.truncate(cwd, budget)
     end
-    head = head_for(cwd)
+    self:refresh()
+    return true
   end
-  local tail = string.format(" │ ? 待回答 %d  ⚑ 待批准 %d ", q, a)
-  local text = narrow and (" " .. count_text .. "│" .. head) or (head .. tail)
-  return Text.truncate(text, math.max(1, vim.o.columns))
+  if not (kind == "members" or kind == "board") then
+    return false
+  end
+  local ok = self.layout:show(kind)
+  if ok then
+    self:refresh()
+  end
+  return ok
 end
 
-function Dashboard:install_tabline()
-  self.saved_tabline = self.saved_tabline or vim.o.tabline
-  self.saved_showtabline = self.saved_showtabline or vim.o.showtabline
-  pcall(function()
-    vim.o.showtabline = 2
-  end)
-  self:update_tabline()
-  if not self.tabline_group then
-    self.tabline_group = vim.api.nvim_create_augroup("AdeTeamTabline" .. tostring(vim.uv.hrtime()), { clear = true })
-    vim.api.nvim_create_autocmd("TabEnter", {
-      group = self.tabline_group,
-      callback = function()
-        self:update_tabline()
-      end,
-    })
-    vim.api.nvim_create_autocmd("User", {
-      group = self.tabline_group,
-      pattern = "AdeChoicesChanged",
-      callback = function()
-        if self:is_open() then
-          self:update_tabline()
-        end
-      end,
-    })
-  end
-end
-
-function Dashboard:update_tabline()
-  if not (self.tab and self.tab:is_open()) then
-    return
-  end
-  -- The title belongs to the dashboard tab; every other tab keeps the saved
-  -- tabline instead of showing this team (N8).
-  if vim.api.nvim_get_current_tabpage() ~= self.tab.tab then
-    if self.saved_tabline then
+---Close one pane; the other pane and the ordinary panel stay as they are.
+---@param kind string|nil
+---@return boolean
+function Dashboard:close(kind)
+  if kind == "all" or kind == nil then
+    if self.refresh_timer then
       pcall(function()
-        vim.o.tabline = self.saved_tabline
+        self.refresh_timer:stop()
+        self.refresh_timer:close()
       end)
+      self.refresh_timer = nil
     end
+    self.pending = false
+    if self.router and self.router:is_worker() then
+      self.router:restore_leader(false)
+    end
+    self.layout:close()
+    return true
+  end
+  if self.layout:is_open_pane(kind) then
+    self.layout:close_pane(kind)
+    return true
+  end
+  return false
+end
+
+---Aliases the rest of the app (and tests) use for the primary pane.
+function Dashboard:sync_aliases()
+  local name
+  for _, candidate in ipairs({ "members", "board" }) do
+    if self.layout:is_open_pane(candidate) then
+      name = candidate
+      break
+    end
+  end
+  self.win = name and self.layout:win(name) or nil
+  self.buf = name and self.layout:buf(name) or nil
+  self.ids = name and self.layout.ids[name] or nil
+  -- The worker transcript lives in the ordinary chat now; the old names point
+  -- at the shared pair so callers keep observing the same thing.
+  local chat = self.router.chat
+  local worker = self.router:is_worker()
+  self.watch_win = worker and chat and chat.win or nil
+  self.watch_buf = worker and chat and chat.buf or nil
+end
+
+function Dashboard:refresh()
+  if not self.layout:is_open() then
     return
   end
-  local text = self:tabline_text():gsub("%%", "%%%%")
-  pcall(function()
-    vim.o.tabline = text
+  self.layout:refresh()
+  self:update_headers()
+  self:sync_aliases()
+end
+
+---Merge frequent `team.changed`/`inbox`/`board_changed` redraws.
+function Dashboard:schedule_refresh()
+  if self.refresh_timer then
+    self.pending = true
+    return
+  end
+  local function paint()
+    self.pending = false
+    self:refresh()
+  end
+  if vim.in_fast_event() then
+    vim.schedule(paint)
+  else
+    paint()
+  end
+  self.refresh_timer = vim.defer_fn(function()
+    self.refresh_timer = nil
+    if self.pending then
+      paint()
+    end
+  end, REFRESH_MS)
+end
+
+---The router's chat target, for the transcript winbar.
+---@return table|nil
+function Dashboard:chat_target()
+  return self.router:chat_target()
+end
+
+---Whether the composer currently submits to a worker.
+---@return boolean
+function Dashboard:is_worker_target()
+  return self.router:is_worker()
+end
+
+---Interrupt a worker from the composer: `<C-c>` must never cancel the
+---leader's own turn while the composer sends to someone else.
+function Dashboard:cancel_target()
+  self:notify("按成员面板里的 c 取消这个 worker 的回合；gl 返回 leader", vim.log.levels.INFO)
+end
+
+---The composer bar text while a worker is the target.
+---@param win integer|nil
+---@return string
+function Dashboard:worker_bar(win)
+  if not self.router:is_worker() then
+    return ""
+  end
+  return self.router:input_winbar(win)
+end
+
+---Send from the ordinary composer to the selected worker, when one is shown.
+---@param text string
+---@param attachments table[]|nil
+---@return boolean handled
+function Dashboard:route_submit(text, attachments)
+  return self.router:route_submit(text, attachments)
+end
+
+---Switch the shared chat to a participant, or back to the leader.
+---@param team string|nil
+---@param participant string|nil
+---@return boolean
+function Dashboard:select(team, participant)
+  return self.router:select(team, participant)
+end
+
+---Selecting the leader needs the *team's* project: falling back to whatever
+---session happens to be current could present another project or agent.
+---@param team string|nil
+---@return boolean
+function Dashboard:select_leader(team)
+  return self.router:restore_leader(true, team)
+end
+
+---The session picker or `:Ade open` took over: stop routing.
+function Dashboard:detach()
+  self.router:detach()
+end
+
+---A watch frame from the team subscription.
+---@param session table|nil
+---@param title string|nil
+function Dashboard:watch(session, title)
+  self.router:on_watch(session, title)
+  self:sync_aliases()
+end
+
+function Dashboard:load_workflows()
+  if self.workflows_requested then
+    return
+  end
+  self.workflows_requested = true
+  local cwd = self:project_cwd()
+  if not cwd then
+    self.workflows_requested = false
+    self.team.workflows_list = {}
+    return
+  end
+  local token = {}
+  self.workflow_token = token
+  vim.defer_fn(function()
+    if self.workflow_token == token and self.workflows_requested then
+      self.workflows_requested = false
+      self.workflow_token = nil
+      self.team.workflows_list = {}
+      self:notify("cannot load workflows (timed out)")
+      self:schedule_refresh()
+    end
+  end, 5000)
+  self.team:workflows(cwd, function(ok, value)
+    if self.workflow_token ~= token and self.workflow_token ~= nil then
+      return
+    end
+    self.workflow_token = nil
+    if ok and type(value) == "table" then
+      self.team.workflows_list = value.workflows or {}
+    else
+      self.team.workflows_list = {}
+      self:notify("cannot load workflows")
+    end
+    self.workflows_requested = false
+    self:schedule_refresh()
   end)
 end
 
-function Dashboard:restore_tabline()
-  if self.saved_tabline then
-    pcall(function()
-      vim.o.tabline = self.saved_tabline
-    end)
-    self.saved_tabline = nil
+---A team disappeared: closed here, by another front end, or by the service.
+---@param team_id string
+function Dashboard:team_closed(team_id)
+  if type(team_id) ~= "string" then
+    return
   end
-  if self.saved_showtabline then
-    pcall(function()
-      vim.o.showtabline = self.saved_showtabline
-    end)
-    self.saved_showtabline = nil
+  local router = self.router
+  if router:current() and router:current().team == team_id then
+    router:restore_leader(false)
   end
-  if self.tabline_group then
-    pcall(vim.api.nvim_del_augroup_by_id, self.tabline_group)
-    self.tabline_group = nil
+  -- Drop the closed team from the kept rows so it cannot come back as stale.
+  if self.snapshot then
+    local kept = {}
+    for _, row in ipairs(self.snapshot) do
+      if row.id ~= team_id then
+        kept[#kept + 1] = row
+      end
+    end
+    self.snapshot = #kept > 0 and kept or nil
   end
+  if not self.layout:is_open() then
+    return
+  end
+  local rows = self:paint_rows()
+  if #rows == 0 then
+    self:refresh()
+    return
+  end
+  if self.selected_id and self.selected_id ~= team_id and self:team_by_id(self.selected_id) then
+    return
+  end
+  self.index = math.max(1, math.min(self.index or 1, #rows))
+  self.selected_id = rows[self.index].id
+  if self.board_selected_id == team_id then
+    self.board_selected_id = nil
+  end
+  self:refresh()
 end
 
-function Dashboard:attach_keys(buf)
+---The cursor's target in whichever pane is focused.
+---@return string|nil kind, string|nil team, string|nil obj, table|nil info
+function Dashboard:current()
+  return self.layout:current()
+end
+
+function Dashboard:home_team()
+  local kind, team = self.layout:current()
+  if team then
+    return team
+  end
+  local row = self:current_team()
+  return row and row.id or nil
+end
+
+---@param buf integer
+---@param pane string|nil
+function Dashboard:attach_keys(buf, pane)
   local function map(lhs, key)
     vim.keymap.set("n", lhs, function()
       self:handle_key(key)
     end, { buffer = buf, nowait = true, silent = true })
   end
+  self.key_pane = pane
   for lhs, key in pairs({
     ["<CR>"] = "cr",
     ["m"] = "m",
@@ -469,16 +753,29 @@ function Dashboard:attach_keys(buf)
 end
 
 ---@param team string|nil
+---@return boolean
 function Dashboard:refuse_stale(team)
-  if team and self.team:is_stale(team) then
+  if not team then
+    return false
+  end
+  -- The team module drops its list on a lost connection while the pane keeps
+  -- the last rows on screen. Either signal means "don't act on this".
+  local row = self:visible_team(team)
+  if (row and row.stale) or self.team:is_stale(team) then
     self:notify("the connection to the service is lost; wait for it to reconnect")
     return true
   end
   return false
 end
 
+---@param team string|nil
+---@return boolean
 function Dashboard:refuse_suspended(team)
-  if team and self.team:is_suspended(team) then
+  if not team then
+    return false
+  end
+  local row = self:visible_team(team)
+  if (row and row.state == "suspended") or self.team:is_suspended(team) then
     self:notify("the team is suspended; wait for the leader session to resume or press x to close it")
     return true
   end
@@ -486,21 +783,18 @@ function Dashboard:refuse_suspended(team)
 end
 
 function Dashboard:handle_key(key)
-  local kind, team_id, obj, info = self:layout_current()
-  local team = team_id or (self:current_team() and self:current_team().id)
+  local kind, team_id, obj, info = self.layout:current()
+  local pane = self.layout:name_of()
+  local team = team_id or (self:pane_team(pane) and self:pane_team(pane).id) or self:home_team()
   if key == "next" then
-    if self.tab and self.tab:is_open() then
-      self.tab:cycle(1)
-    end
+    self.layout:cycle(1)
     return
   end
   if key == "prev" then
-    if self.tab and self.tab:is_open() then
-      self.tab:cycle(-1)
-    end
+    self.layout:cycle(-1)
     return
   end
-  if key == "]" or key == "[t" or key == "]t" then
+  if key == "]t" or key == "[t" then
     local rows = self.team:list_rows()
     if #rows == 0 then
       return
@@ -511,16 +805,14 @@ function Dashboard:handle_key(key)
     return
   end
   if key == "q" then
-    self:close()
+    local pane = self.layout:name_of()
+    self:close(pane or "all")
     return
   end
   if key == "help" then
-    if self.float and self.float:is_open() then
-      self.float.help = not self.float.help
-      self.float:refresh()
-    else
-      self:notify("team: <CR> card/member · a/! pending choice · m message · H history · s spawn · x close")
-    end
+    self:notify(
+      "team: <CR> card/member · a/! pending choice · m message · H history · s spawn · L leader · x close"
+    )
     return
   end
   if key == "zh" or key == "zl" then
@@ -529,8 +821,9 @@ function Dashboard:handle_key(key)
       local board = self:board(self:team_by_id(team)) or {}
       local columns = #(board.columns or {})
       local width = 80
-      if self.tab and self.tab:is_open() and self.tab.panels.board then
-        width = vim.api.nvim_win_get_width(self.tab.panels.board)
+      local win = self.layout:win("board")
+      if win then
+        width = vim.api.nvim_win_get_width(win)
       end
       local visible = Board.visible_columns(width, columns, false)
       local max_columns = math.max(0, columns - visible)
@@ -545,9 +838,9 @@ function Dashboard:handle_key(key)
       self:open_watch(team, obj)
     elseif kind == "card" and obj then
       self:show_detail(Detail.card(self:team_by_id(team), obj), "卡片 " .. tostring(obj.id))
-    elseif kind == "archived_stage" and info then
+    elseif kind == "archived_stage" then
       local expanded = self:expanded(team)
-      expanded[info.stage] = not expanded[info.stage]
+      expanded[obj or ""] = not expanded[obj or ""]
       self:refresh()
     elseif kind == "workflow" and info then
       self:show_detail(Detail.workflow(info.workflow), "流程 " .. tostring(info.workflow.name))
@@ -577,20 +870,18 @@ function Dashboard:handle_key(key)
     if key == "a" and kind == "participant" and obj and team then
       queue:answer_participant(team, obj)
     else
-      local ok, pending = pcall(queue.selectable_count, queue, team)
-      if not ok then
-        local counts = queue:pending_counts(team) or {}
-        pending = (counts.question or 0) + (counts.approval or 0)
-      end
       queue:show_pending(team)
-      -- The component borrows the composer window. With the board in its own
-      -- tab the composer may be hidden, so mount the leader column and retry.
-      if pending > 0 and not queue:is_open() then
-        self:mount_leader()
-        queue:show_pending(team)
+      if team then
+        local ok, pending = pcall(queue.selectable_count, queue, team)
+        if not ok then
+          local counts = queue:pending_counts(team) or {}
+          pending = (counts.question or 0) + (counts.approval or 0)
+        end
+        if pending > 0 and not queue:is_open() then
+          self:notify("打开聊天面板（:Ade open）后可按 ! 显示选择组件")
+        end
       end
     end
-    self:update_tabline()
     return
   end
   if key == "p" or key == "r" or key == "c" then
@@ -626,7 +917,7 @@ function Dashboard:handle_key(key)
     return
   end
   if key == "L" then
-    self:open_leader()
+    self:select_leader()
     return
   end
   if key == "s" then
@@ -660,8 +951,7 @@ function Dashboard:handle_key(key)
 end
 
 function Dashboard:show_detail(lines, title)
-  -- Focus moves into the popup, so paint the board cursor before that.
-  self:update_board_cursor()
+  self.layout:update_cursor()
   self:popup(title or "详情", lines)
 end
 
@@ -690,7 +980,6 @@ function Dashboard:popup(title, lines)
   vim.keymap.set("n", "<Esc>", function()
     pcall(vim.api.nvim_win_close, win, true)
   end, { buffer = buf, nowait = true, silent = true })
-  -- Focus stays in the popup so `q`/`<Esc>` can close it (M7).
 end
 
 function Dashboard:send_to_participant(team, name)
@@ -780,13 +1069,32 @@ function Dashboard:spawn_current(team)
   end
   local cfg = self.config() or {}
   local teams_cfg = type(cfg.teams) == "table" and cfg.teams or {}
+  -- Worker 1's zero-config default: ask the team module for the template names
+  -- first so no templates configured still offers the builtin worker.
   local names = {}
-  for name in pairs(teams_cfg.templates or {}) do
-    names[#names + 1] = name
+  if type(self.team.template_names) == "function" then
+    local ok, list = pcall(self.team.template_names, self.team)
+    if ok and type(list) == "table" then
+      names = vim.deepcopy(list)
+    end
   end
-  table.sort(names)
   if #names == 0 then
-    self:notify("no team templates are configured")
+    for name in pairs(teams_cfg.templates or {}) do
+      names[#names + 1] = name
+    end
+    table.sort(names)
+  end
+  if #names == 0 then
+    -- Not a configuration complaint: `template_names` already accounts for the
+    -- builtin default. An explicit failure reason is worth showing; nothing
+    -- else is.
+    local reason
+    if type(self.team.template_error) == "function" then
+      local cwd = self:project_cwd()
+      local ok, value = pcall(self.team.template_error, self.team, cwd)
+      reason = ok and value or nil
+    end
+    self:notify(reason and ("无法启动 worker：" .. tostring(reason)) or "当前没有可启动的团队模板")
     return
   end
   local function ask_task(template, name)
@@ -848,523 +1156,28 @@ function Dashboard:close_team(team)
   end)
 end
 
----Open a participant's watch (worker) or move the leader chat into the right
----column (wide) / focus it (narrow).
+---Open a participant in the ordinary chat panel. The leader returns to its own
+---session; a worker replays into the shared transcript.
 function Dashboard:open_watch(team, participant)
   if not team or self:refuse_stale(team) or self:refuse_suspended(team) then
     return
   end
   if participant == "leader" then
-    self:open_leader(team)
+    self:select_leader(team)
     return
   end
-  if self.leader_mounted then
-    self:unmount_leader()
-  end
-  if self.tab and self.tab:is_open() then
-    local host = self.tab:open_watch_host()
-    self.watcher.host_win = host
-    self.watcher.keep_focus = true
-  else
-    self.watcher.host_win = nil
-    self.watcher.keep_focus = false
-  end
-  self.watcher:open(team, participant)
-  self.watch_win, self.watch_buf = self.watcher.win, self.watcher.buf
-end
-
-function Dashboard:open_leader(team)
-  if self.tab and self.tab:is_open() then
-    if self.watcher:is_open() or self.watcher.participant then
-      self.watcher:close()
-    end
-    pcall(self.mount_leader, self)
-  else
-    local chat = self.leader_chat and self.leader_chat() or nil
-    if chat and chat.win and vim.api.nvim_win_is_valid(chat.win) then
-      pcall(vim.api.nvim_set_current_win, chat.win)
-    else
-      self:notify("the leader chat window is not open")
-    end
-  end
-end
-
----Move the existing chat/input into the right column of the wide tab.
----
----Uses the normal panel window path (`layout.create_chat_win` /
----`create_input_win`) so wrap, conceal, winfixbuf, width and keys match the
----regular panel. The original panel windows are closed first, never duplicated.
-function Dashboard:mount_leader()
-  if not (self.tab and self.tab:is_open()) then
-    return
-  end
-  local chat = self.leader_chat and self.leader_chat() or nil
-  local input = self.leader_input and self.leader_input() or nil
-  if not (chat and chat.buf and input and input.buf) then
-    self:notify("the leader chat is not available")
-    return
-  end
-  if self.leader_mounted then
-    return
-  end
-  local panel = self.panel and self.panel() or nil
-  local was_visible = chat.win ~= nil and vim.api.nvim_win_is_valid(chat.win)
-  local original_tab = nil
-  if was_visible then
-    original_tab = vim.api.nvim_win_get_tabpage(chat.win)
-  end
-  if panel then
-    -- Closes the original chat/input windows without losing drafts.
-    panel:hide()
-    -- A previously hidden panel stays hidden after unmount.
-    panel.requested = was_visible
-  end
-  -- `panel:hide()` may focus the tab that held the old windows.
-  if self.tab and self.tab:is_open() then
-    pcall(vim.api.nvim_set_current_tabpage, self.tab.tab)
-  end
-  local layout = require("ade.layout")
-  if self.tab and self.tab.begin_resize then
-    self.tab:begin_resize()
-  end
-  local chat_win = layout.create_chat_win(chat.buf, nil)
-  local input_win = chat_win and layout.create_input_win(input.buf, chat_win) or nil
-  if not (chat_win and input_win) then
-    if self.tab and self.tab.end_resize then
-      self.tab:end_resize()
-    end
-    self:notify("unable to move the leader chat to the watch column")
-    if panel then
-      panel:show()
-    end
-    return
-  end
-  if self.tab then
-    self.tab:set_leader_windows(chat_win, input_win)
-    self.tab:end_resize()
-  end
-  chat.win = chat_win
-  input.win = input_win
-  self.leader_mounted = {
-    chat_win = chat_win,
-    input_win = input_win,
-    original_tab = original_tab,
-    panel = panel,
-  }
-  self.leader_team = self.selected_id
-  self.leader_unmounting = false
-  local group = vim.api.nvim_create_augroup("AdeTeamLeaderMount" .. tostring(chat_win), { clear = true })
-  self.leader_mounted.group = group
-  vim.api.nvim_create_autocmd("WinClosed", {
-    group = group,
-    callback = function(args)
-      local win = tonumber(args.match)
-      local mounted = self.leader_mounted
-      if not mounted or self.leader_unmounting then
-        return
-      end
-      if win == mounted.chat_win or win == mounted.input_win then
-        vim.schedule(function()
-          self:unmount_leader()
-        end)
-      end
-    end,
-  })
-  vim.api.nvim_set_current_win(input_win)
-end
-
-function Dashboard:unmount_leader()
-  local mounted = self.leader_mounted
-  if not mounted or self.leader_unmounting then
-    return
-  end
-  self.leader_mounted = nil
-  self.leader_team = nil
-  self.leader_unmounting = true
-  if mounted.group then
-    pcall(vim.api.nvim_del_augroup_by_id, mounted.group)
-  end
-  local chat = self.leader_chat and self.leader_chat() or nil
-  local input = self.leader_input and self.leader_input() or nil
-  if chat then
-    chat.win = nil
-  end
-  if input then
-    input.win = nil
-  end
-  for _, win in ipairs({ mounted.input_win, mounted.chat_win }) do
-    if win and vim.api.nvim_win_is_valid(win) then
-      pcall(vim.api.nvim_win_close, win, true)
-    end
-  end
-  if self.tab and self.tab.clear_leader_windows then
-    self.tab:clear_leader_windows()
-  end
-  local panel = mounted.panel or (self.panel and self.panel() or nil)
-  local show = panel ~= nil and panel.requested ~= false
-  local target = mounted.original_tab
-  if not (target and vim.api.nvim_tabpage_is_valid(target)) then
-    target = vim.api.nvim_get_current_tabpage()
-    if not (target and vim.api.nvim_tabpage_is_valid(target)) then
-      vim.cmd("tabnew")
-      target = vim.api.nvim_get_current_tabpage()
-    end
-  end
-  pcall(vim.api.nvim_set_current_tabpage, target)
-  if show and panel then
-    panel:set_views(chat, input)
-    if not panel:show() then
-      self:notify("unable to restore the leader chat window")
-    end
-  end
-  self.leader_unmounting = false
-end
-
-function Dashboard:open()
-  self.interacting = false
-  if not self.selected_id then
-    local rows = self.team:list_rows()
-    if #rows > 0 then
-      self.selected_id = rows[1].id
-    end
-  end
-  self.cwd = self.team.resolve_cwd and self.team.resolve_cwd() or nil
-  local cfg = self.config() or {}
-  local wide = tonumber((cfg.teams or {}).dashboard and (cfg.teams or {}).dashboard.wide) or 160
-  local use_tab = vim.o.columns >= wide and (cfg.layout or {}).backend ~= "external"
-  if self:is_open() then
-    if use_tab ~= (self.tab ~= nil) then
-      self:close(true)
-    else
-      if self.tab and self.tab:is_open() then
-        pcall(vim.api.nvim_set_current_tabpage, self.tab.tab)
-      end
-      self:refresh()
-      return true
-    end
-  end
-  if #self.team:list_rows() == 0 then
-    self:load_workflows()
-  end
-  if use_tab then
-    self:install_tabline()
-    self.tab = Tab.new(self)
-    self.float = nil
-    self.tab:open()
-  else
-    self.float = Float.new({
-      team = self.team,
-      config = self.config,
-      leader_chat = self.leader_chat,
-      start_team = self.start_team,
-    })
-    self.float.watcher = self.watcher
-    self.tab = nil
-    self.float:open()
-  end
-  self:sync_aliases()
-  self:update_detail()
-  return true
-end
-
-function Dashboard:sync_aliases()
-  if self.float and self.float:is_open() then
-    self.win, self.buf, self.ids = self.float.win, self.float.buf, self.float.ids
-  elseif self.tab and self.tab:is_open() then
-    self.win, self.buf = self.tab.panels.members, self.tab.buffers.members
-    self.ids = self.tab.ids
-  else
-    self.win, self.buf, self.ids = nil, nil, nil
-  end
-  self.watch_win = self.watcher.win
-  self.watch_buf = self.watcher.buf
-end
-
-function Dashboard:refresh()
-  if not self:is_open() then
-    return
-  end
-  if self.float then
-    self.float:refresh()
-    self.watch_win, self.watch_buf = self.watcher.win, self.watcher.buf
-  elseif self.tab then
-    self.tab:refresh()
-    self:update_detail()
-  end
-  self:sync_aliases()
-end
-
----Merge frequent `team.changed`/`inbox`/`board_changed` redraws.
-function Dashboard:schedule_refresh()
-  -- Paint the first change immediately (tests and cursor actions need the new
-  -- rows right away); further changes inside the window coalesce into one
-  -- trailing paint.
-  if self.refresh_timer then
-    self.pending = true
-    return
-  end
-  local function paint()
-    self.pending = false
-    self:refresh()
-  end
-  -- `team.changed` can arrive from the socket's fast event context, where
-  -- buffer APIs are illegal; never lose the paint (and its trailing timer).
-  if vim.in_fast_event() then
-    vim.schedule(paint)
-  else
-    paint()
-  end
-  self.refresh_timer = vim.defer_fn(function()
-    self.refresh_timer = nil
-    if self.pending then
-      paint()
-    end
-  end, REFRESH_MS)
-end
-
-function Dashboard:watch(session, title)
-  self.watcher:on_watch(session, title)
-  self.watch_win, self.watch_buf = self.watcher.win, self.watcher.buf
-end
-
-function Dashboard:load_workflows()
-  if self.workflows_requested then
-    return
-  end
-  self.workflows_requested = true
-  local cwd = self.cwd or (self.team.resolve_cwd and self.team.resolve_cwd())
-  if not cwd then
-    self.workflows_requested = false
-    self.team.workflows_list = {}
-    return
-  end
-  local token = {}
-  self.workflow_token = token
-  vim.defer_fn(function()
-    if self.workflow_token == token and self.workflows_requested then
-      self.workflows_requested = false
-      self.workflow_token = nil
-      self.team.workflows_list = {}
-      self:notify("cannot load workflows (timed out)")
-      self:schedule_refresh()
-    end
-  end, 5000)
-  self.team:workflows(cwd, function(ok, value)
-    if self.workflow_token ~= token and self.workflow_token ~= nil then
-      return
-    end
-    self.workflow_token = nil
-    if ok and type(value) == "table" then
-      self.team.workflows_list = value.workflows or {}
-    else
-      self.team.workflows_list = {}
-      self:notify("cannot load workflows")
-    end
-    self.workflows_requested = false
-    self:schedule_refresh()
-  end)
-end
-
----A team disappeared: closed here, by another front end, or by the service.
----The panel closes only when this was its last team; otherwise it moves to
----the next team. A watch on the closed team is closed too.
----@param team_id string
-function Dashboard:team_closed(team_id)
-  if type(team_id) ~= "string" then
-    return
-  end
-  if self.watcher:current_team() == team_id then
-    self.watcher:close()
-    if self.tab and self.tab:is_open() then
-      self.tab:close_watch_host()
-    end
-    self.watch_win, self.watch_buf = self.watcher.win, self.watcher.buf
-  end
-  if not self:is_open() then
-    return
-  end
-  local rows = self.team:list_rows()
-  if #rows == 0 then
-    -- This was the only team: close the tab/float (closing puts the chat back).
-    self:close()
-    return
-  end
-  -- The mounted chat belongs to the closed team's leader: put it back before
-  -- the panel shows another team (a refresh triggered by `changed` may already
-  -- have moved `selected_id`).
-  if self.leader_mounted and self.leader_team == team_id then
-    self:unmount_leader()
-  end
-  if self.selected_id and self.selected_id ~= team_id and self:team_by_id(self.selected_id) then
-    -- The panel is already showing another team; `team.changed` repaints it.
-    return
-  end
-  self.index = math.max(1, math.min(self.index or 1, #rows))
-  self.selected_id = rows[self.index].id
-end
-
-function Dashboard:close(quiet)
-  if self.refresh_timer then
-    pcall(function()
-      self.refresh_timer:stop()
-      self.refresh_timer:close()
-    end)
-    self.refresh_timer = nil
-  end
-  if self.unmount_leader then
-    self:unmount_leader()
-  end
-  self.watcher:close()
-  if not quiet then
-    self.watcher.host_win = nil
-  end
-  if self.tab then
-    self.tab:close()
-  end
-  if self.float then
-    local panel = self.float
-    self.float = nil
-    panel:close()
-  end
-  self.tab, self.float, self.layout = nil, nil, nil
-  self.win, self.buf, self.ids = nil, nil, nil
-  self.watch_win, self.watch_buf = nil, nil
-  self:restore_tabline()
+  self.router:select(team, participant)
 end
 
 M.Dashboard = Dashboard
 
----Public facade. Narrow mode delegates to the mature float panel; wide mode to
----the tabpage dashboard. Keeping the facade stable preserves the existing
----callers (`:Ade team`, on_changed/on_watch) across a width change.
+---Compatibility facade kept for callers that only know `TeamUI.new`.
 ---@param opts table
 ---@return table
 function M.new(opts)
-  local proxy = { _opts = opts, _impl = nil, _mode = nil, team = opts.team, config = opts.config }
-  local watcher
-  watcher = Watch.new({
-    team = opts.team,
-    config = opts.config,
-    leader_chat = opts.leader_chat,
-    notify = function(message)
-      if opts.notify then
-        opts.notify(message)
-      else
-        vim.notify("ade.nvim: " .. tostring(message), vim.log.levels.WARN)
-      end
-    end,
-    on_change = function(watch)
-      rawset(proxy, "watch_win", watch.win)
-      rawset(proxy, "watch_buf", watch.buf)
-      if proxy._impl then
-        proxy._impl.watch_win, proxy._impl.watch_buf = watch.win, watch.buf
-      end
-    end,
-  })
-  proxy.watcher = watcher
-  local mt = {}
-  function mt.__index(_, key)
-    local impl = rawget(proxy, "_impl")
-    if not impl then
-      return nil
-    end
-    local value = impl[key]
-    if type(value) == "function" then
-      return function(_, ...)
-        return value(impl, ...)
-      end
-    end
-    return value
-  end
-  function mt.__newindex(_, key, value)
-    local impl = rawget(proxy, "_impl")
-    if impl then
-      impl[key] = value
-    else
-      rawset(proxy, key, value)
-    end
-  end
-  setmetatable(proxy, mt)
-
-  local function wide_wanted()
-    local cfg = opts.config() or {}
-    local wide = tonumber((cfg.teams or {}).dashboard and (cfg.teams or {}).dashboard.wide) or 160
-    return vim.o.columns >= wide and (cfg.layout or {}).backend ~= "external"
-  end
-
-  function proxy:open()
-    local mode = wide_wanted() and "tab" or "float"
-    if self._mode ~= mode then
-      if self._impl then
-        pcall(self._impl.close, self._impl, true)
-      end
-      if mode == "tab" then
-        self._impl = M.dashboard(opts)
-        self._impl.watcher = watcher
-      else
-        self._impl = Float.new({
-          team = opts.team,
-          config = opts.config,
-          leader_chat = opts.leader_chat,
-          start_team = opts.start_team,
-        })
-        self._impl.watcher = watcher
-      end
-      self._mode = mode
-    end
-    return self._impl:open()
-  end
-  function proxy:close(quiet)
-    -- The watch view can exist before the dashboard does (`ui:watch` is called
-    -- by `on_watch` even when the panel was never opened).
-    watcher:close()
-    if self._impl then
-      return self._impl:close(quiet)
-    end
-  end
-  ---Close what belongs to a team that disappeared. The facade owns the watch
-  ---view even when the panel was never opened; an existing panel gets the
-  ---close first so it can return the watch column to the layout.
-  ---@param team_id string
-  function proxy:team_closed(team_id)
-    if type(team_id) ~= "string" then
-      return
-    end
-    if self._impl and self._impl.team_closed then
-      return self._impl:team_closed(team_id)
-    end
-    if watcher:current_team() == team_id then
-      watcher:close()
-      rawset(self, "watch_win", watcher.win)
-      rawset(self, "watch_buf", watcher.buf)
-    end
-  end
-  function proxy:is_open()
-    return self._impl ~= nil and self._impl:is_open()
-  end
-  function proxy:refresh()
-    if self._impl then
-      self._impl:refresh()
-    end
-  end
-  function proxy:schedule_refresh()
-    if not self._impl then
-      return
-    end
-    if self._mode == "float" then
-      -- The float panel is cheap and its existing tests rely on the rows being
-      -- current right after a notification.
-      self._impl:refresh()
-    else
-      self._impl:schedule_refresh()
-    end
-  end
-  function proxy:watch(session, title)
-    watcher:on_watch(session, title)
-    rawset(self, "watch_win", watcher.win)
-    rawset(self, "watch_buf", watcher.buf)
-  end
-  return proxy
+  return M.dashboard(opts)
 end
+
+M.Refresh = REFRESH_MS
 
 return M
