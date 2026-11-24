@@ -111,6 +111,62 @@ fn resolve_params(root: &Path, spec: &str, env: &[(&str, &str)]) -> Value {
     })
 }
 
+fn initialize(client: &mut Client, instance: &str) {
+    client.notify(
+        "tunnel.send",
+        json!({
+            "instance": instance,
+            "message": {
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}},
+            },
+        }),
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if client
+            .try_next_notification(Duration::from_millis(50))
+            .is_some_and(|frame| frame["params"]["message"]["id"] == json!(10))
+        {
+            return;
+        }
+    }
+    panic!("no initialize response from {instance}");
+}
+
+fn wait_for_session(client: &mut Client, instance: &str, id: i64) -> String {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if let Some(frame) = client.try_next_notification(Duration::from_millis(50)) {
+            let message = &frame["params"]["message"];
+            if message["id"] == json!(id) {
+                if let Some(session) = message["result"]["sessionId"].as_str() {
+                    return session.to_string();
+                }
+            }
+        }
+    }
+    panic!("no session response from {instance}");
+}
+
+fn wait_for_token(path: &Path, session: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Some(token) = text.lines().rev().find_map(|line| {
+                let (known, token) = line.split_once(' ')?;
+                (known == session).then(|| token.to_string())
+            }) {
+                return token;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("no injected token for {session}");
+}
+
 fn connect(server: &TestServer) -> Client {
     let mut client = server.connect();
     let hello = client.hello(&server.token(), nvim_ade_server::API_VERSION);
@@ -1830,32 +1886,59 @@ fn install_progress_does_not_reach_participant_connections() {
     let server = TestServer::start("participant-progress");
     let mut owner = connect(&server);
     let root = Root::new("participant-progress");
+    // A real ACP agent so `session/new` gets the v3 session token injected
+    // (20.2); the token file is the test's way of reading it back.
+    let token_file = server.dir().join("session-tokens");
+    let agent = fixture("team_agent.py").to_string_lossy().to_string();
     let attached = owner.request(
         1,
         "agent.attach",
         json!({
             "key": {
-                "agent": "dummy",
+                "agent": "team-test",
                 "command": "python3",
-                "args": ["-c", "import time; time.sleep(30)"],
+                "args": [agent],
                 "cwd": server.dir().to_string_lossy(),
             },
             "client_capabilities": {},
+            "env": {
+                "PATH": std::env::var("PATH").unwrap_or_default(),
+                "HOME": server.dir().to_string_lossy(),
+                "NVIM_ADE_SERVER_DIR": server.dir().to_string_lossy(),
+                "TEAM_AGENT_TOKEN_FILE": token_file.to_string_lossy(),
+            },
         }),
     );
     let instance = attached["result"]["instance"]
         .as_str()
-        .expect("dummy instance")
+        .expect("team agent instance")
         .to_string();
-    let leader = owner.request(
+    initialize(&mut owner, &instance);
+    let configured = owner.request(
         2,
-        "team.leader_server",
-        json!({"instance": instance, "cwd": server.dir().to_string_lossy()}),
+        "team.configure",
+        json!({
+            "cwd": server.dir().to_string_lossy(),
+            "config": {"templates": {
+                "dev": {"key": {"agent": "team-test", "command": "python3", "args": [fixture("team_agent.py").to_string_lossy()]}}
+            }},
+        }),
     );
-    let token = leader["result"]["server"]["env"][0]["value"]
-        .as_str()
-        .expect("participant token")
-        .to_string();
+    assert!(configured["result"].is_object(), "{configured}");
+    owner.notify(
+        "tunnel.send",
+        json!({
+            "instance": instance,
+            "message": {
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "session/new",
+                "params": {"cwd": server.dir().to_string_lossy(), "mcpServers": []},
+            },
+        }),
+    );
+    let session_id = wait_for_session(&mut owner, &instance, 11);
+    let token = wait_for_token(&token_file, &session_id);
     let mut participant = server.connect();
     let hello = participant.hello_raw(json!({
         "participant_token": token,
@@ -1864,7 +1947,6 @@ fn install_progress_does_not_reach_participant_connections() {
         "api_version": nvim_ade_server::API_VERSION,
     }));
     assert_eq!(hello["result"]["features"], json!([]), "{hello}");
-    assert_eq!(hello["result"]["participant"]["role"], "leader");
 
     let (response, progress) = one_request(
         &mut owner,
@@ -1881,12 +1963,15 @@ fn install_progress_does_not_reach_participant_connections() {
     );
     assert!(response["error"].is_null(), "{response}");
     assert!(!progress.is_empty(), "the owner must see progress");
-    assert!(
-        participant
-            .try_next_notification(Duration::from_millis(300))
-            .is_none(),
-        "install.progress must not be sent to participant connections"
-    );
+    // A session token does get `notifications/tools/list_changed` (20.3); no
+    // install progress ever reaches a participant connection.
+    while let Some(frame) = participant.try_next_notification(Duration::from_millis(300)) {
+        let method = frame["method"].as_str().unwrap_or_default();
+        assert!(
+            !method.starts_with("install."),
+            "install.progress must not be sent to participant connections: {frame}"
+        );
+    }
     owner.request(
         3,
         "agent.stop",

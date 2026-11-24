@@ -1970,6 +1970,11 @@ leader: team|null}`:
   and nothing is marked. A failed forwarded load leaves the session as it was
   (the fresh token is revoked; the old binding and server list stay).
 
+A forwarded load or resume that was marked one-shot and answered successfully
+restarts that session's log from this load: earlier recorded events are never
+replayed again (the session is marked incomplete, so a later `session/load` is
+forwarded instead of emulated).
+
 `injected` is true while a bound session token's MCP process is connected.
 The switch defaults to `config.session_default`, is stored per
 `(agent, sessionId)` in the service database, and survives restarts. Every

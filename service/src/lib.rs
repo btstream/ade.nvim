@@ -32,7 +32,7 @@ pub mod transport;
 
 /// Version of the front-end (Neovim) <-> service protocol. Integer, bumped on
 /// incompatible changes.
-pub const API_VERSION: i64 = 6;
+pub const API_VERSION: i64 = 7;
 
 /// Version of this service, taken from `Cargo.toml`.
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");

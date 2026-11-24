@@ -213,7 +213,16 @@ pub enum Command {
     TeamWorktree {
         team: String,
         participant: String,
+        /// The participant lifecycle that started this job (20.6/E).
+        lifecycle: u64,
         outcome: WorktreeOutcome,
+    },
+    /// A cancelled worktree job finished discarding its directory: the name is
+    /// free again (20.6/E).
+    WorktreeDiscarded {
+        team: String,
+        participant: String,
+        lifecycle: u64,
     },
     /// The 30 s grace period after cancelling a bus prompt ended (18.11).
     TeamDeadline {
@@ -430,14 +439,14 @@ struct Instance {
     /// True once `agent.stop` was accepted; the instance stays reachable by id
     /// until the process exits (PROTOCOL.md 3.4).
     stopping: bool,
-    /// Fingerprint of the launch this instance runs (`team::launch_fingerprint`).
-    ///
-    /// It covers the key, the environment and the managed release, so two
-    /// instances that share an agent id but start differently are told apart.
-    fingerprint: String,
     /// Lease for a managed release this instance runs (PROTOCOL.md 16.4).
     #[cfg(unix)]
     _lease: Option<install_lock::ReleaseLease>,
+    /// The environment and managed release it was launched with, for the
+    /// built-in worker template (20.4).
+    env: Option<Vec<(String, String)>>,
+    #[cfg(unix)]
+    launch: Option<install::Launch>,
 }
 
 impl Instance {
@@ -503,8 +512,6 @@ pub struct Hub {
     policy: Policy,
     /// Teams and the bus (PROTOCOL.md 18).
     teams: crate::team::Teams,
-    /// Participant connections by connection id, holding the token id.
-    participant_conns: HashMap<u64, String>,
     /// Front-end connections that completed `hello` with the user token.
     frontend_conns: HashSet<u64>,
     /// Responses to service-originated requests, by (instance, agent id).
@@ -526,6 +533,16 @@ pub struct Hub {
     pending_removals: HashMap<(String, String), (u64, Value)>,
     team_sender: mpsc::UnboundedSender<TeamResult>,
     team_results: mpsc::UnboundedReceiver<TeamResult>,
+    /// Forwarded session requests, by (instance, relay agent request id), whose
+    /// token binds only on a successful response.
+    pending_session: HashMap<(String, u64), teams::PendingSession>,
+    /// `(instance, session)` -> the front end asked for a one-shot forwarded
+    /// load rather than an emulated one (20.5).
+    forward_loads: HashSet<(String, String)>,
+    /// The single source of truth for `injected`: every participant connection
+    /// and the token id it authenticated with. A token's *current* binding
+    /// decides which session (if any) it counts for.
+    conn_tokens: HashMap<u64, String>,
 }
 
 impl Hub {
@@ -576,7 +593,6 @@ impl Hub {
             install_event_sender,
             policy: Policy::new(),
             teams: crate::team::Teams::new(crate::team::new_shared_tokens()),
-            participant_conns: HashMap::new(),
             frontend_conns: HashSet::new(),
             driver: HashMap::new(),
             held_prompts: HashMap::new(),
@@ -590,6 +606,9 @@ impl Hub {
             pending_removals: HashMap::new(),
             team_sender,
             team_results,
+            pending_session: HashMap::new(),
+            forward_loads: HashSet::new(),
+            conn_tokens: HashMap::new(),
         }
     }
 
@@ -634,6 +653,12 @@ impl Hub {
                 Ok(rows) => self.teams.restore_workflows(rows),
                 Err(error) => {
                     crate::svc_log!("nvim_ade_server: cannot load stored workflows: {error:#}")
+                }
+            }
+            match self.recorder.load_session_switches() {
+                Ok(rows) => self.teams.restore_switches(rows),
+                Err(error) => {
+                    crate::svc_log!("nvim_ade_server: cannot load session switches: {error:#}")
                 }
             }
             let (stored, expired) = self.teams.restore(
@@ -754,9 +779,29 @@ impl Hub {
             Command::TeamWorktree {
                 team,
                 participant,
+                lifecycle,
                 outcome,
             } => {
-                self.team_worktree(&team, &participant, outcome);
+                self.team_worktree(&team, &participant, lifecycle, outcome);
+                self.update_busy();
+            }
+            Command::WorktreeDiscarded {
+                team,
+                participant,
+                lifecycle,
+            } => {
+                // Only the job that owns this lifecycle may finish its removal:
+                // a newer same-name worker has its own record.
+                let ours = self
+                    .pending_worktrees
+                    .get(&(team.clone(), participant.clone()))
+                    .is_some_and(|pending| pending.spawn.lifecycle == lifecycle);
+                if ours {
+                    self.pending_worktrees
+                        .remove(&(team.clone(), participant.clone()));
+                    self.finish_stopped_start(&team, &participant, lifecycle);
+                }
+                self.drain_team_events();
                 self.update_busy();
             }
             Command::TeamDeadline {
@@ -777,16 +822,47 @@ impl Hub {
             }
             Command::Authenticated { conn, participant } => {
                 if let Some(token) = participant {
-                    self.participant_conns.insert(conn, token);
+                    // The connection holds a token id; its binding is looked up
+                    // live, so a token bound after the handshake still counts.
+                    let identity = self.teams.session_identity(&token);
+                    match identity {
+                        Some(identity) => {
+                            let before = self.session_states(std::slice::from_ref(&identity));
+                            self.conn_tokens.insert(conn, token.clone());
+                            self.publish_session_changes(before);
+                        }
+                        // An early handshake has no identity yet; the binding
+                        // publishes it once the session exists.
+                        None => {
+                            self.conn_tokens.insert(conn, token.clone());
+                        }
+                    }
                     self.frontend_conns.remove(&conn);
                 } else {
-                    self.participant_conns.remove(&conn);
+                    self.conn_tokens.remove(&conn);
                     self.frontend_conns.insert(conn);
                 }
             }
             Command::Disconnected { conn } => {
                 self.conns.remove(&conn);
-                self.participant_conns.remove(&conn);
+                if let Some(token) = self.conn_tokens.get(&conn).cloned() {
+                    if let Some(identity) = self.teams.session_identity(&token) {
+                        let before = self.session_states(std::slice::from_ref(&identity));
+                        self.conn_tokens.remove(&conn);
+                        self.publish_session_changes(before);
+                    } else {
+                        self.conn_tokens.remove(&conn);
+                    }
+                }
+                let pending: Vec<(String, u64)> = self
+                    .pending_session
+                    .iter()
+                    .filter(|(_, pending)| pending.conn == conn)
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in pending {
+                    self.drop_pending_session(&key);
+                }
                 self.frontend_conns.remove(&conn);
                 self.teams.forget_connection(conn);
                 for instance in self.instances.values_mut() {
@@ -973,7 +1049,7 @@ impl Hub {
         let id = request_id(&frame);
         let is_request = object.get("id").is_some();
 
-        if let Some(token) = self.participant_conns.get(&conn).cloned() {
+        if let Some(token) = self.conn_tokens.get(&conn).cloned() {
             if method.starts_with("bus.") {
                 self.handle_participant(conn, &token, &method, &params, &id, is_request);
             } else if is_request {
@@ -989,7 +1065,7 @@ impl Hub {
             return;
         }
 
-        if method.starts_with("team.") {
+        if method.starts_with("team.") || method == "session.teams" {
             if !self.event_log {
                 // Teams are advertised only together with "log"; without it
                 // the methods do not exist.
@@ -1653,10 +1729,6 @@ impl Hub {
                 key
             }
         };
-        #[cfg(unix)]
-        let fingerprint = crate::team::launch_fingerprint(&key, env.as_deref(), launch.as_ref());
-        #[cfg(not(unix))]
-        let fingerprint = crate::team::launch_fingerprint(&key, env.as_deref());
         self.instances.insert(
             instance_id.clone(),
             Instance {
@@ -1670,9 +1742,11 @@ impl Hub {
                 log_key,
                 attached: Vec::new(),
                 stopping: false,
-                fingerprint,
                 #[cfg(unix)]
                 _lease: lease,
+                env,
+                #[cfg(unix)]
+                launch,
             },
         );
         Ok(instance_id)
@@ -1925,10 +1999,48 @@ impl Hub {
         } else {
             None
         };
-        let action = {
+        // 20.5: the front end asked for this session's reload. While a forced
+        // request of that session is still in flight, every load of it is
+        // forwarded too, so an emulated replay never splices old history onto
+        // the new one.
+        let is_reload = matches!(
+            method.as_deref(),
+            Some("session/load") | Some("session/resume")
+        );
+        let marked = session.as_ref().is_some_and(|session| {
+            self.forward_loads
+                .contains(&(instance_id.to_string(), session.clone()))
+        });
+        // Only a forced request of the *same instance* and session keeps this
+        // load off the emulation path; another instance with the same session id
+        // is unrelated (20.5).
+        let forced_in_flight = session.as_ref().is_some_and(|session| {
+            self.pending_session.iter().any(|((owner, _), pending)| {
+                owner == instance_id
+                    && pending.forced
+                    && pending.session.as_deref() == Some(session.as_str())
+            })
+        });
+        let force_forward = is_reload && (marked || forced_in_flight);
+        let mut action = {
             let handle = self.instances.get_mut(instance_id).expect("checked above");
-            handle.relay.frontend_message(conn, &message)
+            if force_forward {
+                handle.relay.forward_request(conn, &message)
+            } else {
+                handle.relay.frontend_message(conn, &message)
+            }
         };
+        // 20.2: a forwarded session request gets the session's team server; its
+        // token binds only on a successful response. An emulated load never
+        // reaches the agent and gets nothing.
+        let mut pending_session = self.inject_forwarded_session(conn, instance_id, &mut action);
+        if force_forward {
+            // The mark belongs to the session; it is consumed only when this
+            // request really reaches the agent's writer below.
+            if let Some(pending) = pending_session.as_mut() {
+                pending.forced = true;
+            }
+        }
         // Turn-scoped policy sets bind to the prompt from the installing
         // connection; a forwarded cancel makes them cancelling (17.3). A frame
         // the relay drops never becomes an in-flight prompt, so it must not
@@ -1944,6 +2056,23 @@ impl Hub {
                     }
                     Some("session/cancel") => self.policy.on_cancel(session),
                     _ => {}
+                }
+            }
+        }
+        if let Some(pending) = &pending_session {
+            match action
+                .forwarded()
+                .and_then(|frame| frame.get("id"))
+                .and_then(Value::as_u64)
+            {
+                Some(agent_id) => {
+                    self.pending_session
+                        .insert((instance_id.to_string(), agent_id), pending.clone());
+                }
+                None => {
+                    if let Some(pending) = pending_session.take() {
+                        self.drop_pending_session_value(pending);
+                    }
                 }
             }
         }
@@ -2001,6 +2130,9 @@ impl Hub {
             Some(handle) => handle,
             None => return,
         };
+        // An unsent frame leaves a registered request unanswerable: undo it
+        // through the same path as any other terminal failure.
+        let agent_id = frame.get("id").and_then(Value::as_u64);
         if !handle.control.send_frame(frame) {
             self.send_tunnel_error(
                 conn,
@@ -2009,6 +2141,29 @@ impl Hub {
                 "the agent is not accepting messages",
                 message_id,
             );
+            if let Some(agent_id) = agent_id {
+                self.drop_pending_session(&(instance_id.to_string(), agent_id));
+            }
+            return;
+        }
+        // The frame reached the agent: the request's record now outlives its
+        // front end, and a one-shot reload is consumed here, by the request
+        // that forced it (20.5/B).
+        if let Some(agent_id) = agent_id {
+            if let Some(pending) = self
+                .pending_session
+                .get_mut(&(instance_id.to_string(), agent_id))
+            {
+                pending.delivered = true;
+                let forced = pending.forced;
+                let session = pending.session.clone();
+                if forced {
+                    if let Some(session) = session {
+                        self.forward_loads
+                            .remove(&(instance_id.to_string(), session));
+                    }
+                }
+            }
         }
     }
 
@@ -2104,25 +2259,50 @@ impl Hub {
     }
 
     /// Forward a `session/load` to the agent (the emulation is not possible).
+    ///
+    /// This is the emulation fallback: it uses the same registration, source
+    /// connection check and send path as a normal forwarded request (20.2/C).
     fn forward_load(&mut self, conn: u64, instance_id: &str, frame: &Value) {
-        let Some(handle) = self.instances.get_mut(instance_id) else {
+        if !self.instances.contains_key(instance_id) || !self.conns.contains_key(&conn) {
+            // The front end left while the log was being read: nothing is
+            // forwarded and no token is issued.
+            return;
+        }
+        let mut action = {
+            let handle = self.instances.get_mut(instance_id).expect("checked above");
+            handle.relay.forward_request(conn, frame)
+        };
+        let mut pending = self.inject_forwarded_session(conn, instance_id, &mut action);
+        let Some(forwarded) = action.forwarded().cloned() else {
+            if let Some(pending) = pending {
+                self.drop_pending_session_value(pending);
+            }
             return;
         };
-        let action = handle.relay.forward_request(conn, frame);
-        let Some(frame) = action.forwarded().cloned() else {
-            return;
-        };
-        if let Some(handle) = self.instances.get(instance_id) {
-            if !handle.control.send_frame(frame) {
-                self.send_tunnel_error(
-                    conn,
-                    instance_id,
-                    FRAME_REJECTED,
-                    "the agent is not accepting messages",
-                    None,
-                );
+        // The log read may have raced a `session.teams` reload: this request is
+        // the earliest one that really reaches the agent, so it owns the mark
+        // (20.5).
+        if let (Some(pending), Some(session)) = (pending.as_mut(), forwarded_session(&forwarded)) {
+            if self
+                .forward_loads
+                .contains(&(instance_id.to_string(), session.clone()))
+            {
+                pending.forced = true;
             }
         }
+        let agent_id = forwarded.get("id").and_then(Value::as_u64);
+        match (pending, agent_id) {
+            (Some(pending), Some(agent_id)) => {
+                self.pending_session
+                    .insert((instance_id.to_string(), agent_id), pending);
+            }
+            (Some(pending), None) => {
+                self.drop_pending_session_value(pending);
+                return;
+            }
+            (None, _) => {}
+        }
+        self.send_to_agent(conn, instance_id, forwarded, None);
     }
 
     /// Handle the outcome of an emulated load: replay, answer, then release the
@@ -2146,6 +2326,34 @@ impl Hub {
                 frontend_id,
                 session_id,
             } => {
+                // A forced reload of the same instance and session may have
+                // reached the agent while this replay was being read: replaying
+                // the old log now would splice two histories, so forward instead
+                // (20.5/Minor 4).
+                let forced_in_flight = self.pending_session.iter().any(|((owner, _), pending)| {
+                    owner == &instance
+                        && pending.forced
+                        && pending.session.as_deref() == Some(session_id.as_str())
+                });
+                if forced_in_flight {
+                    self.release_gate(conn);
+                    let frame = json!({
+                        "jsonrpc": "2.0",
+                        "id": frontend_id,
+                        "method": "session/load",
+                        "params": {
+                            "sessionId": session_id,
+                            "cwd": self
+                                .instances
+                                .get(&instance)
+                                .map(|handle| handle.key.cwd.clone())
+                                .unwrap_or_default(),
+                            "mcpServers": [],
+                        },
+                    });
+                    self.forward_load(conn, &instance, &frame);
+                    return;
+                }
                 for (seq, message) in &messages {
                     self.send_tunnel_recv(conn, &instance, *seq, message);
                 }
@@ -2375,6 +2583,9 @@ impl Hub {
         }
         match outcome.action {
             Some(AgentAction::Response { conn, seq, message }) => {
+                if let Some(request) = &outcome.frontend_request {
+                    self.finish_session(instance_id, request, &message);
+                }
                 self.send_tunnel_recv(conn, instance_id, seq, &message);
             }
             Some(AgentAction::Notification { seq, message }) => {
@@ -2448,7 +2659,19 @@ impl Hub {
             }) => {
                 self.handle_service_response(instance_id, agent_id, seq, &message);
             }
-            Some(AgentAction::Drop) | None => {}
+            Some(AgentAction::Drop) | None => {
+                // The requester left, but the agent still answered a forwarded
+                // session request: its token must go and a forced load still
+                // owns the log boundary (20.5/B).
+                if let Some(request) = &outcome.frontend_request {
+                    if self
+                        .pending_session
+                        .contains_key(&(instance_id.to_string(), request.agent_id))
+                    {
+                        self.finish_session(instance_id, request, &value);
+                    }
+                }
+            }
             Some(AgentAction::Invalid) => {
                 crate::svc_log!(
                     "nvim_ade_server: agent {instance_id} wrote a frame that cannot be relayed; dropped"
@@ -2501,9 +2724,13 @@ impl Hub {
     }
 
     fn instance_exited(&mut self, instance_id: &str) {
-        self.teams.clear_instance_pending(instance_id);
         let delivery = self.delivery_conns(instance_id);
+        // The full state of every session this instance can affect, taken before
+        // anything is revoked: tokens, leadership and connections (20.5/A).
+        let exiting_sessions = self.instance_sessions(instance_id);
+        let before = self.session_states(&exiting_sessions);
         self.fail_held_prompts(instance_id);
+        self.cleanup_instance_pending(instance_id);
         let Some(instance) = self.instances.remove(instance_id) else {
             return;
         };
@@ -2558,6 +2785,10 @@ impl Hub {
         // the team cleanup above handles active teams, this covers a team that
         // was already closed or a start failure.
         self.teams.revoke_instance_tokens(instance_id);
+        // Publish once, comparing the pre-exit snapshot with the state after the
+        // whole cleanup: a session that was injected hears `injected:false` and
+        // a leader change (20.5/A).
+        self.publish_session_changes(before);
     }
 
     fn update_busy(&mut self) {
@@ -2941,6 +3172,14 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn forwarded_session(frame: &Value) -> Option<String> {
+    frame
+        .get("params")
+        .and_then(|params| params.get("sessionId"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3171,9 +3410,11 @@ mod tests {
             log_key: "i1".to_string(),
             attached: vec![1, 2],
             stopping: false,
-            fingerprint: "fp".to_string(),
             #[cfg(unix)]
             _lease: None,
+            env: None,
+            #[cfg(unix)]
+            launch: None,
         };
         let summary = instance_summary(&instance, 0);
         for field in [

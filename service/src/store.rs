@@ -71,7 +71,7 @@ use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBeha
 /// - 1: the S4a event log.
 /// - 2: the team tables (18.15).
 /// - 3: boards, card history and named workflows (19.11).
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// How long a writer waits for another process holding the database lock.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -374,6 +374,22 @@ impl Store {
         )
         .context("marking the sessions incomplete")?;
         tx.commit().context("committing a mark")?;
+        Ok(())
+    }
+
+    /// Mark one session's log incomplete (a forced reload restarted it).
+    pub fn mark_session_incomplete(&self, instance_key: &str, session_id: &str) -> Result<()> {
+        let conn = self.lock()?;
+        let Some(instance_id) = find_instance(&conn, instance_key)? else {
+            return Ok(());
+        };
+        conn.prepare_cached(
+            "INSERT INTO sessions (instance_id, session_id, incomplete) VALUES (?1, ?2, 1) \
+             ON CONFLICT (instance_id, session_id) DO UPDATE SET incomplete = 1",
+        )
+        .context("preparing the session mark")?
+        .execute(params![instance_id, session_id])
+        .context("marking the session incomplete")?;
         Ok(())
     }
 
@@ -888,6 +904,42 @@ impl Store {
     /// Forget every instance and event from the previous service run while
     /// keeping the team rows (section 10/18.15): a new service has no agents,
     /// so old sessions can never be replayed, but teams must survive.
+    /// Store one explicit per-session team switch (20.5).
+    pub fn save_session_switch(&self, agent: &str, session_id: &str, enabled: bool) -> Result<()> {
+        self.lock()?
+            .prepare_cached(
+                "INSERT INTO session_teams (agent, session_id, enabled) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(agent, session_id) DO UPDATE SET enabled = excluded.enabled",
+            )?
+            .execute(params![agent, session_id, enabled as i64])
+            .context("saving a session switch")?;
+        Ok(())
+    }
+
+    pub fn load_session_switches(&self) -> Result<Vec<(String, String, bool)>> {
+        let conn = self.lock()?;
+        let mut statement = conn.prepare("SELECT agent, session_id, enabled FROM session_teams")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("loading session switches")?;
+        Ok(rows)
+    }
+
+    pub fn delete_session_switch(&self, agent: &str, session_id: &str) -> Result<()> {
+        self.lock()?
+            .prepare_cached("DELETE FROM session_teams WHERE agent = ?1 AND session_id = ?2")?
+            .execute(params![agent, session_id])
+            .context("deleting a session switch")?;
+        Ok(())
+    }
+
     pub fn clear_events_for_restart(&self) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn
@@ -1191,6 +1243,12 @@ fn create_schema(conn: &Connection) -> Result<()> {
              json       TEXT    NOT NULL,
              updated_ms INTEGER NOT NULL,
              PRIMARY KEY (scope, project, name)
+         );
+         CREATE TABLE IF NOT EXISTS session_teams (
+             agent      TEXT    NOT NULL,
+             session_id TEXT    NOT NULL,
+             enabled    INTEGER NOT NULL,
+             PRIMARY KEY (agent, session_id)
          );",
     )
     .context("creating tables")

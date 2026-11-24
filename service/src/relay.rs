@@ -487,6 +487,18 @@ pub struct AgentOutcome {
     pub delivered: Vec<Delivery>,
     /// A front end closed or deleted this session successfully.
     pub closed_session: Option<String>,
+    /// The front-end request this frame answers (20.2 token binding).
+    pub frontend_request: Option<FrontendRequest>,
+}
+
+/// The front-end request a response answers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrontendRequest {
+    pub conn: ConnId,
+    pub frontend_id: Value,
+    pub method: String,
+    pub agent_id: u64,
+    pub session_id: Option<String>,
 }
 
 impl AgentOutcome {
@@ -921,6 +933,27 @@ impl Relay {
             .unwrap_or(false)
     }
 
+    /// Whether the agent can reload a session: `loadSession` or a resume
+    /// capability, either a boolean or an object (20.5).
+    pub fn agent_reloads_sessions(&self) -> bool {
+        self.agent_loads_sessions() || self.agent_resumes_sessions()
+    }
+
+    /// Whether the agent advertised `sessionCapabilities.resume`.
+    pub fn agent_resumes_sessions(&self) -> bool {
+        self.initialize
+            .as_ref()
+            .map(|(_, result)| {
+                result
+                    .get("agentCapabilities")
+                    .and_then(|caps| caps.get("sessionCapabilities"))
+                    .and_then(|caps| caps.get("resume"))
+                    .map(|resume| resume.as_bool() == Some(true) || resume.is_object())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
     /// The `seq` of the last agent message seen, for diagnostics and tests.
     pub fn last_seq(&self) -> u64 {
         self.seq
@@ -1327,6 +1360,15 @@ impl Relay {
 
         let mut outcome = AgentOutcome {
             closed_session,
+            frontend_request: frontend
+                .as_ref()
+                .map(|(conn, frontend_id)| FrontendRequest {
+                    conn: *conn,
+                    frontend_id: frontend_id.clone(),
+                    method: outgoing.method.clone(),
+                    agent_id,
+                    session_id: outgoing.session_id.clone(),
+                }),
             ..AgentOutcome::default()
         };
         // Synthetic config/mode events for the replay log (PROTOCOL.md 10).
