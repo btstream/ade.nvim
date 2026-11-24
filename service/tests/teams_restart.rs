@@ -729,6 +729,78 @@ fn a_sigkilled_team_keeps_its_board() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn a_bound_session_token_resumes_the_stored_leader_without_a_bind() {
+    let fixture = Fixture::new("v3-auto-resume");
+    let mut server = fixture.start("v3-auto-resume", &[]);
+    let mut client = fixture.connect(&server);
+    let (team, leader_session, _) = fixture.first_team(&server, &mut client, "do [report]");
+    wait_for(
+        || participant(&mut client, &team, "w1").filter(|entry| entry["instance"].is_string()),
+        "w1 started",
+    );
+    Fixture::shutdown(&mut server);
+
+    let server = fixture.start("v3-auto-resume-2", &[]);
+    let mut client = fixture.connect(&server);
+    fixture.configure(&mut client, &fixture.work, &server, true);
+    let attached = client.request(
+        1,
+        "agent.attach",
+        json!({
+            "key": {
+                "agent": "team-test",
+                "command": "python3",
+                "args": [agent()],
+                "cwd": fixture.work.to_string_lossy(),
+            },
+            "client_capabilities": {},
+            "env": child_env(&server, &fixture.log, &fixture.gate),
+        }),
+    );
+    let instance = attached["result"]["instance"].as_str().unwrap().to_string();
+    tunnel_call(
+        &mut client,
+        &instance,
+        10,
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    // No `team.leader_server` and no `team.bind_leader`: the injected session
+    // token alone binds and resumes the stored team (20.7).
+    let response = tunnel_call(
+        &mut client,
+        &instance,
+        11,
+        "session/load",
+        json!({
+            "sessionId": leader_session,
+            "cwd": fixture.work.to_string_lossy(),
+            "mcpServers": [],
+        }),
+    );
+    assert!(response["result"].is_object(), "{response}");
+    wait_for(
+        || {
+            let entry = team_entry(&mut client, &team);
+            (entry["state"] == "active"
+                && entry["participants"]
+                    .as_array()
+                    .is_some_and(|participants| {
+                        participants.iter().any(|participant| {
+                            participant["name"] == "w1" && participant["instance"].is_string()
+                        })
+                    }))
+            .then_some(())
+        },
+        "the team resumed from the session token",
+    );
+    assert_eq!(
+        team_entry(&mut client, &team)["leader"]["sessionId"],
+        leader_session
+    );
+}
+
+#[test]
 fn a_gracefully_stopped_team_comes_back_suspended_and_resumes_with_its_queue() {
     let fixture = Fixture::new("restart-suspend");
     let mut server = fixture.start("a", &[]);

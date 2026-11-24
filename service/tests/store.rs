@@ -1196,16 +1196,16 @@ fn a_version_one_log_migrates_without_losing_events() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let tables: i64 = conn
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type = 'table'
-             AND name IN ('teams', 'team_meta', 'boards', 'card_history', 'workflows')",
+             AND name IN ('teams', 'team_meta', 'boards', 'card_history', 'workflows', 'session_teams')",
             [],
             |row| row.get(0),
         )
         .expect("tables");
-    assert_eq!(tables, 5);
+    assert_eq!(tables, 6);
 }
 
 #[test]
@@ -1256,7 +1256,7 @@ fn a_version_two_log_with_data_keeps_events_and_teams_when_upgraded() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let tables: i64 = conn
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type = 'table'

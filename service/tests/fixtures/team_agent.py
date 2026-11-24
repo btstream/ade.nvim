@@ -549,6 +549,7 @@ def main():
                     "command": entry.get("command"),
                     "args": entry.get("args"),
                     "env_names": [item.get("name") for item in entry.get("env") or []],
+                    "env": entry.get("env"),
                 }
             log({
                 "event": "session",

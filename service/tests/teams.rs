@@ -5428,3 +5428,308 @@ fn a_restart_resume_takes_the_resuming_launchs_template() {
         "the resumed team takes the configuration the resuming launch supplied"
     );
 }
+
+/// The session token the service injected into a session/new response, read
+/// back from the agent log.
+fn injected_token(harness: &Harness, session: &str) -> String {
+    wait_for(
+        || {
+            harness.events().into_iter().find_map(|event| {
+                if event["event"] != "session" || event["session"] != session {
+                    return None;
+                }
+                event["mcp_entry"]["env"]
+                    .as_array()?
+                    .iter()
+                    .find(|item| item["name"] == "ADE_TEAM_TOKEN")?["value"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+        },
+        "the injected session token",
+    )
+}
+
+#[test]
+fn session_requests_get_a_fresh_ade_team_entry() {
+    let mut harness = Harness::new(
+        "session-inject",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let response = tunnel_call(
+        &mut harness.client,
+        &harness.instance,
+        21,
+        "session/new",
+        json!({
+            "cwd": harness.work.to_string_lossy(),
+            "mcpServers": [
+                {"name": "ade-team", "command": "/bin/false", "args": [], "env": []},
+                {"name": "other", "command": "/bin/true", "args": [], "env": []},
+            ],
+        }),
+    );
+    let session = response["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let token = injected_token(&harness, &session);
+    assert_ne!(token, harness.token, "the service issues its own token");
+    let event = wait_for(
+        || {
+            harness
+                .events()
+                .into_iter()
+                .find(|event| event["event"] == "session" && event["session"] == session)
+        },
+        "the session/new at the agent",
+    );
+    let entry = event["mcp_entry"].clone();
+    assert_eq!(entry["name"], "ade-team", "{entry}");
+    assert!(
+        entry["command"]
+            .as_str()
+            .is_some_and(|command| command.ends_with("nvim_ade_server")),
+        "{entry}"
+    );
+    assert_eq!(
+        event["mcp_entry"]["env_names"],
+        json!(["ADE_TEAM_TOKEN"]),
+        "{event}"
+    );
+    let init = mcp_session(
+        &harness.server,
+        &harness.token,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test"}}}),
+        ],
+        1,
+    );
+    assert_eq!(init["capabilities"]["tools"]["listChanged"], true, "{init}");
+}
+
+#[test]
+fn the_switch_hides_the_session_tools_and_reloads_on_enable() {
+    let mut harness = Harness::new(
+        "session-switch",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let response = tunnel_call(
+        &mut harness.client,
+        &harness.instance,
+        22,
+        "session/new",
+        json!({ "cwd": harness.work.to_string_lossy(), "mcpServers": [] }),
+    );
+    let session = response["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let token = injected_token(&harness, &session);
+
+    let off = harness.client.request(
+        23,
+        "session.teams",
+        json!({
+            "instance": harness.instance,
+            "sessionId": session,
+            "enabled": false,
+        }),
+    );
+    assert_eq!(off["result"]["enabled"], false, "{off}");
+    assert!(mcp_tools(&harness.server, &token).is_empty());
+    let refused = mcp_call(
+        &harness.server,
+        &token,
+        "workflow_get",
+        json!({"name": "x"}),
+    );
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(mcp_text(&refused).contains("teams are off"), "{refused}");
+
+    let on = harness.client.request(
+        24,
+        "session.teams",
+        json!({
+            "instance": harness.instance,
+            "sessionId": session,
+            "enabled": true,
+        }),
+    );
+    assert_eq!(on["result"]["enabled"], true, "{on}");
+    // No MCP process was connected when the switch flipped: the service
+    // reloads the session with a fresh server entry (20.5).
+    let loaded = wait_for(
+        || {
+            harness.events().into_iter().find(|event| {
+                event["event"] == "session"
+                    && event["method"] == "session/load"
+                    && event["session"] == session
+            })
+        },
+        "the in-place session/load",
+    );
+    assert_eq!(loaded["mcp"], true, "{loaded}");
+    assert!(
+        mcp_tools(&harness.server, &token).contains(&"team_spawn".to_string()),
+        "the non-leader session tools are back"
+    );
+}
+
+#[test]
+fn a_second_session_spawns_through_ensure_team_and_is_told_about_the_leader() {
+    let mut harness = Harness::new(
+        "session-led-by",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let response = tunnel_call(
+        &mut harness.client,
+        &harness.instance,
+        25,
+        "session/new",
+        json!({ "cwd": harness.work.to_string_lossy(), "mcpServers": [] }),
+    );
+    let session = response["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let spawn = harness.client.request(
+        26,
+        "team.spawn",
+        json!({
+            "instance": harness.instance,
+            "sessionId": session,
+            "template": "dev",
+            "name": "w2",
+        }),
+    );
+    assert_eq!(spawn["error"]["code"], -32061, "{spawn}");
+    assert!(
+        spawn["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("hand")),
+        "{spawn}"
+    );
+    let item = wait_for(
+        || {
+            harness.team()["inbox"]
+                .as_array()?
+                .iter()
+                .find(|item| item["kind"] == "handover")
+                .cloned()
+        },
+        "the handover item",
+    );
+    assert_eq!(item["from"]["sessionId"], session, "{item}");
+    assert_eq!(item["leader"]["sessionId"], harness.session, "{item}");
+
+    // `move` makes the second chat the leader and the spawn then works.
+    harness.answer(item["id"].as_str().unwrap(), json!({"option": "move"}));
+    let spawn = wait_for(
+        || {
+            let response = harness.client.request(
+                27,
+                "team.spawn",
+                json!({
+                    "instance": harness.instance,
+                    "sessionId": session,
+                    "template": "dev",
+                    "name": "w2",
+                }),
+            );
+            response["result"].is_object().then_some(response)
+        },
+        "the spawn after the handover",
+    );
+    assert_eq!(spawn["result"]["name"], "w2", "{spawn}");
+    assert_eq!(
+        harness.team()["leader"]["sessionId"],
+        session,
+        "the moved leader"
+    );
+}
+
+#[test]
+fn stop_worker_stops_and_optionally_removes_a_worker() {
+    let mut harness = Harness::new(
+        "team-stop-worker",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    harness.spawn(json!({"name": "w1", "task": "do [report]"}));
+    harness.wait_participant("w1", |entry| entry["sessionId"].is_string());
+    let stopped = harness.client.request(
+        28,
+        "team.stop_worker",
+        json!({"team": harness.team, "name": "w1", "remove": true}),
+    );
+    assert!(stopped["result"].is_object(), "{stopped}");
+    wait_for(
+        || {
+            harness.team()["participants"]
+                .as_array()
+                .map(|participants| {
+                    participants
+                        .iter()
+                        .all(|participant| participant["name"] != "w1")
+                        .then_some(())
+                })?
+        },
+        "w1 removed from the team",
+    );
+    let leader = harness.read("leader");
+    assert!(
+        leader["messages"]
+            .as_array()
+            .is_some_and(|messages| messages.iter().any(|message| message["body"]
+                .as_str()
+                .is_some_and(|body| body.contains("w1 stopped by the person")))),
+        "{leader}"
+    );
+}
+
+#[test]
+fn an_empty_template_table_uses_the_builtin_worker() {
+    let mut harness = Harness::new(
+        "builtin-worker",
+        json!({"spawn_confirm": {"auto": []}}),
+        None,
+    );
+    let _ = injected_token(&harness, &harness.session);
+    harness
+        .client
+        .request(30, "team.close", json!({"team": harness.team}));
+    harness.client.request(
+        31,
+        "team.configure",
+        json!({
+            "cwd": harness.work.to_string_lossy(),
+            "config": {"templates": {}, "spawn_confirm": {"auto": []}},
+        }),
+    );
+    let spawned = harness.client.request(
+        29,
+        "team.spawn",
+        json!({
+            "instance": harness.instance,
+            "sessionId": harness.session,
+            "template": "worker",
+        }),
+    );
+    // The built-in template exists and is a worktree template; without a
+    // worktree root the spawn fails on that, not on an unknown template.
+    assert_eq!(spawned["error"]["code"], -32061, "{spawned}");
+    assert!(
+        spawned["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("worktree_root")),
+        "{spawned}"
+    );
+    assert_eq!(
+        harness.list()["teams"][0]["leader"]["sessionId"],
+        harness.session
+    );
+}
