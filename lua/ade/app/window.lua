@@ -32,6 +32,11 @@ end
 function M:select_session(session)
   local S = self:state()
   local previous = S.sess.current
+  -- A team worker transcript is only a view of a worker session; switching the
+  -- real session must never leave the composer pointed at a former target.
+  if S.view.team_ui and S.view.team_ui.detach then
+    pcall(S.view.team_ui.detach, S.view.team_ui)
+  end
   S.sess.current = session
   S.sess.runtime:select(session)
   if session and not session.needs_load and S.conn.client and S.conn.client.created ~= nil then
@@ -148,13 +153,28 @@ function M:install_input_keymaps()
   local S = self:state()
   local actions = self.deps.actions
   local cfg = self.deps.config()
+  -- While the composer sends to a team worker, the leader's session is not what
+  -- the person is looking at: history, the empty-`<C-s>` stop and `<C-c>` must
+  -- not read or cancel `S.sess.current`.
+  local function team_target()
+    local S = self:state()
+    local ui = S.view and S.view.team_ui
+    return ui and ui.is_worker_target and ui:is_worker_target() and ui or nil
+  end
   local function history(direction)
     if cfg.ui.input_history_limit == 0 then
       return nil
     end
     return function()
+      local ui = team_target()
       local session = self:state().sess.current
-      return S.view.input:recall(direction, session and session.blocks)
+      local blocks = session and session.blocks
+      if ui then
+        -- The worker's own display transcript, never the leader's.
+        local display = ui.router and ui.router.display
+        blocks = display and display.blocks or nil
+      end
+      return S.view.input:recall(direction, blocks)
     end
   end
   keymaps.attach_input(S.view.input.buf, {
@@ -168,6 +188,18 @@ function M:install_input_keymaps()
     on_send = function()
       local sessions = self:state()
       -- Ctrl-S submits; when a turn is running and the composer is empty it stops instead.
+      -- The stop only ever targets the session the person is looking at.
+      local ui = team_target()
+      if ui then
+        -- A worker has no local turn to cancel. An empty composer still
+        -- submits nothing, but it must not cancel the leader's turn.
+        if S.view.input:text():match("^%s*$") and #S.view.input.attachments == 0 then
+          ui:cancel_target()
+          return
+        end
+        S.view.input:submit()
+        return
+      end
       local running = sessions.sess.current and sessions.sess.current.status == "running"
       if running and S.view.input:text():match("^%s*$") and #S.view.input.attachments == 0 then
         actions.cancel()
@@ -175,7 +207,14 @@ function M:install_input_keymaps()
       end
       S.view.input:submit()
     end,
-    on_cancel = actions.cancel,
+    on_cancel = function()
+      local ui = team_target()
+      if ui then
+        ui:cancel_target()
+        return
+      end
+      actions.cancel()
+    end,
     on_hide = actions.hide,
     on_add_selection = actions.add_selection,
     on_pick_model = actions.pick_model,

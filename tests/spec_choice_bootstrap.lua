@@ -654,19 +654,18 @@ return function(t)
       t.truthy(form_win(), "the form stays after focus leaves")
     end)
 
-    t.it("mounts the component in the leader-mount input window", function()
+    t.it("mounts the component in the consumer of a worker transcript", function()
       local S = setup({ teams = { dashboard = { wide = 40 } } })
       cleanup(S)
       t.eq(true, controller.open_team())
       local ui = S.view.team_ui
       wait(function()
-        return ui and ui.tab and ui.tab:is_open()
-      end, 5000, "the dashboard tab")
+        return ui.layout:is_open_pane("members")
+      end, 5000, "the members pane")
+      -- The worker transcript is the ordinary chat/input pair, so the choice
+      -- component still mounts in the one composer window.
       local before = S.view.input.win
-      ui:mount_leader()
-      wait(function()
-        return S.view.input.win and S.view.input.win ~= before
-      end, 5000, "the mounted input")
+      t.truthy(before)
       S.view.interactions:open("permission", {
         sessionId = "s1",
         toolCall = { title = "Run", kind = "execute" },
@@ -675,10 +674,15 @@ return function(t)
       local choices = S.view.choices
       wait(function()
         return choices.view:is_open()
-      end, 5000, "the component in the mounted input")
-      t.eq(choices.view.win, vim.api.nvim_get_current_win())
+      end, 5000, "the component in the shared composer")
+      -- The component floats over a shared window rather than opening a
+      -- second composer: it is a `relative = "win"` float with a host.
+      local config = vim.api.nvim_win_get_config(choices.view.win)
+      t.eq("win", config.relative)
+      t.truthy(choices.view.host and vim.api.nvim_win_is_valid(choices.view.host), "the host is the shared window")
+      t.truthy(vim.api.nvim_win_is_valid(before))
       choices:dismiss()
-      ui:unmount_leader()
+      ui:close()
     end)
 
     t.it("stops insert mode before mounting the component", function()

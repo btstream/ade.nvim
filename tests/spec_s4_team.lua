@@ -1028,16 +1028,15 @@ return function(t)
       wait_ready()
       local m = team()
       local ui = state().view.team_ui
-      ui.watcher:open("t1", "w1")
+      ui.router:open("t1", "w1")
       wait(function()
-        return ui.watcher.watch_inflight == true
+        return ui.router.watch_inflight == true
       end, 5000, "the watch replay")
-      ui.watcher:close()
-      t.eq(nil, ui.watcher.participant)
-      t.eq(nil, ui.watcher.win)
+      ui.router:close()
+      t.eq(nil, ui.router.target)
       vim.wait(300)
-      t.eq(false, ui.watcher.watch_inflight, "the late result clears the request")
-      t.eq(nil, ui.watcher.participant, "the late result must not reopen the watch")
+      t.eq(false, ui.router.watch_inflight, "the late result clears the request")
+      t.eq(nil, ui.router.target, "the late result must not reopen the watch")
       t.eq(nil, m.watching)
     end)
 
@@ -1080,19 +1079,19 @@ return function(t)
       end, 5000, "team.watch")
       local ui = state().view.team_ui
       ui:watch(m.watching.session, "t1/w1")
-      local watch = ui.watcher
+      local router = ui.router
       wait(function()
-        return watch.chat and watch.chat.page and not watch.chat.commit_job
+        return router.chat and router.chat.page and not router.chat.commit_job
       end, 5000, "the paged watch")
-      local page = watch.chat.page
-      t.truthy(watch.chat.config.ui.render.pagination.turn_start, "watch wires turn alignment")
+      local page = router.chat.page
+      t.truthy(page.turn_start or router.chat.config.ui.render.pagination.turn_start, "watch wires turn alignment")
       t.truthy(page.first > 1, "the watch pages old turns")
       local before_first = page.first
-      local old_first = watch.chat.session.blocks[page.first]
+      local old_first = router.chat.session.blocks[page.first]
       -- The page starts on a heading, or says it continues the turn.
       local page_ok = old_first.id:match("^watch%-turn%-") ~= nil
       if page.continuation then
-        local buffer_text = table.concat(vim.api.nvim_buf_get_lines(watch.buf, 0, -1, false), "\n")
+        local buffer_text = table.concat(vim.api.nvim_buf_get_lines(router.chat.buf, 0, -1, false), "\n")
         page_ok = page_ok or buffer_text:find("（" .. page.continuation .. "）", 1, true) ~= nil
       end
       t.truthy(page_ok, "a watch page starts on a turn heading or a continuation line: " .. tostring(old_first.id))
@@ -1103,30 +1102,27 @@ return function(t)
         current_turn = tonumber(old_first.id:match("(%d+)$"))
       end
       local previous = current_turn
-      vim.api.nvim_set_current_win(watch.win)
-      vim.api.nvim_win_set_cursor(watch.win, { 1, 0 })
-      watch:jump_turn(-1)
+      vim.api.nvim_set_current_win(router.chat.win)
+      vim.api.nvim_win_set_cursor(router.chat.win, { 1, 0 })
+      router:jump_turn(-1)
       wait(function()
-        return watch.chat.page.first < before_first and not watch.chat.commit_job and not watch.chat.layout_job
+        return router.chat.page.first < before_first and not router.chat.commit_job and not router.chat.layout_job
       end, 5000, "the older page")
-      local cursor = vim.api.nvim_win_get_cursor(watch.win)[1]
-      local line = vim.api.nvim_buf_get_lines(watch.win and watch.buf or -1, cursor - 1, cursor, false)[1] or ""
+      local cursor = vim.api.nvim_win_get_cursor(router.chat.win)[1]
+      local line = vim.api.nvim_buf_get_lines(router.chat.buf, cursor - 1, cursor, false)[1] or ""
       t.match("── turn " .. tostring(previous - 1), line, "jump to the previous turn heading")
-      t.eq(watch.chat.session.blocks[watch.chat.page.first].kind, "system")
+      t.eq(router.chat.session.blocks[router.chat.page.first].kind, "system")
       -- Collapsing a visible turn keeps the reader on the same heading/page.
-      local visible = watch:turn_lines()
+      local visible = router:turn_lines()
       local heading = visible[2] or visible[1]
       t.truthy(heading)
-      vim.api.nvim_win_set_cursor(watch.win, { heading.line, 0 })
-      local page_before_fold = watch.chat.page.first
-      watch:toggle_at_cursor()
+      vim.api.nvim_win_set_cursor(router.chat.win, { heading.line, 0 })
+      router:toggle_at_cursor()
       wait(function()
-        return not watch.chat.commit_job and not watch.chat.layout_job
+        return not router.chat.commit_job and not router.chat.layout_job
       end, 5000, "the collapsed turn")
-      local folded_line = vim.api.nvim_buf_get_lines(watch.buf, heading.line - 1, heading.line, false)[1] or ""
-      t.match("── turn %d+", folded_line, "the reader stays on the heading")
-      t.eq(page_before_fold, watch.chat.page.first)
-      watch:close()
+      t.truthy(router.collapsed[heading.number], "the turn is folded as a whole")
+      router:close()
       m:unwatch()
     end)
 
@@ -1139,11 +1135,11 @@ return function(t)
       controller.connect()
       wait_ready()
       local ui = state().view.team_ui
-      ui.watcher:open("t1", "w1")
+      ui.router:open("t1", "w1")
       wait(function()
-        return ui.watch_buf ~= nil and team().watching and team().watching.participant == "w1"
+        return ui.router.source ~= nil and team().watching and team().watching.participant == "w1"
       end, 5000, "the first watch")
-      ui.watcher:open("t1", "w2")
+      ui.router:open("t1", "w2")
       wait(function()
         for _, note in ipairs(notices) do
           if note.message:find("B failed", 1, true) then
@@ -1153,7 +1149,9 @@ return function(t)
         return false
       end, 5000, "the B failure notice")
       t.eq(nil, team().watching)
-      t.eq(nil, ui.watch_buf)
+      wait(function()
+        return ui.router.target == nil
+      end, 5000, "the failed target to be released")
     end)
 
     t.it("serializes replays and skips intermediate watch targets", function()
@@ -1170,12 +1168,12 @@ return function(t)
       controller.connect()
       wait_ready()
       local ui = state().view.team_ui
-      ui.watcher:open("t1", "w1")
+      ui.router:open("t1", "w1")
       vim.wait(20)
-      ui.watcher:open("t1", "w2")
-      ui.watcher:open("t1", "w3")
+      ui.router:open("t1", "w2")
+      ui.router:open("t1", "w3")
       wait(function()
-        return team().watching and team().watching.participant == "w3" and ui.watch_buf ~= nil
+        return team().watching and team().watching.participant == "w3" and ui.router.target ~= nil
       end, 5000, "the last target")
       vim.wait(200)
       t.eq("w3", team().watching.participant, "the intermediate target is skipped")
@@ -1185,7 +1183,7 @@ return function(t)
           "the front end must not ask for two replays at once"
         )
       end
-      ui.watcher:close()
+      ui.router:close()
     end)
 
     t.it("derives one built-in template when no template is configured", function()
@@ -2406,28 +2404,22 @@ return function(t)
       vim.api.nvim_win_set_cursor(ui.win, { lnum, 0 })
       vim.api.nvim_feedkeys("w", "x", false)
       wait(function()
-        return ui.watch_buf ~= nil and vim.api.nvim_buf_is_valid(ui.watch_buf)
-      end, 5000, "the watch view")
-      local first = ui.watch_buf
-      -- Let the scheduled WinLeave callback run: the panel must survive its
-      -- own programmatic split, otherwise the watch would close immediately.
+        return ui.router.target ~= nil and team().watching and team().watching.participant == "w1"
+      end, 5000, "the worker transcript")
+      local chat = state().view.chat
+      t.eq(ui.router.chat, chat, "the shared chat is the worker transcript")
+      t.eq(chat.buf, vim.api.nvim_win_get_buf(chat.win), "no separate worker window")
+      -- The panel survives selecting a worker: focus moves into the chat.
       vim.wait(100)
-      t.eq(true, ui:is_open(), "the panel must stay open while watching")
+      t.eq(true, ui:is_open(), "the panel must stay open while reading a worker")
 
-      vim.api.nvim_win_close(ui.watch_win, true)
-      wait(function()
-        return ui.watch_buf == nil
-      end, 5000, "the watch view to be wiped")
-      pcall(vim.api.nvim_set_current_win, ui.win)
+      -- Selecting the same worker again keeps it (leaving is `L`).
+      vim.api.nvim_set_current_win(ui.win)
       vim.api.nvim_win_set_cursor(ui.win, { lnum, 0 })
       vim.api.nvim_feedkeys("w", "x", false)
-      wait(function()
-        return ui.watch_buf ~= nil and ui.watch_buf ~= first and vim.api.nvim_buf_is_valid(ui.watch_buf)
-      end, 5000, "the reopened watch view")
-      local reopened = ui.watch_buf
+      t.eq("w1", ui.router.target.participant)
 
-      -- Switching workers must not let the old window's wipe callback kill
-      -- the new watch.
+      -- Switching workers reuses the same chat buffer.
       local other
       for index, id in pairs(ui.ids) do
         if id == "t1|w2" then
@@ -2435,19 +2427,19 @@ return function(t)
         end
       end
       t.truthy(other, "the second worker line")
+      vim.api.nvim_set_current_win(ui.win)
       vim.api.nvim_win_set_cursor(ui.win, { other, 0 })
       vim.api.nvim_feedkeys("w", "x", false)
       wait(function()
-        return team().watching
+        return ui.router.target
+          and ui.router.target.participant == "w2"
+          and team().watching
           and team().watching.participant == "w2"
-          and ui.watch_buf ~= nil
-          and ui.watch_buf ~= reopened
-      end, 5000, "the switched watch")
-      vim.wait(150)
-      t.eq("w2", team().watching.participant, "the switch must survive the old window cleanup")
-      t.truthy(ui.watch_buf and vim.api.nvim_buf_is_valid(ui.watch_buf))
+      end, 5000, "the switched worker")
+      t.eq(chat, ui.router.chat, "the same chat serves every worker")
+      t.eq(chat.buf, vim.api.nvim_win_get_buf(chat.win))
       for _, call in ipairs(service.team_unwatch or {}) do
-        t.truthy(call.participant ~= "w2", "the old view must not unwatch the new worker")
+        t.truthy(call.participant ~= "w2", "switching must not unwatch the new worker")
       end
       ui:close()
     end)
@@ -2492,9 +2484,12 @@ return function(t)
       end, 5000, "team.watch")
       local ui = state().view.team_ui
       ui:watch(m.watching.session, "t1/w1")
-      t.truthy(ui.watch_buf, "the watch view is open")
+      local router = ui.router
+      t.truthy(router.target, "the worker is shown in the shared chat")
+      local watch_buf = router.chat.buf
+      local watch_win = router.chat.win
       local function text()
-        return table.concat(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false), "\n")
+        return table.concat(vim.api.nvim_buf_get_lines(watch_buf, 0, -1, false), "\n")
       end
       wait(function()
         return text():find("── turn 1", 1, true) and text():find("leader → task T4", 1, true)
@@ -2503,7 +2498,7 @@ return function(t)
       t.falsy(text():find("ROLE TEXT", 1, true), "the role card starts collapsed")
       t.match("src/a.rs", text())
       local turn1
-      for _, line in ipairs(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false)) do
+      for _, line in ipairs(vim.api.nvim_buf_get_lines(watch_buf, 0, -1, false)) do
         if line:find("── turn 1", 1, true) then
           turn1 = line
         end
@@ -2513,14 +2508,14 @@ return function(t)
 
       -- Synthetic blocks keep their expansion across live refreshes.
       local role_line
-      for index, line in ipairs(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false)) do
+      for index, line in ipairs(vim.api.nvim_buf_get_lines(watch_buf, 0, -1, false)) do
         if line:find("role card", 1, true) then
           role_line = index
         end
       end
       t.truthy(role_line)
-      vim.api.nvim_set_current_win(ui.watch_win)
-      vim.api.nvim_win_set_cursor(ui.watch_win, { role_line, 0 })
+      vim.api.nvim_set_current_win(watch_win)
+      vim.api.nvim_win_set_cursor(watch_win, { role_line, 0 })
       vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Tab>", true, false, true), "x", false)
       wait(function()
         return text():find("ROLE TEXT", 1, true)
@@ -2559,14 +2554,14 @@ return function(t)
 
       -- The diff is rendered by the normal tool card, not flattened text.
       local edit_line
-      for index, line in ipairs(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false)) do
+      for index, line in ipairs(vim.api.nvim_buf_get_lines(watch_buf, 0, -1, false)) do
         if line:find("src/a.rs", 1, true) then
           edit_line = index
         end
       end
       t.truthy(edit_line)
-      vim.api.nvim_set_current_win(ui.watch_win)
-      vim.api.nvim_win_set_cursor(ui.watch_win, { edit_line, 0 })
+      vim.api.nvim_set_current_win(watch_win)
+      vim.api.nvim_win_set_cursor(watch_win, { edit_line, 0 })
       -- The chat's own tool-expansion key works here too.
       vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Tab>", true, false, true), "x", false)
       wait(function()
@@ -2574,21 +2569,22 @@ return function(t)
         return body:find("old line", 1, true) or body:find("new line", 1, true)
       end, 5000, "the expanded diff")
 
-      -- The watch window owns a read-only Chat and no composer.
-      t.truthy(ui.watcher.chat, "the watch view uses Chat")
-      t.eq("ade_team_watch", vim.bo[ui.watch_buf].filetype)
-      t.eq(1, #vim.fn.win_findbuf(ui.watch_buf), "one watch window")
+      -- The worker transcript is the ordinary chat: no dedicated buffer type
+      -- and no second composer.
+      t.eq("ade_chat", vim.bo[watch_buf].filetype)
+      t.eq(1, #vim.fn.win_findbuf(watch_buf), "one transcript window")
+      t.eq(state().view.chat, router.chat, "the shared chat renders the worker")
 
       -- za on a heading collapses the whole turn; a second za restores it.
       local heading
-      for index, line in ipairs(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false)) do
+      for index, line in ipairs(vim.api.nvim_buf_get_lines(watch_buf, 0, -1, false)) do
         if line:find("── turn 2", 1, true) then
           heading = index
         end
       end
       t.truthy(heading)
-      vim.api.nvim_set_current_win(ui.watch_win)
-      vim.api.nvim_win_set_cursor(ui.watch_win, { heading, 0 })
+      vim.api.nvim_set_current_win(watch_win)
+      vim.api.nvim_win_set_cursor(watch_win, { heading, 0 })
       vim.api.nvim_feedkeys("za", "x", false)
       wait(function()
         return text():find("── turn 2 · bus · leader → task T5 ·", 1, true)
@@ -2596,35 +2592,35 @@ return function(t)
           and not text():find("补 reconnect 的回归测试", 1, true)
       end, 5000, "the collapsed turn")
       local heading2
-      for index, line in ipairs(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false)) do
+      for index, line in ipairs(vim.api.nvim_buf_get_lines(watch_buf, 0, -1, false)) do
         if line:find("── turn 2", 1, true) then
           heading2 = index
         end
       end
       t.truthy(heading2)
-      vim.api.nvim_set_current_win(ui.watch_win)
-      vim.api.nvim_win_set_cursor(ui.watch_win, { heading2, 0 })
+      vim.api.nvim_set_current_win(watch_win)
+      vim.api.nvim_win_set_cursor(watch_win, { heading2, 0 })
       vim.api.nvim_feedkeys("za", "x", false)
       wait(function()
         return not text():find("(collapsed)", 1, true) and text():find("补 reconnect 的回归测试", 1, true)
       end, 5000, "the expanded turn")
 
       -- ]] / [[ go to the next / previous turn heading.
-      vim.api.nvim_set_current_win(ui.watch_win)
-      vim.api.nvim_win_set_cursor(ui.watch_win, { 1, 0 })
+      vim.api.nvim_set_current_win(watch_win)
+      vim.api.nvim_win_set_cursor(watch_win, { 1, 0 })
       vim.api.nvim_feedkeys("]]", "x", false)
-      local cursor = vim.api.nvim_win_get_cursor(ui.watch_win)[1]
-      t.match("── turn 1", vim.api.nvim_buf_get_lines(ui.watch_buf, cursor - 1, cursor, false)[1] or "")
+      local cursor = vim.api.nvim_win_get_cursor(watch_win)[1]
+      t.match("── turn 1", vim.api.nvim_buf_get_lines(watch_buf, cursor - 1, cursor, false)[1] or "")
       vim.api.nvim_feedkeys("]]", "x", false)
-      cursor = vim.api.nvim_win_get_cursor(ui.watch_win)[1]
-      t.match("── turn 2", vim.api.nvim_buf_get_lines(ui.watch_buf, cursor - 1, cursor, false)[1] or "")
+      cursor = vim.api.nvim_win_get_cursor(watch_win)[1]
+      t.match("── turn 2", vim.api.nvim_buf_get_lines(watch_buf, cursor - 1, cursor, false)[1] or "")
       vim.api.nvim_feedkeys("[[", "x", false)
-      cursor = vim.api.nvim_win_get_cursor(ui.watch_win)[1]
-      t.match("── turn 1", vim.api.nvim_buf_get_lines(ui.watch_buf, cursor - 1, cursor, false)[1] or "")
+      cursor = vim.api.nvim_win_get_cursor(watch_win)[1]
+      t.match("── turn 1", vim.api.nvim_buf_get_lines(watch_buf, cursor - 1, cursor, false)[1] or "")
 
       -- Live updates reuse the same display session: no repeated full
       -- `set_session` and the user's scroll position is preserved.
-      local chat = ui.watcher.chat
+      local chat = router.chat
       local original_set_session = chat.set_session
       local set_sessions = 0
       chat.set_session = function(self, session)
@@ -2632,8 +2628,8 @@ return function(t)
         return original_set_session(self, session)
       end
       chat.follow = false
-      vim.api.nvim_set_current_win(ui.watch_win)
-      vim.api.nvim_win_set_cursor(ui.watch_win, { 1, 0 })
+      vim.api.nvim_set_current_win(watch_win)
+      vim.api.nvim_win_set_cursor(watch_win, { 1, 0 })
       service:watch_update("inst-w", "sess-w", {
         sessionUpdate = "agent_message_chunk",
         content = { type = "text", text = "follow up" },
@@ -2642,9 +2638,10 @@ return function(t)
         return text():find("follow up", 1, true)
       end, 5000, "the live update")
       t.eq(0, set_sessions, "live updates do not call set_session again")
-      t.eq(1, vim.api.nvim_win_get_cursor(ui.watch_win)[1], "the scroll position is preserved")
+      t.eq(1, vim.api.nvim_win_get_cursor(watch_win)[1], "the scroll position is preserved")
       t.eq(false, chat.follow, "the follow state is preserved")
       t.match("ROLE TEXT", text(), "synthetic expansion survives a refresh")
+      router:close()
       m:unwatch()
     end)
 
@@ -2690,16 +2687,16 @@ return function(t)
       controller.connect()
       wait_ready()
       local ui = state().view.team_ui
-      ui.watcher:open("t1", "w1")
+      ui.router:open("t1", "w1")
       vim.wait(30)
-      ui.watcher:open("t1", "w2")
+      ui.router:open("t1", "w2")
       vim.wait(30)
-      ui.watcher:open("t1", "w1")
+      ui.router:open("t1", "w1")
       wait(function()
         return team().watching
           and team().watching.participant == "w1"
-          and ui.watch_buf ~= nil
-          and vim.api.nvim_buf_is_valid(ui.watch_buf)
+          and ui.router.target
+          and ui.router.target.participant == "w1"
       end, 5000, "the final A watch")
       vim.wait(400)
       t.eq("w1", team().watching.participant, "a stale A response must not replace the new A")
@@ -2710,7 +2707,7 @@ return function(t)
         end
       end
       t.eq(0, unwatches, "A stays current, so B is skipped and A is never unwatched")
-      ui.watcher:close()
+      ui.router:close()
     end)
 
     t.it("a superseded watch failure does not clear the current watch", function()
@@ -2726,16 +2723,16 @@ return function(t)
       controller.connect()
       wait_ready()
       local ui = state().view.team_ui
-      ui.watcher:open("t1", "w1")
+      ui.router:open("t1", "w1")
       vim.wait(20)
-      ui.watcher:open("t1", "w2")
+      ui.router:open("t1", "w2")
       wait(function()
-        return team().watching and team().watching.participant == "w2" and ui.watch_buf ~= nil
+        return team().watching and team().watching.participant == "w2" and ui.router.target ~= nil
       end, 5000, "the current w2 watch")
       vim.wait(200)
       t.eq("w2", team().watching.participant)
-      t.truthy(ui.watch_buf and vim.api.nvim_buf_is_valid(ui.watch_buf))
-      ui.watcher:close()
+      t.eq("w2", ui.router.target.participant)
+      ui.router:close()
     end)
 
     t.it("closing during an in-flight watch request releases it", function()
@@ -2746,11 +2743,11 @@ return function(t)
       controller.connect()
       wait_ready()
       local ui = state().view.team_ui
-      ui.watcher:open("t1", "w1")
-      ui.watcher:close()
+      ui.router:open("t1", "w1")
+      ui.router:close()
       vim.wait(250)
       t.eq(nil, team().watching, "the late response must not leave a watch")
-      t.eq(nil, ui.watch_buf, "the late response must not open a window")
+      t.eq(nil, ui.router.target, "the late response must not open a worker")
       t.truthy(#(service.team_unwatch or {}) >= 1, "the in-flight watch is released")
     end)
 
@@ -2785,7 +2782,7 @@ return function(t)
       local ui = state().view.team_ui
       ui:watch(m.watching.session, "t1/w1")
       local function text()
-        return table.concat(vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false), "\n")
+        return table.concat(vim.api.nvim_buf_get_lines(ui.router.chat.buf, 0, -1, false), "\n")
       end
       wait(function()
         local body = text()
@@ -2793,10 +2790,11 @@ return function(t)
           and body:find("earlier instruction", 1, true)
           and body:find("earlier turn text", 1, true)
       end, 5000, "the replay fallback and team.read supplement")
+      ui.router:close()
       m:unwatch()
     end)
 
-    t.it("watch open toggles the same participant and pairs unwatch/watch", function()
+    t.it("selecting the same worker keeps it and switching pairs unwatch/watch", function()
       local service, dir = start_service(t, "watch-toggle", {
         team_watch = { instance = "inst-w", sessionId = "sess-w" },
       })
@@ -2804,57 +2802,71 @@ return function(t)
       controller.connect()
       wait_ready()
       local ui = state().view.team_ui
-      ui.watcher:open("t1", "w1")
+      local chat = state().view.chat
+      ui.router:open("t1", "w1")
       wait(function()
-        return ui.watch_buf ~= nil and vim.api.nvim_buf_is_valid(ui.watch_buf)
-      end, 5000, "the first watch")
-      local first = ui.watch_buf
-      ui.watcher:open("t1", "w1")
-      wait(function()
-        return ui.watch_buf == nil and team().watching == nil
-      end, 5000, "the same participant to close the watch")
+        return ui.router.target ~= nil and team().watching and team().watching.participant == "w1"
+      end, 5000, "the first worker")
+      ui.router:open("t1", "w1")
+      t.eq("w1", ui.router.target.participant, "re-selecting keeps the transcript")
+      t.eq("w1", team().watching.participant)
 
-      ui.watcher:open("t1", "w2")
+      ui.router:open("t1", "w2")
       wait(function()
-        return ui.watch_buf ~= nil and ui.watch_buf ~= first and team().watching and team().watching.participant == "w2"
+        return team().watching and team().watching.participant == "w2" and ui.router.target.participant == "w2"
       end, 5000, "the other worker")
-      local found = false
-      for _, call in ipairs(service.team_unwatch or {}) do
-        if call.participant == "w1" then
-          found = true
-        end
-      end
-      t.truthy(found, "switching away unwatches the previous worker")
-      ui.watcher:close()
       wait(function()
-        return ui.watch_buf == nil and team().watching == nil
-      end, 5000, "the closed watch")
+        for _, call in ipairs(service.team_unwatch or {}) do
+          if call.participant == "w1" then
+            return true
+          end
+        end
+        return false
+      end, 5000, "switching away to unwatch the previous worker")
+      t.eq(chat, ui.router.chat, "one chat serves every worker")
+      ui.router:close()
+      wait(function()
+        return ui.router.target == nil and team().watching == nil
+      end, 5000, "the released worker")
+      t.eq(state().sess.current, chat.session, "the leader session is back")
     end)
 
-    t.it("selecting the leader reuses the existing chat window", function()
+    t.it("selecting the leader returns to the bound leader session", function()
       local service, dir = start_service(t, "watch-leader")
       setup(t, "watch-leader", service, dir)
       controller.connect()
       wait_ready()
+      wait(function()
+        local entry = team() and team():team("t1")
+        return entry ~= nil and type(entry.leader) == "table" and entry.leader.sessionId ~= nil
+      end, 5000, "the bound leader")
       controller.open()
       local chat = state().view.chat
+      local input = state().view.input
       wait(function()
         return chat.win ~= nil and vim.api.nvim_win_is_valid(chat.win)
       end, 5000, "the leader chat window")
+      -- The bound leader is the app's own session; both must stay identical.
+      local leader = state().sess.all[team():team("t1").leader.sessionId]
+      t.truthy(leader, "the service's leader session is this front end's session")
+      t.eq(leader, state().sess.current)
       local ui = state().view.team_ui
-      ui.watcher:open("t1", "w1")
+      ui.router:open("t1", "w1")
       wait(function()
-        return ui.watch_buf ~= nil
-      end, 5000, "the worker watch")
-      ui.watcher:open("t1", "leader")
+        return ui.router.target ~= nil
+      end, 5000, "the worker transcript")
+      t.eq(chat, ui.router.chat)
+      ui.router:open("t1", "leader")
       wait(function()
-        return ui.watch_buf == nil and vim.api.nvim_get_current_win() == chat.win
+        return ui.router.target == nil and vim.api.nvim_get_current_win() == chat.win
       end, 5000, "focus the leader's own chat")
-      t.eq(nil, ui.watcher.chat, "no second Chat is created for the leader")
+      t.eq(leader, chat.session, "the leader's session is restored")
+      t.eq(leader.id, input.session_key, "the composer is back on the leader session")
+      t.eq(leader, state().sess.current, "the app state follows the same session")
       t.eq(nil, team().watching, "the leader is not watched")
     end)
 
-    t.it("ends the watch when its window, the panel, or the team goes away", function()
+    t.it("ends the watch when the pane, the panel, or the team goes away", function()
       local service, dir = start_service(t, "watch-end")
       setup(t, "watch-end", service, dir)
       controller.connect()
@@ -2873,19 +2885,20 @@ return function(t)
         return service.team_unwatch and #service.team_unwatch or 0
       end
 
-      -- Closing the read-only window ends the watch on the service.
+      -- Leaving the worker (`gl`/`L`) ends the watch on the service.
       watch("w1")
       local ui = state().view.team_ui
       ui:watch(m.watching.session, "t1/w1")
-      t.truthy(ui.watch_win, "the watch window")
+      t.truthy(ui.router.target, "the worker is shown in the shared chat")
       local before = unwatches()
-      vim.api.nvim_win_close(ui.watch_win, true)
+      ui.router:restore_leader(true)
       wait(function()
         return m.watching == nil and unwatches() > before
-      end, 5000, "the window close to unwatch")
+      end, 5000, "returning to the leader to unwatch")
 
       -- Closing the panel ends it too.
       watch("w2")
+      ui:watch(m.watching.session, "t1/w2")
       before = unwatches()
       ui:close()
       wait(function()

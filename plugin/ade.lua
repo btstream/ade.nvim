@@ -45,7 +45,7 @@ local SUBCOMMANDS = {
 local SERVICE_SUBCOMMANDS = { "install", "status", "start", "stop", "agents", "kill" }
 
 ---Subcommands of `:Ade team`.
-local TEAM_SUBCOMMANDS = { "start", "close", "answer" }
+local TEAM_SUBCOMMANDS = { "agents", "board", "start", "close", "answer" }
 
 ---Workflow names known from the configuration and the last service listing.
 ---@return string[]
@@ -169,11 +169,16 @@ local function setup()
       elseif sub == "agents" then
         ade.manage_agents()
       elseif sub == "team" then
-        -- `:Ade team` opens the panel; `start [workflow]` starts a workflow
-        -- and `close` ends the team for this cwd (19.7).
+        -- `:Ade team` and `:Ade team agents` open or focus the members pane;
+        -- `:Ade team board` does the same for the board. `start [workflow]`
+        -- starts a workflow and `close` ends the team for this cwd (19.7).
         local action, argument = rest:match("^(%S+)%s*(.-)%s*$")
         if action == nil or action == "" then
           ade.open_team()
+        elseif action == "agents" then
+          ade.open_team("members")
+        elseif action == "board" then
+          ade.open_team("board")
         elseif action == "start" then
           ade.start_team(argument ~= "" and argument or nil)
         elseif action == "close" then

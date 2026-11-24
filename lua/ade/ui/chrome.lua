@@ -52,6 +52,7 @@ end
 ---@param opts {config: fun(): table, current: fun(): table|nil,
 ---  session_label: fun(session: table|nil): string|nil,
 ---  waiting: fun(session: table|nil): boolean,
+---  team_target?: (fun(): {agent: string, title: string}|nil)|nil,
 ---  chat: fun(): table|nil, input: fun(): table|nil, clock?: fun(): number}
 function Chrome.new(opts)
   return setmetatable({
@@ -59,6 +60,7 @@ function Chrome.new(opts)
     current = opts.current,
     session_label = opts.session_label,
     waiting = opts.waiting,
+    team_target = opts.team_target,
     get_chat = opts.chat,
     get_input = opts.input,
     pending = false,
@@ -220,16 +222,19 @@ function Chrome:chat_bar(win)
     return ""
   end
   win = win or vim.api.nvim_get_current_win()
+  -- While a worker is shown in the ordinary transcript, the title says who is
+  -- being read instead of pretending it is the leader's own session.
+  local team = self.team_target and self.team_target() or nil
   local session = self.current()
   local chat = self.get_chat()
-  local agent = session and session.agent_name or cfg.agent
+  local agent = team and team.agent or (session and session.agent_name or cfg.agent)
   local profile = session and session.profile or require("ade.agents").get(cfg.agents and cfg.agents[agent], agent)
   return toolbar.chat_title({
     icons = cfg.ui.icons,
     icon_overrides = cfg.ui.icon_overrides,
     agent = agent,
     profile = profile.name,
-    title = self.session_label(session),
+    title = team and team.title or self.session_label(session),
     pending_new = chat and chat.pending_new or false,
   }, vim.api.nvim_win_get_width(win))
 end
