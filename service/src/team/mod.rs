@@ -818,10 +818,13 @@ pub struct SpawnRequest {
 
 #[derive(Debug)]
 pub struct StopOutcome {
+    /// The live instance to stop, if any.
     pub instance: Option<String>,
     /// Lifecycle of the start attempt that must not go on.
     pub lifecycle: u64,
     pub remove: bool,
+    /// A start of that lifecycle was in flight.
+    pub start_pending: bool,
 }
 
 #[derive(Debug)]
@@ -1427,10 +1430,6 @@ impl Teams {
         self.token_entry(token_id);
     }
 
-    pub fn bind_session_record_public(&mut self, instance: &str, session: &str, token_id: &str) {
-        self.bind_session_record(instance, session, token_id);
-    }
-
     /// Bind a `session/new` token to the successful response's session id and
     /// resume a stored team led by it (20.2/20.7). `Err` when the token does
     /// not belong to `(instance, session)`.
@@ -1494,6 +1493,30 @@ impl Teams {
         self.token_records.get(token_id)?.cwd.clone()
     }
 
+    /// Every session a team participant knows: (instance, session).
+    pub fn participant_sessions(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for team in self.teams.values() {
+            for participant in team.participants.values() {
+                if let (Some(instance), Some(session)) =
+                    (participant.instance.clone(), participant.session.clone())
+                {
+                    out.push((instance, session));
+                }
+            }
+        }
+        out
+    }
+
+    /// Every session identity with a bound session token.
+    pub fn token_sessions(&self) -> Vec<(String, String)> {
+        self.token_records
+            .values()
+            .filter(|record| record.role == Role::Session && record.bound)
+            .filter_map(|record| Some((record.instance.clone()?, record.session.clone()?)))
+            .collect()
+    }
+
     /// Every bound session token of a cwd: (instance, session, agent).
     pub fn sessions_for_cwd(&self, cwd: &str) -> Vec<(String, String, String)> {
         self.token_records
@@ -1512,6 +1535,15 @@ impl Teams {
             .collect()
     }
 
+    /// The session a token id is currently bound to, if any.
+    pub fn session_identity(&self, token_id: &str) -> Option<(String, String)> {
+        let record = self.token_records.get(token_id)?;
+        if record.role != Role::Session || !record.bound {
+            return None;
+        }
+        Some((record.instance.clone()?, record.session.clone()?))
+    }
+
     /// The bound session token id of `(instance, session)`, if one exists.
     pub fn session_token_of(&self, instance: &str, session: &str) -> Option<String> {
         self.token_records
@@ -1523,33 +1555,6 @@ impl Teams {
                     && record.session.as_deref() == Some(session)
             })
             .map(|(id, _)| id.clone())
-    }
-
-    /// The first connected token id of `(instance, session)`.
-    pub fn token_id_connected(&self, instance: &str, session: &str) -> Option<String> {
-        self.token_records
-            .iter()
-            .find(|(_, record)| {
-                record.role == Role::Session
-                    && record.bound
-                    && record.instance.as_deref() == Some(instance)
-                    && record.session.as_deref() == Some(session)
-            })
-            .map(|(id, _)| id.clone())
-    }
-
-    pub fn session_auth_by_session(
-        &self,
-        instance: &str,
-        session: &str,
-    ) -> Option<(&str, &str, &str)> {
-        let (id, _) = self.token_records.iter().find(|(_, record)| {
-            record.role == Role::Session
-                && record.bound
-                && record.instance.as_deref() == Some(instance)
-                && record.session.as_deref() == Some(session)
-        })?;
-        self.session_auth(id)
     }
 
     /// The team entry the session leads, if any (`session.teams.leader`).
@@ -1864,18 +1869,6 @@ impl Teams {
             .and_then(|leader| leader.agent.clone())
     }
 
-    /// Cwd of the session token bound to `(instance, session)`.
-    pub fn session_token_cwd(&self, instance: &str, session: &str) -> Option<String> {
-        self.token_records
-            .values()
-            .find(|record| {
-                record.role == Role::Session
-                    && record.instance.as_deref() == Some(instance)
-                    && record.session.as_deref() == Some(session)
-            })
-            .and_then(|record| record.cwd.clone())
-    }
-
     /// Fill an already loaded configuration's built-in template from an
     /// instance launch.
     pub fn fill_builtin_config(&self, config: &mut TeamConfig, launch: &LeaderLaunch) {
@@ -1890,10 +1883,7 @@ impl Teams {
             team.reserved_names.remove(name);
         }
         self.events.push(TeamEvent::Changed(team_id.to_string()));
-        self.persist_removal(team_id, name);
     }
-
-    fn persist_removal(&mut self, _team_id: &str, _name: &str) {}
 
     /// The handover refusal of a session, if one is waiting.
     pub fn take_handover_refusal(&mut self, instance: &str, session: &str) -> Option<String> {
@@ -4023,6 +4013,8 @@ impl Teams {
             return;
         };
         self.by_instance.remove(instance);
+        // The start (if any) is over: no callback will come for it again.
+        participant.starting = false;
         if participant.state == ParticipantState::Exited {
             // A `stop_worker remove: true` waits for the real exit (20.6).
             if participant.remove_after_exit {
@@ -4095,12 +4087,16 @@ impl Teams {
 
     /// `team.stop_worker` (20.6): stop one worker, optionally dropping it from
     /// the team after it exited. Returns the instance to stop.
+    /// `team.stop_worker` (20.6). Liveness comes from the caller's instance
+    /// table and the pending start it owns, never from the UI state (20.6/#7).
     pub fn stop_worker(
         &mut self,
         team_id: &str,
         name: &str,
         remove: bool,
         notify_leader: bool,
+        live: bool,
+        start_pending: bool,
     ) -> Result<StopOutcome, TeamError> {
         let Some(team) = self.teams.get_mut(team_id) else {
             return Err(TeamError::unknown("unknown team"));
@@ -4116,12 +4112,7 @@ impl Teams {
         }
         let instance = participant.instance.clone();
         let lifecycle = participant.lifecycle;
-        let starting = participant.starting;
-        // A participant whose state is already `exited` has no live process,
-        // even if its historical instance id is still recorded.
-        let live = (participant.state != ParticipantState::Exited)
-            .then(|| instance.clone())
-            .flatten();
+        let stopping_instance = live.then(|| instance.clone()).flatten();
         let closed = team.closed;
         if participant.state != ParticipantState::Exited {
             participant.set_state(ParticipantState::Exited);
@@ -4137,10 +4128,10 @@ impl Teams {
             }
         }
         participant.remove_after_exit = remove;
-        // A participant with no instance and no start in flight has already
+        // A participant with no live instance and no start in flight has already
         // exited: the removal is complete right away (20.6). A start that is
         // still running completes it through its callback.
-        let alive = live.is_some() || starting;
+        let alive = stopping_instance.is_some() || start_pending;
         let drop_now = remove && !alive;
         if drop_now {
             team.participants.remove(name);
@@ -4172,9 +4163,10 @@ impl Teams {
         }
         self.events.push(TeamEvent::Changed(team_id.to_string()));
         Ok(StopOutcome {
-            instance: live,
+            instance: stopping_instance,
             lifecycle,
             remove,
+            start_pending,
         })
     }
 
@@ -5060,9 +5052,6 @@ impl Teams {
                     enabled: snapshot.config.enabled,
                     session_default: snapshot.config.session_default,
                     builtin_worker: snapshot.config.builtin_worker,
-                    // A derived template is rebuilt from the leader's launch by
-                    // the front end that resumes the team; the stored snapshot
-                    // never carries one (its command is not persisted either).
                 }
             };
             let mut participants = HashMap::new();
@@ -7570,7 +7559,9 @@ mod tests {
     fn a_stopped_worker_can_be_removed_and_frees_its_name() {
         let (mut teams, team) = fixture(json!({}));
         let instance = add_worker(&mut teams, &team, "w1");
-        let returned = teams.stop_worker(&team, "w1", false, true).unwrap();
+        let returned = teams
+            .stop_worker(&team, "w1", false, true, true, false)
+            .unwrap();
         assert_eq!(returned.instance.as_deref(), Some(instance.as_str()));
         let worker = &teams.team(&team).unwrap().participants["w1"];
         assert_eq!(worker.state, ParticipantState::Exited);
@@ -7584,7 +7575,9 @@ mod tests {
                 .is_some_and(|body| body.contains("w1 stopped by the person"))));
 
         let second = add_worker(&mut teams, &team, "w2");
-        let stopped = teams.stop_worker(&team, "w2", true, true).unwrap();
+        let stopped = teams
+            .stop_worker(&team, "w2", true, true, true, false)
+            .unwrap();
         // `remove: true` drops the participant only once it really exited.
         assert!(teams.team(&team).unwrap().participants.contains_key("w2"));
         teams.worker_exited(&second, "stopped");
@@ -7596,8 +7589,12 @@ mod tests {
         assert!(teams
             .request_spawn(&team, "dev", Some("w2"), None, None, None)
             .is_ok());
-        assert!(teams.stop_worker(&team, "leader", false, true).is_err());
-        assert!(teams.stop_worker(&team, "nobody", false, true).is_err());
+        assert!(teams
+            .stop_worker(&team, "leader", false, true, false, false)
+            .is_err());
+        assert!(teams
+            .stop_worker(&team, "nobody", false, true, false, false)
+            .is_err());
     }
 
     #[test]

@@ -528,6 +528,11 @@ def main():
                 },
             )
         elif method in ("session/new", "session/load", "session/resume"):
+            load_delay = os.environ.get("TEAM_AGENT_LOAD_DELAY")
+            if load_delay and method in ("session/load", "session/resume"):
+                # A slow load lets the tests change the session state while the
+                # request is in flight.
+                time.sleep(float(load_delay))
             if method == "session/load" and os.environ.get("TEAM_AGENT_LOAD_FAIL") == "1":
                 log({"event": "load-failed", "session": params.get("sessionId")})
                 error(ident, "load failed")

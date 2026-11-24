@@ -45,18 +45,27 @@ pub(crate) enum StartResult {
     Replied,
 }
 
-/// A forwarded session request whose token binds, and whose server list
-/// commits, only if the agent answers successfully (20.2/20.7).
-#[derive(Debug)]
+/// The effective per-session state whose change is published (20.3/20.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionState {
+    pub enabled: bool,
+    pub injected: bool,
+    pub leader: bool,
+}
+
+/// A forwarded session request whose token binds only if the agent answers
+/// successfully (20.2/20.7).
+#[derive(Debug, Clone)]
 pub(crate) struct PendingSession {
     pub token_id: String,
     pub cwd: String,
     pub agent: String,
-    /// The user's `mcpServers` from the request, without `ade-team`.
-    pub servers: Value,
+    /// The request method (`session/new`, `session/load`, `session/resume`).
+    pub method: String,
     /// The session id the request named (`session/load`/`resume`); `None` for
     /// `session/new`, whose id comes from the response.
     pub session: Option<String>,
+    /// The front-end connection that sent the request.
     pub conn: u64,
 }
 
@@ -177,6 +186,7 @@ impl Hub {
     /// later; this only prepares the request.
     pub(crate) fn prepare_session_request(
         &mut self,
+        conn: u64,
         instance: &str,
         message: &mut Value,
     ) -> Option<PendingSession> {
@@ -195,7 +205,6 @@ impl Hub {
             .and_then(|params| params.get("sessionId"))
             .and_then(Value::as_str)
             .map(str::to_string);
-        let servers = user_servers(message);
         let inject = self.should_inject(instance, &session, &cwd, &agent);
         let (token_id, token) = match inject {
             Some(()) => {
@@ -214,9 +223,9 @@ impl Hub {
             token_id: token_id.unwrap_or_default(),
             cwd,
             agent,
-            servers,
+            method,
             session,
-            conn: 0,
+            conn,
         })
     }
 
@@ -224,6 +233,7 @@ impl Hub {
     /// the commit its response triggers (20.2).
     pub(crate) fn inject_forwarded_session(
         &mut self,
+        conn: u64,
         instance: &str,
         action: &mut crate::relay::FrontendAction,
     ) -> Option<PendingSession> {
@@ -233,7 +243,7 @@ impl Hub {
             _ => return None,
         };
         let mut probe = frame.clone();
-        let prepared = self.prepare_session_request(instance, &mut probe)?;
+        let prepared = self.prepare_session_request(conn, instance, &mut probe)?;
         *frame = probe;
         Some(prepared)
     }
@@ -264,120 +274,259 @@ impl Hub {
         }
     }
 
-    /// A forwarded session request was answered: commit the token, the server
-    /// list and (for a load/resume) the stored team's resume on success; revoke
-    /// the request's token and keep the previous state on failure (20.2/20.7).
+    /// A forwarded session request was answered: bind the token on success and
+    /// (for a load/resume) resume the stored team; undo it on failure
+    /// (20.2/20.7).
     pub(crate) fn finish_session(
         &mut self,
         instance: &str,
         request: &crate::relay::FrontendRequest,
         message: &Value,
     ) {
+        let key = (instance.to_string(), request.agent_id);
         let Some(pending) = self
             .pending_session
-            .remove(&(instance.to_string(), request.agent_id))
+            .get(&key)
+            .map(|pending| PendingSession {
+                token_id: pending.token_id.clone(),
+                cwd: pending.cwd.clone(),
+                agent: pending.agent.clone(),
+                method: pending.method.clone(),
+                session: pending.session.clone(),
+                conn: pending.conn,
+            })
         else {
             return;
         };
-        let PendingSession {
-            token_id,
-            cwd,
-            agent,
-            servers,
-            session,
-            conn,
-        } = pending;
-        let _ = conn;
-        let requested = session.or_else(|| request.session_id.clone());
-        if message.get("error").is_some() {
-            if !token_id.is_empty() {
-                self.teams.revoke(&token_id);
-            }
-            return;
-        }
+        let failed = message.get("error").is_some();
         let session = message
             .get("result")
             .and_then(|result| result.get("sessionId"))
             .and_then(Value::as_str)
             .map(str::to_string)
-            .or(requested);
-        let Some(session) = session else {
-            if !token_id.is_empty() {
-                self.teams.revoke(&token_id);
-            }
+            .or_else(|| pending.session.clone())
+            .or_else(|| request.session_id.clone());
+        if failed || session.is_none() {
+            // One undo path: revoke this request's token, drop the record and
+            // leave the previous binding untouched.
+            self.drop_pending_session(&key);
             return;
-        };
-        // The user's servers are committed for injected and uninjected
-        // sessions alike, so a later front-end reload carries them.
-        self.session_servers
-            .insert((instance.to_string(), session.clone()), servers);
-        if token_id.is_empty() {
+        }
+        let session = session.expect("checked above");
+        // The reload mark is consumed by this answered request either way: the
+        // log restarts from a successful forced load/resume (20.5).
+        let consumed = matches!(pending.method.as_str(), "session/load" | "session/resume")
+            && self
+                .forward_loads
+                .remove(&(instance.to_string(), session.clone()));
+        if pending.token_id.is_empty() {
+            self.pending_session.remove(&key);
+            if consumed {
+                self.mark_log_restarted(instance, &session);
+            }
             return;
         }
         if self
             .teams
-            .bind_session_token(instance, &session, &token_id, &agent)
+            .bind_session_token(instance, &session, &pending.token_id, &pending.agent)
             .is_err()
         {
-            self.teams.revoke(&token_id);
+            self.drop_pending_session(&key);
             return;
         }
-        self.session_state_changed(instance, &session);
-        // A forwarded load/resume that got a token resumes the stored team
-        // (20.7).
-        if matches!(request.method.as_str(), "session/load" | "session/resume") {
-            self.resume_for_session(instance, &session, &agent, &cwd);
+        self.pending_session.remove(&key);
+        if consumed {
+            self.mark_log_restarted(instance, &session);
+        }
+        let identity = (instance.to_string(), session.clone());
+        self.sessions_changed(&[identity]);
+        if matches!(pending.method.as_str(), "session/load" | "session/resume") {
+            self.resume_for_session(instance, &session, &pending.agent, &pending.cwd);
         }
     }
 
-    /// Publish the session's tool state when it changed, from the single
-    /// source of truth: the connected, bound session tokens (20.3/20.5).
-    pub(crate) fn session_state_changed(&mut self, instance: &str, session: &str) {
-        self.teams.refresh_session_auth(instance, session);
+    /// A forced reload replays history the service may already hold: the
+    /// session's earlier log is no longer a complete replay source (20.5).
+    fn mark_log_restarted(&mut self, instance: &str, session: &str) {
+        let Some(handle) = self.instances.get(instance) else {
+            return;
+        };
+        if self.recorder.enabled() {
+            self.recorder
+                .mark_session_incomplete(&handle.log_key, session);
+        }
+    }
+
+    /// Undo a forwarded session request that will not be committed: revoke its
+    /// token, forget the record and keep the previous binding (20.2).
+    pub(crate) fn drop_pending_session(&mut self, key: &(String, u64)) {
+        if let Some(pending) = self.pending_session.remove(key) {
+            self.drop_pending_session_value(pending);
+        }
+    }
+
+    /// The single undo path for a request that will not be committed.
+    pub(crate) fn drop_pending_session_value(&mut self, pending: PendingSession) {
+        if !pending.token_id.is_empty() {
+            self.teams.revoke(&pending.token_id);
+        }
+        // The request's source connection may have handshaked with that token
+        // already; nothing else refers to it now.
+        self.conn_tokens
+            .retain(|_, token| token != &pending.token_id);
+    }
+
+    /// `injected` from the single source of truth: a connection holds a token
+    /// id whose *current* binding is this session (20.5).
+    pub(crate) fn session_injected(&self, instance: &str, session: &str) -> bool {
+        self.conn_tokens
+            .values()
+            .any(|token| match self.teams.session_identity(token) {
+                Some((owner, current)) => owner == instance && current == session,
+                None => false,
+            })
+    }
+
+    /// Snapshot the effective state of `identities`. Identities never seen
+    /// before are snapshotted from the hub's cache, so a first notification
+    /// still goes out after a change.
+    pub(crate) fn session_states(
+        &self,
+        identities: &[(String, String)],
+    ) -> Vec<((String, String), SessionState)> {
+        identities
+            .iter()
+            .map(|identity| {
+                let state = self
+                    .session_cache
+                    .get(identity)
+                    .copied()
+                    .unwrap_or_else(|| self.session_state(&identity.0, &identity.1));
+                (identity.clone(), state)
+            })
+            .collect()
+    }
+
+    /// The effective state of one session: `enabled`, `injected`, `leader` and
+    /// the tool set it implies.
+    pub(crate) fn session_state(&self, instance: &str, session: &str) -> SessionState {
+        let cwd = self
+            .instances
+            .get(instance)
+            .map(|handle| handle.key.cwd.clone());
         let agent = self
             .instances
             .get(instance)
             .map(|handle| handle.key.agent.clone())
             .unwrap_or_default();
+        let enabled = cwd
+            .as_deref()
+            .map(|cwd| self.teams.enabled_for(&agent, session, cwd))
+            .unwrap_or_else(|| self.teams.switch(&agent, session).unwrap_or(true));
         let injected = self.session_injected(instance, session);
-        self.announce_switch(instance, session, &agent, injected);
-        self.notify_tools_changed(&(instance.to_string(), session.to_string()));
-    }
-
-    /// Whether a bound session token of this session has a connected MCP
-    /// process (`injected`, 20.5).
-    pub(crate) fn session_injected(&self, instance: &str, session: &str) -> bool {
-        let Some(token_id) = self.teams.session_token_of(instance, session) else {
-            return false;
-        };
-        self.injected_conns
-            .values()
-            .any(|(owner, current)| owner == instance && current == session)
-            && self.teams.session_auth(&token_id).is_some()
-    }
-
-    /// Connect a session token that handshook before it was bound.
-    pub(crate) fn refresh_session(&mut self, instance: &str, session: &str) {
-        if self.session_injected(instance, session) {
-            return;
+        let token = self.teams.session_token_of(instance, session);
+        let leader = token
+            .as_deref()
+            .and_then(|token| self.teams.session_role(token).0)
+            .is_some_and(|role| role == "leader")
+            && self.teams.session_team_entry(instance, session).is_object();
+        SessionState {
+            enabled,
+            injected,
+            leader,
         }
-        let Some(token_id) = self.teams.session_token_of(instance, session) else {
-            return;
-        };
-        let Some(conn) = self.token_conns.get(&token_id).copied() else {
-            return;
-        };
-        self.injected_conns
-            .insert(conn, (instance.to_string(), session.to_string()));
-        self.session_state_changed(instance, session);
+    }
+
+    /// Publish the difference between `before` and the current state of the
+    /// same identities, to front ends and to the sessions' MCP processes.
+    pub(crate) fn publish_session_changes(
+        &mut self,
+        before: Vec<((String, String), SessionState)>,
+    ) {
+        for (identity, old) in before {
+            let new = self.session_state(&identity.0, &identity.1);
+            let known = self.session_cache.insert(identity.clone(), new);
+            // An identity seen for the first time after a change has no
+            // comparable previous state; `before` already carries the state
+            // recorded when the operation started.
+            let changed = match known {
+                Some(previous) => new != previous,
+                None => new != old,
+            };
+            if !changed {
+                continue;
+            }
+            self.teams.refresh_session_auth(&identity.0, &identity.1);
+            let entry = self.teams.session_team_entry(&identity.0, &identity.1);
+            self.send_to_frontends(&json!({
+                "jsonrpc": "2.0",
+                "method": "session.teams_changed",
+                "params": {
+                    "instance": identity.0,
+                    "sessionId": identity.1,
+                    "enabled": new.enabled,
+                    "injected": new.injected,
+                    "leader": entry,
+                },
+            }));
+            self.notify_tools_changed(&identity);
+        }
+    }
+
+    /// Snapshot `identities`, run `body`, publish what changed.
+    pub(crate) fn with_session_changes<R>(
+        &mut self,
+        identities: Vec<(String, String)>,
+        body: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let before = self.session_states(&identities);
+        let result = body(self);
+        self.publish_session_changes(before);
+        result
+    }
+
+    /// Convenience for the common case: one identity, snapshot/change/publish.
+    pub(crate) fn sessions_changed(&mut self, identities: &[(String, String)]) {
+        self.publish_session_changes(self.session_states(identities));
+    }
+
+    /// Every known session of a cwd: bound session tokens and team
+    /// participants of instances running there.
+    pub(crate) fn sessions_of_cwd(&self, cwd: &str) -> Vec<(String, String)> {
+        let mut sessions: Vec<(String, String)> = self
+            .teams
+            .token_sessions()
+            .into_iter()
+            .filter(|(instance, _)| {
+                self.instances
+                    .get(instance)
+                    .is_some_and(|handle| handle.key.cwd == cwd)
+            })
+            .collect();
+        for (instance, session) in self.teams.participant_sessions() {
+            if self
+                .instances
+                .get(&instance)
+                .is_some_and(|handle| handle.key.cwd == cwd)
+            {
+                sessions.push((instance, session));
+            }
+        }
+        sessions.sort();
+        sessions.dedup();
+        sessions
     }
 
     /// Tell a session's MCP process its tool set changed (20.3).
     pub(crate) fn notify_tools_changed(&self, key: &(String, String)) {
         let conns: Vec<u64> = self
-            .injected_conns
+            .conn_tokens
             .iter()
-            .filter(|(_, (instance, session))| instance == &key.0 && session == &key.1)
+            .filter(|(_, token)| {
+                self.teams
+                    .session_identity(token)
+                    .is_some_and(|(instance, session)| instance == key.0 && session == key.1)
+            })
             .map(|(conn, _)| *conn)
             .collect();
         for conn in conns {
@@ -389,33 +538,6 @@ impl Hub {
                 }),
             );
         }
-    }
-
-    /// `session.teams_changed` to every front end (20.5).
-    pub(crate) fn announce_switch(
-        &self,
-        instance: &str,
-        session: &str,
-        agent: &str,
-        injected: bool,
-    ) {
-        let enabled = self
-            .instances
-            .get(instance)
-            .map(|handle| self.teams.enabled_for(agent, session, &handle.key.cwd))
-            .unwrap_or_else(|| self.teams.switch(agent, session).unwrap_or(true));
-        let leader = self.teams.session_team_entry(instance, session);
-        self.send_to_frontends(&json!({
-            "jsonrpc": "2.0",
-            "method": "session.teams_changed",
-            "params": {
-                "instance": instance,
-                "sessionId": session,
-                "enabled": enabled,
-                "injected": injected,
-                "leader": leader,
-            },
-        }));
     }
 
     // -- session tools (PROTOCOL.md 20.3) ----------------------------------
@@ -660,14 +782,13 @@ impl Hub {
     /// `ensure_team` for a session token; `led_by` queues the handover item
     /// and turns into the documented tool error (20.4).
     fn ensure_session_team(&mut self, token_id: &str) -> Result<String, TeamError> {
-        let Some((instance, session, agent)) = self.teams.session_auth(token_id) else {
+        let Some((instance, session, _agent)) = self.teams.session_auth(token_id) else {
             let mut error = TeamError::not_allowed("teams are not available for this chat");
             error.data = Some(json!({ "reason": "no_tools" }));
             return Err(error);
         };
         let instance = instance.to_string();
         let session = session.to_string();
-        let agent = agent.to_string();
         let handle = self
             .instances
             .get(&instance)
@@ -681,10 +802,7 @@ impl Hub {
         };
         match self.teams.ensure_team(&instance, &session, &launch) {
             Ok(team) => {
-                self.refresh_session(&instance, &session);
-                self.notify_tools_changed(&(instance.clone(), session.clone()));
-                let injected = self.session_injected(&instance, &session);
-                self.announce_switch(&instance, &session, &agent, injected);
+                self.sessions_changed(&[(instance.clone(), session.clone())]);
                 Ok(team)
             }
             Err(error)
@@ -842,7 +960,10 @@ impl Hub {
     fn bus_stop_worker(&mut self, team: &str, params: &Value) -> Result<(Value, bool), TeamError> {
         let name = required_team_string(params, "name")?;
         let remove = optional_bool(params, "remove")?.unwrap_or(false);
-        let outcome = self.teams.stop_worker(team, &name, remove, false)?;
+        let (live, start_pending) = self.worker_liveness(team, &name);
+        let outcome = self
+            .teams
+            .stop_worker(team, &name, remove, false, live, start_pending)?;
         self.apply_stop(team, &name, &outcome);
         Ok((json!({}), true))
     }
@@ -858,6 +979,24 @@ impl Hub {
         if remove {
             self.teams.finish_worker_removal(team, participant);
         }
+    }
+
+    /// Whether the worker has a live instance and/or a start in flight, from
+    /// the hub's own tables (20.6/#7).
+    fn worker_liveness(&self, team: &str, name: &str) -> (bool, bool) {
+        let instance = self
+            .teams
+            .team(team)
+            .and_then(|entry| entry.participants.get(name))
+            .and_then(|worker| worker.instance.clone());
+        let live = instance
+            .as_deref()
+            .is_some_and(|instance| self.instances.contains_key(instance));
+        let start_pending = self
+            .pending_worktrees
+            .get(&(team.to_string(), name.to_string()))
+            .is_some_and(|pending| !pending.cancelled);
+        (live, start_pending)
     }
 
     /// Cancel a start in flight and stop the instance when there is one (20.6).
@@ -979,7 +1118,7 @@ impl Hub {
                     launch: handle.launch.clone(),
                 };
                 let team = self.teams.ensure_team(&instance, &session, &launch)?;
-                self.session_state_changed(&instance, &session);
+                self.sessions_changed(&[(instance.clone(), session.clone())]);
                 Ok(team)
             }
         }
@@ -1001,7 +1140,10 @@ impl Hub {
                 let team = required_team_string(params, "team")?;
                 let name = required_team_string(params, "name")?;
                 let remove = optional_bool(params, "remove")?.unwrap_or(false);
-                let outcome = self.teams.stop_worker(&team, &name, remove, true)?;
+                let (live, start_pending) = self.worker_liveness(&team, &name);
+                let outcome =
+                    self.teams
+                        .stop_worker(&team, &name, remove, true, live, start_pending)?;
                 self.apply_stop(&team, &name, &outcome);
                 let _ = outcome;
                 Ok(json!({}))
@@ -1082,17 +1224,7 @@ impl Hub {
     /// A new configuration may inject tools into sessions that were created
     /// before it (20.2).
     fn announce_configured(&mut self, cwd: &str) {
-        let sessions: Vec<(String, String, String)> = self
-            .teams
-            .sessions_for_cwd(cwd)
-            .into_iter()
-            .filter(|(instance, _, _)| self.instances.contains_key(instance))
-            .collect();
-        for (instance, session, _agent) in sessions {
-            // A configure may flip `enabled`/`session_default`: both the front
-            // end and the session's MCP process hear the new tool set (20.3).
-            self.session_state_changed(&instance, &session);
-        }
+        self.sessions_changed(&self.sessions_of_cwd(cwd));
     }
 
     /// Start every stored participant of a resumed team (18.15).
@@ -1267,48 +1399,45 @@ impl Hub {
                 .clone()
                 .zip(entry.leader_session.clone())
         });
+        // A and B may share an instance, so both sides are always in the set.
+        let mut identities: Vec<(String, String)> =
+            vec![(instance.to_string(), session.to_string())];
+        if let Some((old_instance, old_session)) = &previous {
+            identities.push((old_instance.clone(), old_session.clone()));
+        }
         let suspended = self.teams.is_suspended(team);
-        self.teams.set_leader(team, instance, session)?;
-        if let Some((old_instance, old_session)) = previous.clone() {
-            if old_instance != instance {
-                self.refresh_session(&old_instance, &old_session);
-                self.notify_tools_changed(&(old_instance.clone(), old_session.clone()));
-                let agent = self
-                    .instances
-                    .get(&old_instance)
-                    .map(|handle| handle.key.agent.clone())
-                    .unwrap_or_default();
-                let injected = self.session_injected(&old_instance, &old_session);
-                self.announce_switch(&old_instance, &old_session, &agent, injected);
+        let result = self.with_session_changes(identities, |hub| {
+            hub.teams.set_leader(team, instance, session)?;
+            if suspended {
+                if let Some(handle) = hub.instances.get(instance) {
+                    let launch = crate::team::LeaderLaunch {
+                        cwd: handle.key.cwd.clone(),
+                        key: handle.key.clone(),
+                        env: handle.env.clone(),
+                        #[cfg(unix)]
+                        launch: handle.launch.clone(),
+                    };
+                    let mut config = hub.teams.config_for(&handle.key.cwd);
+                    hub.teams.fill_builtin_config(&mut config, &launch);
+                    hub.teams.start_resume_with_config(
+                        team,
+                        instance,
+                        session,
+                        &handle.key.agent,
+                        config,
+                    );
+                }
             }
-        }
-        self.refresh_session(instance, session);
-        self.notify_tools_changed(&(instance.to_string(), session.to_string()));
-        let agent = self
-            .instances
-            .get(instance)
-            .map(|handle| handle.key.agent.clone())
-            .unwrap_or_default();
-        let injected = self.session_injected(instance, session);
-        self.announce_switch(instance, session, &agent, injected);
+            Ok::<(), TeamError>(())
+        });
+        result?;
         if suspended {
-            if let Some(handle) = self.instances.get(instance) {
-                let launch = crate::team::LeaderLaunch {
-                    cwd: handle.key.cwd.clone(),
-                    key: handle.key.clone(),
-                    env: handle.env.clone(),
-                    #[cfg(unix)]
-                    launch: handle.launch.clone(),
-                };
-                let mut config = self.teams.config_for(&handle.key.cwd);
-                self.teams.fill_builtin_config(&mut config, &launch);
-                self.teams
-                    .start_resume_with_config(team, instance, session, &agent, config);
-                self.resume_team(team);
-            }
-        }
-        if !suspended {
-            self.send_leader_notice(team, instance, session);
+            // One notice: the resume summary, the base instructions and the
+            // current status (20.4/20.8).
+            self.resume_team(team);
+            self.send_resume_notice(team, &[]);
+        } else {
+            self.send_leader_notice(team);
         }
         Ok(())
     }
@@ -1339,7 +1468,7 @@ impl Hub {
         self.teams.enabled_for(agent, session, &handle.key.cwd)
     }
 
-    fn send_leader_notice(&mut self, team: &str, _instance: &str, _session: &str) {
+    fn send_leader_notice(&mut self, team: &str) {
         let Ok(status) = self.teams.status(team, "leader", "") else {
             return;
         };
@@ -1348,6 +1477,26 @@ impl Hub {
             crate::team::brief::leader_instructions(),
             status
         );
+        let _ = self
+            .teams
+            .send_message(team, "human", "leader", Kind::Notice, &body, None, vec![]);
+    }
+
+    /// The one notice a suspended handover sends: the resume summary, the base
+    /// instructions and the current `bus.status` (20.4/20.8).
+    fn send_resume_notice(&mut self, team: &str, failures: &[String]) {
+        let Ok(status) = self.teams.status(team, "leader", "") else {
+            return;
+        };
+        let mut body = String::from("team resumed after a service restart");
+        if !failures.is_empty() {
+            body.push_str("; not resumed: ");
+            body.push_str(&failures.join(", "));
+        }
+        body.push_str("\n\n");
+        body.push_str(crate::team::brief::leader_instructions());
+        body.push_str("\n\n");
+        body.push_str(&status.to_string());
         let _ = self
             .teams
             .send_message(team, "human", "leader", Kind::Notice, &body, None, vec![]);
@@ -1390,46 +1539,63 @@ impl Hub {
                         error.data = Some(json!({ "reason": "leads_team" }));
                         return Err(error);
                     }
-                    let team = leader
+                }
+                let close_team = leads.then(|| {
+                    leader
                         .get("id")
                         .and_then(Value::as_str)
                         .unwrap_or_default()
-                        .to_string();
-                    self.close_team(&team)?;
-                }
-                self.remember_switch(&agent, &session, false);
-                self.forward_loads
-                    .remove(&(instance.clone(), session.clone()));
-                self.session_state_changed(&instance, &session);
-                return Ok(json!({
-                    "enabled": false,
-                    "injected": injected,
-                    "leader": Value::Null,
-                }));
+                        .to_string()
+                });
+                let identity = (instance.clone(), session.clone());
+                let mut reload = false;
+                let _ = &mut reload;
+                return self.with_session_changes(vec![identity], |hub| {
+                    if let Some(team) = close_team {
+                        hub.close_team(&team)?;
+                    }
+                    hub.remember_switch(&agent, &session, false);
+                    hub.forward_loads
+                        .remove(&(instance.clone(), session.clone()));
+                    Ok(json!({
+                        "enabled": false,
+                        "injected": injected,
+                        "leader": Value::Null,
+                    }))
+                });
             }
-            self.remember_switch(&agent, &session, true);
+            // Validate before persisting or marking (20.5): a disabled cwd or an
+            // agent without load/resume changes nothing.
             let mut reload = false;
             if !injected {
-                // 20.5: the front end performs the reload; the service only
-                // forwards that session's next load/resume instead of emulating
-                // it.
+                if !self.teams.has_config(&cwd) || !self.teams.config_for(&cwd).enabled {
+                    let mut error = TeamError::not_allowed("teams are disabled for this cwd");
+                    error.data = Some(json!({ "reason": "off" }));
+                    return Err(error);
+                }
                 if !can_reload {
                     let mut error = TeamError::not_allowed("the agent cannot reload a session");
                     error.data = Some(json!({ "reason": "reload_unsupported" }));
                     return Err(error);
                 }
-                self.forward_loads
-                    .insert((instance.clone(), session.clone()));
                 reload = true;
             }
-            let leader = self.teams.session_team_entry(&instance, &session);
-            self.session_state_changed(&instance, &session);
-            Ok(json!({
-                "enabled": true,
-                "injected": injected,
-                "leader": leader,
-                "reload": reload,
-            }))
+            let identity = (instance.clone(), session.clone());
+            self.with_session_changes(vec![identity], |hub| {
+                hub.remember_switch(&agent, &session, true);
+                if reload {
+                    hub.forward_loads
+                        .insert((instance.clone(), session.clone()));
+                }
+                let leader = hub.teams.session_team_entry(&instance, &session);
+                let injected = hub.session_injected(&instance, &session);
+                Ok(json!({
+                    "enabled": true,
+                    "injected": injected,
+                    "leader": leader,
+                    "reload": reload,
+                }))
+            })
         })();
         match result {
             Ok(value) => self.send_to(conn, &success(id, value)),
@@ -1453,9 +1619,17 @@ impl Hub {
         if self.teams.session_token_of(instance, session).is_none() {
             return;
         }
+        // Commit-time re-check: a switch turned off or a cwd disabled while the
+        // load was in flight must not resume (20.7/#5).
+        if !self.teams.has_config(cwd) || !self.teams.config_for(cwd).enabled {
+            return;
+        }
         let Some(handle) = self.instances.get(instance) else {
             return;
         };
+        if !self.teams.enabled_for(&handle.key.agent, session, cwd) {
+            return;
+        }
         let launch = crate::team::LeaderLaunch {
             cwd: cwd.to_string(),
             key: handle.key.clone(),
@@ -1465,9 +1639,11 @@ impl Hub {
         };
         let mut config = self.teams.config_for(cwd);
         self.teams.fill_builtin_config(&mut config, &launch);
-        self.teams
-            .start_resume_with_config(&team_id, instance, session, agent, config);
-        self.session_state_changed(instance, session);
+        let identity = (instance.to_string(), session.to_string());
+        self.with_session_changes(vec![identity], |hub| {
+            hub.teams
+                .start_resume_with_config(&team_id, instance, session, agent, config);
+        });
         self.resume_team(&team_id);
     }
 
@@ -1705,17 +1881,13 @@ impl Hub {
         // Pending worker writes are flushed before the team (and its board)
         // goes away (19.2).
         self.flush_pending_board(team, false);
+        let before = leader
+            .as_ref()
+            .map(|(instance, session)| self.session_states(&[(instance.clone(), session.clone())]))
+            .unwrap_or_default();
         let (_entry, workers) = self.teams.close(team)?;
+        self.publish_session_changes(before);
         if let Some((instance, session)) = leader {
-            self.refresh_session(&instance, &session);
-            self.notify_tools_changed(&(instance.clone(), session.clone()));
-            let agent = self
-                .instances
-                .get(&instance)
-                .map(|handle| handle.key.agent.clone())
-                .unwrap_or_default();
-            let injected = self.session_injected(&instance, &session);
-            self.announce_switch(&instance, &session, &agent, injected);
             let running = self
                 .instances
                 .get(&instance)
@@ -2605,14 +2777,7 @@ impl Hub {
                     let _ = self.apply_set_leader(&team, &instance, &session);
                 } else {
                     self.teams.set_handover_refusal(&instance, &session);
-                    let agent = self
-                        .instances
-                        .get(&instance)
-                        .map(|handle| handle.key.agent.clone())
-                        .unwrap_or_default();
-                    let injected = self.session_injected(&instance, &session);
-                    self.announce_switch(&instance, &session, &agent, injected);
-                    self.notify_tools_changed(&(instance, session));
+                    self.sessions_changed(&[(instance, session)]);
                 }
                 false
             }
@@ -3615,8 +3780,8 @@ impl Hub {
         }
     }
 
-    /// Drop the forwarded session requests, server lists, one-shot loads and
-    /// session connections of a dying instance (20.2/20.5).
+    /// Drop the forwarded session requests, one-shot loads and sessions of a
+    /// dying instance (20.2/20.5).
     pub(crate) fn cleanup_instance_pending(&mut self, instance: &str) {
         let keys: Vec<(String, u64)> = self
             .pending_session
@@ -3625,22 +3790,18 @@ impl Hub {
             .cloned()
             .collect();
         for key in keys {
-            if let Some(pending) = self.pending_session.remove(&key) {
-                self.teams.revoke(&pending.token_id);
-            }
+            self.drop_pending_session(&key);
         }
-        self.session_servers
-            .retain(|(owner, _), _| owner != instance);
         self.forward_loads.retain(|(owner, _)| owner != instance);
-        let conns: Vec<u64> = self
-            .injected_conns
-            .iter()
-            .filter(|(_, (owner, _))| owner == instance)
-            .map(|(conn, _)| *conn)
+        let sessions: Vec<(String, String)> = self
+            .conn_tokens
+            .values()
+            .filter_map(|token| {
+                let (owner, session) = self.teams.session_identity(token)?;
+                (owner == instance).then_some((owner, session))
+            })
             .collect();
-        for conn in conns {
-            self.injected_conns.remove(&conn);
-        }
+        self.sessions_changed(&sessions);
     }
 
     pub(crate) fn fail_held_prompts(&mut self, instance: &str) {
@@ -3791,15 +3952,17 @@ impl Hub {
             .instances
             .get(instance)
             .map(|handle| handle.key.agent.clone());
+        let identity = (instance.to_string(), session.to_string());
+        let before = self.session_states(std::slice::from_ref(&identity));
         self.teams.leader_session_closed(instance, session);
         self.teams.revoke_session_tokens(instance, session);
+        // A closed session consumes its unused one-shot mark (20.5).
+        self.forward_loads.remove(&identity);
         if let Some(agent) = agent {
             self.recorder.delete_session_switch(&agent, session);
-            self.announce_switch(instance, session, &agent, false);
         }
-        self.session_servers
-            .remove(&(instance.to_string(), session.to_string()));
-        self.notify_tools_changed(&(instance.to_string(), session.to_string()));
+        self.publish_session_changes(before);
+        self.notify_tools_changed(&identity);
         self.drain_team_events();
     }
 
@@ -4005,23 +4168,6 @@ pub(crate) fn inject_team_server(params: &mut Value, token: &str) {
             inject_team_server_value(servers, token);
         }
     }
-}
-
-/// The user's own `mcpServers` of a session request, without `ade-team`.
-fn user_servers(message: &Value) -> Value {
-    let servers = message
-        .get("params")
-        .and_then(|params| params.get("mcpServers"))
-        .cloned()
-        .filter(|value| value.is_array())
-        .unwrap_or_else(|| json!([]));
-    let Value::Array(items) = servers else {
-        return json!([]);
-    };
-    json!(items
-        .into_iter()
-        .filter(|item| item.get("name").and_then(Value::as_str) != Some("ade-team"))
-        .collect::<Vec<_>>())
 }
 
 fn inject_team_server_value(servers: &mut Value, token: &str) {

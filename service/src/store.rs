@@ -377,6 +377,22 @@ impl Store {
         Ok(())
     }
 
+    /// Mark one session's log incomplete (a forced reload restarted it).
+    pub fn mark_session_incomplete(&self, instance_key: &str, session_id: &str) -> Result<()> {
+        let conn = self.lock()?;
+        let Some(instance_id) = find_instance(&conn, instance_key)? else {
+            return Ok(());
+        };
+        conn.prepare_cached(
+            "INSERT INTO sessions (instance_id, session_id, incomplete) VALUES (?1, ?2, 1) \
+             ON CONFLICT (instance_id, session_id) DO UPDATE SET incomplete = 1",
+        )
+        .context("preparing the session mark")?
+        .execute(params![instance_id, session_id])
+        .context("marking the session incomplete")?;
+        Ok(())
+    }
+
     /// Total payload size of one instance's stored messages, in bytes.
     pub fn instance_bytes(&self, instance_key: &str) -> Result<u64> {
         let conn = self.lock()?;

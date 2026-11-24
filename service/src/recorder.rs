@@ -126,6 +126,11 @@ enum Job {
         project: String,
         name: String,
     },
+    /// Mark one session incomplete in the store.
+    MarkSessionIncomplete {
+        instance_key: String,
+        session_id: String,
+    },
     /// Complete the receiver once every earlier job is written.
     Barrier(oneshot::Sender<()>),
 }
@@ -353,6 +358,20 @@ impl Recorder {
         })
         .await
         .context("reading the event log")?
+    }
+
+    /// Mark one session's log incomplete: a forced reload restarted it, so
+    /// earlier events are not replayed (20.5).
+    pub fn mark_session_incomplete(&self, instance_key: &str, session_id: &str) {
+        if !self.enabled {
+            return;
+        }
+        let key = instance_key.to_string();
+        let session = session_id.to_string();
+        self.send(Job::MarkSessionIncomplete {
+            instance_key: key,
+            session_id: session,
+        });
     }
 
     /// Queue "delete this instance's log", ordered with the events around it.
@@ -817,6 +836,13 @@ impl Writer {
                         self.write(&mut batch);
                         self.mark_incomplete(&instance);
                     }
+                    Job::MarkSessionIncomplete {
+                        instance_key,
+                        session_id,
+                    } => {
+                        self.write(&mut batch);
+                        self.mark_session_incomplete_now(&instance_key, &session_id);
+                    }
                     Job::TeamSave {
                         id,
                         state_json,
@@ -903,6 +929,13 @@ impl Writer {
                 Job::MarkIncomplete(instance) => {
                     self.write(&mut batch);
                     self.mark_incomplete(&instance);
+                }
+                Job::MarkSessionIncomplete {
+                    instance_key,
+                    session_id,
+                } => {
+                    self.write(&mut batch);
+                    self.mark_session_incomplete_now(&instance_key, &session_id);
                 }
                 Job::TeamSave {
                     id,
@@ -1289,6 +1322,19 @@ impl Writer {
     fn mark_incomplete(&mut self, instance: &str) {
         if let Err(error) = self.store.mark_instance_incomplete(instance) {
             self.report_failure(instance, &error);
+        }
+    }
+
+    /// Mark one session incomplete without touching the instance counters.
+    fn mark_session_incomplete_now(&self, instance_key: &str, session_id: &str) {
+        if let Err(error) = self
+            .inner
+            .store
+            .mark_session_incomplete(instance_key, session_id)
+        {
+            crate::logging::log(format_args!(
+                "nvim_ade_server: cannot mark session {session_id} incomplete: {error:#}"
+            ));
         }
     }
 

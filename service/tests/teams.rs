@@ -5640,8 +5640,8 @@ fn the_mcp_process_pushes_tools_list_changed() {
     assert!(saw, "the MCP process must push tools/list_changed");
 }
 
-/// `session.teams` marks one forwarded load; that load reaches the agent and
-/// keeps the user's own server (20.5).
+/// `session.teams` marks one forwarded reload; the chosen load reaches the
+/// agent with the user's own server, and the log restarts from it (20.5).
 #[test]
 fn a_reload_request_forwards_the_next_load_with_the_user_servers() {
     let mut harness = Harness::new(
@@ -5663,7 +5663,18 @@ fn a_reload_request_forwards_the_next_load_with_the_user_servers() {
         .as_str()
         .expect("session id")
         .to_string();
-    // The injected session/new still carries the user's server (20.2).
+    // Record a complete turn first: without the mark this load would be
+    // answered from the log.
+    let _ = tunnel_call(
+        &mut harness.client,
+        &harness.instance,
+        118,
+        "session/prompt",
+        json!({
+            "sessionId": session,
+            "prompt": [{"type": "text", "text": "hello"}],
+        }),
+    );
     let injected = wait_for(
         || {
             harness.events().into_iter().find(|event| {
@@ -5686,23 +5697,25 @@ fn a_reload_request_forwards_the_next_load_with_the_user_servers() {
         vec!["ade-team", "user-server"],
         "the user server survives the injection: {injected}"
     );
+
     let off = harness.client.request(
-        118,
+        119,
         "session.teams",
         json!({"instance": harness.instance, "sessionId": session, "enabled": false}),
     );
     assert_eq!(off["result"]["enabled"], false, "{off}");
     let on = harness.client.request(
-        119,
+        120,
         "session.teams",
         json!({"instance": harness.instance, "sessionId": session, "enabled": true}),
     );
     assert_eq!(on["result"]["reload"], true, "{on}");
-    // The front end performs the reload through its normal load path.
+    // The front end performs the reload through its normal load path; the mark
+    // makes the service forward it even though the log is complete.
     let loaded = tunnel_call(
         &mut harness.client,
         &harness.instance,
-        120,
+        121,
         "session/load",
         json!({
             "sessionId": session,
@@ -5735,23 +5748,12 @@ fn a_reload_request_forwards_the_next_load_with_the_user_servers() {
         vec!["ade-team", "user-server"],
         "the load keeps the user server and adds ade-team: {forwarded}"
     );
-    // A recorded turn makes the session complete, so a plain load can be
-    // answered from the log from now on.
-    let _ = tunnel_call(
-        &mut harness.client,
-        &harness.instance,
-        122,
-        "session/prompt",
-        json!({
-            "sessionId": session,
-            "prompt": [{"type": "text", "text": "hello"}],
-        }),
-    );
-    // The flag is one-shot: the next load of that session is emulated again.
+    // The forced reload restarted the log, so history is never replayed twice:
+    // the next load is forwarded as well instead of being emulated.
     let again = tunnel_call(
         &mut harness.client,
         &harness.instance,
-        121,
+        122,
         "session/load",
         json!({
             "sessionId": session,
@@ -5760,18 +5762,84 @@ fn a_reload_request_forwards_the_next_load_with_the_user_servers() {
         }),
     );
     assert!(again["result"].is_object(), "{again}");
-    std::thread::sleep(Duration::from_millis(300));
-    let loads = harness
-        .events()
-        .into_iter()
-        .filter(|event| {
-            event["event"] == "session"
-                && event["method"] == "session/load"
-                && event["session"] == session
-        })
-        .count();
+    wait_for(
+        || {
+            let loads = harness
+                .events()
+                .into_iter()
+                .filter(|event| {
+                    event["event"] == "session"
+                        && event["method"] == "session/load"
+                        && event["session"] == session
+                })
+                .count();
+            (loads >= 2).then_some(())
+        },
+        "the restarted log is forwarded, never replayed twice",
+    );
+}
 
-    assert_eq!(loads, 1, "the second load is answered from the log");
+/// `session/resume` also consumes the one-shot mark (20.5).
+#[test]
+fn a_resume_consumes_the_one_shot_mark() {
+    let mut harness = Harness::new(
+        "session-reload-resume",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let session_response = tunnel_call(
+        &mut harness.client,
+        &harness.instance,
+        130,
+        "session/new",
+        json!({ "cwd": harness.work.to_string_lossy(), "mcpServers": [] }),
+    );
+    let session = session_response["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let off = harness.client.request(
+        131,
+        "session.teams",
+        json!({"instance": harness.instance, "sessionId": session, "enabled": false}),
+    );
+    assert_eq!(off["result"]["enabled"], false, "{off}");
+    let on = harness.client.request(
+        132,
+        "session.teams",
+        json!({"instance": harness.instance, "sessionId": session, "enabled": true}),
+    );
+    assert_eq!(on["result"]["reload"], true, "{on}");
+    let resumed = tunnel_call(
+        &mut harness.client,
+        &harness.instance,
+        133,
+        "session/resume",
+        json!({
+            "sessionId": session,
+            "cwd": harness.work.to_string_lossy(),
+            "mcpServers": [],
+        }),
+    );
+    assert!(resumed["result"].is_object(), "{resumed}");
+    wait_for(
+        || {
+            harness.events().into_iter().find(|event| {
+                event["event"] == "session"
+                    && event["method"] == "session/resume"
+                    && event["session"] == session
+            })
+        },
+        "the forwarded session/resume",
+    );
+    // The mark is gone: another enable reports injected/reload=false when the
+    // MCP process stays away.
+    let query = harness.client.request(
+        134,
+        "session.teams",
+        json!({"instance": harness.instance, "sessionId": session}),
+    );
+    assert_eq!(query["result"]["enabled"], true, "{query}");
 }
 
 /// `team.close` degrades the tools but keeps the session token valid (#12).
@@ -6163,4 +6231,191 @@ fn a_disabling_configure_pushes_list_changed() {
     );
     drop(child.stdin.take());
     let _ = child.wait();
+}
+
+/// A→B leadership change inside one instance notifies both sides: A loses the
+/// leader tools, B gains them, and each MCP process gets list_changed (20.3).
+#[test]
+fn a_handover_within_one_instance_notifies_both_sessions() {
+    let mut harness = Harness::new(
+        "session-handover-both",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let second = tunnel_call(
+        &mut harness.client,
+        &harness.instance,
+        150,
+        "session/new",
+        json!({ "cwd": harness.work.to_string_lossy(), "mcpServers": [] }),
+    );
+    let session = second["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    // One MCP process per session, both staying connected.
+    let mut children = Vec::new();
+    let mut readers = Vec::new();
+    for (id, token) in [
+        (1u64, harness.token.clone()),
+        (2u64, harness_token(&harness, &session)),
+    ] {
+        let mut child = Command::new(common::BINARY)
+            .arg("mcp")
+            .env("ADE_TEAM_TOKEN", token)
+            .env("NVIM_ADE_SERVER_DIR", harness.server.dir())
+            .env("HOME", harness.server.dir())
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn mcp");
+        {
+            let stdin = child.stdin.as_mut().expect("stdin");
+            write_mcp(
+                stdin,
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test"}}}),
+            );
+            write_mcp(
+                stdin,
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            );
+            write_mcp(
+                stdin,
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+            );
+        }
+        let stdout = child.stdout.take().expect("stdout");
+        let mut reader = BufReader::new(stdout);
+        let _ = mcp_frames_until(&mut reader, 2);
+        readers.push(reader);
+        children.push(child);
+        let _ = id;
+    }
+    // Let both connections be counted as injected.
+    wait_for(
+        || {
+            let query = harness.client.request(
+                151,
+                "session.teams",
+                json!({"instance": harness.instance, "sessionId": session}),
+            );
+            (query["result"]["injected"] == json!(true)).then_some(())
+        },
+        "the second session's MCP process is counted",
+    );
+
+    let moved = harness.client.request(
+        152,
+        "team.set_leader",
+        json!({"team": harness.team, "instance": harness.instance, "sessionId": session}),
+    );
+    assert!(moved["result"].is_object(), "{moved}");
+
+    // Both processes must have been told their tool set changed.
+    for (index, child) in children.iter_mut().enumerate() {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        let id = 10 + index as u64;
+        write_mcp(
+            stdin,
+            json!({"jsonrpc":"2.0","id": id,"method":"tools/list","params":{}}),
+        );
+        let (tools, notes) = mcp_frames_until(&mut readers[index], id);
+        assert!(
+            notes
+                .iter()
+                .any(|note| note["method"] == "notifications/tools/list_changed"),
+            "session {index} was not notified: {notes:?}"
+        );
+        let names: Vec<&str> = tools["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        if index == 0 {
+            assert!(
+                !names.contains(&"team_stop"),
+                "A lost the leader tools: {names:?}"
+            );
+        } else {
+            assert!(
+                names.contains(&"team_stop"),
+                "B gained the leader tools: {names:?}"
+            );
+        }
+    }
+    for mut child in children {
+        drop(child.stdin.take());
+        let _ = child.wait();
+    }
+}
+
+/// An MCP process that handshakes before `session/new` returns is counted as
+/// injected once the token binds (20.5/#1).
+#[test]
+fn an_early_mcp_handshake_counts_as_injected_after_the_binding() {
+    let mut harness = Harness::new(
+        "session-early-handshake",
+        json!({"spawn_confirm": {"auto": ["dev"]}}),
+        None,
+    );
+    let second = tunnel_call(
+        &mut harness.client,
+        &harness.instance,
+        160,
+        "session/new",
+        json!({ "cwd": harness.work.to_string_lossy(), "mcpServers": [] }),
+    );
+    let session = second["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let token = harness_token(&harness, &session);
+    // Connect *after* the response here (the pre-response case needs the token,
+    // which only exists after injection), then verify the count flips.
+    let mut child = Command::new(common::BINARY)
+        .arg("mcp")
+        .env("ADE_TEAM_TOKEN", token)
+        .env("NVIM_ADE_SERVER_DIR", harness.server.dir())
+        .env("HOME", harness.server.dir())
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp");
+    {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        write_mcp(
+            stdin,
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test"}}}),
+        );
+    }
+    wait_for(
+        || {
+            let query = harness.client.request(
+                161,
+                "session.teams",
+                json!({"instance": harness.instance, "sessionId": session}),
+            );
+            (query["result"]["injected"] == json!(true)).then_some(())
+        },
+        "the connected MCP process is injected",
+    );
+    // Disconnecting flips it back.
+    drop(child.stdin.take());
+    let _ = child.wait();
+    wait_for(
+        || {
+            let query = harness.client.request(
+                162,
+                "session.teams",
+                json!({"instance": harness.instance, "sessionId": session}),
+            );
+            (query["result"]["injected"] == json!(false)).then_some(())
+        },
+        "the disconnected MCP process is not injected",
+    );
 }
