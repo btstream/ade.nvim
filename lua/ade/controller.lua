@@ -463,17 +463,6 @@ function M.load_session(session_id)
   end
 end
 
----Create a new session, optionally reporting the outcome to the caller.
----@param opts {on_created: (fun(session: table)|nil)|nil, on_failed: (fun(err: string)|nil)|nil}|nil
-function M.new_session(opts)
-  if S.sess.service then
-    S.sess.service:create(function()
-      S.conn.skip_auto_restore = true
-      M.connect()
-    end, opts)
-  end
-end
-
 ---Browse stored sessions. <CR> opens, <C-d> deletes, typing filters.
 function M.pick_session()
   if S.sess.service then

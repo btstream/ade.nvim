@@ -39,6 +39,18 @@ function Options:still_current(client, generation, session)
   return self.ui_current(client, generation, session) and self.current() == session
 end
 
+---Whether the connection context of a captured write is still valid.
+---
+---Unlike `still_current` this ignores which chat is on screen: a write the
+---person asked for through a command (`:Ade team start`) targets a session, not
+---the UI selection, so switching chats meanwhile must not drop it.
+---@param client table|nil
+---@param generation integer
+---@return boolean
+function Options:context_current(client, generation)
+  return self.ui_current(client, generation, nil)
+end
+
 -- ACP replies can replace all configOptions; serialize writes per session so
 -- an older snapshot can never arrive after a newer write.
 function Options:apply(control, value, client, generation, session, cycling)
@@ -66,15 +78,51 @@ function Options:apply(control, value, client, generation, session, cycling)
   self:drain(session, queue)
 end
 
+---Set a control on an explicit session, independent of the UI selection.
+---
+---Used by flows that act on a chosen session (a team start on the tree's row).
+---The write still fences on the client/generation it was issued for, and the
+---outcome is reported through `cb` so the caller can say what really happened.
+---@param control table
+---@param value any
+---@param client table|nil
+---@param generation integer
+---@param session table
+---@param cb fun(ok: boolean, err: any)|nil
+---@return boolean queued
+function Options:set_for(control, value, client, generation, session, cb)
+  if not client or not session or not self:context_current(client, generation) then
+    if cb then
+      pcall(cb, false, "the session is no longer available")
+    end
+    return false
+  end
+  local queue = self.changes[session]
+  if not queue then
+    queue = { pending = {} }
+    self.changes[session] = queue
+  end
+  queue.pending[#queue.pending + 1] = {
+    id = control.id,
+    value = value,
+    client = client,
+    generation = generation,
+    unattended = true,
+    cb = cb,
+  }
+  self:drain(session, queue)
+  return true
+end
+
 function Options:drain(session, queue)
   if queue.active then
     return
   end
   while #queue.pending > 0 do
     local change = table.remove(queue.pending, 1)
-    local control = self:still_current(change.client, change.generation, session)
-      and session.controls
-      and controls_mod.by_id(session.controls, change.id)
+    local valid = change.unattended and self:context_current(change.client, change.generation)
+      or self:still_current(change.client, change.generation, session)
+    local control = valid and session.controls and controls_mod.by_id(session.controls, change.id)
     local value
     if control then
       value = change.value
@@ -105,6 +153,9 @@ function Options:drain(session, queue)
     if change.cycling then
       queue.cycling = nil
     end
+    if change.cb then
+      pcall(change.cb, false, control and "the agent no longer offers that value" or "the session is gone")
+    end
   end
   self.changes[session] = nil
 end
@@ -120,6 +171,9 @@ function Options:write(control, value, change, session, on_finally)
     if not ok then
       task.status = "failed"
       local message = type(result) == "table" and (result.message or vim.inspect(result)) or tostring(result)
+      if change.cb then
+        pcall(change.cb, false, message)
+      end
       self.notify("unable to change " .. (control.name or control.id) .. ": " .. message, vim.log.levels.ERROR)
       return
     end
@@ -140,7 +194,13 @@ function Options:write(control, value, change, session, on_finally)
     end
     session._toolbar_labels = nil
     self.on_changed()
+    if change.cb then
+      pcall(change.cb, true, nil)
+    end
   end, function(err)
+    if change.cb then
+      pcall(change.cb, false, err)
+    end
     self.notify("unable to change " .. (control.name or control.id) .. ": " .. tostring(err), vim.log.levels.ERROR)
   end, on_finally)
 end

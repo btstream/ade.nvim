@@ -35,7 +35,8 @@ end
 ---  leader_input: (fun(): table|nil)|nil, current_session: (fun(): table|nil)|nil,
 ---  find_session: (fun(id: string): table|nil)|nil, instance: (fun(): string|nil)|nil,
 ---  start_team: (fun(workflow: string, session: table|nil)|nil)|nil, select_session: (fun(session: table)|nil)|nil,
----  open_session: (fun(session: table)|nil)|nil, sessions: (fun(): table|nil)|nil}
+---  open_session: (fun(session: table, opts: table|nil)|nil)|nil, sessions: (fun(): table|nil)|nil,
+---  connection_generation: (fun(): any)|nil}
 ---@return table
 function M.dashboard(opts)
   local self = setmetatable({
@@ -50,6 +51,7 @@ function M.dashboard(opts)
     open_session = opts.open_session,
     sessions = opts.sessions,
     instance_of = opts.instance,
+    connection_generation = opts.connection_generation,
     panel = opts.panel,
     start_team = opts.start_team,
     layout = nil,
@@ -61,6 +63,7 @@ function M.dashboard(opts)
     pending = false,
     requested = {},
     switch_queried = {},
+    switch_queried_generation = nil,
     tree_meta = {},
   }, Dashboard)
   self.layout = Pane.new(self)
@@ -186,6 +189,17 @@ function Dashboard:board_team()
   local rows = self:paint_rows()
   if #rows == 0 then
     return nil
+  end
+  if self.open_board_target then
+    -- A tree action named the exact team to show (`b` on any project's row);
+    -- that wins over the project cwd until the pane is closed.
+    for _, row in ipairs(rows) do
+      if row.id == self.open_board_target then
+        self.board_selected_id = row.id
+        return row
+      end
+    end
+    self.open_board_target = nil
   end
   local cwd = self:project_cwd()
   if cwd then
@@ -325,6 +339,9 @@ function Dashboard:tree_groups()
       order[#order + 1] = cwd
     end
     local instance = session.instance or nil
+    -- Online means "this session's own instance is the one connected here". With
+    -- no live client nothing is online; never borrow a cached binding or a
+    -- team's leader instance to make a foreign row look addressable.
     by_cwd[cwd][#by_cwd[cwd] + 1] = {
       session = session,
       instance = instance,
@@ -374,19 +391,25 @@ function Dashboard:render_tree()
   local win = self.layout:win("tree")
   local width = win and math.max(20, vim.api.nvim_win_get_width(win)) or 60
   local groups = self:tree_groups()
-  -- Read each visible session's switch once its own instance is known, so
-  -- `[team off]` is real data and browsing never guesses an instance.
+  -- A new connection may see different switches: forget the "already asked"
+  -- marks so the rows are read again on it.
+  local generation = self.connection_generation and self.connection_generation() or nil
+  if generation ~= self.switch_queried_generation then
+    self.switch_queried = {}
+    self.switch_queried_generation = generation
+  end
+  -- Read each online row's switch once, so `[team off]` is real data and
+  -- browsing never guesses an instance. Offline rows are not queried at all.
   for _, group in ipairs(groups) do
     for _, entry in ipairs(group.sessions) do
-      if
-        entry.instance
-        and not entry.switch
-        and not self.switch_queried[entry.instance .. "\0" .. entry.session.id]
-      then
-        self.switch_queried[entry.instance .. "\0" .. entry.session.id] = true
+      local key = entry.instance and (entry.instance .. "\0" .. entry.session.id) or nil
+      if entry.online and key and not entry.switch and not self.switch_queried[key] then
+        self.switch_queried[key] = true
         self.team:query_session_teams(entry.instance, entry.session.id, group.cwd, function(ok)
           if not ok then
-            self.switch_queried[entry.instance .. "\0" .. entry.session.id] = nil
+            -- One attempt per connection: no refresh loop on a failing row.
+            -- `t` on that row retries explicitly.
+            self.switch_queried[key] = true
           end
           self:schedule_refresh()
         end)
@@ -575,6 +598,10 @@ end
 ---@return boolean
 function Dashboard:open(kind)
   kind = kind or "members"
+  if kind ~= "board" then
+    -- `:Ade team board` follows the cwd again; only `b` pins a team.
+    self.open_board_target = nil
+  end
   self.resolved_cwd = self.team.resolve_cwd and self.team.resolve_cwd() or nil
   if not self.selected_id then
     local rows = self.team:list_rows()
@@ -952,22 +979,25 @@ function Dashboard:handle_tree_key(key, info)
     return true
   end
   if key == "b" then
-    -- The board of the row's team, not whichever team was selected before.
+    -- The board of the row's team, not whichever project the editor cwd (or a
+    -- previous selection) points at. `:Ade team board` keeps following the cwd.
     if info.team then
       self.board_selected_id = info.team.id
-      self.resolved_cwd = info.cwd
+      self.open_board_target = info.team.id
     end
     self:open("board")
     return true
   end
   if key == "<CR>" or key == "cr" then
     if kind == "tree_worker" and info.team then
-      self.router:open(info.team, info.participant and info.participant.name)
+      self.router:open(info.team_row and info.team_row.id or info.team, info.participant and info.participant.name)
       return true
     end
     if kind == "tree_session" and session then
+      -- `<CR>` loads a released session with its own instance and cwd; the
+      -- loader refuses a row of another instance or project.
       if self.open_session then
-        self.open_session(session)
+        self.open_session(session, { instance = info.instance, cwd = info.cwd })
       elseif self.select_session then
         self.select_session(session)
       end
@@ -983,13 +1013,18 @@ function Dashboard:handle_tree_key(key, info)
           self:notify(blocked, vim.log.levels.WARN)
           return true
         end
-        self.team:stop_worker(info.team, info.participant.name, false, function(ok, value)
-          if not ok then
-            self:notify(
-              "cannot stop " .. tostring(info.participant.name) .. ": " .. tostring(value and value.message or value)
-            )
+        self.team:stop_worker(
+          info.team_row and info.team_row.id or info.team,
+          info.participant.name,
+          false,
+          function(ok, value)
+            if not ok then
+              self:notify(
+                "cannot stop " .. tostring(info.participant.name) .. ": " .. tostring(value and value.message or value)
+              )
+            end
           end
-        end)
+        )
       end
       return true
     end
@@ -1033,14 +1068,20 @@ function Dashboard:handle_tree_key(key, info)
     end
     local state = info.switch
     if not state then
-      -- Unknown is not "off": ask first, then act on the real answer.
-      self.team:query_session_teams(instance, session.id, info.cwd, function(ok, value)
-        if not ok or type(value) ~= "table" then
+      -- Unknown is not "off": ask first, then act on the real answer. Read the
+      -- cache afterwards: a newer notification may have replaced this reply.
+      self.team:query_session_teams(instance, session.id, info.cwd, function(ok)
+        if not ok then
           self:notify("cannot read the teams switch", vim.log.levels.WARN)
           return
         end
-        if value.enabled then
-          self:set_teams_off(info, session, instance, value)
+        local latest = self.team:session_teams(instance, session.id)
+        if not latest then
+          self:notify("cannot read the teams switch", vim.log.levels.WARN)
+          return
+        end
+        if latest.enabled then
+          self:set_teams_off(info, session, instance, latest)
         else
           self:set_teams_on(session, instance)
         end
@@ -1085,7 +1126,7 @@ function Dashboard:handle_tree_key(key, info)
         return
       end
       -- A pending start flow would otherwise rebuild the team it just closed.
-      require("ade.app.team_start").cancel_for(info.cwd)
+      require("ade.app.team_start").cancel_for(info.team.cwd or info.cwd)
       self.team:close(info.team.id, function(ok, value)
         if not ok then
           self:notify("cannot close the team: " .. tostring(value and value.message or value))

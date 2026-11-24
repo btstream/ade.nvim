@@ -428,13 +428,122 @@ return function(t)
       t.eq(true, seen.ok)
       t.eq(true, seen.value.reload, "the service marks a forwarded load")
       local before = #sent_frames(service, "session/load")
+      local reloaded
       -- The front end must perform the load itself, through its normal path.
       team():reload_session(inst, "sess_mock", function(ok)
-        t.eq(true, ok)
+        reloaded = ok
       end)
       wait(function()
         return #sent_frames(service, "session/load") > before
       end, 5000, "the forwarded load")
+      wait(function()
+        return reloaded ~= nil
+      end, 5000, "the reload to settle")
+      t.eq(true, reloaded)
+      -- Loading the session in place replaces the transcript projection of the
+      -- same logical session; that is not "leaving" it, so no session/close may
+      -- follow (it would revoke the token the load just injected).
+      vim.wait(200)
+      t.eq(0, #calls_of(service, "session/close"), "an in-place reload must not close the session")
+      wait(function()
+        local state = team():session_teams(inst, "sess_mock")
+        return state ~= nil and state.injected == true
+      end, 5000, "the switch to show the injected tools")
+    end)
+
+    t.it("auto-starts once on an empty team list and again when tools appear", function()
+      local service, dir = start_service(t, "auto-start-empty")
+      service.teams = {}
+      setup(t, dir, {
+        teams = {
+          auto_start = true,
+          max_workers = 3,
+          spawn_confirm = { auto = {} },
+          limits = { max_turns_per_task = 30, max_turns_total = 200 },
+        },
+      })
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #calls_of(service, "team.start") == 1
+      end, 8000, "the auto-start of an empty project")
+      local call = calls_of(service, "team.start")[1].params
+      t.eq("sess_mock", call.sessionId)
+      t.eq("default", call.workflow)
+      vim.wait(300)
+      t.eq(1, #calls_of(service, "team.start"), "only one auto-start per session")
+    end)
+
+    t.it("auto-starts when the switch reports injected later", function()
+      local service, dir = start_service(t, "auto-start-later", { session_injected_default = false })
+      service.teams = {}
+      setup(t, dir, {
+        teams = {
+          auto_start = true,
+          max_workers = 3,
+          spawn_confirm = { auto = {} },
+          limits = { max_turns_per_task = 30, max_turns_total = 200 },
+        },
+      })
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #calls_of(service, "session.teams") >= 1
+      end, 5000, "the switch")
+      local inst = instance()
+      vim.wait(300)
+      t.eq(0, #calls_of(service, "team.start"), "nothing starts before the tools are injected")
+      -- The service now reports the session injected: the pending decision runs.
+      service.session_switches[tostring(inst) .. "\0sess_mock"] = { enabled = true, injected = true }
+      service:emit_session_teams(inst, "sess_mock")
+      wait(function()
+        return #calls_of(service, "team.start") >= 1
+      end, 8000, "the auto-start after injected")
+    end)
+
+    t.it("pair team.spawn answers structured errors instead of an inbox item", function()
+      local service, dir = start_service(t, "spawn-pair")
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #calls_of(service, "session.teams") >= 1
+      end, 5000, "the switch")
+      local inst = instance()
+      -- Off first: the pair form must say why, not create an item.
+      service.session_switches[tostring(inst) .. "\0sess_mock"] = { enabled = false, injected = true }
+      local seen
+      team():spawn_pair(inst, "sess_mock", "worker", nil, nil, function(ok, value)
+        seen = { ok = ok, value = value }
+      end)
+      wait(function()
+        return seen ~= nil
+      end, 5000, "the off refusal")
+      t.eq(false, seen.ok)
+      t.eq("off", seen.value.data.reason)
+      -- Injected but another chat leads: structured led_by, no item either.
+      service.session_switches[tostring(inst) .. "\0sess_mock"] = { enabled = true, injected = true }
+      service.teams.t9 = {
+        id = "t9",
+        cwd = dir,
+        state = "active",
+        leader = { instance = "inst-other", sessionId = "other" },
+        participants = { { name = "leader", state = "idle" } },
+        inbox = {},
+      }
+      seen = nil
+      team():spawn_pair(inst, "sess_mock", "worker", nil, nil, function(ok, value)
+        seen = { ok = ok, value = value }
+      end)
+      wait(function()
+        return seen ~= nil
+      end, 5000, "the led_by refusal")
+      t.eq(false, seen.ok)
+      t.eq("led_by", seen.value.data.reason)
+      local spawns = calls_of(service, "team.spawn")
+      t.eq(2, #spawns)
+      t.eq("sess_mock", spawns[1].params.sessionId)
+      t.eq(nil, spawns[1].params.team, "the pair form sends no team id")
     end)
 
     t.it("team.start from {instance, sessionId} answers led_by without an inbox item", function()
@@ -744,6 +853,73 @@ return function(t)
         wait(function()
           return #calls_of(service, "team.close") == 1
         end, 5000, "the close")
+      end)
+
+      t.it("b opens the row's team even when the editor cwd is another project", function()
+        local service, dir = start_service(t, "tree-board-other")
+        setup(t, dir)
+        controller.connect()
+        wait_ready()
+        wait(function()
+          return #calls_of(service, "session.teams") >= 1
+        end, 5000, "the switch")
+        -- A team of a different project, not the editor's cwd.
+        local other_cwd = dir .. "-other"
+        service.teams.t9 = {
+          id = "t9",
+          cwd = other_cwd,
+          state = "active",
+          leader = { instance = "inst-x", sessionId = "s-other" },
+          participants = { { name = "leader", state = "idle" } },
+          inbox = {},
+        }
+        team():refresh()
+        wait(function()
+          return team():team("t9") ~= nil
+        end, 5000, "the other project's team")
+        open_tree()
+        local ui = state().view.team_ui
+        t.eq(true, ui:handle_tree_key("b", { kind = "tree_session", cwd = other_cwd, team = team():team("t9") }))
+        wait(function()
+          return ui:is_open("board")
+        end, 5000, "the board pane")
+        t.eq("t9", ui.board_selected_id, "the tree's row decides the board")
+        t.eq("t9", ui:board_team().id)
+      end)
+
+      t.it("never marks a row online without a live client", function()
+        local service, dir = start_service(t, "tree-no-live")
+        setup(t, dir)
+        controller.connect()
+        wait_ready()
+        wait(function()
+          return #calls_of(service, "session.teams") >= 1
+        end, 5000, "the switch")
+        local ui = state().view.team_ui
+        -- Pretend the connection is gone while the team snapshot still names a
+        -- leader: no row may look online, and `t` must refuse instead of
+        -- guessing an instance.
+        local real_instance = ui.instance_of
+        ui.instance_of = function()
+          return nil
+        end
+        t.cleanup(function()
+          ui.instance_of = real_instance
+        end)
+        local groups = ui:tree_groups()
+        for _, group in ipairs(groups) do
+          for _, entry in ipairs(group.sessions) do
+            t.falsy(entry.online, "no live client means no online row")
+          end
+        end
+        t.truthy(table
+          .concat(
+            vim.tbl_map(function(group)
+              return group.cwd
+            end, groups),
+            ","
+          )
+          :find(dir, 1, true))
       end)
 
       t.it("b opens the board of the row's team", function()

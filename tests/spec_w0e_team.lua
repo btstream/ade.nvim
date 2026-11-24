@@ -74,6 +74,12 @@ return function(t)
     end
     function fake_team:start_session(instance, id, workflow, task, cb)
       calls.starts[#calls.starts + 1] = { instance = instance, id = id, workflow = workflow, task = task }
+      if opts.start_off_once and #calls.starts == 1 then
+        -- Another front end switched the session off while the task prompt was
+        -- open: the first start is refused structurally.
+        cb(false, { code = -32061, data = { reason = "off" } })
+        return
+      end
       if opts.led_by and #calls.starts == 1 then
         cb(
           false,
@@ -124,7 +130,7 @@ return function(t)
       config = function()
         return {
           backend = "service",
-          teams = { enabled = true, default = "default" },
+          teams = { enabled = true, default = "default", session_default = opts.session_default },
           cwd = cwd,
         }
       end,
@@ -151,8 +157,9 @@ return function(t)
       connect = function() end,
       pick_agent = function() end,
       options = function()
-        return nil
+        return opts.options
       end,
+      canonical_session = opts.canonical_session,
       client = function()
         return { proc = { instance = "i1" } }
       end,
@@ -313,6 +320,123 @@ return function(t)
       })
       t.truthy(summary:match("done it"))
       t.truthy(summary:match("older reply"))
+    end)
+
+    t.it("refuses to promise a replacement session when new sessions start with teams off", function()
+      local h = harness(t, {
+        tag = "default-off",
+        reload_unsupported = true,
+        session_default = false,
+      })
+      h.states["i1\0s1"] = { enabled = true, injected = false }
+      stub_ui(t, {
+        task = "",
+        select = function(items)
+          return items[1]
+        end,
+      })
+      local notices = {}
+      h.flow.deps.notify = function(message)
+        notices[#notices + 1] = tostring(message)
+      end
+      h.flow:start("default")
+      wait_idle(h.flow)
+      t.eq(0, h.calls.news, "no replacement session is created")
+      t.eq(0, #h.calls.starts)
+      local text = table.concat(notices, "\n")
+      t.truthy(text:match("session_default"))
+      t.truthy(text:match("cannot reload"))
+    end)
+
+    t.it("reloads before retrying a start refused with off", function()
+      local h = harness(t, { tag = "off-retry", start_off_once = true, enabled = true })
+      stub_ui(t, { task = "" })
+      h.flow:start("default")
+      wait_idle(h.flow)
+      t.eq(2, #h.calls.starts, "the refused start is retried once")
+      t.eq(1, #h.calls.enables, "the retry enables the session first")
+      t.eq(true, h.calls.enables[1].enabled)
+    end)
+
+    t.it("reports the model switch applied to the start target", function()
+      local applied = {}
+      local options = {
+        set_for = function(self, control, value, client, generation, session, cb)
+          applied[#applied + 1] = { value = value, session = session.id, client = client, generation = generation }
+          if cb then
+            cb(true, nil)
+          end
+          return true
+        end,
+      }
+      local notices = {}
+      local h = harness(t, {
+        tag = "model-target",
+        options = options,
+        workflows = {
+          {
+            name = "default",
+            summary = "flow",
+            leader = { model = "big" },
+            team = {},
+          },
+        },
+        canonical_session = function(instance, id)
+          return h_all_target
+        end,
+      })
+      local h_all_target -- defined below for the closure above
+      local controls = { model = { id = "model", options = { { value = "big" } } } }
+      local target = { id = "s1", instance = "i1", controls = controls }
+      h_all_target = target
+      h.session.controls = controls
+      h.flow.deps.notify = function(message)
+        notices[#notices + 1] = tostring(message)
+      end
+      stub_ui(t, { task = "" })
+      h.flow:start("default")
+      wait_idle(h.flow)
+      vim.wait(500, function()
+        return #applied > 0
+      end, 20)
+      t.eq(1, #applied, "the workflow model is written once")
+      t.eq("s1", applied[1].session)
+      t.eq("big", applied[1].value)
+      local text = table.concat(notices, "\n")
+      t.truthy(text:match("switched"))
+      t.falsy(text:match("could not"))
+    end)
+
+    t.it("does not claim a model switch that failed", function()
+      local options = {
+        set_for = function(_, _, _, _, _, _, cb)
+          if cb then
+            cb(false, "the agent refused")
+          end
+          return true
+        end,
+      }
+      local notices = {}
+      local h = harness(t, {
+        tag = "model-fails",
+        options = options,
+        workflows = {
+          { name = "default", summary = "flow", leader = { model = "big" }, team = {} },
+        },
+      })
+      h.session.controls = { model = { id = "model", options = { { value = "big" } } } }
+      h.flow.deps.notify = function(message)
+        notices[#notices + 1] = tostring(message)
+      end
+      stub_ui(t, { task = "" })
+      h.flow:start("default")
+      wait_idle(h.flow)
+      vim.wait(500, function()
+        return table.concat(notices, "\n"):match("could not switch") ~= nil
+      end, 20)
+      local text = table.concat(notices, "\n")
+      t.truthy(text:match("could not switch"))
+      t.falsy(text:match("switched to big."))
     end)
 
     t.it("turns a led_by error into a choice and retries after the move", function()

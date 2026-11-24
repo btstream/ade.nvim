@@ -64,6 +64,10 @@ function M.new(opts)
     warned_skipped = {},
     -- cwd -> array of `team.list` entries, newest snapshot only.
     list_by_cwd = {},
+    -- True once a full `team.list` answered successfully on this connection.
+    -- "An empty snapshot" and "no snapshot yet" are different facts, and only
+    -- the former may let auto-start decide a cwd has no team.
+    list_ready = false,
     -- "instance\0sessionId" -> {enabled, injected, leader} from session.teams
     -- and `session.teams_changed`.
     session_states = {},
@@ -190,6 +194,7 @@ function Team:forget_connection()
   self.session_states = {}
   self.session_queries = {}
   self.bound = {}
+  self.list_ready = false
   -- A board request that was in flight when the connection died may still
   -- call back; bumping its token makes that late reply a no-op while the next
   -- `team.changed` can start a fresh request.
@@ -648,7 +653,13 @@ function Team:prepare(cwd, client)
   end)
   if not ok then
     local message = type(value) == "table" and (value.message or value.code) or tostring(value)
-    self.notify("this session will not get team tools: " .. tostring(message), vim.log.levels.WARN)
+    -- We cannot opt this one request out of a configuration the service already
+    -- holds, so do not promise "no tools": say the configuration failed and the
+    -- session may miss them.
+    self.notify(
+      "team configuration did not apply; this session may not get team tools: " .. tostring(message),
+      vim.log.levels.WARN
+    )
   end
 end
 
@@ -679,7 +690,9 @@ end
 ---@param session_id string
 ---@param value table
 ---@param seq integer|nil
-function Team:apply_session_teams(instance, session_id, value, seq)
+---@param opts {evaluate: boolean|nil}|nil `evaluate = false` is a pure read:
+---  it caches the state but never lets it start a team (tree queries).
+function Team:apply_session_teams(instance, session_id, value, seq, opts)
   local key = session_key(instance, session_id)
   if not key or type(value) ~= "table" then
     return
@@ -715,9 +728,12 @@ function Team:apply_session_teams(instance, session_id, value, seq)
       self.bound[cwd] = { instance = instance, session_id = session_id, team = state.leader.id }
     end
   end
-  -- Only the session on screen may auto-start, and only once its authoritative
-  -- team snapshot is in.
-  self:_maybe_auto_start(instance, session_id)
+  -- Only a real state change of the session on screen may auto-start, and only
+  -- once the authoritative team snapshot is in. A tree query passes
+  -- `evaluate = false`, so merely browsing never starts anything.
+  if not opts or opts.evaluate ~= false then
+    self:_maybe_auto_start(instance, session_id)
+  end
   self:changed()
 end
 
@@ -727,6 +743,25 @@ function Team:on_session_teams_changed(payload)
     return
   end
   self:apply_session_teams(payload.instance, payload.sessionId, payload)
+end
+
+---Whether `(instance, sessionId)` is the session on screen.
+---@param instance string|nil
+---@param session_id string|nil
+---@return boolean
+function Team:is_current(instance, session_id)
+  local session
+  if self.current then
+    local ok, value = pcall(self.current)
+    session = ok and value or nil
+  else
+    local runtime = self.get_runtime and self.get_runtime() or nil
+    session = runtime and runtime.current or nil
+  end
+  if not session or session.id ~= session_id then
+    return false
+  end
+  return not instance or not session.instance or session.instance == instance
 end
 
 ---@param key string
@@ -765,7 +800,9 @@ function Team:query_session_teams(instance, session_id, cwd, cb)
   self:_call("session.teams", { instance = instance, sessionId = session_id }, function(ok, value)
     query.inflight = false
     if ok and type(value) == "table" then
-      self:apply_session_teams(instance, session_id, value, seq)
+      -- A query never starts a team for a background session, but the session
+      -- on screen may auto-start once it learns its tools are injected.
+      self:apply_session_teams(instance, session_id, value, seq, { evaluate = self:is_current(instance, session_id) })
     elseif self.session_queries[key] == query then
       -- A failed query must not poison the cache: a later attempt may retry.
       self.session_queries[key] = nil
@@ -846,7 +883,15 @@ function Team:reload_session(instance, session_id, cb)
     cb(false, "this front end cannot reload a session")
     return
   end
+  self.reload_seq = (self.reload_seq or 0) + 1
+  local seq = self.reload_seq
   local ok, err = pcall(self.reload_session_fn, instance, session_id, function(reloaded, value)
+    if seq ~= self.reload_seq or not self:available() then
+      -- The connection or a newer reload superseded this one: never report a
+      -- stale success, and settle the caller.
+      cb(false, "the reload was cancelled")
+      return
+    end
     if reloaded then
       -- The load's own bind reports the fresh switch; query it so the cache
       -- carries `injected: true` rather than the pre-load answer.
@@ -916,10 +961,10 @@ end
 ---Start the configured default workflow for the session on screen, once its
 ---switch is on, tools are injected and the cwd has no team.
 ---
----Triggered only by current-session events (`session.teams_changed` or the
----current session being opened), never by browsing the tree. The decision waits
----for the cwd's authoritative `team.list` snapshot: an empty cache means "not
----known yet", not "no team".
+---Triggered only by current-session events (`session.teams_changed` or a query
+---about the session on screen), never by browsing the tree. The decision waits
+---for a complete `team.list` on this connection: "no snapshot yet" and "the
+---snapshot lists no team for this cwd" are different facts.
 ---@param instance string|nil
 ---@param session_id string|nil
 function Team:_maybe_auto_start(instance, session_id)
@@ -931,21 +976,18 @@ function Team:_maybe_auto_start(instance, session_id)
   if self.auto_starting then
     return
   end
-  local function current()
-    if self.current then
-      local ok, session = pcall(self.current)
-      if ok then
-        return session
-      end
-    end
-    local runtime = self.get_runtime and self.get_runtime() or nil
-    return runtime and runtime.current or nil
-  end
-  local session = current()
-  if not session or session.id ~= session_id then
+  if not self:is_current(instance, session_id) then
     return
   end
-  if instance and session.instance and session.instance ~= instance then
+  local session
+  if self.current then
+    local ok, value = pcall(self.current)
+    session = ok and value or nil
+  else
+    local runtime = self.get_runtime and self.get_runtime() or nil
+    session = runtime and runtime.current or nil
+  end
+  if not session then
     return
   end
   local key = session_key(instance, session_id)
@@ -957,9 +999,10 @@ function Team:_maybe_auto_start(instance, session_id)
     return
   end
   local cwd = session.cwd
-  if not cwd or not self.list_by_cwd[cwd] then
-    -- The snapshot has not arrived yet; `refresh`/`team.list` completion will
-    -- re-run this decision.
+  if not cwd or not self.list_ready then
+    -- A complete snapshot has not arrived yet; `refresh`'s completion re-runs
+    -- this decision. An empty snapshot does set `list_ready`, so a project
+    -- with no team at all can still auto-start.
     return
   end
   if self:team_for_cwd(cwd) then
@@ -1002,6 +1045,7 @@ function Team:refresh(cb)
     self.teams = {}
     self.inbox = {}
     self.list_by_cwd = {}
+    self.list_ready = false
     self:changed()
     if cb then
       cb()
@@ -1023,6 +1067,7 @@ function Team:refresh(cb)
         end
       end
       self.list_by_cwd = by_cwd
+      self.list_ready = true
       -- Keep open items announced by `team.inbox` when an older snapshot does
       -- not list them yet: the list and the notification stream race.
       local announced = {}
@@ -1057,6 +1102,7 @@ function Team:refresh(cb)
       self.teams = {}
       self.inbox = {}
       self.list_by_cwd = {}
+      self.list_ready = false
       self:changed()
     end
     self:_sync_boards()
@@ -1407,6 +1453,29 @@ function Team:spawn(team, template, name, task, cb)
     end
     cb(ok, value)
   end)
+end
+
+---Start a worker from a session pair (PROTOCOL.md 20.4): the service calls
+---`ensure_team` first and answers a structured `-32061` (`led_by`, `off`,
+---`no_tools`) instead of creating a spawn inbox item.
+---@param instance string
+---@param session_id string
+---@param template string
+---@param name string|nil
+---@param task string|nil
+---@param cb fun(ok: boolean, value: any)|nil
+function Team:spawn_pair(instance, session_id, template, name, task, cb)
+  cb = cb or function() end
+  self:_call(
+    "team.spawn",
+    { instance = instance, sessionId = session_id, template = template, name = name, task = task },
+    function(ok, value)
+      if ok then
+        self:refresh()
+      end
+      cb(ok, value)
+    end
+  )
 end
 
 ---Remove an exited worker's worktree (18.12).

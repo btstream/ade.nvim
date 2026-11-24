@@ -22,6 +22,28 @@ function M:state()
   return self.deps.state()
 end
 
+---Whether two session objects are the same logical conversation.
+---
+---A load or resume replaces the object with a new projection of the same
+---`(instance, sessionId)`; leaving that session is not "switching away", so the
+---idle-close below must not fire for it (it would close the session the load
+---just produced, revoking its fresh token).
+---@param a table|nil
+---@param b table|nil
+---@return boolean
+local function same_session(a, b)
+  if a == b then
+    return true
+  end
+  if type(a) ~= "table" or type(b) ~= "table" then
+    return false
+  end
+  if a.id ~= b.id then
+    return false
+  end
+  return a.instance == nil or b.instance == nil or a.instance == b.instance
+end
+
 ---Make `session` the one on screen.
 ---
 ---Switching away leaves the previous session active on the agent side. Ask it to
@@ -47,7 +69,7 @@ function M:select_session(session)
   end
   if
     previous
-    and previous ~= session
+    and not same_session(previous, session)
     and previous.status == "idle"
     and #(previous.queue or {}) == 0
     and S.sess.service

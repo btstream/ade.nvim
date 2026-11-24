@@ -517,20 +517,41 @@ function M.build(ctx, opts, action)
         cb(false, "no session service")
         return
       end
+      -- Bind the reload to the client that answered `session.teams`: on a new
+      -- connection the one-shot forward marker belongs to the old instance.
+      local client = S.conn.client
+      local live = client and client.proc and client.proc.instance or nil
+      if instance and live and instance ~= live then
+        cb(false, "the service connection changed before the reload")
+        return
+      end
+      local generation = ctx.Operations.generation
+      local done = false
+      local function finish(ok, value)
+        if done then
+          return
+        end
+        done = true
+        if ctx.Operations.generation ~= generation then
+          cb(false, "the reload was cancelled")
+          return
+        end
+        cb(ok, value)
+      end
       local ok, err = pcall(S.sess.service.load, S.sess.service, session_id, {
         kind = "reload",
         reload = true,
+        client = client,
         on_restored = function()
-          cb(true, { reloaded = true })
+          finish(true, { reloaded = true })
         end,
         on_failed = function(message)
-          cb(false, message)
+          finish(false, message)
         end,
       })
       if not ok then
-        cb(false, tostring(err))
+        finish(false, tostring(err))
       end
-      local _ = instance
     end,
     on_turn = function(session)
       if session == S.sess.current and S.view.chat then
@@ -1071,6 +1092,9 @@ function M.build(ctx, opts, action)
     sessions = function()
       return S.sess.all or {}
     end,
+    connection_generation = function()
+      return ctx.Operations.generation
+    end,
     find_session = function(id)
       if type(id) ~= "string" then
         return nil
@@ -1086,12 +1110,15 @@ function M.build(ctx, opts, action)
     select_session = activate_session,
     -- The tree's `<CR>` opens a session the way `:Ade sessions` does: a released
     -- or `needs_load` session is replayed first, not merely selected.
-    open_session = function(session)
+    open_session = function(session, opts)
       if not session then
         return
       end
       if S.sess.service then
+        opts = opts or {}
         S.sess.service:open(session, {
+          instance = opts.instance,
+          cwd = opts.cwd,
           on_failed = function(message)
             notify("cannot open that session: " .. tostring(message), vim.log.levels.WARN)
           end,
@@ -1158,7 +1185,29 @@ function M.build(ctx, opts, action)
       return S.sess.all and S.sess.all[id] or nil
     end,
     select_session = function(session)
+      -- A leader found by id may have been released: open it the normal way so
+      -- `session/load` restores it instead of showing an empty transcript.
+      if session and S.sess.service then
+        S.sess.service:open(session, {
+          on_failed = function(message)
+            notify("cannot open the leader session: " .. tostring(message), vim.log.levels.WARN)
+          end,
+        })
+        return
+      end
       return activate_session(session)
+    end,
+    canonical_session = function(instance, session_id)
+      -- The runtime holds one canonical object per session id; a reload
+      -- replaces it, so a flow must look it up again for (instance, id).
+      local session = S.sess.all and S.sess.all[session_id] or nil
+      if not session then
+        return nil
+      end
+      if instance and session.instance and session.instance ~= instance then
+        return nil
+      end
+      return session
     end,
     submit = function(text, session)
       -- Address the replacement session when one is given; never the composer's

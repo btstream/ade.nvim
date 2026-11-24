@@ -49,9 +49,10 @@ Server.__index = Server
 ---  old_service_methods?: table<string, boolean>,
 ---  team_workflows_delay?: integer,
 ---  run_error?: table, uninstall_error?: table, canned_agent?: boolean,
+---  agent_capabilities?: table,
 ---  session_reload_unsupported?: boolean|table<string, boolean>,
 ---  team_answer_error?: table,
----  session_teams_default?: boolean}|nil
+---  session_teams_default?: boolean, session_injected_default?: boolean}|nil
 ---@return FakeService
 function M.new(opts)
   opts = opts or {}
@@ -155,6 +156,8 @@ function M.new(opts)
     team_card_history_error = opts.team_card_history_error,
     team_answer_error = opts.team_answer_error,
     session_teams_default = opts.session_teams_default ~= false and true or false,
+    -- Tests that need the "tools still connecting" state start here.
+    session_injected_default = opts.session_injected_default ~= false,
     session_reload_unsupported = opts.session_reload_unsupported,
     -- "instance\0sessionId" -> {enabled, injected}
     session_switches = {},
@@ -164,6 +167,9 @@ function M.new(opts)
     -- Answer ACP requests with canned replies instead of spawning a child. Used
     -- by tests about notifications, where a real agent would only add noise.
     canned_agent = opts.canned_agent == true,
+    -- Extra `initialize` agent capabilities for the canned agent (tests that
+    -- need `sessionCapabilities.close` or `resume`).
+    agent_capabilities = opts.agent_capabilities,
     clients = {},
     instances = {},
     -- Instances whose stop was requested but whose exit has not been announced
@@ -302,7 +308,7 @@ function Server:switch_of(instance, session_id)
   local key = tostring(instance) .. "\0" .. tostring(session_id)
   local switch = self.session_switches[key]
   if not switch then
-    switch = { enabled = self.session_teams_default, injected = true }
+    switch = { enabled = self.session_teams_default, injected = self.session_injected_default ~= false }
     self.session_switches[key] = switch
   end
   return switch
@@ -606,14 +612,58 @@ function Server:dispatch(message, client)
   end
   if method == "team.spawn" then
     self.team_spawns[#self.team_spawns + 1] = vim.deepcopy(params)
-    local spawn_team = self.teams[params.team]
-    if spawn_team and spawn_team.state == "suspended" then
-      return error_reply(ident, -32064, "suspended")
-    end
     if self.team_spawn_error then
       return error_reply(ident, self.team_spawn_error.code, self.team_spawn_error.message, self.team_spawn_error.data)
     end
-    local team = self.teams[params.team]
+    local team
+    if params.instance ~= nil then
+      -- PROTOCOL.md 20.4: the pair form calls `ensure_team` first, and answers a
+      -- structured -32061 instead of creating an inbox item.
+      self.session_cwds = self.session_cwds or {}
+      local key = tostring(params.instance) .. "\0" .. tostring(params.sessionId)
+      local cwd = self.session_cwds[key] or "/"
+      local switch = self:switch_of(params.instance, params.sessionId)
+      if not switch.enabled then
+        return error_reply(ident, -32061, "teams are off for this chat", { reason = "off" })
+      end
+      if not switch.injected then
+        return error_reply(ident, -32061, "this chat has no team tools", { reason = "no_tools" })
+      end
+      team = self:team_led_by(params.sessionId)
+      if not team then
+        local other
+        for _, candidate in pairs(self.teams) do
+          if candidate.cwd == cwd and candidate.state ~= "closed" then
+            other = candidate
+          end
+        end
+        if other then
+          return error_reply(ident, -32061, "led by another chat", {
+            reason = "led_by",
+            team = vim.deepcopy(other),
+            leader = other.leader,
+          })
+        end
+        self.team_seq = (self.team_seq or 0) + 1
+        team = {
+          id = "t" .. self.team_seq,
+          cwd = cwd,
+          state = "active",
+          leader = { instance = params.instance, sessionId = params.sessionId },
+          participants = {},
+          inbox = {},
+          limits = { max_turns_per_task = 30, max_turns_total = 200, turns_total = 0 },
+        }
+        self.teams[team.id] = team
+        self:broadcast("team.changed", { team = vim.deepcopy(team) })
+        self:emit_session_teams(params.instance, params.sessionId)
+      end
+    else
+      team = self.teams[params.team]
+      if team and team.state == "suspended" then
+        return error_reply(ident, -32064, "suspended")
+      end
+    end
     local name = params.name
     if name == nil then
       local taken = {}
@@ -632,6 +682,9 @@ function Server:dispatch(message, client)
       self:emit(client, "team.changed", { team = vim.deepcopy(team) })
     end
     local result = { name = name }
+    if team then
+      result.team = vim.deepcopy(team)
+    end
     if self.team_spawn_warning then
       result.warning = self.team_spawn_warning
     end
@@ -682,6 +735,13 @@ function Server:dispatch(message, client)
     local ensured
     if params.instance ~= nil then
       self.session_cwds = self.session_cwds or {}
+      local switch = self:switch_of(params.instance, params.sessionId)
+      if not switch.enabled then
+        return error_reply(ident, -32061, "teams are off for this chat", { reason = "off" })
+      end
+      if not switch.injected then
+        return error_reply(ident, -32061, "this chat has no team tools", { reason = "no_tools" })
+      end
       local key = tostring(params.instance) .. "\0" .. tostring(params.sessionId)
       local cwd = self.session_cwds[key] or "/"
       local leader = self:team_led_by(params.sessionId)
@@ -1200,7 +1260,13 @@ function Server:on_tunnel_send(params, client)
     if not instance.handler and self.canned_agent then
       -- A minimal ACP answerer: `initialize`, `session/new`, `session/prompt`.
       local replies = {
-        initialize = { protocolVersion = 1, agentCapabilities = { loadSession = true }, authMethods = {} },
+        initialize = {
+          protocolVersion = 1,
+          agentCapabilities = vim.tbl_deep_extend("force", {
+            loadSession = true,
+          }, self.agent_capabilities or {}),
+          authMethods = {},
+        },
         ["session/new"] = { sessionId = "sess_mock", configOptions = {} },
         ["session/load"] = { configOptions = {} },
         ["session/prompt"] = { stopReason = "end_turn" },

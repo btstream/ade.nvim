@@ -327,19 +327,65 @@ function Flow:check_switch(workflow, session, instance, cwd, generation, queried
     self:ask_task(workflow, session, instance, cwd, generation)
     return
   end
+  self:enable_tools(session, instance, function(ok, err, continued)
+    if continued then
+      -- The flow continued on its own (a replacement session took over).
+      return
+    end
+    if not ok then
+      self:finish()
+      self:notify("cannot enable teams for this session: " .. self.deps.report_error(err), vim.log.levels.WARN)
+      return
+    end
+    self:ask_task(workflow, session, instance, cwd, generation)
+  end, { workflow = workflow, cwd = cwd, generation = generation })
+end
+
+---Enable the session's tools, running the front-end reload the service asks for
+---(PROTOCOL.md 20.5). Shared by the pre-check and the `off`/`no_tools` retry so
+---both apply the same `reload: true` rule.
+---
+---`cb(ok, err, continued)`: `continued` means the flow already moved on (a
+---replacement session is taking over) and the caller must not prompt again.
+---@param session table
+---@param instance string
+---@param cb fun(ok: boolean, err: any, continued: boolean|nil)
+---@param ctx {workflow: table, cwd: string, generation: integer}
+function Flow:enable_tools(session, instance, cb, ctx)
+  local team = self:team()
+  if not team then
+    cb(false, "teams are not available")
+    return
+  end
   team:set_session_teams(instance, session.id, true, false, function(ok, value)
     vim.schedule(function()
-      if not self:alive(generation) then
+      if not self:alive(ctx.generation) then
+        cb(false, "the start was cancelled")
         return
       end
       if not ok then
         local data = type(value) == "table" and type(value.data) == "table" and value.data or {}
         if data.reason == "reload_unsupported" then
-          self:offer_new_session(workflow, session, instance, cwd, generation)
+          -- A new session would follow the same configuration; when that
+          -- configuration starts sessions with teams off, injecting is
+          -- impossible and offering "open a new session" would be a false
+          -- promise.
+          if self:session_default_off() then
+            self:finish()
+            self:notify(
+              "this agent cannot reload teams in place, and new sessions start with teams off "
+                .. "(teams.session_default = false); set teams.session_default = true and open a new session",
+              vim.log.levels.WARN
+            )
+            cb(false, "reload_unsupported with session_default = false")
+            return
+          end
+          self:offer_new_session(ctx.workflow, session, instance, ctx.cwd, ctx.generation, function(replaced, err2)
+            cb(replaced, err2, true)
+          end)
           return
         end
-        self:finish()
-        self:notify("cannot enable teams for this session: " .. self.deps.report_error(value), vim.log.levels.WARN)
+        cb(false, value)
         return
       end
       if type(value) == "table" and value.reload == true then
@@ -347,25 +393,30 @@ function Flow:check_switch(workflow, session, instance, cwd, generation, queried
         -- the load that makes the agent replay and gets the tools injected.
         team:reload_session(instance, session.id, function(reloaded, err)
           vim.schedule(function()
-            if not self:alive(generation) then
+            if not self:alive(ctx.generation) then
+              cb(false, "the start was cancelled")
               return
             end
-            if not reloaded then
-              self:finish()
-              self:notify(
-                "cannot reload the session's team tools: " .. self.deps.report_error(err),
-                vim.log.levels.WARN
-              )
+            if reloaded then
+              cb(true, nil)
               return
             end
-            self:ask_task(workflow, session, instance, cwd, generation)
+            cb(false, "cannot reload the session's team tools: " .. self.deps.report_error(err))
           end)
         end)
         return
       end
-      self:ask_task(workflow, session, instance, cwd, generation)
+      cb(true, nil)
     end)
   end)
+end
+
+---Whether new sessions of this cwd start with their team switch off.
+---@return boolean
+function Flow:session_default_off()
+  local cfg = self:config()
+  local teams = type(cfg.teams) == "table" and cfg.teams or {}
+  return teams.session_default == false
 end
 
 ---A session that cannot reload has to be replaced; carry its conversation
@@ -379,7 +430,8 @@ end
 ---@param instance string
 ---@param cwd string
 ---@param generation integer
-function Flow:offer_new_session(workflow, session, instance, cwd, generation)
+function Flow:offer_new_session(workflow, session, instance, cwd, generation, cb)
+  cb = cb or function() end
   local accept = "open a new session and hand over a summary"
   local cancel = "cancel"
   vim.ui.select({ accept, cancel }, {
@@ -389,10 +441,12 @@ function Flow:offer_new_session(workflow, session, instance, cwd, generation)
     end,
   }, function(choice)
     if not self:alive(generation) then
+      cb(false, "the start was cancelled")
       return
     end
     if choice ~= accept then
       self:finish()
+      cb(false, "cancelled")
       return
     end
     local summary = self:summary(session)
@@ -402,24 +456,28 @@ function Flow:offer_new_session(workflow, session, instance, cwd, generation)
     if not self.deps.new_session then
       self:finish()
       self:notify("cannot open a replacement session here", vim.log.levels.WARN)
+      cb(false, "cannot open a session here")
       return
     end
     self.deps.new_session({
       on_created = function(created)
         vim.schedule(function()
           if not self:alive(generation) then
+            cb(false, "the start was cancelled")
             return
           end
-          self:handover(workflow, created, instance, cwd, generation, summary)
+          self:handover(workflow, created, instance, cwd, generation, summary, cb)
         end)
       end,
       on_failed = function(message)
         vim.schedule(function()
           if not self:alive(generation) then
+            cb(false, "the start was cancelled")
             return
           end
           self:finish()
           self:notify("cannot open the replacement session: " .. tostring(message), vim.log.levels.WARN)
+          cb(false, message)
         end)
       end,
     })
@@ -465,29 +523,29 @@ end
 ---@param cwd string
 ---@param generation integer
 ---@param summary string|nil
-function Flow:handover(workflow, session, instance, cwd, generation, summary)
+---@param cb fun(ok: boolean, err: any)|nil
+function Flow:handover(workflow, session, instance, cwd, generation, summary, cb)
+  cb = cb or function() end
   local team = self:team()
   if not team or not session then
+    cb(false, "no session to hand over to")
     return
   end
-  team:set_session_teams(instance, session.id, true, false, function(ok, value)
-    vim.schedule(function()
-      if not self:alive(generation) then
-        return
-      end
-      if not ok then
-        self:finish()
-        self:notify("cannot enable teams in the new session: " .. self.deps.report_error(value), vim.log.levels.WARN)
-        return
-      end
-      if summary and summary ~= "" and self.deps.submit then
-        -- Always addressed to the replacement session: the person may have
-        -- switched elsewhere while the switch RPC was in flight.
-        pcall(self.deps.submit, summary, session)
-      end
-      self:ask_task(workflow, session, instance, cwd, generation)
-    end)
-  end)
+  self:enable_tools(session, instance, function(ok, err)
+    if not ok then
+      self:finish()
+      self:notify("cannot enable teams in the new session: " .. self.deps.report_error(err), vim.log.levels.WARN)
+      cb(false, err)
+      return
+    end
+    if summary and summary ~= "" and self.deps.submit then
+      -- Always addressed to the replacement session: the person may have
+      -- switched elsewhere while the switch RPC was in flight.
+      pcall(self.deps.submit, summary, session)
+    end
+    self:ask_task(workflow, session, instance, cwd, generation)
+    cb(true, nil)
+  end, { workflow = workflow, cwd = cwd, generation = generation })
 end
 
 ---Ask for the task, then start the workflow on this session.
@@ -541,22 +599,23 @@ function Flow:launch(workflow, session, instance, cwd, generation, task, retried
         return
       end
       if (data.reason == "off" or data.reason == "no_tools") and not retried then
-        self:team():set_session_teams(instance, session.id, true, false, function(ok2, value2)
-          vim.schedule(function()
-            if not self:alive(generation) then
-              return
-            end
-            if ok2 then
-              self:launch(workflow, session, instance, cwd, generation, task, true)
-            else
-              self:finish()
-              self:notify(
-                "cannot start " .. tostring(workflow.name) .. ": " .. self.deps.report_error(value2),
-                vim.log.levels.WARN
-              )
-            end
-          end)
-        end)
+        -- Same enable -> reload -> continue path as the pre-check: the service
+        -- may answer `reload: true`, and a plain retry would come back
+        -- `no_tools` again.
+        self:enable_tools(session, instance, function(ok2, err2, continued)
+          if continued then
+            return
+          end
+          if ok2 then
+            self:launch(workflow, session, instance, cwd, generation, task, true)
+            return
+          end
+          self:finish()
+          self:notify(
+            "cannot start " .. tostring(workflow.name) .. ": " .. self.deps.report_error(err2),
+            vim.log.levels.WARN
+          )
+        end, { workflow = workflow, cwd = cwd, generation = generation })
         return
       end
       self:finish()
@@ -662,7 +721,7 @@ function Flow:apply_leader_model(workflow, session, client)
   if not session then
     return
   end
-  if not session.controls then
+  if not session.controls and type(session.refresh_controls) == "function" then
     session:refresh_controls()
   end
   local control = session.controls and session.controls.model or nil
@@ -681,12 +740,33 @@ function Flow:apply_leader_model(workflow, session, client)
     return
   end
   local options = self.deps.options and self.deps.options() or nil
-  if not options or type(options.apply) ~= "function" or not client then
+  if not options or client == nil or type(options.set_for) ~= "function" then
     return
   end
   local generation = self.deps.generation and self.deps.generation() or 0
-  options:apply(control, model, client, generation, session)
-  self:notify("leader model switched to " .. model, vim.log.levels.INFO)
+  -- Take the canonical object for (instance, sessionId): the original session
+  -- may have been replaced by a reload, and the write must land on the target
+  -- chat rather than the one the UI happens to show.
+  local target = session
+  if self.deps.canonical_session then
+    local found = self.deps.canonical_session(session.instance, session.id)
+    if found then
+      target = found
+    end
+  end
+  local control_now = (target.controls and target.controls.model) or control
+  options:set_for(control_now, model, client, generation, target, function(ok, err)
+    vim.schedule(function()
+      if ok then
+        self:notify("leader model switched to " .. model, vim.log.levels.INFO)
+      else
+        self:notify(
+          "could not switch the leader model to " .. model .. ": " .. self.deps.report_error(err),
+          vim.log.levels.WARN
+        )
+      end
+    end)
+  end)
 end
 
 M.Flow = Flow

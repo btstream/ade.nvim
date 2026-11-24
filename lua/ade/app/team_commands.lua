@@ -35,6 +35,7 @@ function M.new(deps)
     find_session = deps.find_session,
     select_session = deps.select_session,
     submit = deps.submit,
+    canonical_session = deps.canonical_session,
   })
   return self
 end

@@ -95,12 +95,41 @@ end
 ---
 ---`<CR>` in the team tree must not merely set `current`: a released session has
 ---to be loaded/replayed first, exactly as the normal picker would.
+---
+---`opts.instance` / `opts.cwd` are the tree row's values: a row of another
+---instance (or another cwd) is refused instead of being loaded through the
+---current agent, where a same-named session could be a different conversation.
 ---@param session table|nil
----@param opts {on_failed: (fun(err: string)|nil)|nil}|nil
+---@param opts {instance: string|nil, cwd: string|nil,
+---  on_failed: (fun(err: string)|nil)|nil}|nil
+---@return boolean opened
 function Sessions:open(session, opts)
   opts = opts or {}
   if not session then
-    return
+    return false
+  end
+  local client = self.get_client()
+  local live = client and client.proc and client.proc.instance or nil
+  local own = session.instance
+  if opts.instance and own and opts.instance ~= own then
+    if opts.on_failed then
+      pcall(opts.on_failed, "that session belongs to another service instance")
+    end
+    return false
+  end
+  local wanted = opts.instance or own
+  if wanted and live and wanted ~= live then
+    if opts.on_failed then
+      pcall(opts.on_failed, "that session's service instance is not connected here")
+    end
+    return false
+  end
+  local row_cwd = opts.cwd or session.cwd
+  if opts.cwd and session.cwd and opts.cwd ~= session.cwd then
+    if opts.on_failed then
+      pcall(opts.on_failed, "that session belongs to another project")
+    end
+    return false
   end
   local runtime = self.get_runtime()
   local cached = runtime and runtime.sessions and runtime.sessions[session.id] or nil
@@ -108,9 +137,10 @@ function Sessions:open(session, opts)
     runtime:intend()
     self.activate(cached)
     self.dispatch_queued(cached)
-    return
+    return true
   end
-  self:load(session.id, { kind = "load", on_failed = opts.on_failed })
+  self:load(session.id, { kind = "load", cwd = row_cwd, on_failed = opts.on_failed })
+  return true
 end
 
 ---Request a new session from the agent.
@@ -156,11 +186,17 @@ function Sessions:create(on_missing, opts)
       task.status = "failed"
       runtime:drop_create(token)
       local auth = self.get_auth and self.get_auth()
-      if auth and auth:require(result, {
-        retry = function()
-          self:create()
-        end,
-      }) then
+      if
+        auth
+        and auth:require(result, {
+          retry = function()
+            -- The retry is the same request from the caller's point of view: keep
+            -- its `on_created` / `on_failed` so a start flow still learns how the
+            -- replacement session ended.
+            self:create(on_missing, opts)
+          end,
+        })
+      then
         return
       end
       local message = type(result) == "table" and (result.message or vim.inspect(result)) or tostring(result)
@@ -243,6 +279,22 @@ function Sessions:resume(session_id, opts)
   local entry = runtime:stage(session_id, cwd)
   local intent = opts.intent or runtime:intend()
   opts.intent = intent
+  -- Whether the caller was told how this attempt ended: a cancelled attempt
+  -- still has to settle the flow waiting on it (`on_failed`), exactly once.
+  local settled = false
+  local function settle(ok, message)
+    if settled then
+      return
+    end
+    settled = true
+    if ok then
+      if opts.on_restored and (not opts.cold_restore or runtime.selection == intent) then
+        pcall(opts.on_restored)
+      end
+    elseif opts.on_failed then
+      pcall(opts.on_failed, tostring(message))
+    end
+  end
   -- Hold the same replay lock as `replay`: a second load while this request is
   -- in flight would stage a second projection for the same session id.
   self.replaying = true
@@ -310,21 +362,20 @@ function Sessions:resume(session_id, opts)
     self.on_changed()
     self.notify("Session resumed (history is not replayed)")
     self.catalog:refresh_title(entry)
-    if opts.on_restored and (not opts.cold_restore or runtime.selection == intent) then
-      pcall(opts.on_restored)
-    end
+    settle(true)
   end, function(err)
     runtime:rollback(entry)
     if opts.cold_restore then
+      settled = true
       self:cold_restore_failed(opts, runtime, intent, tostring(err), err)
       return
     end
     self.notify("unable to resume the session: " .. tostring(err), vim.log.levels.ERROR)
-    if opts.on_failed then
-      pcall(opts.on_failed, tostring(err))
-    end
+    settle(false, err)
   end, function(_, owned)
     if not owned then
+      -- A reconnect cancelled the attempt: the caller must not wait forever.
+      settle(false, "the resume was cancelled")
       return
     end
     runtime:rollback(entry)
@@ -349,6 +400,20 @@ function Sessions:replay(session_id, opts)
   local intent = opts.intent or runtime:intend()
   opts.intent = intent
   local client = self.get_client()
+  local settled = false
+  local function settle(ok, message)
+    if settled then
+      return
+    end
+    settled = true
+    if ok then
+      if opts.on_restored and (not opts.cold_restore or runtime.selection == intent) then
+        pcall(opts.on_restored)
+      end
+    elseif opts.on_failed then
+      pcall(opts.on_failed, tostring(message))
+    end
+  end
   -- Identifies this attempt so a cancelled/superseded replay's cleanup does not
   -- clear the flag of a newer one.
   self.replay_seq = (self.replay_seq or 0) + 1
@@ -434,19 +499,16 @@ function Sessions:replay(session_id, opts)
     self.prune()
     self.on_changed()
     self.catalog:refresh_title(entry)
-    if opts.on_restored and (not opts.cold_restore or runtime.selection == intent) then
-      pcall(opts.on_restored)
-    end
+    settle(true)
   end, function(err)
     -- `on_finally` owns the rollback and the pending cleanup for every ending.
     if opts.cold_restore then
+      settled = true
       self:cold_restore_failed(opts, runtime, intent, tostring(err), err)
       return
     end
     self.notify("unable to load the session: " .. tostring(err), vim.log.levels.ERROR)
-    if opts.on_failed then
-      pcall(opts.on_failed, tostring(err))
-    end
+    settle(false, err)
   end, function(_, owned)
     -- Cleanup is per id: a newer attempt for the same id owns the bookkeeping;
     -- one for a different id must not keep this id's staging record alive.
@@ -463,6 +525,9 @@ function Sessions:replay(session_id, opts)
       self.on_replaying(false)
     end
     if not owned then
+      -- A reconnect/supersession cancelled the attempt: settle the caller so a
+      -- start flow waiting on the reload does not hang.
+      settle(false, "the load was cancelled")
       return
     end
     if runtime.sessions[entry.id] == entry then
@@ -499,7 +564,8 @@ end
 ---automatic restore: the user must be able to tell "reopened your conversation"
 ---from "started a new one because X".
 ---@param session_id string
----@param opts {kind: string|nil, reload: boolean|nil, on_failed: fun(err: string)|nil, on_restored: fun()|nil}|nil
+---@param opts {kind: string|nil, reload: boolean|nil, client: table|nil, cwd: string|nil,
+---  on_failed: fun(err: string)|nil, on_restored: fun()|nil}|nil
 function Sessions:load(session_id, opts)
   opts = opts or {}
   local function failed(message)
@@ -512,12 +578,25 @@ function Sessions:load(session_id, opts)
     failed("no agent process is running")
     return
   end
+  if opts.client and opts.client ~= self.get_client() then
+    -- The reload belonged to the connection that answered `session.teams`; on a
+    -- new connection the marked load would be sent to a different instance.
+    failed("the service connection changed before the reload")
+    return
+  end
   local runtime = self.get_runtime()
   local cached = runtime.sessions[session_id]
   -- A team reload must really reach the agent: the service marks one forwarded
   -- load and injects the tools on it, so a cached, idle session cannot just be
   -- re-activated here (PROTOCOL.md 20.5).
   local forced = opts.reload == true or opts.kind == "reload"
+  if forced and cached and (cached.status ~= "idle" or #cached.queue > 0) then
+    -- Reloading flushes the transcript; doing that under a running turn would
+    -- replace what the agent is still writing.
+    self.notify("Finish or cancel the turn before reloading this session's team tools", vim.log.levels.WARN)
+    failed("a turn is still running")
+    return
+  end
   if not forced and cached and not cached.needs_load and (cached.status ~= "idle" or #cached.queue > 0) then
     runtime:intend()
     self.activate(cached)
