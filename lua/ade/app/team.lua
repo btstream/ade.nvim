@@ -134,7 +134,7 @@ end
 function Team:available()
   local cfg = self.config() or {}
   local teams = type(cfg.teams) == "table" and cfg.teams or {}
-  if cfg.backend == "direct" or teams.spawn_from_chat == false then
+  if cfg.backend == "direct" or teams.enabled == false or teams.spawn_from_chat == false then
     return false
   end
   if not templates_possible(cfg, teams) then
@@ -267,12 +267,12 @@ M.BUILTIN_ROLE = table.concat({
   "更新你负责的看板卡片的正文和字段，但不要改看板结构。",
 }, "\n")
 
----The worker template used when `teams.templates` is empty.
+---The worker template used when `teams.templates` is empty or inherits.
 ---
 ---The entry is derived from the leader's own resolved launch: a template only
 ---names an entry, and the service may only start what the person could have
----started from Neovim. It is never read from configuration, so no template
----name, tool argument or stored workflow can supply a different command.
+---started from Neovim. No template name, tool argument or stored workflow can
+---supply a different command.
 ---`worktree = true` keeps workers from writing into the leader's tree: when
 ---the cwd is not a git work tree the spawn fails and says so, rather than
 ---silently sharing the directory.
@@ -408,28 +408,29 @@ function Team:service_config(cwd)
   -- Set only by the built-in fallback below; an explicit configuration owns
   -- every template it names.
   local derived = nil
+  local inherited = (teams.templates or {})[M.BUILTIN_TEMPLATE]
+  inherited = inherited and inherited.agent == "inherit" and inherited or nil
   for name, template in pairs(teams.templates or {}) do
-    local launch, err = Resolve.resolve(cfg, template.agent, cfg.launch_origin, store)
-    if not launch then
-      skipped[#skipped + 1] = { name = name, text = string.format("%s: %s", name, tostring(err)) }
-    else
-      templates[name] = wire_template(cfg, template.agent, launch, template)
+    if template ~= inherited then
+      local launch, err = Resolve.resolve(cfg, template.agent, cfg.launch_origin, store)
+      if not launch then
+        skipped[#skipped + 1] = { name = name, text = string.format("%s: %s", name, tostring(err)) }
+      else
+        templates[name] = wire_template(cfg, template.agent, launch, template)
+      end
     end
   end
-  if next(teams.templates or {}) == nil then
-    -- Zero-config teams: one template, fixed name, derived from the leader's own
-    -- launch. A failure here is a real problem (the person cannot run the
-    -- configured agent at all), so it is reported like a broken explicit
-    -- template instead of being hidden.
+  if inherited or next(teams.templates or {}) == nil then
     local template, launch, err = M.builtin_template(cfg, store)
     if not template then
       skipped[#skipped + 1] = {
         name = M.BUILTIN_TEMPLATE,
-        builtin = true,
+        builtin = not inherited,
         text = tostring(err),
       }
     else
-      templates[M.BUILTIN_TEMPLATE] = wire_template(cfg, template.agent, launch, template)
+      local options = vim.tbl_extend("force", template, inherited or {})
+      templates[M.BUILTIN_TEMPLATE] = wire_template(cfg, template.agent, launch, options)
       -- State which agent the template belongs to. The service only gives this
       -- configuration to a leader of that agent, so another front end on the
       -- same cwd cannot make a worker start a different adapter.
@@ -835,7 +836,7 @@ end
 
 ---Start the enabled default workflow once per team (19.7).
 ---
----`teams.enabled = true` replaces the per-worker `team.spawn` loop: the
+---`teams.auto_start = true` opts into starting the workflow on bind: the
 ---service starts the workflow's members and skips names that already exist, so
 ---a re-bind, a reconnect or a second front end never starts them twice.
 ---@param team_id string|nil
@@ -846,7 +847,7 @@ function Team:start_enabled_workers(team_id, entry)
   end
   local cfg = self.config() or {}
   local teams = type(cfg.teams) == "table" and cfg.teams or {}
-  if teams.enabled ~= true then
+  if teams.enabled == false or teams.auto_start ~= true then
     return
   end
   local team = self.teams[team_id]

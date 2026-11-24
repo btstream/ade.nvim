@@ -1077,11 +1077,13 @@ leader，它可以按需启动 worker（各自是一个独立的 agent 会话，
 git worktree 里工作），worker 之间通过服务总线（bus）传消息；团队和看板
 保存在服务里，Neovim 退出后继续运行。
 
-不写 teams 配置也能组队。直接在聊天里要求 leader 分工，或使用
-:Ade team start default。没有自定义模板时，内置 worker 模板使用 leader
+团队功能默认开启。直接在聊天里要求 leader 分工，或使用 :Ade team start，
+不需要预先连接服务。不写 teams.templates 时，内置 worker 模板使用 leader
 同类 agent 的启动配置，要求当前 Git 仓库已有提交以创建独立 worktree。
 无法创建时不会回退到共享目录。普通聊天和打开面板都不启动 worker；
 从聊天发起的启动申请默认仍需批准。
+teams.enabled = false 关闭团队；原先用 teams.enabled = true 启用自动启动
+流程的配置，改用 teams.auto_start = true。
 
 服务里没有流程状态机：流程只是一段 leader 遵循的约定，服务只负责校验、
 保存、转发和提取。看板同理：服务保存结构，不解释列名或字段的含义。
@@ -1235,7 +1237,8 @@ leader 保存流程时，只有你在对话里明确提到 leader 的 agent、�
 配置 ~
                                                             *ade-teams-config*
     teams = {
-      enabled = false,         -- true: 建团队后按 default 流程自动组队
+      enabled = true,          -- false: 关闭团队功能
+      auto_start = false,      -- true: 绑定 leader 后自动启动默认流程
       default = "dev",         -- 默认流程名（或 "default"）
       workflows = {            -- 命名流程；同名时覆盖内置的 default
         dev = {
@@ -1283,6 +1286,8 @@ leader 保存流程时，只有你在对话里明确提到 leader 的 agent、�
 直接报错（错误里给出新写法），不做迁移。流程必须有 summary 或 text 之一：
 只写 text 时 summary 取正文第一行；只列成员、两者都不写会报错。每个流程的
 team 人数不能超过 max_workers，否则 setup 报错（写明流程名和两个数字）。
+如需修改内置 worker 模板的角色等参数，可显式配置单个模板
+teams.templates = { worker = { agent = "inherit", worktree = true } }。
 
 迁移示例：
 
@@ -1316,20 +1321,18 @@ team 人数不能超过 max_workers，否则 setup 报错（写明流程名和�
 对话          直接对 leader 说要做的事。leader 按上面的约定组队；每次
               spawn 都要你在选择组件里确认，可以逐个批准或一次全部批准。
 命令          :Ade team start [流程]。已有命名流程时最快；不用逐个确认。
-自动          teams.enabled = true 时，leader 建好团队、且团队还没有
+自动          teams.auto_start = true 时，leader 建好团队、且团队还没有
               worker，前端调用一次 team.start {default 流程}；重连或
               第二个前端不会重复。
 
 :Ade team start [流程] 的步骤：
 
-1. 没给流程名时，用 team.workflows 的结果弹出选择器（名字、一行说明、
-   范围）。
+1. 按需连接服务。没给流程名时，使用 teams.default（默认是 default）。
 2. 流程要求别的 leader.agent 而当前会话不是时，问你是“另开该 agent 的
    会话（有团队时先结束）”还是“忽略，用当前 leader”。
 3. 当前 cwd 已有带 worker 的团队时问你：“结束后重新开始”“只补流程里缺
    的成员”或“取消”。
-4. 输入这次的任务（可留空）。取消输入就什么都不做：不关团队、不切换
-   agent、不新建会话。
+4. 输入这次的任务（可留空）。取消输入时不关团队、不切换 agent、不新建会话。
 5. 确保 leader 会话：没有会话时打开聊天并新建，等待 leader 绑定。
 6. 调 team.start：服务按流程逐个启动成员（已在团队里的名字跳过），再给
    leader 发一条 notice：基础说明、任务、流程名和正文、成员（名字、模

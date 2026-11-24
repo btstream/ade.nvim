@@ -1372,6 +1372,41 @@ def scenario_default_team(case):
     return "ordinary chat stayed solo; explicit spawn used the built-in isolated worker"
 
 
+def scenario_cold_team_start(case):
+    """12. The start command works before any agent or service is connected."""
+    editor = case.editor("cold", use_team_defaults=True)
+    editor.lua(
+        """
+        vim.ui.input = function(opts, callback)
+          _G.ade_e2e_task_prompt = opts.prompt
+          callback(nil)
+        end
+        vim.cmd("Ade team start")
+        """
+    )
+    wait_until(lambda: editor.lua("return _G.ade_e2e_task_prompt"), "the default task prompt")
+    assert "default" in editor.lua("return _G.ade_e2e_task_prompt")
+    assert not case.agent_events(), "cancelling the task started an agent"
+
+    editor.lua(
+        """
+        vim.ui.input = function(_, callback)
+          callback("plan the cold start task")
+        end
+        vim.cmd("Ade team start")
+        """
+    )
+    case.wait_agent_prompt("plan the cold start task")
+    editor.wait_team(
+        lambda value: value["teams"] and any(
+            team.get("workflow_name") == "default" for team in value["teams"].values()
+        ),
+        "the started default workflow",
+    )
+    assert len([event for event in case.agent_events() if event.get("event") == "session"]) == 1
+    return "the bare command connected, selected default, and started the Leader only after task input"
+
+
 SCENARIOS = [
     ("1-chat-spawn", scenario_chat_spawn),
     ("2-refuse-spawn", scenario_refuse_spawn),
@@ -1384,6 +1419,7 @@ SCENARIOS = [
     ("9-close", scenario_close),
     ("10-single-agent", scenario_single_agent),
     ("11-default-team", scenario_default_team),
+    ("12-cold-team-start", scenario_cold_team_start),
 ]
 
 

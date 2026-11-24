@@ -128,18 +128,18 @@ M.defaults = {
   -- advertise support for are dropped rather than sent and rejected.
   mcp_servers = {},
 
-  -- Teams (PROTOCOL.md section 19). `enabled` starts the default workflow when
-  -- a leader creates its team; templates may run in a worktree.
+  -- Teams (PROTOCOL.md section 19). Enabling the feature does not auto-start it.
   teams = {
-    enabled = false,
-    default = nil,
+    enabled = true,
+    auto_start = false,
+    default = "default",
     -- Named workflows: `{ <name> = { summary?, text?, leader?, team?, columns? } }`.
     workflows = {},
     spawn_from_chat = true,
     max_workers = 3,
     spawn_confirm = { auto = {} },
     limits = { max_turns_per_task = 30, max_turns_total = 200 },
-    templates = {},
+    templates = {}, -- resolved to the inherited `worker` template when empty
     -- Team panel layout (W0f): below this width the panel uses a float.
     dashboard = {
       wide = 160,
@@ -1357,6 +1357,9 @@ function M.validate(cfg)
   if type(teams.enabled) ~= "boolean" then
     fail("teams.enabled must be a boolean")
   end
+  if type(teams.auto_start) ~= "boolean" then
+    fail("teams.auto_start must be a boolean")
+  end
   if type(teams.spawn_from_chat) ~= "boolean" then
     fail("teams.spawn_from_chat must be a boolean")
   end
@@ -1391,7 +1394,11 @@ function M.validate(cfg)
     if type(template.agent) ~= "string" or template.agent == "" then
       fail("%s.agent must be a non-empty string", where)
     end
-    if type(cfg.agents[template.agent]) ~= "table" then
+    if template.agent == "inherit" then
+      if name ~= M.BUILTIN_TEMPLATE or next(teams.templates, next(teams.templates)) ~= nil then
+        fail('%s.agent = "inherit" is only supported for the sole template "worker"', where)
+      end
+    elseif type(cfg.agents[template.agent]) ~= "table" then
       fail("%s.agent %q is not a configured agent", where, template.agent)
     end
     if template.model ~= nil and type(template.model) ~= "string" then

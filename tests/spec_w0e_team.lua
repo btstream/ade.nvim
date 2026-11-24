@@ -498,7 +498,7 @@ return function(t)
   end)
 
   t.describe("W0e start flow", function()
-    t.it("picks a workflow and starts it with the task", function()
+    t.it("uses the default workflow and only asks for the task", function()
       local cwd = "/tmp/w0e-flow"
       local fake_ = fake_team(cwd, { { id = "t1", cwd = cwd, state = "active", participants = {} } })
       local flow = fake_flow(cwd, fake_)
@@ -507,12 +507,11 @@ return function(t)
       t.cleanup(function()
         vim.ui.select, vim.ui.input = original_select, original_input
       end)
-      vim.ui.select = function(items, opts, cb)
-        asked = { kind = "select", prompt = opts and opts.prompt, items = items }
-        cb(items[1])
+      vim.ui.select = function()
+        error("a workflow picker is not needed")
       end
       vim.ui.input = function(opts, cb)
-        asked.input = opts.prompt
+        asked = opts.prompt
         cb("do the thing")
       end
       flow:start(nil)
@@ -520,11 +519,11 @@ return function(t)
         return #fake_.starts == 1
       end, 5000, "the workflow start")
       t.eq("/tmp/w0e-flow", fake_.asked_cwd)
-      t.eq("dev", fake_.starts[1].workflow)
+      t.eq("default", fake_.starts[1].workflow)
       t.eq("t1", fake_.starts[1].team)
       t.eq("do the thing", fake_.starts[1].task)
       t.eq(1, fake_.opened, "the panel opens after a successful start")
-      t.truthy(asked and asked.kind == "select")
+      t.match("task for default", asked)
     end)
 
     t.it("reports an unknown workflow without asking for a task", function()
@@ -1159,7 +1158,7 @@ return function(t)
           return {
             agent = "opencode",
             cwd = cwd,
-            teams = teams_config({ enabled = true, default = "dev" }),
+            teams = teams_config({ auto_start = true, default = "dev" }),
           }
         end,
         connection = function()

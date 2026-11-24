@@ -90,7 +90,7 @@ end
 function Flow:available()
   local cfg = self:config()
   local teams = type(cfg.teams) == "table" and cfg.teams or {}
-  if teams.spawn_from_chat == false or cfg.backend == "direct" then
+  if teams.enabled == false or teams.spawn_from_chat == false or cfg.backend == "direct" then
     return false
   end
   local team = self:team()
@@ -110,7 +110,9 @@ end
 function Flow:template_problem(cwd)
   local cfg = self:config()
   local teams = type(cfg.teams) == "table" and cfg.teams or {}
-  if next(teams.templates or {}) ~= nil then
+  local templates = teams.templates or {}
+  local worker = templates[require("ade.config").BUILTIN_TEMPLATE]
+  if next(templates) ~= nil and not (worker and worker.agent == "inherit") then
     return nil
   end
   local team = self:team()
@@ -235,14 +237,18 @@ function Flow:wait_for(predicate, label, done)
   check()
 end
 
----Entry point. `name` is a workflow name, or nil to pick one.
+---Entry point. `name` is a workflow name, or nil for the configured default.
 ---@param name string|nil
 function Flow:start(name)
   local cwd = self:cwd()
-  -- Check first: a switch flow waits for the rebuilt Team to reconnect, and an
-  -- extra start while that Team is not available yet must not kill it.
-  if not self:available() then
-    self:notify("teams are not available: connect to the service first", vim.log.levels.WARN)
+  local cfg = self:config()
+  local teams = cfg.teams or {}
+  if teams.enabled == false or teams.spawn_from_chat == false then
+    self:notify("team session tools are disabled in the configuration", vim.log.levels.WARN)
+    return
+  end
+  if cfg.backend == "direct" then
+    self:notify("team start requires the service backend", vim.log.levels.WARN)
     return
   end
   local problem = self:template_problem(cwd)
@@ -253,7 +259,12 @@ function Flow:start(name)
     self:notify(problem, vim.log.levels.WARN)
     return
   end
+  local available = self:available()
   local previous = running[cwd]
+  if previous and not available then
+    -- A workflow switching agents may be waiting for its new connection.
+    return
+  end
   if previous then
     -- Starting again replaces the old flow instead of leaving it wedged; the
     -- old flow may belong to a controller that `pick_agent` rebuilt.
@@ -266,6 +277,37 @@ function Flow:start(name)
   self.registered_generation = generation
   active[cwd] = true
   running[cwd] = { flow = self, generation = generation }
+  name = name ~= nil and name ~= "" and name or (teams.default or "default")
+  if available then
+    self:load_workflows(name, cwd, generation)
+    return
+  end
+  -- Connect the service socket only. Preparing a Leader before the task
+  -- prompt would create a session even if the person cancels the command.
+  local S = self.deps.state()
+  local service = S and S.conn and S.conn.service
+  if not service or type(service.ensure) ~= "function" then
+    self:finish()
+    self:notify("team start requires a connection to the service", vim.log.levels.WARN)
+    return
+  end
+  service:ensure(function(ok, err)
+    vim.schedule(function()
+      if not self:alive(generation) then
+        return
+      end
+      if not ok or not self:available() then
+        self:finish()
+        local detail = err and self.deps.report_error(err) or "the service does not support teams"
+        self:notify("cannot start a team: " .. tostring(detail), vim.log.levels.WARN)
+        return
+      end
+      self:load_workflows(name, cwd, generation)
+    end)
+  end)
+end
+
+function Flow:load_workflows(name, cwd, generation)
   local team = self:team()
   team:workflows(cwd, function(ok, value)
     -- The callback runs in the socket's fast event context; the steps below
@@ -292,24 +334,6 @@ function Flow:on_workflows(ok, value, name, cwd, generation)
     return
   end
   local workflows = type(value) == "table" and type(value.workflows) == "table" and value.workflows or {}
-  if #workflows == 0 then
-    self:finish()
-    self:notify("no workflows are configured", vim.log.levels.WARN)
-    return
-  end
-  if name == nil or name == "" then
-    self:pick(workflows, generation, function(workflow)
-      if not self:alive(generation) then
-        return
-      end
-      if workflow then
-        self:with_workflow(workflow, cwd, generation)
-      else
-        self:finish()
-      end
-    end)
-    return
-  end
   local workflow
   for _, entry in ipairs(workflows) do
     if entry.name == name then
@@ -323,33 +347,6 @@ function Flow:on_workflows(ok, value, name, cwd, generation)
     return
   end
   self:with_workflow(workflow, cwd, generation)
-end
-
----@param workflows table[]
----@param generation integer
----@param on_choice fun(workflow: table|nil)
-function Flow:pick(workflows, generation, on_choice)
-  local items = {}
-  local by_name = {}
-  for _, workflow in ipairs(workflows) do
-    local label = string.format("%-16s %s", tostring(workflow.name), tostring(workflow.summary or ""))
-    if workflow.scope and workflow.scope ~= "builtin" then
-      label = label .. "  [" .. tostring(workflow.scope) .. "]"
-    end
-    items[#items + 1] = label
-    by_name[label] = workflow
-  end
-  vim.ui.select(items, {
-    prompt = "workflow",
-    format_item = function(item)
-      return item
-    end,
-  }, function(choice)
-    if not self:alive(generation) then
-      return
-    end
-    on_choice(choice and by_name[choice] or nil)
-  end)
 end
 
 ---Whether a team entry is the unused leader-only team of another session.

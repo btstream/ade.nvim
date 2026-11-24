@@ -1223,13 +1223,13 @@ return function(t)
       -- Zero config still starts nobody: binding the leader is the whole
       -- interaction until the person or the leader asks for a worker.
       t.eq(0, #calls_of(service, "team.spawn"), "no worker starts on its own")
-      t.eq(0, #calls_of(service, "team.start"), "the default workflow is opt-in (teams.enabled)")
+      t.eq(0, #calls_of(service, "team.start"), "automatic start is opt-in")
     end)
 
-    t.it("starts the built-in default workflow when teams.enabled is set", function()
+    t.it("starts the built-in default workflow when teams.auto_start is set", function()
       local service, dir = start_service(t, "enabled-default")
       setup(t, "enabled-default", service, dir, {
-        teams = { spawn_from_chat = true, enabled = true, templates = {} },
+        teams = { spawn_from_chat = true, auto_start = true, templates = {} },
       })
       state().config.teams.templates = {}
       controller.connect()
@@ -1239,8 +1239,52 @@ return function(t)
       end, 5000, "the built-in default workflow")
       t.eq("default", service.team_starts[1].workflow, "the built-in default flow, not a named one")
       local configured = calls_of(service, "team.configure")[1].params.config
-      t.eq(nil, configured.default_workflow, "no workflow name is invented by the front end")
+      t.eq("default", configured.default_workflow)
       t.truthy(configured.templates.worker, "the leader can spawn the derived template")
+    end)
+
+    t.it("does not auto-start a configured workflow just because teams are enabled", function()
+      local service, dir = start_service(t, "default-no-auto")
+      setup(t, "default-no-auto", service, dir, {
+        teams = teams_config({
+          default = "dev",
+          workflows = { dev = { summary = "dev", team = { { name = "w1", template = "worker" } } } },
+        }),
+      })
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return team().bound[dir] ~= nil
+      end, 5000, "the bound leader")
+      t.eq(true, state().config.teams.enabled)
+      t.eq(false, state().config.teams.auto_start)
+      t.eq(0, #service.team_starts)
+    end)
+
+    t.it("does not inject team tools when teams.enabled is false", function()
+      local service, dir = start_service(t, "disabled-teams")
+      setup(t, "disabled-teams", service, dir, {
+        teams = teams_config({ enabled = false, auto_start = true }),
+      })
+      controller.connect()
+      wait_ready()
+      t.eq({}, sent_frames(service, "session/new")[1].params.mcpServers)
+      t.eq(0, #calls_of(service, "team.configure"))
+      t.eq(0, #service.team_starts)
+    end)
+
+    t.it("resolves an explicit inherited worker without changing its actual agent", function()
+      local service, dir = start_service(t, "inherited-worker")
+      setup(t, "inherited-worker", service, dir, {
+        teams = { templates = { worker = { agent = "inherit", role = "Inspect the code." } } },
+      })
+      controller.connect()
+      wait_ready()
+      local configured = calls_of(service, "team.configure")[1].params.config
+      t.eq({ template = "worker", agent = "opencode" }, configured.derived)
+      t.eq("opencode", configured.templates.worker.key.agent)
+      t.eq("Inspect the code.", configured.templates.worker.role)
+      t.eq(true, configured.templates.worker.worktree)
     end)
 
     t.it("lets explicit templates replace the derived one", function()
@@ -1601,7 +1645,7 @@ return function(t)
 
     local function enabled_teams(over)
       return teams_config(vim.tbl_deep_extend("force", {
-        enabled = true,
+        auto_start = true,
         default = "dev",
         workflows = {
           dev = {

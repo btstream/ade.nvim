@@ -768,11 +768,14 @@ require("ade").setup({
 **选择组件**审批和回答问题。团队和看板存在服务的 SQLite 事件日志里，Neovim 退出后
 继续运行；服务重启后未关闭的团队变为挂起，恢复 leader 会话后继续。
 
-使用服务后端时，组队不需要写 `teams` 配置。直接让 leader 分工并组队，或用
-`:Ade team start default`。没有自定义模板时，内置 `worker` 模板使用 leader 同类
+使用支持团队的服务后端时，团队功能默认开启，不需要写 `teams` 配置。直接让 leader
+分工并组队，或用 `:Ade team start`，即使还没连服务也可以执行。没有自定义模板时，
+内置 `worker` 模板使用 leader 同类
 Agent 的启动配置，启动独立会话，并要求当前目录是有提交的 Git 仓库，以便创建
 独立 worktree。不能创建 worktree 时不会回退到共享目录。普通聊天和打开面板都
 不会启动 worker；聊天里发起的启动申请默认仍需批准。
+可以用 `teams.enabled = false` 关闭团队功能。以前用 `teams.enabled = true` 启用
+自动启动流程的配置，改用 `teams.auto_start = true`。
 
 团队有一块**看板**（列、卡片、负责人、阶段）：leader 管结构（列、建卡/删卡、挪列、
 指派负责人），worker 只写自己负责卡片的正文和键值。卡片是给你看的，不是 agent 之间
@@ -793,7 +796,8 @@ agent，`leader.role` 最多 4 KiB。每个项目或用户的已存流程最多 
 
 ```lua
 teams = {
-  enabled = false,             -- true: leader 建团队后按 default 流程自动组队
+  enabled = true,              -- false: 关闭团队功能
+  auto_start = false,          -- true: leader 绑定后自动启动默认流程
   default = "dev",             -- 默认流程名（teams.workflows 里的名字或 "default"）
   workflows = {
     dev = {
@@ -849,8 +853,8 @@ teams = {
 | 方式 | 说明 |
 |---|---|
 | 对话 | 直接告诉 leader 要做什么；它复述计划、你确认后组队，每次 spawn 在选择组件里确认（可一次全部批准） |
-| `:Ade team start [流程]` | 按命名流程启动；没给名字时弹出流程选择器，已存在的名字跳过，不用逐个确认；成功后自动打开面板 |
-| `teams.enabled = true` | leader 建团队且还没有 worker 时，前端调用一次 `team.start` 按 `default` 流程启动；重连不会重复 |
+| `:Ade team start [流程]` | 没给名字时用 `teams.default`（默认 `default`）；显式流程中预设的成员不用逐个确认，已存在的名字跳过 |
+| `teams.auto_start = true` | leader 建团队且还没有 worker 时，前端调用一次 `team.start` 启动默认流程；重连不会重复 |
 
 命令：
 
@@ -866,7 +870,7 @@ teams = {
 补全：`:Ade team <Tab>` 补全 `agents` / `board` / `start` / `close` / `answer`；`:Ade team start <Tab>` 补全配置里的
 流程名、已知的服务流程名和 `default`。
 
-`:Ade team start` 依次：选流程 → 是否切换 leader agent → 已有团队怎么处理 → 输入任务
+`:Ade team start` 依次：按需连服务 → 确定流程 → 是否切换 leader agent → 已有团队怎么处理 → 输入任务
 → 确保 leader 会话 → `team.start` → 打开面板。取消任务输入时什么都不动：不关团队、
 不切换 agent、不新建会话。旧服务（api_version 5）上没有 team.start、看板和流程接口：
 前端提示“服务版本过旧；空闲后会自动更新，或用 `:Ade service stop` 手动重启”，不会

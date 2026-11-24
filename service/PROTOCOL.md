@@ -1296,9 +1296,8 @@ lives, `team.read` of a worker also returns `worktree`.
 `team.spawn {team, template, name?, task?}` `<- {name}` starts a worker on
 behalf of `human`: no inbox item, no confirmation (the person asked), the
 same limits as 18.3. The leader receives a `notice` from `human`
-(`"worker <name> started from template <template>"`). Front ends use it for
-teams defined in their configuration (`teams.enabled`): after `team.bind_leader`
-created the team, they start the configured workers once.
+(`"worker <name> started from template <template>"`). Automatic workflow
+startup uses `team.start` instead (19.7).
 
 ### 18.14 Version restarts and teams (S4c)
 
@@ -1708,7 +1707,7 @@ skipped (it stays open and is listed in `failed`); the others take effect.
    error (the members already started stay).
 
 The front end uses `team.start` for `:Ade team start` and for the automatic
-start of `teams.enabled` (instead of calling `team.spawn` per worker).
+start of `teams.auto_start` (instead of calling `team.spawn` per worker).
 
 ### 19.8 Leader instructions
 
