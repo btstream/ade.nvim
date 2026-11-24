@@ -1957,15 +1957,18 @@ leader: team|null}`:
   `close: true` is also given, in which case the team is closed first
   (`team.close`);
 - `enabled: true` and `injected: false` (the session was created before teams
-  were configured, under the direct backend, or the server process died):
-  the service performs an **in-place reload**: it sends the agent a real
-  `session/load` (when the agent advertised `loadSession`) or
-  `session/resume` (when it advertised `sessionCapabilities.resume`) for the
-  same session with `mcpServers` = the session's last known servers plus a
-  fresh `ade-team` entry. The agent's replay notifications are consumed by
-  the service: neither relayed nor recorded. The result is returned when the
-  agent answered. If neither capability exists: `-32061`,
-  `data.reason = "reload_unsupported"`.
+  were configured, under the direct backend, or the server process died): the
+  result carries `reload: true` and the service marks the session **one-shot
+  forward**: the next `session/load` (or `session/resume`) of that session from
+  any front end is forwarded to the agent (never emulated, section 12) and gets
+  the injection of 20.2 like any forwarded load. The **front end** then performs
+  that load through its normal load path (it clears and re-renders the
+  transcript from the agent's replay). The service never sends a load itself and
+  never swallows or filters any frame. If the agent advertised neither
+  `loadSession` nor `sessionCapabilities.resume` (either a boolean `true` or an
+  object), the call fails with `-32061`, `data.reason = "reload_unsupported"`,
+  and nothing is marked. A failed forwarded load leaves the session as it was
+  (the fresh token is revoked; the old binding and server list stay).
 
 `injected` is true while a bound session token's MCP process is connected.
 The switch defaults to `config.session_default`, is stored per
@@ -1988,11 +1991,15 @@ no notice to itself.
 
 ### 20.7 Recovery
 
-A stored team is resumed when a session token is bound (20.2) to its stored
-leader `sessionId` for the same agent and the cwd has a configuration. No
-ordering between `team.configure` and the session request matters: whichever
-comes second triggers the resume. A team stored for another agent stays
-suspended (`-32061` only on an explicit `team.set_leader`).
+A stored (suspended) team is resumed only when **all** hold: a forwarded
+`session/load` or `session/resume` of its stored leader `sessionId` was
+**answered successfully** by the agent; that request got a session token
+(20.2: the instance's cwd is configured and enabled, and the session's switch
+is on); the instance's `key.cwd` equals the team's cwd; and the instance runs
+the stored leader agent. Nothing else resumes a team: a `team.configure`
+arriving later does not (the front end always configures before its session
+requests, 20.2); the person can still use `:Ade team on` (20.5 reload) or
+`team.set_leader` (20.4). There is no resume candidate state.
 
 ### 20.8 Summary of method changes
 
