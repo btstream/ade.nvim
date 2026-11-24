@@ -438,6 +438,11 @@ struct Instance {
     /// Lease for a managed release this instance runs (PROTOCOL.md 16.4).
     #[cfg(unix)]
     _lease: Option<install_lock::ReleaseLease>,
+    /// The environment and managed release it was launched with, for the
+    /// built-in worker template (20.4).
+    env: Option<Vec<(String, String)>>,
+    #[cfg(unix)]
+    launch: Option<install::Launch>,
 }
 
 impl Instance {
@@ -526,6 +531,20 @@ pub struct Hub {
     pending_removals: HashMap<(String, String), (u64, Value)>,
     team_sender: mpsc::UnboundedSender<TeamResult>,
     team_results: mpsc::UnboundedReceiver<TeamResult>,
+    /// (instance, session) -> the `mcpServers` of its last session request
+    /// (20.5 in-place reload).
+    session_servers: HashMap<(String, String), Value>,
+    /// `session/new` requests whose token binds on the response, by
+    /// (connection, serialized front-end id): (token_id, instance, cwd, agent).
+    pending_session_new: HashMap<(u64, String), (String, String, String, String)>,
+    /// Sessions whose `session/load`/`session/resume` replay is run by the
+    /// service for `session.teams`: not relayed, not recorded (20.5).
+    reloading: HashSet<(String, String)>,
+    /// Session-token MCP connections: connection -> (instance, session, agent).
+    injected_conns: HashMap<u64, (String, String, String)>,
+    /// Participant token id -> its connection, for tokens that connect before
+    /// they are bound.
+    token_conns: HashMap<String, u64>,
 }
 
 impl Hub {
@@ -590,6 +609,11 @@ impl Hub {
             pending_removals: HashMap::new(),
             team_sender,
             team_results,
+            session_servers: HashMap::new(),
+            pending_session_new: HashMap::new(),
+            reloading: HashSet::new(),
+            injected_conns: HashMap::new(),
+            token_conns: HashMap::new(),
         }
     }
 
@@ -634,6 +658,12 @@ impl Hub {
                 Ok(rows) => self.teams.restore_workflows(rows),
                 Err(error) => {
                     crate::svc_log!("nvim_ade_server: cannot load stored workflows: {error:#}")
+                }
+            }
+            match self.recorder.load_session_switches() {
+                Ok(rows) => self.teams.restore_switches(rows),
+                Err(error) => {
+                    crate::svc_log!("nvim_ade_server: cannot load session switches: {error:#}")
                 }
             }
             let (stored, expired) = self.teams.restore(
@@ -777,6 +807,21 @@ impl Hub {
             }
             Command::Authenticated { conn, participant } => {
                 if let Some(token) = participant {
+                    self.token_conns.insert(token.clone(), conn);
+                    if let Some((instance, session, agent)) =
+                        self.teams
+                            .session_auth(&token)
+                            .map(|(instance, session, agent)| {
+                                (instance.to_string(), session.to_string(), agent.to_string())
+                            })
+                    {
+                        self.injected_conns
+                            .insert(conn, (instance.clone(), session.clone(), agent.clone()));
+                        self.teams.session_connected(&instance, &session);
+                        let injected = self.teams.is_injected(&agent, &session);
+                        self.announce_switch(&instance, &session, &agent, injected);
+                        self.notify_tools_changed(&(instance, session));
+                    }
                     self.participant_conns.insert(conn, token);
                     self.frontend_conns.remove(&conn);
                 } else {
@@ -786,7 +831,14 @@ impl Hub {
             }
             Command::Disconnected { conn } => {
                 self.conns.remove(&conn);
-                self.participant_conns.remove(&conn);
+                if let Some(token) = self.participant_conns.remove(&conn) {
+                    self.token_conns.remove(&token);
+                }
+                if let Some((instance, session, agent)) = self.injected_conns.remove(&conn) {
+                    self.teams.session_disconnected(&instance, &session);
+                    let injected = self.teams.is_injected(&agent, &session);
+                    self.announce_switch(&instance, &session, &agent, injected);
+                }
                 self.frontend_conns.remove(&conn);
                 self.teams.forget_connection(conn);
                 for instance in self.instances.values_mut() {
@@ -989,7 +1041,7 @@ impl Hub {
             return;
         }
 
-        if method.starts_with("team.") {
+        if method.starts_with("team.") || method == "session.teams" {
             if !self.event_log {
                 // Teams are advertised only together with "log"; without it
                 // the methods do not exist.
@@ -1673,6 +1725,9 @@ impl Hub {
                 fingerprint,
                 #[cfg(unix)]
                 _lease: lease,
+                env,
+                #[cfg(unix)]
+                launch,
             },
         );
         Ok(instance_id)
@@ -1826,7 +1881,7 @@ impl Hub {
             );
             return;
         };
-        let Some(message) = message else {
+        let Some(mut message) = message else {
             return;
         };
         let Some(handle) = self.instances.get(instance_id) else {
@@ -1916,6 +1971,9 @@ impl Hub {
                 }
             }
         }
+        // 20.2: the service injects the session's team server before the relay
+        // sees the frame, so the agent gets the modified request.
+        self.prepare_session_request(conn, instance_id, &mut message);
         // Only a response that the relay actually forwarded closes the inbox
         // item. A watcher has no front-end request mapping, so its
         // `$/cancel_request` is dropped by the relay and must not answer an
@@ -2352,10 +2410,27 @@ impl Hub {
             return;
         };
         let outcome = instance.relay.agent_message_full(&value, &attached);
+        // The replay of a `session.teams` reload is consumed (20.5): neither
+        // relayed nor recorded.
+        let reloading = outcome
+            .frontend_request
+            .is_none()
+            .then(|| {
+                value
+                    .get("params")
+                    .and_then(|params| params.get("sessionId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .flatten()
+            .is_some_and(|session| self.reloading.contains(&(instance_id.to_string(), session)));
         // Record what the agent said before anything is delivered: the log is
         // the source of later replays (PROTOCOL.md 10).
         let had_prompt_finished = outcome.prompt_finished.is_some();
-        let events = outcome.events.clone();
+        let mut events = outcome.events.clone();
+        if reloading {
+            events.clear();
+        }
         self.record_events(instance_id, events);
 
         // Retractions come first: a front end must close the question before
@@ -2375,11 +2450,16 @@ impl Hub {
         }
         match outcome.action {
             Some(AgentAction::Response { conn, seq, message }) => {
+                if let Some(request) = &outcome.frontend_request {
+                    self.finish_session_new(request, &message);
+                }
                 self.send_tunnel_recv(conn, instance_id, seq, &message);
             }
             Some(AgentAction::Notification { seq, message }) => {
-                for conn in attached {
-                    self.send_tunnel_recv(conn, instance_id, seq, &message);
+                if !reloading {
+                    for conn in attached {
+                        self.send_tunnel_recv(conn, instance_id, seq, &message);
+                    }
                 }
             }
             Some(AgentAction::Request {
@@ -3174,6 +3254,9 @@ mod tests {
             fingerprint: "fp".to_string(),
             #[cfg(unix)]
             _lease: None,
+            env: None,
+            #[cfg(unix)]
+            launch: None,
         };
         let summary = instance_summary(&instance, 0);
         for field in [

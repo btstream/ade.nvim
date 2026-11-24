@@ -90,6 +90,8 @@ impl TeamError {
 pub enum Role {
     Leader,
     Worker,
+    /// A session's own token (20.2): the chat may build or lead a team.
+    Session,
 }
 
 impl Role {
@@ -97,6 +99,7 @@ impl Role {
         match self {
             Self::Leader => "leader",
             Self::Worker => "worker",
+            Self::Session => "session",
         }
     }
 }
@@ -222,6 +225,8 @@ pub enum ItemKind {
     Request,
     Message,
     Limit,
+    /// Another chat leads this cwd's team (20.4); answered `move` or `refuse`.
+    Handover,
 }
 
 impl ItemKind {
@@ -233,6 +238,7 @@ impl ItemKind {
             Self::Request => "request",
             Self::Message => "message",
             Self::Limit => "limit",
+            Self::Handover => "handover",
         }
     }
 }
@@ -321,6 +327,15 @@ pub struct InboxItem {
     pub participant: Option<String>,
     pub scope: Option<String>,
     pub limit_task: Option<String>,
+    /// A `handover` item (20.4): the requesting session and the current leader.
+    #[serde(default)]
+    pub from_instance: Option<String>,
+    #[serde(default)]
+    pub from_session: Option<String>,
+    #[serde(default)]
+    pub leader_instance: Option<String>,
+    #[serde(default)]
+    pub leader_session: Option<String>,
     /// The agent-side request id, for permission/request items. Never exposed.
     pub agent_id: Option<Value>,
 }
@@ -391,6 +406,16 @@ impl InboxItem {
                     out["task"] = json!(task);
                 }
             }
+            ItemKind::Handover => {
+                out["from"] = json!({
+                    "instance": self.from_instance,
+                    "sessionId": self.from_session,
+                });
+                out["leader"] = json!({
+                    "instance": self.leader_instance,
+                    "sessionId": self.leader_session,
+                });
+            }
         }
         out
     }
@@ -445,6 +470,14 @@ pub struct TeamConfig {
     /// Parent directory for worker worktrees; required when a template asks
     /// for one (18.12).
     pub worktree_root: Option<String>,
+    /// Whether the service injects the team server into sessions of this cwd
+    /// (20.2; default true).
+    pub enabled: bool,
+    /// The default per-session switch (20.5; default true).
+    pub session_default: bool,
+    /// `templates` was empty: one `worker` template is built from the leader
+    /// instance at team creation (20.4).
+    pub builtin_worker: bool,
     /// The template a front end derived from its own leader's launch.
     ///
     /// Nothing in the configuration says which command owns it, so the front end
@@ -480,6 +513,9 @@ impl Default for TeamConfig {
             workflows: HashMap::new(),
             default_workflow: None,
             worktree_root: None,
+            enabled: true,
+            session_default: true,
+            builtin_worker: false,
             derived: None,
         }
     }
@@ -818,6 +854,8 @@ struct TokenRecord {
     name: Option<String>,
     instance: Option<String>,
     cwd: Option<String>,
+    /// The ACP session a session token is bound to (20.2).
+    session: Option<String>,
     /// The agent the instance ran when the token was issued (leaders only).
     agent: Option<String>,
     /// Fingerprint of that instance's launch, so a bind never crosses over to
@@ -852,6 +890,16 @@ pub struct SpawnPlan {
     pub worktree_root: Option<String>,
 }
 
+/// The leader launch a built-in `worker` template is copied from (20.4).
+#[derive(Debug, Clone)]
+pub struct LeaderLaunch {
+    pub cwd: String,
+    pub key: InstanceKey,
+    pub env: Option<Vec<(String, String)>>,
+    #[cfg(unix)]
+    pub launch: Option<crate::install::Launch>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SpawnRequest {
     pub team: String,
@@ -874,6 +922,13 @@ pub enum SpawnOutcome {
 pub enum AnswerEffect {
     Question,
     Spawn(SpawnRequest),
+    /// A `handover` item (20.4); `move` runs `team.set_leader`.
+    Handover {
+        team: String,
+        instance: String,
+        session: String,
+        hand_over: bool,
+    },
     Permission {
         instance: String,
         agent_id: Value,
@@ -929,6 +984,11 @@ pub struct Teams {
     workflows: workflow::StoredWorkflows,
     /// cwd -> project key, so git runs at most once per cwd.
     project_keys: HashMap<String, String>,
+    /// Explicit per-session switch state (20.5), keyed by (agent, sessionId).
+    /// Absent means the cwd configuration's `session_default`.
+    session_switches: HashMap<(String, String), bool>,
+    /// (agent, sessionId) -> connected session-token MCP processes (20.5).
+    injected: HashMap<(String, String), usize>,
     /// Tests inspect the board of a closed team after it is removed.
     #[cfg(test)]
     closed_boards: HashMap<String, board::Board>,
@@ -954,6 +1014,8 @@ impl Teams {
             next_group: 0,
             workflows: workflow::StoredWorkflows::new(),
             project_keys: HashMap::new(),
+            session_switches: HashMap::new(),
+            injected: HashMap::new(),
             #[cfg(test)]
             closed_boards: HashMap::new(),
             #[cfg(test)]
@@ -1210,6 +1272,72 @@ impl Teams {
         Ok(stored)
     }
 
+    /// `bus.workflow_save` from a session token (20.3): the cwd's
+    /// configuration is the reference, a running team or the stored one.
+    pub fn workflow_save_for_cwd(
+        &mut self,
+        cwd: &str,
+        project: &str,
+        value: &Value,
+        scope: workflow::Scope,
+        replace: bool,
+    ) -> Result<workflow::Workflow, TeamError> {
+        let config = self.config_for_cwd(cwd);
+        let stored = workflow::parse_workflow(value, scope, Some(&config))?;
+        if config.workflows.contains_key(&stored.name) {
+            return Err(TeamError::not_allowed("workflow exists"));
+        }
+        if self.workflows.get(scope, project, &stored.name).is_some() && !replace {
+            return Err(TeamError::not_allowed("workflow exists"));
+        }
+        if self.workflows.count(scope, project) >= MAX_STORED_WORKFLOWS
+            && self.workflows.get(scope, project, &stored.name).is_none()
+        {
+            return Err(TeamError::not_allowed("too many workflows"));
+        }
+        self.workflows.insert(project, stored.clone());
+        Ok(stored)
+    }
+
+    pub fn workflow_get_for_cwd(
+        &self,
+        cwd: &str,
+        project: &str,
+        name: &str,
+    ) -> Result<Value, TeamError> {
+        let config = self.config_for_cwd(cwd);
+        let resolved = workflow::resolve(&config, &self.workflows, project, name)
+            .ok_or_else(|| TeamError::invalid(format!("unknown workflow {name}")))?;
+        Ok(json!({ "workflow": resolved.to_json() }))
+    }
+
+    pub fn workflow_delete_for_cwd_scope(
+        &mut self,
+        cwd: &str,
+        project: &str,
+        name: &str,
+        scope: Option<workflow::Scope>,
+    ) -> Result<workflow::Workflow, TeamError> {
+        let config = self.config_for_cwd(cwd);
+        match scope {
+            Some(scope) => self
+                .workflows
+                .remove(scope, project, name)
+                .ok_or_else(|| TeamError::not_allowed("no such workflow")),
+            None => {
+                if config.workflows.contains_key(name) {
+                    return Err(TeamError::not_allowed("workflow is configured"));
+                }
+                for scope in [workflow::Scope::Project, workflow::Scope::User] {
+                    if let Some(removed) = self.workflows.remove(scope, project, name) {
+                        return Ok(removed);
+                    }
+                }
+                Err(TeamError::not_allowed("no such workflow"))
+            }
+        }
+    }
+
     /// `bus.workflow_get` (19.5).
     pub fn workflow_get(
         &self,
@@ -1339,6 +1467,7 @@ impl Teams {
                 name: None,
                 instance,
                 cwd,
+                session: None,
                 agent,
                 instance_fingerprint: fingerprint,
                 bound: false,
@@ -1359,7 +1488,7 @@ impl Teams {
         }
     }
 
-    fn revoke(&mut self, token_id: &str) {
+    pub fn revoke(&mut self, token_id: &str) {
         if let Some(record) = self.token_records.remove(token_id) {
             if let Ok(mut map) = self.tokens.lock() {
                 map.remove(&record.hash);
@@ -1398,7 +1527,518 @@ impl Teams {
         Some((record.role, record.team.clone(), record.name.clone()))
     }
 
+    // -- session switches and tokens (PROTOCOL.md 20.2/20.5) ---------------
+
+    /// The stored explicit switch, if any.
+    pub fn switch(&self, agent: &str, session: &str) -> Option<bool> {
+        self.session_switches
+            .get(&(agent.to_string(), session.to_string()))
+            .copied()
+    }
+
+    /// Whether the session's switch is on: its stored value, else the cwd
+    /// configuration's `session_default` (true without a configuration).
+    pub fn enabled_for(&self, agent: &str, session: &str, cwd: &str) -> bool {
+        let config = self.config_for(cwd);
+        if self.configs.contains_key(cwd) && !config.enabled {
+            return false;
+        }
+        self.switch(agent, session)
+            .unwrap_or(config.session_default)
+    }
+
+    /// Store a switch; returns whether it changed.
+    pub fn set_switch(&mut self, agent: &str, session: &str, enabled: bool) -> bool {
+        let key = (agent.to_string(), session.to_string());
+        if self.session_switches.get(&key) == Some(&enabled) {
+            return false;
+        }
+        self.session_switches.insert(key, enabled);
+        true
+    }
+
+    pub fn restore_switches(&mut self, rows: Vec<(String, String, bool)>) {
+        for (agent, session, enabled) in rows {
+            self.session_switches.insert((agent, session), enabled);
+        }
+    }
+
+    /// True while some connected MCP process holds a bound token of the
+    /// session (20.5).
+    pub fn is_injected(&self, agent: &str, session: &str) -> bool {
+        self.injected
+            .get(&(agent.to_string(), session.to_string()))
+            .is_some_and(|count| *count > 0)
+    }
+
+    pub fn session_connected(&mut self, instance: &str, session: &str) {
+        let Some(record) = self
+            .token_records
+            .values()
+            .find(|record| {
+                record.role == Role::Session
+                    && record.instance.as_deref() == Some(instance)
+                    && record.session.as_deref() == Some(session)
+            })
+            .and_then(|record| record.agent.clone())
+        else {
+            return;
+        };
+        *self
+            .injected
+            .entry((record, session.to_string()))
+            .or_insert(0) += 1;
+    }
+
+    pub fn session_disconnected(&mut self, instance: &str, session: &str) {
+        let agent = self
+            .token_records
+            .values()
+            .find(|record| {
+                record.role == Role::Session
+                    && record.instance.as_deref() == Some(instance)
+                    && record.session.as_deref() == Some(session)
+            })
+            .and_then(|record| record.agent.clone());
+        let Some(agent) = agent else {
+            return;
+        };
+        let key = (agent, session.to_string());
+        if let Some(count) = self.injected.get_mut(&key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.injected.remove(&key);
+            }
+        }
+    }
+
+    /// Issue a session token. `session` is set for load/resume (bound at
+    /// once); a `session/new` token is bound by its response.
+    pub fn issue_session_token(
+        &mut self,
+        instance: &str,
+        cwd: &str,
+        agent: &str,
+        session: Option<&str>,
+    ) -> (String, String) {
+        let (token_id, token) = self.create_token(
+            Role::Session,
+            Some(instance.to_string()),
+            Some(cwd.to_string()),
+            Some(agent.to_string()),
+            None,
+        );
+        if let Some(record) = self.token_records.get_mut(&token_id) {
+            record.session = session.map(str::to_string);
+            record.bound = session.is_some();
+        }
+        if let Some(session) = session {
+            self.bind_session_record(instance, session, &token_id);
+        }
+        (token_id, token)
+    }
+
+    fn bind_session_record(&mut self, instance: &str, session: &str, token_id: &str) {
+        let Some(record) = self.token_records.get_mut(token_id) else {
+            return;
+        };
+        if record.role != Role::Session || record.instance.as_deref() != Some(instance) {
+            return;
+        }
+        record.session = Some(session.to_string());
+        record.bound = true;
+        self.token_entry(token_id);
+    }
+
+    pub fn bind_session_record_public(&mut self, instance: &str, session: &str, token_id: &str) {
+        self.bind_session_record(instance, session, token_id);
+    }
+
+    /// Bind a `session/new` token to the successful response's session id and
+    /// resume a stored team led by it (20.2/20.7). `Err` when the token does
+    /// not belong to `(instance, session)`.
+    pub fn bind_session_token(
+        &mut self,
+        instance: &str,
+        session: &str,
+        token_id: &str,
+        agent: &str,
+    ) -> Result<(), TeamError> {
+        let Some(record) = self.token_records.get(token_id) else {
+            return Err(TeamError::not_allowed("unknown session token"));
+        };
+        if record.role != Role::Session
+            || record.instance.as_deref() != Some(instance)
+            || record.agent.as_deref() != Some(agent)
+            || record
+                .session
+                .as_deref()
+                .is_some_and(|known| known != session)
+        {
+            return Err(TeamError::not_allowed(
+                "session token does not belong to this session",
+            ));
+        }
+        self.bind_session_record(instance, session, token_id);
+        Ok(())
+    }
+
+    /// Revoke every session token bound to `(instance, session)`.
+    pub fn revoke_session_tokens(&mut self, instance: &str, session: &str) {
+        let agent = self
+            .token_records
+            .values()
+            .find(|record| {
+                record.role == Role::Session
+                    && record.instance.as_deref() == Some(instance)
+                    && record.session.as_deref() == Some(session)
+            })
+            .and_then(|record| record.agent.clone());
+        let ids: Vec<String> = self
+            .token_records
+            .iter()
+            .filter(|(_, record)| {
+                record.role == Role::Session
+                    && record.instance.as_deref() == Some(instance)
+                    && record.session.as_deref() == Some(session)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            self.revoke(&id);
+        }
+        if let Some(agent) = agent {
+            self.injected.remove(&(agent, session.to_string()));
+        }
+    }
+
+    /// The session a session token belongs to, with its instance and agent.
+    pub fn session_auth(&self, token_id: &str) -> Option<(&str, &str, &str)> {
+        let record = self.token_records.get(token_id)?;
+        if record.role != Role::Session || !record.bound {
+            return None;
+        }
+        Some((
+            record.instance.as_deref()?,
+            record.session.as_deref()?,
+            record.agent.as_deref()?,
+        ))
+    }
+
+    pub fn session_cwd(&self, token_id: &str) -> Option<String> {
+        self.token_records.get(token_id)?.cwd.clone()
+    }
+
+    /// Every bound session token of a cwd: (instance, session, agent).
+    pub fn sessions_for_cwd(&self, cwd: &str) -> Vec<(String, String, String)> {
+        self.token_records
+            .values()
+            .filter(|record| record.role == Role::Session && record.bound)
+            .filter_map(|record| {
+                if record.cwd.as_deref() != Some(cwd) {
+                    return None;
+                }
+                Some((
+                    record.instance.clone()?,
+                    record.session.clone()?,
+                    record.agent.clone()?,
+                ))
+            })
+            .collect()
+    }
+
+    /// The first connected token id of `(instance, session)`.
+    pub fn token_id_connected(&self, instance: &str, session: &str) -> Option<String> {
+        self.token_records
+            .iter()
+            .find(|(_, record)| {
+                record.role == Role::Session
+                    && record.bound
+                    && record.instance.as_deref() == Some(instance)
+                    && record.session.as_deref() == Some(session)
+            })
+            .map(|(id, _)| id.clone())
+    }
+
+    pub fn session_auth_by_session(
+        &self,
+        instance: &str,
+        session: &str,
+    ) -> Option<(&str, &str, &str)> {
+        let (id, _) = self.token_records.iter().find(|(_, record)| {
+            record.role == Role::Session
+                && record.bound
+                && record.instance.as_deref() == Some(instance)
+                && record.session.as_deref() == Some(session)
+        })?;
+        self.session_auth(id)
+    }
+
+    /// The team entry the session leads, if any (`session.teams.leader`).
+    pub fn session_team_entry(&self, instance: &str, session: &str) -> Value {
+        let Some((team, _)) = self.by_instance.get(instance) else {
+            return Value::Null;
+        };
+        let Some(entry) = self.teams.get(team) else {
+            return Value::Null;
+        };
+        if entry.leader_session.as_deref() == Some(session) {
+            team_entry(entry)
+        } else {
+            Value::Null
+        }
+    }
+
+    /// The session's team role and team (20.2): `leader` only while it really
+    /// leads its cwd's team.
+    pub fn session_role(&self, token_id: &str) -> (Option<String>, Option<String>) {
+        let Some((instance, session, _)) = self.session_auth(token_id) else {
+            return (None, None);
+        };
+        let Some((team, _)) = self.by_instance.get(instance) else {
+            return (None, None);
+        };
+        let Some(entry) = self.teams.get(team) else {
+            return (None, None);
+        };
+        if entry.leader_session.as_deref() == Some(session)
+            && entry.leader_instance.as_deref() == Some(instance)
+            && !entry.closed
+        {
+            (Some("leader".to_string()), Some(team.clone()))
+        } else {
+            (None, Some(team.clone()))
+        }
+    }
+
+    /// Refresh the shared auth entry of every token of a session (the hello
+    /// result reads it).
+    pub fn refresh_session_auth(&mut self, instance: &str, session: &str) {
+        let ids: Vec<String> = self
+            .token_records
+            .iter()
+            .filter(|(_, record)| {
+                record.role == Role::Session
+                    && record.instance.as_deref() == Some(instance)
+                    && record.session.as_deref() == Some(session)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let (name, team) = self.session_role(&id);
+            if let Some(record) = self.token_records.get_mut(&id) {
+                record.name = name;
+                record.team = team;
+            }
+            self.token_entry(&id);
+        }
+    }
+
     // -- leader ------------------------------------------------------------
+
+    /// Fill a built-in `worker` template from the leader's own launch.
+    fn fill_builtin_worker(config: &mut TeamConfig, launch: &LeaderLaunch) {
+        if !config.builtin_worker {
+            return;
+        }
+        let Some(template) = config.templates.get_mut("worker") else {
+            return;
+        };
+        if !template.key.agent.is_empty() {
+            return;
+        }
+        template.key = launch.key.clone();
+        template.key.cwd = launch.cwd.clone();
+        template.env = launch.env.clone();
+        #[cfg(unix)]
+        {
+            template.launch = launch.launch.clone();
+        }
+        template.worktree = true;
+    }
+
+    /// Create a team for `cwd` with this session as its leader (20.4).
+    fn create_team(
+        &mut self,
+        instance: &str,
+        session: &str,
+        agent: &str,
+        cwd: &str,
+        config: TeamConfig,
+    ) -> String {
+        self.next_team += 1;
+        let id = format!("t{}", self.next_team);
+        let mut team = Team {
+            id: id.clone(),
+            cwd: cwd.to_string(),
+            leaderless: false,
+            closed: false,
+            suspended: false,
+            suspended_at: None,
+            pending_resume: None,
+            leader_instance: Some(instance.to_string()),
+            leader_session: Some(session.to_string()),
+            leader_fingerprint: None,
+            participants: HashMap::new(),
+            order: vec!["leader".to_string()],
+            reserved_names: HashSet::new(),
+            config,
+            inbox: Vec::new(),
+            messages: Vec::new(),
+            next_message: 0,
+            task_turns: HashMap::new(),
+            total_turns: 0,
+            total_limit_hit: false,
+            task_limit_hit: HashSet::new(),
+            watchers: HashMap::new(),
+            pending_items: HashMap::new(),
+            created_at: now_ms(),
+            board: board::Board::default(),
+            board_flush_at: None,
+            current_group: None,
+        };
+        let mut leader = Participant::new("leader", Role::Leader);
+        leader.instance = Some(instance.to_string());
+        leader.session = Some(session.to_string());
+        leader.agent = Some(agent.to_string());
+        team.participants.insert("leader".to_string(), leader);
+        self.by_cwd.insert(cwd.to_string(), id.clone());
+        self.by_instance
+            .insert(instance.to_string(), (id.clone(), "leader".to_string()));
+        self.teams.insert(id.clone(), team);
+        self.events.push(TeamEvent::Changed(id.clone()));
+        id
+    }
+
+    /// The session a bound session token belongs to; `Err` with the documented
+    /// reason data when it holds none or the switch is off (20.4 step 1).
+    fn ensure_session(&self, instance: &str, session: &str) -> Result<(String, String), TeamError> {
+        let found = self.token_records.values().find(|record| {
+            record.role == Role::Session
+                && record.bound
+                && record.instance.as_deref() == Some(instance)
+                && record.session.as_deref() == Some(session)
+        });
+        let Some(record) = found else {
+            let mut error = TeamError::not_allowed("this chat has no team tools (no_tools)");
+            error.data = Some(json!({ "reason": "no_tools" }));
+            return Err(error);
+        };
+        let (Some(agent), Some(cwd)) = (record.agent.clone(), record.cwd.clone()) else {
+            let mut error = TeamError::not_allowed("this chat has no team tools (no_tools)");
+            error.data = Some(json!({ "reason": "no_tools" }));
+            return Err(error);
+        };
+        if !self.enabled_for(&agent, session, &cwd) {
+            let mut error = TeamError::not_allowed("teams are off for this chat");
+            error.data = Some(json!({ "reason": "off" }));
+            return Err(error);
+        }
+        Ok((agent, cwd))
+    }
+
+    /// The single path to a team (20.4). Returns the team id when this session
+    /// leads it; `led_by` carries the current leader.
+    pub fn ensure_team(
+        &mut self,
+        instance: &str,
+        session: &str,
+        launch: &LeaderLaunch,
+    ) -> Result<String, TeamError> {
+        let (agent, cwd) = self.ensure_session(instance, session)?;
+        let mut config = self.config_for(&cwd);
+        Self::fill_builtin_worker(&mut config, launch);
+        if let Some(team_id) = self.by_cwd.get(&cwd).cloned() {
+            let team = self.teams.get(&team_id).expect("cwd index");
+            if team.leader_instance.as_deref() == Some(instance)
+                && team.leader_session.as_deref() == Some(session)
+            {
+                return Ok(team_id);
+            }
+            let mut error = TeamError::not_allowed("the team is led by another chat");
+            error.data = Some(json!({
+                "reason": "led_by",
+                "team": team_id,
+                "leader": {
+                    "instance": team.leader_instance,
+                    "sessionId": team.leader_session,
+                },
+            }));
+            return Err(error);
+        }
+        Ok(self.create_team(instance, session, &agent, &cwd, config))
+    }
+
+    /// Fill a stored team's built-in `worker` template from the leader the
+    /// resume brought (20.7).
+    pub fn fill_leader_template(&mut self, team_id: &str, launch: &LeaderLaunch) {
+        if let Some(team) = self.teams.get_mut(team_id) {
+            Self::fill_builtin_worker(&mut team.config, launch);
+        }
+    }
+
+    /// Bind a session token to a live, leaderless or suspended team (20.4
+    /// `team.set_leader`). `Err` as in [`Self::ensure_team`].
+    pub fn set_leader(
+        &mut self,
+        team_id: &str,
+        instance: &str,
+        session: &str,
+    ) -> Result<(), TeamError> {
+        let (agent, cwd) = self.ensure_session(instance, session)?;
+        let team = self
+            .teams
+            .get(team_id)
+            .ok_or_else(|| TeamError::unknown("unknown team"))?;
+        if team.cwd != cwd {
+            return Err(TeamError::invalid("the session is not in the team's cwd"));
+        }
+        let previous = team.leader_instance.clone();
+        let closed = team.closed;
+        let suspended = team.suspended;
+        let old_session = team.leader_session.clone();
+        if let Some(previous) = &previous {
+            if previous != instance
+                && self
+                    .by_instance
+                    .get(previous)
+                    .is_some_and(|(_, name)| name == "leader")
+            {
+                self.by_instance.remove(previous);
+            }
+        }
+        let team = self.teams.get_mut(team_id).expect("checked above");
+        team.leader_instance = Some(instance.to_string());
+        team.leader_session = Some(session.to_string());
+        team.leaderless = false;
+        // A suspended team is resumed by the caller (18.15 with this session as
+        // leader); the remaining state change is the same.
+        team.pending_resume = None;
+        let leader = team
+            .participants
+            .entry("leader".to_string())
+            .or_insert_with(|| Participant::new("leader", Role::Leader));
+        leader.instance = Some(instance.to_string());
+        leader.session = Some(session.to_string());
+        leader.agent = Some(agent.clone());
+        leader.set_state(ParticipantState::Idle);
+        leader.reason = None;
+        self.by_instance.insert(
+            instance.to_string(),
+            (team_id.to_string(), "leader".to_string()),
+        );
+        if let (Some(old_instance), Some(old_session)) =
+            (previous.as_deref(), old_session.as_deref())
+        {
+            self.refresh_session_auth(old_instance, old_session);
+        }
+        self.refresh_session_auth(instance, session);
+        self.events.push(TeamEvent::Changed(team_id.to_string()));
+        if closed || suspended {
+            return Ok(());
+        }
+        Ok(())
+    }
 
     pub fn leader_server(
         &mut self,
@@ -1537,6 +2177,25 @@ impl Teams {
         if let Some(team) = self.teams.get_mut(team_id) {
             team.pending_resume = None;
         }
+    }
+
+    pub fn has_config(&self, cwd: &str) -> bool {
+        self.configs.contains_key(cwd)
+    }
+
+    pub fn set_pending_resume(&mut self, team_id: &str, instance: &str, session: &str) {
+        if let Some(team) = self.teams.get_mut(team_id) {
+            team.pending_resume = Some((instance.to_string(), session.to_string()));
+        }
+    }
+
+    /// The stored leader agent of a suspended team.
+    pub fn stored_leader_agent(&self, team_id: &str) -> Option<String> {
+        self.teams
+            .get(team_id)?
+            .participants
+            .get("leader")
+            .and_then(|leader| leader.agent.clone())
     }
 
     pub fn clear_instance_pending(&mut self, instance: &str) {
@@ -2171,6 +2830,10 @@ impl Teams {
                 participant: None,
                 scope: None,
                 limit_task: None,
+                from_instance: None,
+                from_session: None,
+                leader_instance: None,
+                leader_session: None,
                 agent_id: None,
             };
             let item_id = item.id.clone();
@@ -2288,6 +2951,10 @@ impl Teams {
             participant: None,
             scope: None,
             limit_task: None,
+            from_instance: None,
+            from_session: None,
+            leader_instance: None,
+            leader_session: None,
             agent_id,
         };
         let team = self.teams.get_mut(team_id)?;
@@ -2441,6 +3108,10 @@ impl Teams {
             participant: None,
             scope: None,
             limit_task: None,
+            from_instance: None,
+            from_session: None,
+            leader_instance: None,
+            leader_session: None,
             agent_id: None,
         };
         team.inbox.push(item);
@@ -2658,6 +3329,10 @@ impl Teams {
             participant: None,
             scope: None,
             limit_task: None,
+            from_instance: None,
+            from_session: None,
+            leader_instance: None,
+            leader_session: None,
             agent_id: None,
         };
         team.inbox.push(item);
@@ -3277,6 +3952,10 @@ impl Teams {
                 participant: Some(name.clone()),
                 scope: Some("task".to_string()),
                 limit_task: Some(task.clone()),
+                from_instance: None,
+                from_session: None,
+                leader_instance: None,
+                leader_session: None,
                 agent_id: None,
             };
             let item_id = item.id.clone();
@@ -3313,6 +3992,10 @@ impl Teams {
                 participant: None,
                 scope: Some("total".to_string()),
                 limit_task: None,
+                from_instance: None,
+                from_session: None,
+                leader_instance: None,
+                leader_session: None,
                 agent_id: None,
             };
             let item_id = item.id.clone();
@@ -3394,7 +4077,7 @@ impl Teams {
         if team.suspended
             && !matches!(
                 kind,
-                ItemKind::Question | ItemKind::Message | ItemKind::Limit
+                ItemKind::Question | ItemKind::Message | ItemKind::Limit | ItemKind::Handover
             )
         {
             return Err(TeamError::not_allowed("team suspended"));
@@ -3603,6 +4286,19 @@ impl Teams {
                 }
             }
             ItemKind::Message | ItemKind::Limit => AnswerEffect::Ack,
+            ItemKind::Handover => {
+                let picked = option.or_else(|| text.filter(|text| !text.is_empty()));
+                match picked.as_deref() {
+                    Some("move") | Some("refuse") => {}
+                    _ => return Err(TeamError::invalid("answer move or refuse")),
+                }
+                AnswerEffect::Handover {
+                    team: team_id.clone(),
+                    instance: item.from_instance.clone().unwrap_or_default(),
+                    session: item.from_session.clone().unwrap_or_default(),
+                    hand_over: picked.as_deref() == Some("move"),
+                }
+            }
         };
         team.inbox[position].state = ItemState::Answered;
         if matches!(kind, ItemKind::Permission | ItemKind::Request) {
@@ -3698,6 +4394,53 @@ impl Teams {
             }
         }
         None
+    }
+
+    /// Create the `handover` item of a session that asked for a team led by
+    /// another chat (20.4).
+    pub fn create_handover(&mut self, team_id: &str, instance: &str, session: &str) -> String {
+        let leader = self
+            .teams
+            .get(team_id)
+            .map(|team| (team.leader_instance.clone(), team.leader_session.clone()))
+            .unwrap_or((None, None));
+        let id = self.next_inbox_id();
+        let item = InboxItem {
+            id: id.clone(),
+            team: team_id.to_string(),
+            kind: ItemKind::Handover,
+            from: "human".to_string(),
+            body: "the team is led by another chat; hand it over?".to_string(),
+            at: now_ms(),
+            state: ItemState::Open,
+            options: Some(vec!["move".to_string(), "refuse".to_string()]),
+            template: None,
+            name: None,
+            task: None,
+            model: None,
+            role: None,
+            label: None,
+            questions: None,
+            agent: None,
+            group: None,
+            instance: None,
+            session: None,
+            tool_call: None,
+            tool_options: None,
+            method: None,
+            params: None,
+            message_id: None,
+            participant: None,
+            scope: None,
+            limit_task: None,
+            from_instance: Some(instance.to_string()),
+            from_session: Some(session.to_string()),
+            leader_instance: leader.0,
+            leader_session: leader.1,
+            agent_id: None,
+        };
+        self.add_inbox_item(team_id, item);
+        id
     }
 
     pub fn add_inbox_item(&mut self, team_id: &str, item: InboxItem) -> Option<String> {
@@ -3869,6 +4612,75 @@ impl Teams {
         self.events.push(TeamEvent::Changed(team_id));
     }
 
+    /// `team.stop_worker` (20.6): stop one worker, optionally dropping it from
+    /// the team after it exited. Returns the instance to stop.
+    pub fn stop_worker(
+        &mut self,
+        team_id: &str,
+        name: &str,
+        remove: bool,
+    ) -> Result<Option<String>, TeamError> {
+        let Some(team) = self.teams.get_mut(team_id) else {
+            return Err(TeamError::unknown("unknown team"));
+        };
+        if name == "leader" || name == "human" {
+            return Err(TeamError::invalid(format!("{name} is not a worker")));
+        }
+        let Some(participant) = team.participants.get_mut(name) else {
+            return Err(TeamError::unknown("unknown participant"));
+        };
+        if participant.role != Role::Worker {
+            return Err(TeamError::invalid(format!("{name} is not a worker")));
+        }
+        let instance = participant.instance.clone();
+        if let Some(instance) = &instance {
+            self.by_instance.remove(instance);
+        }
+        let closed = team.closed;
+        if participant.state != ParticipantState::Exited {
+            participant.set_state(ParticipantState::Exited);
+            participant.reason = Some("stopped".to_string());
+            participant.bus_turn = false;
+            participant.mailbox.clear();
+            for item in &mut team.inbox {
+                if item.state == ItemState::Open && item.from == name {
+                    item.state = ItemState::Orphaned;
+                    self.events
+                        .push(TeamEvent::Inbox(team_id.to_string(), item.id.clone()));
+                }
+            }
+        }
+        if remove {
+            team.participants.remove(name);
+            team.order.retain(|entry| entry != name);
+            team.reserved_names.remove(name);
+        }
+        if let Some(instance) = &instance {
+            let ids: Vec<String> = self
+                .token_records
+                .iter()
+                .filter(|(_, record)| record.instance.as_deref() == Some(instance))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in ids {
+                self.revoke(&id);
+            }
+        }
+        if !closed {
+            let _ = self.send_message(
+                team_id,
+                "human",
+                "leader",
+                Kind::Notice,
+                &format!("worker {name} stopped by the person"),
+                None,
+                vec![],
+            );
+        }
+        self.events.push(TeamEvent::Changed(team_id.to_string()));
+        Ok(instance)
+    }
+
     pub fn leader_exited(&mut self, instance: &str, reason: &str) {
         let Some(team) = self
             .teams
@@ -3964,6 +4776,17 @@ impl Teams {
     }
 
     pub fn revoke_instance_tokens(&mut self, instance: &str) {
+        let sessions: Vec<(String, String)> = self
+            .token_records
+            .values()
+            .filter(|record| record.role == Role::Session)
+            .filter_map(|record| {
+                if record.instance.as_deref() != Some(instance) {
+                    return None;
+                }
+                Some((record.agent.clone()?, record.session.clone()?))
+            })
+            .collect();
         let ids: Vec<String> = self
             .token_records
             .iter()
@@ -3972,6 +4795,9 @@ impl Teams {
             .collect();
         for id in ids {
             self.revoke(&id);
+        }
+        for key in sessions {
+            self.injected.remove(&key);
         }
     }
 
@@ -4469,6 +5295,12 @@ struct ConfigSnapshot {
     max_turns_per_task: u64,
     max_turns_total: u64,
     worktree_root: Option<String>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_true")]
+    session_default: bool,
+    #[serde(default)]
+    builtin_worker: bool,
     templates: BTreeMap<String, TemplateSnapshot>,
     workflows: BTreeMap<String, workflow::Workflow>,
     default_workflow: Option<String>,
@@ -4494,6 +5326,10 @@ struct TeamSnapshot {
     reserved_names: Vec<String>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for ConfigSnapshot {
     fn default() -> Self {
         Self {
@@ -4502,6 +5338,9 @@ impl Default for ConfigSnapshot {
             max_turns_per_task: 30,
             max_turns_total: 200,
             worktree_root: None,
+            enabled: true,
+            session_default: true,
+            builtin_worker: false,
             templates: BTreeMap::new(),
             workflows: BTreeMap::new(),
             default_workflow: None,
@@ -4568,6 +5407,9 @@ impl Team {
                 max_turns_per_task: self.config.max_turns_per_task,
                 max_turns_total: self.config.max_turns_total,
                 worktree_root: self.config.worktree_root.clone(),
+                enabled: self.config.enabled,
+                session_default: self.config.session_default,
+                builtin_worker: self.config.builtin_worker,
                 templates,
                 workflows: self
                     .config
@@ -4729,6 +5571,9 @@ impl Teams {
                     workflows: snapshot.config.workflows.into_iter().collect(),
                     default_workflow: snapshot.config.default_workflow,
                     worktree_root: snapshot.config.worktree_root.clone(),
+                    enabled: snapshot.config.enabled,
+                    session_default: snapshot.config.session_default,
+                    builtin_worker: snapshot.config.builtin_worker,
                     // A derived template is rebuilt from the leader's launch by
                     // the front end that resumes the team; the stored snapshot
                     // never carries one (its command is not persisted either).
@@ -4999,6 +5844,32 @@ fn parse_config(value: &Value) -> Result<TeamConfig, TeamError> {
             return Err(TeamError::invalid("templates must be an object"));
         }
     }
+    // 20.4: an empty template table still gets the built-in `worker`, which is
+    // filled from the leader instance's own launch at team creation. It has to
+    // be present here so workflows and `spawn_confirm.auto` can name it.
+    let builtin_worker = templates.is_empty();
+    if builtin_worker {
+        templates.insert(
+            "worker".to_string(),
+            Template {
+                key: InstanceKey {
+                    agent: String::new(),
+                    command: String::new(),
+                    args: Vec::new(),
+                    cwd: String::new(),
+                    capabilities: Value::Null,
+                },
+                env: None,
+                #[cfg(unix)]
+                launch: None,
+                model: None,
+                role: String::new(),
+                models: Vec::new(),
+                tool_style: ToolStyle::Direct,
+                worktree: true,
+            },
+        );
+    }
     // Workflows validate against the templates of this same configuration
     // (19.1), so they are parsed after them.
     let templates_for_workflows = TeamConfig {
@@ -5097,6 +5968,18 @@ fn parse_config(value: &Value) -> Result<TeamConfig, TeamError> {
                 .ok_or_else(|| TeamError::invalid("limits.max_turns_total must be an integer"))?;
         }
     }
+    let enabled = match object.get("enabled") {
+        None | Some(Value::Null) => true,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| TeamError::invalid("enabled must be a boolean"))?,
+    };
+    let session_default = match object.get("session_default") {
+        None | Some(Value::Null) => true,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| TeamError::invalid("session_default must be a boolean"))?,
+    };
     let worktree_root = match object.get("worktree_root") {
         None | Some(Value::Null) => None,
         Some(value) => {
@@ -5156,6 +6039,9 @@ fn parse_config(value: &Value) -> Result<TeamConfig, TeamError> {
         workflows,
         default_workflow,
         worktree_root,
+        enabled,
+        session_default,
+        builtin_worker,
         derived,
     })
 }
@@ -6392,6 +7278,10 @@ mod tests {
             participant: None,
             scope: None,
             limit_task: None,
+            from_instance: None,
+            from_session: None,
+            leader_instance: None,
+            leader_session: None,
             agent_id: Some(json!(42)),
         };
         teams.teams.get_mut(&team).unwrap().inbox.push(item.clone());
@@ -7601,5 +8491,195 @@ mod tests {
                 && message["body"]
                     .as_str()
                     .is_some_and(|body| body.contains("owner cleared on C1"))));
+    }
+    // -- section 20 --------------------------------------------------------
+
+    fn launch(cwd: &str) -> LeaderLaunch {
+        LeaderLaunch {
+            cwd: cwd.to_string(),
+            key: InstanceKey {
+                agent: "opencode".to_string(),
+                command: "opencode-acp".to_string(),
+                args: vec![],
+                cwd: cwd.to_string(),
+                capabilities: Value::Null,
+            },
+            env: None,
+            #[cfg(unix)]
+            launch: None,
+        }
+    }
+
+    /// Issue and bind a session token the way the hub does, and return its id.
+    fn session(teams: &mut Teams, instance: &str, cwd: &str, session: &str) -> String {
+        let (token_id, _token) =
+            teams.issue_session_token(instance, cwd, "opencode", Some(session));
+        token_id
+    }
+
+    #[test]
+    fn a_chat_alone_creates_no_team_and_ensure_team_creates_one() {
+        let mut teams = Teams::new(new_shared_tokens());
+        teams.configure("/p", config(json!({}))).expect("configure");
+        session(&mut teams, "i1", "/p", "s1");
+        assert!(teams.list()["teams"].as_array().unwrap().is_empty());
+
+        let team = teams
+            .ensure_team("i1", "s1", &launch("/p"))
+            .expect("the first request creates the team");
+        let entry = teams.entry(&team).expect("entry");
+        assert_eq!(entry["leader"]["sessionId"], "s1");
+        // Asking again from the same session returns the same team.
+        assert_eq!(teams.ensure_team("i1", "s1", &launch("/p")).unwrap(), team);
+    }
+
+    #[test]
+    fn another_chat_is_told_to_hand_the_team_over() {
+        let (mut teams, team) = fixture(json!({}));
+        let second = session(&mut teams, "i2", "/p", "s2");
+        let error = teams
+            .ensure_team("i2", "s2", &launch("/p"))
+            .expect_err("led by another chat");
+        assert_eq!(error.code, NOT_ALLOWED);
+        let data = error.data.expect("data");
+        assert_eq!(data["reason"], "led_by");
+        assert_eq!(data["team"], team);
+        assert_eq!(data["leader"]["sessionId"], "s1");
+        assert_eq!(teams.session_role(&second).0, None);
+
+        // The person answers `move`: the team changes leader and the second
+        // chat's tools become the leader set.
+        let request = teams.create_handover(&team, "i2", "s2");
+        let (effect, _) = teams
+            .answer_with(&request, None, None, Some("move".to_string()), None)
+            .expect("move");
+        let AnswerEffect::Handover {
+            instance,
+            session,
+            hand_over,
+            ..
+        } = effect
+        else {
+            panic!("handover effect: {effect:?}");
+        };
+        assert!(hand_over);
+        teams
+            .set_leader(&team, &instance, &session)
+            .expect("set leader");
+        assert_eq!(
+            teams.team(&team).unwrap().leader_session.as_deref(),
+            Some("s2")
+        );
+        assert_eq!(teams.session_role(&second).0.as_deref(), Some("leader"));
+        assert_eq!(
+            teams.team(&team).unwrap().participants["leader"]
+                .session
+                .as_deref(),
+            Some("s2")
+        );
+    }
+
+    #[test]
+    fn an_off_switch_hides_the_tools_and_ensure_team_refuses() {
+        let mut teams = Teams::new(new_shared_tokens());
+        teams.configure("/p", config(json!({}))).expect("configure");
+        session(&mut teams, "i1", "/p", "s1");
+        teams.set_switch("opencode", "s1", false);
+        let error = teams
+            .ensure_team("i1", "s1", &launch("/p"))
+            .expect_err("switch off");
+        assert_eq!(error.data.unwrap()["reason"], "off");
+        // A configuration may be disabled as a whole.
+        teams.set_switch("opencode", "s1", true);
+        teams
+            .configure("/p", config(json!({"enabled": false})))
+            .unwrap();
+        assert!(!teams.enabled_for("opencode", "s1", "/p"));
+        // A session without a token has no tools either.
+        let error = teams.ensure_team("i9", "s9", &launch("/p")).unwrap_err();
+        assert_eq!(error.data.unwrap()["reason"], "no_tools");
+    }
+
+    #[test]
+    fn a_stopped_worker_can_be_removed_and_frees_its_name() {
+        let (mut teams, team) = fixture(json!({}));
+        let instance = add_worker(&mut teams, &team, "w1");
+        let returned = teams.stop_worker(&team, "w1", false).unwrap();
+        assert_eq!(returned.as_deref(), Some(instance.as_str()));
+        let worker = &teams.team(&team).unwrap().participants["w1"];
+        assert_eq!(worker.state, ParticipantState::Exited);
+        assert_eq!(worker.reason.as_deref(), Some("stopped"));
+        assert!(teams.read(&team, "leader", None).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["body"]
+                .as_str()
+                .is_some_and(|body| body.contains("w1 stopped by the person"))));
+
+        let second = add_worker(&mut teams, &team, "w2");
+        teams.stop_worker(&team, "w2", true).unwrap();
+        assert!(!teams.team(&team).unwrap().participants.contains_key("w2"));
+        assert!(!teams.team(&team).unwrap().order.contains(&"w2".to_string()));
+        assert!(teams.token_role(&second).is_none());
+        // The name is free again: a new spawn may take it.
+        assert!(teams
+            .request_spawn(&team, "dev", Some("w2"), None, None, None)
+            .is_ok());
+        assert!(teams.stop_worker(&team, "leader", false).is_err());
+        assert!(teams.stop_worker(&team, "nobody", false).is_err());
+    }
+
+    #[test]
+    fn an_empty_template_table_gets_a_builtin_worker_from_the_leader() {
+        let mut teams = Teams::new(new_shared_tokens());
+        teams.configure("/p", json!({"templates": {}})).unwrap();
+        session(&mut teams, "i1", "/p", "s1");
+        let team = teams.ensure_team("i1", "s1", &launch("/p")).unwrap();
+        let template = &teams.team(&team).unwrap().config.templates["worker"];
+        assert_eq!(template.key.agent, "opencode");
+        assert_eq!(template.key.command, "opencode-acp");
+        assert!(template.worktree);
+        assert_eq!(template.role, "");
+        // Workflows and automatic spawns may name it.
+        teams
+            .configure(
+                "/p",
+                json!({
+                    "templates": {},
+                    "spawn_confirm": {"auto": ["worker"]},
+                    "workflows": {
+                        "flow": {
+                            "name": "flow",
+                            "summary": "one worker",
+                            "team": [{"name": "w1", "template": "worker"}]
+                        }
+                    }
+                }),
+            )
+            .expect("builtin validation");
+    }
+
+    #[test]
+    fn a_settled_switch_round_trips_through_the_database_rows() {
+        let mut teams = Teams::new(new_shared_tokens());
+        teams.restore_switches(vec![
+            ("opencode".to_string(), "s1".to_string(), false),
+            ("opencode".to_string(), "s2".to_string(), true),
+        ]);
+        assert_eq!(teams.switch("opencode", "s1"), Some(false));
+        assert_eq!(teams.switch("opencode", "s2"), Some(true));
+        assert!(!teams.set_switch("opencode", "s2", true));
+    }
+
+    #[test]
+    fn injected_count_tracks_session_connections() {
+        let mut teams = Teams::new(new_shared_tokens());
+        session(&mut teams, "i1", "/p", "s1");
+        assert!(!teams.is_injected("opencode", "s1"));
+        teams.session_connected("i1", "s1");
+        assert!(teams.is_injected("opencode", "s1"));
+        teams.session_disconnected("i1", "s1");
+        assert!(!teams.is_injected("opencode", "s1"));
     }
 }

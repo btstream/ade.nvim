@@ -516,6 +516,37 @@ impl Recorder {
         self.inner.store.load_teams()
     }
 
+    /// Read the stored per-session switches. Startup only.
+    pub fn load_session_switches(&self) -> Result<Vec<(String, String, bool)>> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        self.inner.store.load_session_switches()
+    }
+
+    /// Persist one switch through the writer's store (small, synchronous).
+    pub fn save_session_switch(&self, agent: &str, session_id: &str, enabled: bool) {
+        if !self.enabled {
+            return;
+        }
+        if let Err(error) = self
+            .inner
+            .store
+            .save_session_switch(agent, session_id, enabled)
+        {
+            crate::svc_log!("nvim_ade_server: cannot save a session switch: {error:#}");
+        }
+    }
+
+    pub fn delete_session_switch(&self, agent: &str, session_id: &str) {
+        if !self.enabled {
+            return;
+        }
+        if let Err(error) = self.inner.store.delete_session_switch(agent, session_id) {
+            crate::svc_log!("nvim_ade_server: cannot delete a session switch: {error:#}");
+        }
+    }
+
     /// Number of team snapshot transactions actually written (a test sees
     /// whether a batch coalesced several saves for one team).
     pub fn team_write_count(&self) -> usize {

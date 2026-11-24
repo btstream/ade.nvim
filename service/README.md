@@ -5,7 +5,7 @@ Neovim, one process per user, and holds ACP agent processes so they outlive the
 front end. It relays raw ACP JSON-RPC between an agent and whichever front end
 is attached; it is not an ACP client itself.
 
-The protocol (api_version 6) is specified in [`PROTOCOL.md`](PROTOCOL.md). That
+The protocol (api_version 7) is specified in [`PROTOCOL.md`](PROTOCOL.md). That
 document is the contract: socket and token paths are in "Where things live"
 below, everything else is there.
 
@@ -14,7 +14,7 @@ below, everything else is there.
 | Command | What it does |
 |---|---|
 | `nvim_ade_server serve [--socket <path>] [--idle-timeout <secs>] [--print-paths] [--event-log on\|off] [--event-log-max-mb <n>]` | Run the service. `--idle-timeout` overrides `NVIM_ADE_SERVER_IDLE_TIMEOUT_SECS` (default 1800); `--print-paths` prints the resolved paths and exits without binding. `--event-log` (default `on`) and `--event-log-max-mb` (default 256, 16–4096) are the event log flags of PROTOCOL.md section 15. |
-| `nvim_ade_server version` | Print `{"version":"0.7.1","api_version":6}` on one line. |
+| `nvim_ade_server version` | Print `{"version":"0.8.0","api_version":7}` on one line. |
 | `nvim_ade_server mcp` | MCP over stdio for a team participant. Reads `ADE_TEAM_TOKEN` from the environment (never from argv) and connects to the service socket; it never prints the token. |
 
 `serve` prints exactly one line on stdout:
@@ -138,7 +138,7 @@ is kept for `agent.exited`.
 [`PROTOCOL.md`](PROTOCOL.md) is normative; this is a short orientation.
 
 JSON-RPC 2.0, one UTF-8 JSON object per line, terminated by `\n`, max 64 MiB.
-The current `api_version` is **6** and `hello` reports `features: ["tunnel",
+The current `api_version` is **7** and `hello` reports `features: ["tunnel",
 "install", "policy", "log", "teams"]` on unix (`"install"` is absent on Windows;
 with `--event-log off` `"log"` and `"teams"` are absent too, because teams need
 the event log). A participant connection (`hello.participant_token`) gets an
@@ -151,11 +151,11 @@ empty `features` list and may call only `bus.*`.
 | `install.resolve / run / uninstall` | front end → service | managed npm installs, unix only (PROTOCOL.md 16) |
 | `policy.set / clear / list` | front end → service | permission rule sets (PROTOCOL.md 17) |
 | `policy.applied` (notification) | service → attached front ends | a request the policy answered itself |
-| `team.configure / leader_server / bind_leader / list / send / read / answer / answer_group / watch / unwatch / reset_limits / close` | front end → service | teams and the bus (PROTOCOL.md 18, 19) |
+| `team.configure / list / set_leader / stop_worker / session.teams / send / read / answer / answer_group / watch / unwatch / reset_limits / close` | front end → service | teams and the bus (PROTOCOL.md 18, 19) |
 | `team.start / workflows / workflow_delete / board / card_history` | front end → service | workflows and the board (PROTOCOL.md 19) |
 | `bus.spawn / send / ask_human / status / read` | participant (MCP) → service | tools for a team agent (PROTOCOL.md 18.6) |
-| `bus.board_update / card_update / workflow_save / workflow_get / workflow_delete` | participant (MCP) → service | board and workflow tools (PROTOCOL.md 19.5, 19.10) |
-| `team.changed`, `team.inbox`, `team.board_changed` (notifications) | service → every front end | team state, inbox and board changes |
+| `bus.board_update / card_update / workflow_save / workflow_get / workflow_delete / stop_worker` | participant (MCP) → service | board, workflow and worker tools (PROTOCOL.md 19.5, 19.10, 20.6) |
+| `team.changed`, `team.inbox`, `team.board_changed`, `session.teams_changed` (notifications) | service → every front end | team, inbox, board and per-session switch changes |
 | `install.progress` (notification) | service → every front end | install/uninstall progress |
 | `$/cancel_request` (notification) | front end → service | cancel that connection's running install request |
 | `tunnel.send` (notification) | front end → service | one ACP message for an instance |
@@ -263,7 +263,7 @@ dependencies. Each one is listed here as required:
 |---|---|---|
 | `random` | `src/lib.rs`, used in `src/token.rs` | `std::random::random` generates the 32 random bytes of the front-end token, so no `rand`/`getrandom` dependency is needed. Remove it once `std::random` is stabilised. |
 
-## Teams, boards and workflows (api_version 6)
+## Teams, boards and workflows (api_version 7)
 
 With the event log on, `hello` offers `"teams"` (PROTOCOL.md section 19). A team
 is one leader agent plus up to `max_workers` worker agents that talk through a
@@ -377,7 +377,7 @@ fail (only an empty value falls back to 1800).
 
 ## Known limitations
 
-Behaviour that is deliberately not implemented in api_version 6 (or not
+Behaviour that is deliberately not implemented in api_version 7 (or not
 verified on every platform). None of these break the contract in
 [`PROTOCOL.md`](PROTOCOL.md); they are the places where the front end or a later
 stage has to compensate.
