@@ -1013,6 +1013,33 @@ function M.build(ctx, opts, action)
     current_session = function()
       return S.sess.current
     end,
+    find_session = function(id)
+      if type(id) ~= "string" then
+        return nil
+      end
+      local session = S.sess.all and S.sess.all[id] or nil
+      if session then
+        return session
+      end
+      -- A session that exists on the agent but was never loaded here is not
+      -- addressable as a transcript, so it does not count.
+      return nil
+    end,
+    select_session = function(session)
+      ctx.activate_session(session)
+    end,
+    instance = function()
+      local client = S.conn.client
+      local instance = client and client.proc and client.proc.instance or nil
+      if instance then
+        return instance
+      end
+      -- Before an agent client attaches (or in a restored window), the team
+      -- module still remembers which instance bound this cwd's leader.
+      local cwd = ctx.resolve_cwd()
+      local bound = cwd and S.view.team and S.view.team.bound and S.view.team.bound[cwd] or nil
+      return bound and bound.instance or nil
+    end,
     start_team = function(workflow)
       if S.view.team_commands then
         S.view.team_commands:start(workflow)

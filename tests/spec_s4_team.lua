@@ -2416,18 +2416,25 @@ return function(t)
       t.eq(state().sess.current, chat.session, "the leader session is back")
     end)
 
-    t.it("selecting the leader returns to the leader's own session", function()
+    t.it("selecting the leader returns to the bound leader session", function()
       local service, dir = start_service(t, "watch-leader")
       setup(t, "watch-leader", service, dir)
       controller.connect()
       wait_ready()
+      wait(function()
+        local entry = team() and team():team("t1")
+        return entry ~= nil and type(entry.leader) == "table" and entry.leader.sessionId ~= nil
+      end, 5000, "the bound leader")
       controller.open()
       local chat = state().view.chat
       local input = state().view.input
       wait(function()
         return chat.win ~= nil and vim.api.nvim_win_is_valid(chat.win)
       end, 5000, "the leader chat window")
-      local leader = state().sess.current
+      -- The bound leader is the app's own session; both must stay identical.
+      local leader = state().sess.all[team():team("t1").leader.sessionId]
+      t.truthy(leader, "the service's leader session is this front end's session")
+      t.eq(leader, state().sess.current)
       local ui = state().view.team_ui
       ui.router:open("t1", "w1")
       wait(function()
@@ -2440,6 +2447,7 @@ return function(t)
       end, 5000, "focus the leader's own chat")
       t.eq(leader, chat.session, "the leader's session is restored")
       t.eq(leader.id, input.session_key, "the composer is back on the leader session")
+      t.eq(leader, state().sess.current, "the app state follows the same session")
       t.eq(nil, team().watching, "the leader is not watched")
     end)
 

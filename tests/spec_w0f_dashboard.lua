@@ -133,6 +133,33 @@ return function(t)
     return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
   end
 
+  -- This front end's own service instance, which is what the team's leader
+  -- record must name for the panel to trust it.
+  local function own_instance()
+    local client = controller.state().conn.client
+    return client and client.proc and client.proc.instance or nil
+  end
+
+  -- Two sessions in the same project and agent, only one of them the leader.
+  -- `opts.instance` pretends this front end runs on another instance.
+  local function install_leader(t, dir, opts)
+    local state = controller.state()
+    local leader = State.new("leader-session", dir)
+    leader.agent_name = "opencode"
+    local other = State.new("other-session", dir)
+    other.agent_name = "opencode"
+    state.sess.all["leader-session"] = leader
+    state.sess.all["other-session"] = other
+    state.sess.current = leader
+    state.view.input:switch_session(leader.id, nil, leader)
+    if opts and opts.instance then
+      -- Pretend the binding was made by another instance: that is the value
+      -- `team.bound` (and the agent process) would carry.
+      state.view.team.bound[dir] = { instance = opts.instance, session_id = leader.id, team = "t1" }
+    end
+    return leader, other
+  end
+
   local function base_team(dir, over)
     return vim.tbl_deep_extend("force", {
       id = "t1",
@@ -165,6 +192,7 @@ return function(t)
       },
       inbox = {},
       limits = { max_turns_per_task = 30, max_turns_total = 200, turns_total = 41 },
+      leader = { instance = own_instance(), sessionId = "leader-session" },
     }, over or {})
   end
 
@@ -484,10 +512,7 @@ return function(t)
       wait(function()
         return chat.win ~= nil and input.win ~= nil
       end, 5000, "the ordinary panel")
-      local leader = State.new("leader-session", dir)
-      leader.agent_name = "opencode"
-      controller.state().sess.current = leader
-      input:switch_session(leader.id, nil, leader)
+      local leader = install_leader(t, dir)
       service:team_changed(base_team(dir))
       wait(function()
         return team():team("t1") ~= nil
@@ -698,10 +723,7 @@ return function(t)
       wait(function()
         return team():team("t1") ~= nil
       end, 5000, "the team")
-      local leader = State.new("leader-hidden", dir)
-      leader.agent_name = "opencode"
-      controller.state().sess.current = leader
-      input:switch_session(leader.id, nil, leader)
+      local leader = install_leader(t, dir)
       controller.hide()
       wait(function()
         return chat.win == nil
@@ -760,6 +782,199 @@ return function(t)
       vim.wait(120)
       t.truthy(foreign ~= chat.session or chat.session == nil, "a foreign cwd is not presented as the leader")
       t.eq(nil, UI.router.target)
+      UI:close()
+    end)
+
+    t.it("only the bound leader session is accepted, never just any session in the project", function()
+      wide(t)
+      local service, dir = start_service(t, "leader-session-id")
+      setup(t, "leader-session-id", service, dir)
+      controller.connect()
+      wait_ready()
+      controller.open()
+      local chat = controller.state().view.chat
+      local input = controller.state().view.input
+      wait(function()
+        return input.win ~= nil
+      end, 5000, "the composer")
+      local leader, other = install_leader(t, dir)
+      -- The screen shows *another* session of the same cwd and agent.
+      controller.state().sess.current = other
+      input:switch_session(other.id, nil, other)
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team("members"))
+      local UI = ui()
+      UI.router:select("t1", "w1")
+      wait(function()
+        return UI.router.target ~= nil
+      end, 5000, "the worker")
+
+      -- Selecting the leader switches to the *bound* session, not to whatever
+      -- session happens to be current.
+      UI.router:select("t1", "leader")
+      t.eq(nil, UI.router.target)
+      t.eq(leader, chat.session, "the transcript shows the bound leader")
+      t.eq(leader.id, input.session_key, "the composer owns the leader session")
+      t.eq(leader, controller.state().sess.current, "the app state follows the same session")
+
+      -- Now the bound session is not in this front end at all: the selection
+      -- must be refused and the worker with its draft left alone.
+      UI.router:select("t1", "w1")
+      wait(function()
+        return UI.router.target ~= nil
+      end, 5000, "the worker again")
+      controller.state().sess.all["leader-session"] = nil
+      controller.state().sess.current = other
+      input:switch_session(other.id, nil, other)
+      UI.router:select("t1", "w1")
+      wait(function()
+        return UI.router.target ~= nil
+      end, 5000, "the worker once more")
+      vim.api.nvim_buf_set_lines(input.buf, 0, -1, false, { "worker draft" })
+      local notices = {}
+      UI.notify_fn = function(message)
+        notices[#notices + 1] = tostring(message)
+      end
+      local target_before = UI.router.target
+      t.eq(false, UI.router:select("t1", "leader"), "an unknown leader session is refused")
+      t.eq(target_before, UI.router.target, "the worker target is kept")
+      t.eq("w1", UI.router.target.participant)
+      t.eq("worker draft", table.concat(vim.api.nvim_buf_get_lines(input.buf, 0, -1, false), "\n"))
+      t.match("leader", table.concat(notices, "\n"))
+      UI:close()
+    end)
+
+    t.it("a leader bound to another instance is refused", function()
+      wide(t)
+      local service, dir = start_service(t, "leader-other-instance")
+      setup(t, "leader-other-instance", service, dir)
+      controller.connect()
+      wait_ready()
+      controller.open()
+      local input = controller.state().view.input
+      wait(function()
+        return input.win ~= nil
+      end, 5000, "the composer")
+      install_leader(t, dir, { instance = "inst-here" })
+      service:team_changed(base_team(dir, { leader = { instance = "inst-remote", sessionId = "leader-session" } }))
+      -- The team module's binding is what the panel trusts for "our instance".
+      controller.state().view.team.bound[dir] = { instance = "inst-here", session_id = "leader-session", team = "t1" }
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team("members"))
+      local UI = ui()
+      UI.router:select("t1", "w1")
+      wait(function()
+        return UI.router.target ~= nil
+      end, 5000, "the worker")
+      vim.api.nvim_buf_set_lines(input.buf, 0, -1, false, { "keep me" })
+      local notices = {}
+      UI.notify_fn = function(message)
+        notices[#notices + 1] = tostring(message)
+      end
+      UI.router:select("t1", "leader")
+      t.eq("w1", UI.router.target and UI.router.target.participant, "the target is kept")
+      t.eq("keep me", table.concat(vim.api.nvim_buf_get_lines(input.buf, 0, -1, false), "\n"))
+      t.match("另一个服务实例", table.concat(notices, "\n"))
+      UI:close()
+    end)
+
+    t.it("the real keys never cancel the leader while a worker is shown", function()
+      wide(t)
+      local service, dir = start_service(t, "keys-cancel")
+      setup(t, "keys-cancel", service, dir)
+      controller.connect()
+      wait_ready()
+      controller.open()
+      local chat = controller.state().view.chat
+      local input = controller.state().view.input
+      wait(function()
+        return input.win ~= nil
+      end, 5000, "the composer")
+      local leader = install_leader(t, dir)
+      leader.status = "running"
+      local cancelled = 0
+      local original_cancel = controller.state().view
+      local real_cancel = controller.cancel
+      controller.cancel = function(...)
+        cancelled = cancelled + 1
+        return real_cancel(...)
+      end
+      t.cleanup(function()
+        controller.cancel = real_cancel
+      end)
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team("members"))
+      local UI = ui()
+      UI.router:select("t1", "w1")
+      wait(function()
+        return UI.router.target ~= nil
+      end, 5000, "the worker transcript")
+      -- The real composer buffer is the one with the mapped keys.
+      local keys = {}
+      for _, map in ipairs(vim.api.nvim_buf_get_keymap(input.buf, "n")) do
+        keys[map.lhs:lower()] = map.callback
+      end
+      t.truthy(keys["<c-s>"], "the composer binds <C-S>")
+      t.truthy(keys["<c-c>"], "the composer binds <C-C>")
+      -- Empty composer + the real <C-S> / <C-c> callbacks.
+      vim.api.nvim_buf_set_lines(input.buf, 0, -1, false, { "" })
+      keys["<c-s>"]()
+      keys["<c-c>"]()
+      t.eq(0, cancelled, "a worker target must not cancel the leader's turn")
+      t.eq("running", leader.status, "the leader turn is untouched")
+      -- A non-empty submit still goes to the worker, not to the leader.
+      local sends_before = #service.team_sends
+      vim.api.nvim_buf_set_lines(input.buf, 0, -1, false, { "to the worker" })
+      keys["<c-s>"]()
+      wait(function()
+        return #service.team_sends > sends_before
+      end, 5000, "the worker send")
+      t.eq("w1", service.team_sends[#service.team_sends].to)
+      t.eq(0, cancelled)
+      UI:close()
+    end)
+
+    t.it("worker input history comes from the worker transcript, not the leader", function()
+      wide(t)
+      local service, dir = start_service(t, "history")
+      setup(t, "history", service, dir)
+      controller.connect()
+      wait_ready()
+      controller.open()
+      local input = controller.state().view.input
+      wait(function()
+        return input.win ~= nil
+      end, 5000, "the composer")
+      local leader = install_leader(t, dir)
+      leader.blocks = { { id = "l1", kind = "user", text = "leader-only prompt" } }
+      service:team_changed(base_team(dir))
+      wait(function()
+        return team():team("t1") ~= nil
+      end, 5000, "the team")
+      t.eq(true, controller.open_team("members"))
+      local UI = ui()
+      UI.router:select("t1", "w1")
+      wait(function()
+        return UI.router.target ~= nil
+      end, 5000, "the worker transcript")
+      local keys = {}
+      for _, map in ipairs(vim.api.nvim_buf_get_keymap(input.buf, "n")) do
+        keys[map.lhs:lower()] = map.callback
+      end
+      local recall = keys["<c-p>"] or keys["<up>"]
+      t.truthy(recall, "the composer binds a history key")
+      vim.api.nvim_buf_set_lines(input.buf, 0, -1, false, { "" })
+      recall()
+      local text = table.concat(vim.api.nvim_buf_get_lines(input.buf, 0, -1, false), "\n")
+      t.falsy(text:find("leader-only prompt", 1, true), "the leader's prompts do not leak into the worker")
       UI:close()
     end)
 

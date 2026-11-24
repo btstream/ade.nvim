@@ -28,6 +28,9 @@ local INTERRUPT_MS = 5000
 ---@param opts {team: table, config: fun(): table, notify: fun(message: string, level: integer|nil),
 ---  panel: (fun(): table|nil)|nil, leader_chat: (fun(): table|nil)|nil,
 ---  leader_input: (fun(): table|nil)|nil, current_session: (fun(): table|nil)|nil,
+---  find_session: (fun(id: string): table|nil)|nil,
+---  select_session: (fun(session: table)|nil)|nil,
+---  instance: (fun(): string|nil)|nil,
 ---  on_change: (fun()|nil)}
 ---@return table
 function M.new(opts)
@@ -39,6 +42,9 @@ function M.new(opts)
     leader_chat = opts.leader_chat,
     leader_input = opts.leader_input,
     current_session = opts.current_session,
+    find_session = opts.find_session,
+    select_session = opts.select_session,
+    instance_of = opts.instance,
     on_change = opts.on_change,
     target = nil,
     display = nil,
@@ -308,7 +314,10 @@ function Router:bind_keys()
   local function bind_leader(buf)
     for _, lhs in ipairs({ "gl" }) do
       self:bind_key(buf, "n", lhs, function()
-        self:select(nil, "leader")
+        -- `gl` leaves the worker transcript: it goes back to the ordinary
+        -- session the panel showed before, which is not claimed to be the
+        -- team's leader (that is `L` in the pane).
+        self:leave_worker(true)
       end)
     end
   end
@@ -398,7 +407,7 @@ function Router:on_watch(session, title)
       return
     end
     if self.target then
-      self:restore_leader(false)
+      self:leave_worker(false)
     end
     return
   end
@@ -543,7 +552,7 @@ function Router:pump()
     if not ok then
       local message = type(value) == "table" and (value.message or value.code) or tostring(value)
       self:notify("无法查看 " .. tostring(target.participant) .. "：" .. tostring(message))
-      self:select(nil, "leader")
+      self:leave_worker(true)
       return
     end
     if self.pending_target then
@@ -648,16 +657,39 @@ function Router:select(team, participant)
   return true
 end
 
----Whether `session` may stand in as this team's leader.
+---Normalized absolute path for comparison.
+---@param path string
+---@return string
+local function normalize_path(path)
+  local value = vim.fn.fnamemodify(tostring(path), ":p")
+  if #value > 1 then
+    value = value:gsub("/+$", "")
+  end
+  return value
+end
+
+---Whether `session` is this front end's own leader of `team`.
 ---
----The app's current session is usually the leader, but a session restored from
----another project or another agent must never be presented as *this team's*
----leader.
+---Being in the same cwd and agent is not enough: one project routinely has
+---several sessions, and only the one the service bound as the leader
+---(`team.list[].leader.sessionId`, on our own instance) is *the* leader.
 ---@param session table|nil
----@param team string|nil
+---@param row table|nil
 ---@return boolean
-function Router:leader_eligible(session, team)
-  if not session then
+function Router:is_leader_session(session, row)
+  if not (session and type(row) == "table") then
+    return false
+  end
+  local leader = type(row.leader) == "table" and row.leader or nil
+  if not (leader and type(leader.sessionId) == "string" and leader.sessionId ~= "") then
+    return false
+  end
+  if tostring(session.id) ~= leader.sessionId then
+    return false
+  end
+  -- Another instance may lead this cwd's team; its session id is not ours.
+  local ours = self.instance_of and self.instance_of() or nil
+  if type(leader.instance) == "string" and leader.instance ~= "" and ours and leader.instance ~= ours then
     return false
   end
   local ok, cfg = pcall(self.config)
@@ -665,55 +697,103 @@ function Router:leader_eligible(session, team)
   if agent and session.agent_name and session.agent_name ~= agent then
     return false
   end
-  if team and session.cwd then
-    local row = self.team:team(team)
-    local cwd = (row and row.cwd) or (self.team.resolve_cwd and self.team.resolve_cwd() or nil)
-    if cwd then
-      local function norm(path)
-        local value = vim.fn.fnamemodify(tostring(path), ":p")
-        if #value > 1 then
-          value = value:gsub("/+$", "")
-        end
-        return value
-      end
-      if norm(session.cwd) ~= norm(cwd) then
-        return false
-      end
+  if row.cwd and session.cwd then
+    if normalize_path(session.cwd) ~= normalize_path(row.cwd) then
+      return false
     end
   end
   return true
 end
 
----The leader session to show: the app's current one when it qualifies, or the
----one this panel showed before a worker replaced it.
+---The exact leader session of `team`, or nil when this front end cannot prove
+---one (another instance leads it, the session is gone, or the team is suspended).
 ---@param team string|nil
 ---@return table|nil session
 function Router:leader_session(team)
-  local session = self.current_session and self.current_session() or nil
-  if not self:leader_eligible(session, team) then
-    session = self.saved_leader and self.saved_leader.session or nil
+  if not team then
+    return nil
   end
-  if self:leader_eligible(session, team) then
+  local row = self.team:team(team)
+  local leader = type(row) == "table" and type(row.leader) == "table" and row.leader or nil
+  if not (leader and type(leader.sessionId) == "string" and leader.sessionId ~= "") then
+    return nil
+  end
+  local session = self.current_session and self.current_session() or nil
+  if session and self:is_leader_session(session, row) then
     return session
+  end
+  -- The leader exists but is not the session on screen: find it by id.
+  local found = self.find_session and self.find_session(leader.sessionId) or nil
+  if found and self:is_leader_session(found, row) then
+    return found
   end
   return nil
 end
 
----Put the ordinary chat back on the leader's own session.
+---Tell the person why the team's leader cannot be shown here.
+---@param team string|nil
+function Router:leader_unavailable(team)
+  local row = self.team:team(team)
+  local leader = type(row) == "table" and type(row.leader) == "table" and row.leader or nil
+  local message
+  if not leader or type(leader.sessionId) ~= "string" or leader.sessionId == "" then
+    message = "这个团队还没有可切换的 leader 会话"
+  else
+    local ours = self.instance_of and self.instance_of() or nil
+    if type(leader.instance) == "string" and leader.instance ~= "" and ours and leader.instance ~= ours then
+      message = "这个团队的 leader 属于另一个服务实例，本窗口无法切换"
+    else
+      message = "团队 leader 会话（"
+        .. leader.sessionId
+        .. "）不在本前端，无法切换；当前目标保持不变"
+    end
+  end
+  self:notify(message, vim.log.levels.WARN)
+end
+
+---Put the shared transcript back on the leader.
 ---
----Selecting the leader from a pane must also reveal the ordinary panel: the
----person asked to talk to the leader, so a hidden chat is opened and focused.
+---Two distinct intents share this path:
 ---
----When this front end has no eligible leader session for that team (another
----cwd or agent), the composer keeps the slot it had before the worker: drafts
----are never dropped to a key that cannot be restored later.
+---  * `select("leader")` / `L` in a pane: talk to *the team's leader*. That is
+---    the exact session the service bound (`team.list[].leader`), not merely
+---    any session in the same cwd. When it cannot be shown here (another
+---    instance, a session this front end does not have), nothing changes: the
+---    worker stays on screen with its draft, and the person is told why.
+---  * `gl` from a worker transcript: leave the worker and go back to the
+---    ordinary session the panel showed before the worker replaced it. That is
+---    not necessarily the team leader and does not claim to be.
 ---@param focus boolean|nil
 ---@param team string|nil the team whose leader is meant
+---@param mode string|nil "leader" (default) or "previous"
 ---@return boolean
-function Router:restore_leader(focus, team)
+function Router:restore_leader(focus, team, mode)
+  mode = mode or "leader"
+  local team_id = team or (self.target and self.target.team)
+  local previous = self.saved_leader
+  local session
+  if mode == "previous" then
+    -- Leave the worker: go back to exactly what the composer showed before.
+    session = previous and previous.session or nil
+    if session and self.find_session and not self.find_session(session.id) then
+      -- The session the panel came from is gone; fall back to the app's own.
+      session = nil
+    end
+    if not session then
+      session = self.current_session and self.current_session() or nil
+    end
+  else
+    session = self:leader_session(team_id)
+    if not session then
+      -- Leave everything as it is: the worker, its draft and its send target.
+      if focus then
+        pcall(self.refresh_bar, self)
+      end
+      self:leader_unavailable(team_id)
+      return false
+    end
+  end
   local was_worker = self.target ~= nil
-  local session = self:leader_session(team or (self.target and self.target.team))
-  local saved = self.saved_leader
   if focus then
     self:ensure_panel()
   end
@@ -721,27 +801,28 @@ function Router:restore_leader(focus, team)
   local chat = self.leader_chat and self.leader_chat() or self.chat
   local input = self.leader_input and self.leader_input() or self.input
   self.chat, self.input = chat, input
+  local same = chat and chat.session == session
   if chat and session then
-    if chat.session ~= session then
-      chat:set_session(session)
+    if not same then
+      if self.select_session then
+        -- Let the app switch, so `S.sess.current`, the transcript and the
+        -- composer all follow the same session instead of drifting apart.
+        pcall(self.select_session, session)
+      end
+      if self.chat and self.chat.session ~= session then
+        self.chat:set_session(session)
+      end
     end
     chat.pending_new = false
   elseif chat and not session then
     chat:set_session(nil)
   end
-  if input and session then
+  if input and session and input.session_key ~= session.id then
     local restored = drafts.get(session.cwd, session.id)
     input:switch_session(session.id, restored, session)
-  elseif input and saved and saved.key then
-    -- No eligible leader session: put the composer back where it was before
-    -- the worker instead of leaving the worker's key selected.
-    local restored = drafts.get(saved.owner and saved.owner.cwd or "", saved.key)
-    input:switch_session(saved.key, restored, saved.owner)
   end
   if focus and chat and chat.win and vim.api.nvim_win_is_valid(chat.win) then
     pcall(vim.api.nvim_set_current_win, chat.win)
-  elseif focus and not session then
-    self:notify("这个团队的 leader 会话不属于当前项目或 agent，无法切回", vim.log.levels.WARN)
   end
   if was_worker then
     self:changed()
@@ -1096,8 +1177,16 @@ end
 ---@param participant string
 function Router:participant_gone(team, participant)
   if self.target and self.target.team == team and self.target.participant == participant then
-    self:restore_leader(false)
+    self:leave_worker(false)
   end
+end
+
+---Leave the worker transcript and go back to the ordinary session it replaced
+---(`gl`). Unlike `L`, this makes no claim that the session is the team leader.
+---@param focus boolean|nil
+---@return boolean
+function Router:leave_worker(focus)
+  return self:restore_leader(focus, self.target and self.target.team or nil, "previous")
 end
 
 ---Compatibility entry the panes and older callers use: open a participant.
@@ -1114,9 +1203,9 @@ function Router:open(team, participant)
   return self:select(team, participant)
 end
 
----Drop the worker target and go back to the leader's own session.
+---Drop the worker target and go back to where the composer was before.
 function Router:close()
-  self:restore_leader(false)
+  self:restore_leader(false, nil, "previous")
 end
 
 function Router:close_view()

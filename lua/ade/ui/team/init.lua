@@ -31,6 +31,7 @@ end
 ---@param opts {team: table, config: fun(): table, notify: fun(message: string, level: integer|nil)|nil,
 ---  panel: (fun(): table|nil)|nil, leader_chat: (fun(): table|nil)|nil,
 ---  leader_input: (fun(): table|nil)|nil, current_session: (fun(): table|nil)|nil,
+---  find_session: (fun(id: string): table|nil)|nil, instance: (fun(): string|nil)|nil,
 ---  start_team: (fun(workflow: string)|nil)|nil, select_session: (fun(session: table)|nil)|nil}
 ---@return table
 function M.dashboard(opts)
@@ -41,7 +42,9 @@ function M.dashboard(opts)
     leader_chat = opts.leader_chat,
     leader_input = opts.leader_input,
     current_session = opts.current_session,
+    find_session = opts.find_session,
     select_session = opts.select_session,
+    instance_of = opts.instance,
     panel = opts.panel,
     start_team = opts.start_team,
     layout = nil,
@@ -64,6 +67,9 @@ function M.dashboard(opts)
     leader_chat = opts.leader_chat,
     leader_input = opts.leader_input,
     current_session = opts.current_session,
+    find_session = opts.find_session,
+    select_session = opts.select_session,
+    instance = opts.instance,
     on_change = function()
       self:update_headers()
       self:sync_aliases()
@@ -571,8 +577,18 @@ end
 
 ---Interrupt a worker from the composer: `<C-c>` must never cancel the
 ---leader's own turn while the composer sends to someone else.
+---An empty submit / `<C-c>` while a worker is the target.
+---
+---The worker has no local turn to stop and cancelling the leader's turn would
+---be wrong, so this only explains the state. Cancelling a worker's own turn
+---stays an explicit `c` in the members pane.
 function Dashboard:cancel_target()
-  self:notify("按成员面板里的 c 取消这个 worker 的回合；gl 返回 leader", vim.log.levels.INFO)
+  self:notify(
+    "当前输入发往 worker "
+      .. tostring(self.router:current_participant() or "?")
+      .. "：按成员面板里的 c 取消它的回合，gl 返回普通会话",
+    vim.log.levels.INFO
+  )
 end
 
 ---The composer bar text while a worker is the target.
@@ -607,6 +623,14 @@ end
 ---@return boolean
 function Dashboard:select_leader(team)
   return self.router:restore_leader(true, team)
+end
+
+---`gl` in a worker transcript: leave the worker for the ordinary session the
+---panel showed before. This makes no claim to be the team's leader.
+---@param focus boolean|nil
+---@return boolean
+function Dashboard:leave_worker(focus)
+  return self.router:leave_worker(focus)
 end
 
 ---The session picker or `:Ade open` took over: stop routing.

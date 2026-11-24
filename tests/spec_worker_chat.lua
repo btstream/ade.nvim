@@ -25,6 +25,7 @@ return function(t)
         { name = "w2", state = "idle", task = "_", queued = 0, turns = {}, state = over.w2_state or "idle" },
       },
       inbox = {},
+      leader = { instance = "inst-1", sessionId = "leader" },
     }
     local team = { sends = {}, rows = { row }, watching = nil, unwatches = 0 }
     function team:list_rows()
@@ -170,12 +171,20 @@ return function(t)
     local chat = fake_chat(over.config or Config.defaults)
     local input = fake_input()
     local leader = State.new("leader", "/tmp")
+    leader.agent_name = "opencode"
+    if over.leader_instance then
+      team.rows[1].leader = { instance = over.leader_instance, sessionId = "leader" }
+    end
+    if over.leader_missing then
+      team.rows[1].leader = { instance = over.leader_instance or "inst-1", sessionId = "gone-leader" }
+    end
+    local sessions = { leader = leader, [over.other_id or "other"] = over.other }
     local router = Router.new({
       team = team,
       config = function()
         return over.config or Config.defaults
       end,
-      notify = function() end,
+      notify = over.notify or function() end,
       panel = function()
         return nil
       end,
@@ -186,7 +195,22 @@ return function(t)
         return input
       end,
       current_session = function()
-        return leader
+        return over.current_session or leader
+      end,
+      find_session = function(id)
+        local found = sessions[id]
+        if found == nil and id == "leader" then
+          return leader
+        end
+        return found
+      end,
+      select_session = function(session)
+        if over.select_session then
+          over.select_session(session)
+        end
+      end,
+      instance = function()
+        return over.instance or "inst-1"
       end,
     })
     team.on_watch = function(session, title)
@@ -368,6 +392,68 @@ return function(t)
       team.on_watch(nil, nil)
       t.eq(nil, router.target)
       t.eq(nil, chat._ade_team_display)
+    end)
+
+    t.it("accepts only the bound leader session, not any session in the project", function()
+      local other = State.new("other", "/tmp")
+      other.agent_name = "opencode"
+      local router = setup(t, { current_session = other })
+      router:select("t1", "w1")
+      -- The leader record points at `leader` while the screen shows `other`:
+      -- the bound session is selected by id, not the current one.
+      t.eq(true, router:select("t1", "leader"))
+      t.eq(nil, router.target)
+      t.eq("leader", session_id(router), "the transcript shows the bound leader")
+    end)
+
+    t.it("a leader session this front end lacks keeps the worker and its draft", function()
+      local other = State.new("other", "/tmp")
+      other.agent_name = "opencode"
+      local router = setup(t, { current_session = other, leader_missing = true })
+      local notices = {}
+      router.notify_fn = function(message)
+        notices[#notices + 1] = tostring(message)
+      end
+      router:select("t1", "w1")
+      local target = router.target
+      t.eq(false, router:select("t1", "leader"))
+      t.eq(target, router.target, "the worker target is kept")
+      t.eq("w1", router.target.participant)
+      t.match("gone%-leader", table.concat(notices, "\n"))
+    end)
+
+    t.it("a leader from another instance is refused without changing the target", function()
+      local router = setup(t, { instance = "inst-here", leader_instance = "inst-remote" })
+      local notices = {}
+      router.notify_fn = function(message)
+        notices[#notices + 1] = tostring(message)
+      end
+      router:select("t1", "w1")
+      local target = router.target
+      t.eq(false, router:select("t1", "leader"))
+      t.eq(target, router.target)
+      t.match("另一个服务实例", table.concat(notices, "\n"))
+    end)
+
+    t.it("gl leaves the worker for the previous session without claiming the leader", function()
+      -- The panel showed a session that is *not* the team's leader.
+      local plain = State.new("plain", "/tmp")
+      plain.agent_name = "opencode"
+      local router = setup(t, { current_session = plain, leader_missing = true })
+      router:select("t1", "w1")
+      t.truthy(router.target)
+      t.eq(true, router:leave_worker(true))
+      t.eq(nil, router.target)
+      t.eq("plain", session_id(router), "the previous ordinary session is back")
+      -- `L` (restore_leader) refuses here: that session is not the team leader.
+      router:select("t1", "w1")
+      local notices = {}
+      router.notify_fn = function(message)
+        notices[#notices + 1] = tostring(message)
+      end
+      t.eq(false, router:restore_leader(true, "t1"))
+      t.eq("w1", router.target.participant, "the worker stays for a failed Leader switch")
+      t.eq(1, #notices)
     end)
 
     t.it("a late send callback never clears another target's draft", function()
