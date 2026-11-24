@@ -244,25 +244,21 @@ return function(t)
     -- (`lua/ade/app/sessions.lua:572–584`, `lua/ade/app/window.lua:40–58`).
     -- The service then forgets the session and revokes the token just injected,
     -- while the front end reports success.
-    t.pending(
-      "does not close the session it just reloaded",
-      "lua/ade/app/window.lua:40–58 + sessions.lua:572–584: an in-place reload replaces the projection, so select_session closes the same session id",
-      function()
-        local service, dir = start_canned(t, "on-close")
-        setup(t, dir)
-        controller.connect()
-        wait_ready()
-        mark_uninjected(service)
-        vim.cmd("Ade team on")
-        wait(function()
-          return #sent_frames(service, "session/load") >= 1
-        end, 15000, "the reload's session/load")
-        vim.wait(1000)
-        local closes = sent_frames(service, "session/close")
-        t.eq(0, #closes, "the reloaded session must not be closed: " .. vim.inspect(closes))
-        t.eq(true, state().sess.current ~= nil, "the session is still on screen")
-      end
-    )
+    t.it("does not close the session it just reloaded", function()
+      local service, dir = start_canned(t, "on-close")
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      mark_uninjected(service)
+      vim.cmd("Ade team on")
+      wait(function()
+        return #sent_frames(service, "session/load") >= 1
+      end, 15000, "the reload's session/load")
+      vim.wait(1000)
+      local closes = sent_frames(service, "session/close")
+      t.eq(0, #closes, "the reloaded session must not be closed: " .. vim.inspect(closes))
+      t.eq(true, state().sess.current ~= nil, "the session is still on screen")
+    end)
 
     t.it("reports a failed reload and leaves the session usable", function()
       local service, dir = start_canned(t, "on-reload-broken")
@@ -405,21 +401,17 @@ return function(t)
     -- honouring `value2.reload` (`lua/ade/app/team_start.lua:543–561`). Under the
     -- new rule the service only marks a one-shot forward, so the retry can still
     -- see `no_tools`.
-    t.pending(
-      "reloads before retrying a start that answered no_tools",
-      "lua/ade/app/team_start.lua:543–561: the off/no_tools retry ignores value2.reload",
-      function()
-        local flow, calls = flow_harness(t, {
-          tag = "no-tools",
-          first_start_reason = "no_tools",
-          enable_answers_reload = true,
-        })
-        flow:start("default")
-        wait_idle(flow)
-        t.eq(1, #calls.reloads, "the retry must run the load the service asked for")
-        t.eq(2, #calls.starts, "and then retry the start")
-      end
-    )
+    t.it("reloads before retrying a start that answered no_tools", function()
+      local flow, calls = flow_harness(t, {
+        tag = "no-tools",
+        first_start_reason = "no_tools",
+        enable_answers_reload = true,
+      })
+      flow:start("default")
+      wait_idle(flow)
+      t.eq(1, #calls.reloads, "the retry must run the load the service asked for")
+      t.eq(2, #calls.starts, "and then retry the start")
+    end)
 
     t.it("retries a start that answered off without reloading when the switch is already in place", function()
       local flow, calls = flow_harness(t, { tag = "off", first_start_reason = "off" })
@@ -438,117 +430,118 @@ return function(t)
       t.eq("go", calls.starts[1].task)
     end)
 
-    -- PRODUCTION BUG (review round 2, blocker 3): a legal
-    -- `teams.session_default = false` configuration cannot complete a handover.
-    -- The replacement session is created under the same configuration, so
-    -- `session/new` injects nothing and `handover`'s enable answers
-    -- `reload_unsupported` — the flow stops and the summary is never sent
-    -- (`lua/ade/app/team_start.lua:330–338,398–425,468–488`).
-    t.pending(
-      "hands a summary to a replacement session created with session_default = false",
-      "lua/ade/app/team_start.lua:468–488: the handover's enable answers reload_unsupported and the summary is dropped",
-      function()
-        local cwd = base_cwd("reload-default-off")
-        local session = { id = "s1", cwd = cwd, instance = "i1", blocks = { { kind = "user", text = "fix it" } } }
-        local submitted = {}
-        local created = { id = "s2", cwd = cwd, instance = "i1", blocks = {} }
-        local fake_team = {
-          available = function()
-            return true
-          end,
-        }
-        -- The switch is off for every session, and enabling it always needs a
-        -- reload the agent cannot do.
-        function fake_team:workflows(_, cb)
-          cb(true, { workflows = { { name = "default", summary = "the flow", team = {} } } })
-        end
-        function fake_team:session_teams()
-          return nil
-        end
-        function fake_team:query_session_teams(_, _, _, cb)
-          cb(true, { enabled = false, injected = false })
-        end
-        function fake_team:set_session_teams(_, _, _, _, cb)
-          cb(false, { code = -32061, data = { reason = "reload_unsupported" } })
-        end
-        function fake_team:reload_session()
-          error("this agent cannot reload")
-        end
-        function fake_team:start_session()
-          error("a start without tools is a production bug, not a test path")
-        end
-        local S = { view = { team = fake_team }, sess = { current = session, all = { s1 = session, s2 = created } } }
-        local flow = TeamStart.new({
-          state = function()
-            return S
-          end,
-          config = function()
-            return {
-              backend = "service",
-              cwd = cwd,
-              teams = { enabled = true, default = "default", session_default = false },
-            }
-          end,
-          notify = function() end,
-          resolve_cwd = function()
-            return cwd
-          end,
-          open = function() end,
-          new_session = function(opts)
-            S.sess.current = created
-            if opts and opts.on_created then
-              opts.on_created(created)
-            end
-          end,
-          connect = function() end,
-          pick_agent = function() end,
-          options = function()
-            return nil
-          end,
-          client = function()
-            return { proc = { instance = "i1" } }
-          end,
-          generation = function()
-            return 0
-          end,
-          report_error = function(value)
-            return type(value) == "table" and tostring(value.data and value.data.reason or value.message or value.code)
-              or tostring(value)
-          end,
-          choices = function()
-            return nil
-          end,
-          find_session = function(id)
-            return S.sess.all[id]
-          end,
-          select_session = function() end,
-          submit = function(text, target)
-            submitted[#submitted + 1] = { text = text, id = target and target.id }
-          end,
-        })
-        local original_select, original_input = vim.ui.select, vim.ui.input
-        vim.ui.select = function(items, _, cb)
-          cb(items[1])
-        end
-        vim.ui.input = function(_, cb)
-          cb("")
-        end
-        t.cleanup(function()
-          vim.ui.select, vim.ui.input = original_select, original_input
-        end)
-        flow:start("default")
-        wait_idle(flow)
-        t.truthy(#submitted > 0, "the summary reaches the replacement session")
-        t.eq("s2", submitted[1].id)
-        t.match("fix it", submitted[1].text)
+    -- Leader decision (review round 2, blocker 3): with
+    -- `teams.session_default = false` a replacement session would be created
+    -- under the same configuration and get no team tools either, so the flow
+    -- must say so and stop instead of promising a handover.
+    t.it("refuses the handover when new sessions start with teams off", function()
+      local cwd = base_cwd("reload-default-off")
+      local session = { id = "s1", cwd = cwd, instance = "i1", blocks = { { kind = "user", text = "fix it" } } }
+      local submitted = {}
+      local created = { id = "s2", cwd = cwd, instance = "i1", blocks = {} }
+      local notices = {}
+      local new_sessions = 0
+      local fake_team = {
+        available = function()
+          return true
+        end,
+      }
+      -- The switch is off for every session, and enabling it always needs a
+      -- reload the agent cannot do.
+      function fake_team:workflows(_, cb)
+        cb(true, { workflows = { { name = "default", summary = "the flow", team = {} } } })
       end
-    )
+      function fake_team:session_teams()
+        return nil
+      end
+      function fake_team:query_session_teams(_, _, _, cb)
+        cb(true, { enabled = false, injected = false })
+      end
+      function fake_team:set_session_teams(_, _, _, _, cb)
+        cb(false, { code = -32061, data = { reason = "reload_unsupported" } })
+      end
+      function fake_team:reload_session()
+        error("this agent cannot reload")
+      end
+      function fake_team:start_session()
+        error("a start without tools is a production bug, not a test path")
+      end
+      local S = { view = { team = fake_team }, sess = { current = session, all = { s1 = session, s2 = created } } }
+      local flow = TeamStart.new({
+        state = function()
+          return S
+        end,
+        config = function()
+          return {
+            backend = "service",
+            cwd = cwd,
+            teams = { enabled = true, default = "default", session_default = false },
+          }
+        end,
+        notify = function(message)
+          notices[#notices + 1] = tostring(message)
+        end,
+        resolve_cwd = function()
+          return cwd
+        end,
+        open = function() end,
+        new_session = function(opts)
+          new_sessions = new_sessions + 1
+          S.sess.current = created
+          if opts and opts.on_created then
+            opts.on_created(created)
+          end
+        end,
+        connect = function() end,
+        pick_agent = function() end,
+        options = function()
+          return nil
+        end,
+        client = function()
+          return { proc = { instance = "i1" } }
+        end,
+        generation = function()
+          return 0
+        end,
+        report_error = function(value)
+          return type(value) == "table" and tostring(value.data and value.data.reason or value.message or value.code)
+            or tostring(value)
+        end,
+        choices = function()
+          return nil
+        end,
+        find_session = function(id)
+          return S.sess.all[id]
+        end,
+        select_session = function() end,
+        submit = function(text, target)
+          submitted[#submitted + 1] = { text = text, id = target and target.id }
+        end,
+      })
+      local original_select, original_input = vim.ui.select, vim.ui.input
+      vim.ui.select = function(items, _, cb)
+        cb(items[1])
+      end
+      vim.ui.input = function(_, cb)
+        cb("")
+      end
+      t.cleanup(function()
+        vim.ui.select, vim.ui.input = original_select, original_input
+      end)
+      flow:start("default")
+      wait_idle(flow)
+      t.eq(0, new_sessions, "no replacement session is created")
+      t.eq(0, #submitted, "the summary is not handed over")
+      local text = table.concat(notices, "\n")
+      t.match("session_default", text)
+      t.match("cannot reload", text)
+    end)
 
     -- The leader-model write is addressed to the start target and the client
-    -- that served it (review round 2, item 12). The production `Options:apply`
-    -- still refuses a session object that is no longer `current`
-    -- (`lua/ade/app/options.lua:38–46,73–77`), which is what makes an in-place
-    -- reload lose the write; that part is reported, not pinned here.
+    -- that served it (review round 2, item 12). Production uses
+    -- `Options:set_for`, which fences on the client/generation but not on the
+    -- UI selection, so a chat switch (or an in-place reload's new projection)
+    -- does not drop it.
     t.it("applies the leader model to the session the workflow started in", function()
       local cwd = base_cwd("leader-model")
       local session = { id = "s1", cwd = cwd, instance = "i1", blocks = {}, controls = nil }
@@ -580,7 +573,7 @@ return function(t)
       end
       local S = { view = { team = fake_team }, sess = { current = session, all = { s1 = session } } }
       local options = {
-        apply = function(_, control, model, client, generation, target)
+        set_for = function(_, control, model, client, generation, target, cb)
           applied[#applied + 1] = {
             control = control and control.id,
             model = model,
@@ -588,6 +581,10 @@ return function(t)
             generation = generation,
             target = target and target.id,
           }
+          if cb then
+            cb(true, nil)
+          end
+          return true
         end,
       }
       local flow = TeamStart.new({

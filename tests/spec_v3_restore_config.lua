@@ -330,9 +330,15 @@ return function(t)
       local frames = sent_frames(service, "session/new")
       t.eq(1, #frames, "exactly one session/new")
       t.eq(0, #(frames[1].params.mcpServers or {}), "a refused configure injects nothing")
+      -- The notice must not promise "no tools": the service may keep a
+      -- configuration it already holds for this cwd, so the session may still
+      -- get them. It says the configuration did not apply.
       wait(function()
-        return joined(notices):find("will not get team tools", 1, true) ~= nil
+        return joined(notices):find("team configuration did not apply", 1, true) ~= nil
       end, 5000, "the refused-configure notice")
+      wait(function()
+        return joined(notices):find("may not get team tools", 1, true) ~= nil
+      end, 5000, "the refused-configure caveat")
       t.match("invalid configuration", joined(notices))
     end)
 

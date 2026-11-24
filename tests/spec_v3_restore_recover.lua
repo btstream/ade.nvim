@@ -517,26 +517,22 @@ return function(t)
     -- cwd that already has a team. An empty project therefore never satisfies
     -- the condition, no matter how often the snapshot or `injected` arrives.
     -- `lua/ade/app/team.lua:925–978,1011–1025,1052–1054`.
-    t.pending(
-      "starts the configured workflow once for a current opt-in session with no team",
-      "lua/ade/app/team.lua: _maybe_auto_start needs list_by_cwd[cwd], which is never set for a cwd without a team",
-      function()
-        local service, dir = start_service(t, "auto-start")
-        setup(t, dir, { teams = auto_teams })
-        controller.connect()
-        wait_ready()
-        wait(function()
-          return #service.team_starts == 1
-        end, 15000, "the enabled workflow")
-        t.eq("dev", service.team_starts[1].workflow)
-        t.eq(nil, service.team_starts[1].task)
-        t.truthy(service.team_starts[1].sessionId, "the start names the current session")
-        -- A second snapshot for the same session must not start it again.
-        team():refresh()
-        vim.wait(300)
-        t.eq(1, #service.team_starts, "the workflow starts only once per session")
-      end
-    )
+    t.it("starts the configured workflow once for a current opt-in session with no team", function()
+      local service, dir = start_service(t, "auto-start")
+      setup(t, dir, { teams = auto_teams })
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #service.team_starts == 1
+      end, 15000, "the enabled workflow")
+      t.eq("dev", service.team_starts[1].workflow)
+      t.eq(nil, service.team_starts[1].task)
+      t.truthy(service.team_starts[1].sessionId, "the start names the current session")
+      -- A second snapshot for the same session must not start it again.
+      team():refresh()
+      vim.wait(300)
+      t.eq(1, #service.team_starts, "the workflow starts only once per session")
+    end)
 
     t.it("does not auto-start just because teams are enabled", function()
       local service, dir = start_service(t, "auto-off")
@@ -555,23 +551,19 @@ return function(t)
 
     -- Same production bug: a late `session.teams_changed` with `injected: true`
     -- re-runs `_maybe_auto_start`, which still finds no `list_by_cwd[cwd]` entry.
-    t.pending(
-      "does not start twice when the injected state arrives late",
-      "lua/ade/app/team.lua: the empty-project auto-start gate never opens, so no first start exists",
-      function()
-        local service, dir = start_service(t, "auto-late")
-        setup(t, dir, { teams = auto_teams })
-        controller.connect()
-        wait_ready()
-        wait(function()
-          return #service.team_starts == 1
-        end, 15000, "the first auto start")
-        local instance = own_instance()
-        service:emit_session_teams(instance, state().sess.current.id)
-        vim.wait(300)
-        t.eq(1, #service.team_starts)
-      end
-    )
+    t.it("does not start twice when the injected state arrives late", function()
+      local service, dir = start_service(t, "auto-late")
+      setup(t, dir, { teams = auto_teams })
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #service.team_starts == 1
+      end, 15000, "the first auto start")
+      local instance = own_instance()
+      service:emit_session_teams(instance, state().sess.current.id)
+      vim.wait(300)
+      t.eq(1, #service.team_starts)
+    end)
 
     t.it("does not auto-start when the session already leads a team", function()
       local service, dir = start_service(t, "auto-led")
@@ -592,6 +584,12 @@ return function(t)
       wait(function()
         return #calls_of(service, "session.teams") >= 1
       end, 5000, "the session's switch")
+      -- The opt-in session's own switch event legitimately auto-starts once;
+      -- let that settle so the baseline below covers only the tree's read.
+      wait(function()
+        return #service.team_starts >= 1
+      end, 15000, "the session's own auto-start")
+      vim.wait(200)
       local starts = #service.team_starts
       -- Browsing the tree of another instance's session reads its switch and
       -- must not create a team or start a workflow.
@@ -605,9 +603,11 @@ return function(t)
       end, 5000, "the foreign query")
       t.eq(true, seen.ok)
       vim.wait(300)
-      t.eq(starts, #service.team_starts)
+      t.eq(starts, #service.team_starts, "a read never starts another workflow")
       t.eq(before, #calls_of(service, "team.start"))
-      t.eq(nil, team():team_for_cwd(dir), "a query does not create a team")
+      for _, start in ipairs(service.team_starts) do
+        t.truthy(start.sessionId ~= "s-other", "the read session is never the start target")
+      end
       -- A `session.teams_changed` for a session that is not on screen is also a
       -- read: it must not auto-start anything.
       service:emit_session_teams("inst-other", "s-other")

@@ -995,6 +995,11 @@ function Dashboard:handle_tree_key(key, info)
     -- previous selection) points at. The target is passed explicitly, so the
     -- pin cannot leak into `:Ade team board`.
     local team_id = info.team_row and info.team_row.id or (type(info.team) == "table" and info.team.id) or nil
+    if not team_id and info.cwd then
+      -- The project header row names a cwd, not a team.
+      local row = self.team:team_for_cwd(info.cwd)
+      team_id = row and row.id or nil
+    end
     self:open("board", { team = team_id })
     return true
   end
@@ -1066,7 +1071,9 @@ function Dashboard:handle_tree_key(key, info)
       return true
     end
     if self.start_team then
-      self:start_team(nil, session)
+      -- A plain injected function, not a method: pass the row's session as its
+      -- target and leave the UI selection alone.
+      self.start_team(nil, session)
     end
     return true
   end

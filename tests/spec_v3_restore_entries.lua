@@ -307,75 +307,67 @@ return function(t)
     -- the dashboard becomes the workflow name and the row's session is dropped
     -- (`lua/ade/ui/team/init.lua:1023–1025`; the flow then reports
     -- "unknown workflow table: 0x…").
-    t.pending(
-      "`S` starts in the row's session, not the current one",
-      "lua/ade/ui/team/init.lua:1024 `self:start_team(nil, session)` passes the dashboard as the workflow and drops the session",
-      function()
-        local service, dir = start_service(t, "tree-start")
-        setup(t, dir, {
-          teams = {
-            max_workers = 3,
-            spawn_confirm = { auto = {} },
-            templates = {},
-            dashboard = { wide = 100 },
-            workflows = { dev = { summary = "dev", team = { { name = "w1", template = "worker" } } } },
-          },
-        })
-        controller.connect()
-        wait_ready()
-        local current = state().sess.current
-        local other = add_session("s-other", dir, own_instance())
-        other.needs_load = false
-        other.status = "idle"
-        local UI = open_tree()
-        cursor_on("s-other")
-        local original_select, original_input = vim.ui.select, vim.ui.input
-        t.cleanup(function()
-          vim.ui.select, vim.ui.input = original_select, original_input
-        end)
-        vim.ui.select = function(items, _, cb)
-          cb(items[1])
-        end
-        vim.ui.input = function(_, cb)
-          cb("row task")
-        end
-        UI:handle_key("S")
-        wait(function()
-          return #calls_of(service, "team.start") == 1
-        end, 10000, "the start from the row")
-        local start = calls_of(service, "team.start")[1].params
-        t.eq("s-other", start.sessionId, "the row's session is the start target")
-        t.eq(own_instance(), start.instance)
-        t.eq("row task", start.task)
-        t.eq(current, state().sess.current, "starting elsewhere does not switch the chat")
+    t.it("`S` starts in the row's session, not the current one", function()
+      local service, dir = start_service(t, "tree-start")
+      setup(t, dir, {
+        teams = {
+          max_workers = 3,
+          spawn_confirm = { auto = {} },
+          templates = {},
+          dashboard = { wide = 100 },
+          workflows = { dev = { summary = "dev", team = { { name = "w1", template = "worker" } } } },
+        },
+      })
+      controller.connect()
+      wait_ready()
+      local current = state().sess.current
+      local other = add_session("s-other", dir, own_instance())
+      other.needs_load = false
+      other.status = "idle"
+      local UI = open_tree()
+      cursor_on("s-other")
+      local original_select, original_input = vim.ui.select, vim.ui.input
+      t.cleanup(function()
+        vim.ui.select, vim.ui.input = original_select, original_input
+      end)
+      vim.ui.select = function(items, _, cb)
+        cb(items[1])
       end
-    )
+      vim.ui.input = function(_, cb)
+        cb("row task")
+      end
+      UI:handle_key("S")
+      wait(function()
+        return #calls_of(service, "team.start") == 1
+      end, 10000, "the start from the row")
+      local start = calls_of(service, "team.start")[1].params
+      t.eq("s-other", start.sessionId, "the row's session is the start target")
+      t.eq(own_instance(), start.instance)
+      t.eq("row task", start.task)
+      t.eq(current, state().sess.current, "starting elsewhere does not switch the chat")
+    end)
 
     -- PRODUCTION BUG (review round 2, "树查询重新连接仍不可靠"): the renderer
     -- queries every row that has an instance and no cached switch, without
     -- checking `entry.online` (`lua/ade/ui/team/init.lua:373–395`). Opening the
     -- tree with a session from a service instance this editor is not connected
     -- to asks the service about it instead of leaving it alone.
-    t.pending(
-      "does not query the switch of an offline row",
-      "lua/ade/ui/team/init.lua: render_tree queries a row whose instance is not the live one",
-      function()
-        local service, dir = start_service(t, "tree-offline")
-        setup(t, dir)
-        controller.connect()
-        wait_ready()
-        add_session("s-other", dir, "inst-old")
-        local UI = open_tree()
-        wait(function()
-          return tree_line("s-other") ~= nil
-        end, 5000, "the foreign row")
-        vim.wait(200)
-        for _, call in ipairs(calls_of(service, "session.teams")) do
-          t.truthy(call.params.instance ~= "inst-old", "the old instance must never be queried")
-        end
-        _ = UI
+    t.it("does not query the switch of an offline row", function()
+      local service, dir = start_service(t, "tree-offline")
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      add_session("s-other", dir, "inst-old")
+      local UI = open_tree()
+      wait(function()
+        return tree_line("s-other") ~= nil
+      end, 5000, "the foreign row")
+      vim.wait(200)
+      for _, call in ipairs(calls_of(service, "session.teams")) do
+        t.truthy(call.params.instance ~= "inst-old", "the old instance must never be queried")
       end
-    )
+      _ = UI
+    end)
 
     t.it("queries a row once its own instance is live and marks its switch", function()
       local service, dir = start_service(t, "tree-instance")
@@ -414,48 +406,44 @@ return function(t)
     -- the row (`lua/ade/ui/team/init.lua:954–960`), but `open()` then overwrites
     -- `resolved_cwd` from the editor cwd and `board_team()` prefers the project
     -- cwd (`576–579`, `185–209`), so the pane resolves `t1` instead of `t2`.
-    t.pending(
-      "`b` on a row of another project opens that project's board",
-      "lua/ade/ui/team/init.lua:954–960 vs 576–579: open()/board_team() override the row's board target with the editor cwd",
-      function()
-        local other_dir = tmpdir("tree-board-other")
-        local service, dir = start_service(t, "tree-board", {
-          team_board = { rev = 1, columns = { "todo" }, cards = {} },
-        })
-        setup(t, dir)
-        controller.connect()
-        wait_ready()
-        seed_team(service, dir)
-        local other = {
-          id = "t2",
-          cwd = other_dir,
-          state = "active",
-          leader = { instance = "inst-other", sessionId = "s-other" },
-          participants = { { name = "leader", state = "idle" }, { name = "w9", state = "idle" } },
-          inbox = {},
-          limits = {},
-        }
-        service.teams.t2 = vim.deepcopy(other)
-        service:team_changed(other)
-        add_session("s-other", other_dir, "inst-other")
-        wait(function()
-          return team():team("t2") ~= nil
-        end, 5000, "the other project's team")
-        local UI = open_tree()
-        cursor_on(other_dir)
-        UI:handle_key("b")
-        wait(function()
-          return UI:is_open("board")
-        end, 5000, "the board pane")
-        vim.wait(150)
-        t.eq("t2", UI.board_selected_id, "the row's project is the board target")
-        -- `:Ade team board` keeps following the editor's cwd.
-        UI:close()
-        t.eq(true, controller.open_team("board"))
-        t.eq("t1", UI.board_selected_id)
-        UI:close()
-      end
-    )
+    t.it("`b` on a row of another project opens that project's board", function()
+      local other_dir = tmpdir("tree-board-other")
+      local service, dir = start_service(t, "tree-board", {
+        team_board = { rev = 1, columns = { "todo" }, cards = {} },
+      })
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      seed_team(service, dir)
+      local other = {
+        id = "t2",
+        cwd = other_dir,
+        state = "active",
+        leader = { instance = "inst-other", sessionId = "s-other" },
+        participants = { { name = "leader", state = "idle" }, { name = "w9", state = "idle" } },
+        inbox = {},
+        limits = {},
+      }
+      service.teams.t2 = vim.deepcopy(other)
+      service:team_changed(other)
+      add_session("s-other", other_dir, "inst-other")
+      wait(function()
+        return team():team("t2") ~= nil
+      end, 5000, "the other project's team")
+      local UI = open_tree()
+      cursor_on(other_dir)
+      UI:handle_key("b")
+      wait(function()
+        return UI:is_open("board")
+      end, 5000, "the board pane")
+      vim.wait(150)
+      t.eq("t2", UI.board_selected_id, "the row's project is the board target")
+      -- `:Ade team board` keeps following the editor's cwd.
+      UI:close()
+      t.eq(true, controller.open_team("board"))
+      t.eq("t1", UI.board_selected_id)
+      UI:close()
+    end)
 
     t.it("`x` on a non-leader row never closes the team", function()
       local service, dir = start_service(t, "tree-close-row")
