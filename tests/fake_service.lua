@@ -164,6 +164,15 @@ function M.new(opts)
     -- Answer ACP requests with canned replies instead of spawning a child. Used
     -- by tests about notifications, where a real agent would only add noise.
     canned_agent = opts.canned_agent == true,
+    -- The capabilities the canned agent advertises in its `initialize` reply.
+    -- Defaults to the historic `loadSession: true`; tests about the resume
+    -- fallback set a resume-only shape here.
+    canned_capabilities = opts.canned_capabilities,
+    -- A canned agent that also answers `session/resume` (the historic reply
+    -- table has no entry for it).
+    canned_resume = opts.canned_resume == true,
+    -- A canned `session/load` that fails with this JSON-RPC error.
+    canned_load_error = opts.canned_load_error,
     clients = {},
     instances = {},
     -- Instances whose stop was requested but whose exit has not been announced
@@ -1199,15 +1208,32 @@ function Server:on_tunnel_send(params, client)
   vim.schedule(function()
     if not instance.handler and self.canned_agent then
       -- A minimal ACP answerer: `initialize`, `session/new`, `session/prompt`.
+      local capabilities = self.canned_capabilities or { loadSession = true }
       local replies = {
-        initialize = { protocolVersion = 1, agentCapabilities = { loadSession = true }, authMethods = {} },
+        initialize = {
+          protocolVersion = 1,
+          agentCapabilities = vim.deepcopy(capabilities),
+          authMethods = {},
+        },
         ["session/new"] = { sessionId = "sess_mock", configOptions = {} },
         ["session/load"] = { configOptions = {} },
+        ["session/resume"] = { configOptions = {} },
         ["session/prompt"] = { stopReason = "end_turn" },
         ["session/close"] = {},
         ["session/delete"] = {},
       }
+      if not self.canned_resume then
+        replies["session/resume"] = nil
+      end
       local result = message.method and replies[message.method]
+      if message.method == "session/load" and self.canned_load_error and message.id ~= nil then
+        self:deliver(instance, {
+          jsonrpc = "2.0",
+          id = message.id,
+          error = vim.deepcopy(self.canned_load_error),
+        })
+        return
+      end
       if result and message.id ~= nil then
         -- Track session lifetimes exactly like the relay (PROTOCOL.md 11), and
         -- report them in the `agent.attach` shape (PROTOCOL.md 3.2): a test
