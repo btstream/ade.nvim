@@ -1836,3 +1836,173 @@ next line when given.
   a `notice` from `human` whose body is `"to <worker>: <body>"` (`task`
   copied; the `[card …]` prefix of 19.3 kept). Only `"leader"` is allowed in
   `cc`, and only when `to` is a worker (`-32060` otherwise).
+
+## 20. Teams v3: session tools, lazy teams, per-session switch (api_version 7)
+
+This section is normative and takes precedence over sections 18 and 19 where
+they disagree. It removes the coupling "creating a session = binding a team":
+every chat **can** start a team, but a team exists only once one is asked
+for. There is still at most one team per `cwd`.
+
+### 20.1 Removed
+
+- `team.leader_server` and `team.bind_leader` are gone (`-32601`). The front
+  end no longer puts anything into `mcpServers`; the service does (20.2).
+- `config.derived` (19.1) is gone and ignored if sent; the derived-config
+  fingerprints, the "chat by-product" take-over (19.1) and `pending_resume`
+  ordering between `team.configure` and a bind are gone.
+- A session that merely chats never creates a team, is never persisted as one
+  and never keeps the service from idle-exiting.
+
+### 20.2 Session tools (the service injects the MCP server)
+
+`team.configure {cwd, config}` gains `config.enabled` (boolean, default true)
+and `config.session_default` (boolean, default true). The front end calls
+`team.configure` for a cwd **before** its first session request in that cwd
+(and again when its setup changes). With no configuration for a cwd, or
+`enabled: false`, nothing below happens for that cwd.
+
+When a front end's `session/new`, `session/load` (forwarded, not emulated) or
+`session/resume` for an instance whose `key.cwd` has an enabled
+configuration passes through the relay, the service appends to
+`params.mcpServers` (creating the array if absent) the entry
+`{"name": "ade-team", "command": <absolute path of the service binary>,
+"args": ["mcp"], "env": [{"name": "ADE_TEAM_TOKEN", "value": <token>}]}`
+with a fresh **session token**. An entry already named `ade-team` in the
+request is replaced. Workers keep their own injection (18.3) and are never
+given a session token.
+
+- `session/load` / `session/resume`: the token is bound to `(instance,
+  sessionId)` immediately (the id is in the request).
+- `session/new`: the token is bound when the successful response arrives
+  (`result.sessionId`). A failed response revokes it.
+- A token is revoked when its session is closed/deleted or its instance
+  exits. Tokens are stored only as hashes (as in 18.6).
+
+An emulated `session/load` (section 12) never reaches the agent: the agent
+keeps the server it already has, and the existing binding stays valid.
+
+The MCP server's `hello` result now carries `participant {token_id, role,
+name, team}` where `role` is `"session"` for a session token; `name`/`team`
+are the session's current team role (`"leader"`, `t3`) or null. The role is
+re-evaluated at every `tools/list` and `tools/call`; parameters never choose it.
+
+### 20.3 Tools by state
+
+| Session state | `tools/list` |
+|---|---|
+| switch off (20.5) | empty |
+| not the leader of any team | `team_spawn`, `bus_status`, `workflow_get`, `workflow_save`, `workflow_delete` |
+| leader of its cwd's team | the full leader set (18.6, 19.10) plus `team_stop` (20.6) |
+
+`initialize` declares `capabilities: {"tools": {"listChanged": true}}`, and
+the MCP process sends `notifications/tools/list_changed` when the set
+changes (a team is created or closed for this session, leadership moves, the
+switch flips). Agents that ignore the notification still get a correct
+answer at call time: a tool not in the current set returns `isError: true`
+with a one-line reason (`teams are off for this chat`, `this chat does not
+lead the team`, ...).
+
+The base instructions (19.8) are now sent to **every** session token's
+`initialize`, unchanged in substance: build a team only when the person asks
+or agrees.
+
+### 20.4 Lazy team creation and the leader
+
+`Teams::ensure_team(instance, sessionId)` is the single path to a team:
+
+1. the session must hold a bound session token and its switch must be on
+   (`-32061`, `data.reason = "no_tools"` / `"off"`);
+2. no team for the cwd: a team is created with this session as leader and
+   the cwd's configuration (snapshot, as before);
+3. the cwd's team is led by this session: it is returned;
+4. otherwise `-32061` with `data = {reason: "led_by", team, leader:
+   {instance, sessionId}}`.
+
+When `config.templates` is empty the team gets one template named `worker`
+(the front end's `BUILTIN_TEMPLATE`) built by the service from the leader
+instance's own `key`, `env` and `launch` (as stored by `agent.attach`), with
+`worktree: true` and an empty role. Validation of a configuration with empty
+`templates` accepts `worker` in workflows and `spawn_confirm.auto`.
+
+Callers of `ensure_team`:
+
+- `bus.spawn` (`team_spawn`) from a session token. On `led_by` the service
+  creates an inbox item `{kind: "handover", team, from: {instance,
+  sessionId}, leader: {instance, sessionId}}` (answers `"move"` or
+  `"refuse"`, 18.5 rules) and the tool result is `isError: true`, text: the
+  team is led by another chat and the person was asked to hand it over.
+  `"move"` runs `team.set_leader` for the requesting session and sends it a
+  `notice`; `"refuse"` sends it a `notice` too.
+- `team.spawn` and `team.start` accept **either** `team` **or**
+  `{instance, sessionId}` (exactly one form, `-32060`); the second form calls
+  `ensure_team` first. Their results gain `team`.
+
+`team.set_leader {team, instance, sessionId}` `<- {}`: moves the leader of a
+live, leaderless or suspended team to that session. The session must be in
+the team's cwd, hold a bound session token and have its switch on
+(`-32061`, `data.reason` as in 20.4). The previous leader's tools fall back
+to the non-leader set; the new leader receives one `notice` from `human`
+with the base instructions and the current `bus_status` text. A suspended
+team is resumed by it (18.15 resume, with this session as leader).
+
+### 20.5 Per-session switch
+
+`session.teams {instance, sessionId, enabled?}` `<- {enabled, injected,
+leader: team|null}`:
+
+- without `enabled`: query only;
+- `enabled: false`: tools disappear for the session. If the session leads a
+  team the call fails with `-32061` `data.reason = "leads_team"` unless
+  `close: true` is also given, in which case the team is closed first
+  (`team.close`);
+- `enabled: true` and `injected: false` (the session was created before teams
+  were configured, under the direct backend, or the server process died):
+  the service performs an **in-place reload**: it sends the agent a real
+  `session/load` (when the agent advertised `loadSession`) or
+  `session/resume` (when it advertised `sessionCapabilities.resume`) for the
+  same session with `mcpServers` = the session's last known servers plus a
+  fresh `ade-team` entry. The agent's replay notifications are consumed by
+  the service: neither relayed nor recorded. The result is returned when the
+  agent answered. If neither capability exists: `-32061`,
+  `data.reason = "reload_unsupported"`.
+
+`injected` is true while a bound session token's MCP process is connected.
+The switch defaults to `config.session_default`, is stored per
+`(agent, sessionId)` in the service database, and survives restarts. Every
+change sends `session.teams_changed {instance, sessionId, enabled, injected,
+leader}` to every connection.
+
+### 20.6 Stopping one worker
+
+`team.stop_worker {team, name, remove?}` `<- {}`: stops a worker's instance
+(as on `team.close`); the participant becomes `exited` with reason `stopped`
+and its open items are orphaned. With `remove: true` the participant is also
+dropped from the team (its name becomes free again) after it exited; its
+worktree is kept (use `team.remove_worktree` first if wanted). `leader` and
+`human` are `-32060`; an unknown name `-32064`. The leader receives a
+`notice` (`worker <name> stopped by the person`).
+
+Leader tool `team_stop {name, remove?}` → `bus.stop_worker`, same rules,
+no notice to itself.
+
+### 20.7 Recovery
+
+A stored team is resumed when a session token is bound (20.2) to its stored
+leader `sessionId` for the same agent and the cwd has a configuration. No
+ordering between `team.configure` and the session request matters: whichever
+comes second triggers the resume. A team stored for another agent stays
+suspended (`-32061` only on an explicit `team.set_leader`).
+
+### 20.8 Summary of method changes
+
+| Method | Change |
+|---|---|
+| `team.configure` | gains `enabled`, `session_default`; `derived` ignored |
+| `team.leader_server`, `team.bind_leader` | removed |
+| `team.spawn`, `team.start` | `team` or `{instance, sessionId}`; result gains `team` |
+| `team.set_leader` | new (20.4) |
+| `team.stop_worker` | new (20.6) |
+| `session.teams` | new (20.5); notification `session.teams_changed` |
+| `team.answer` | handles `handover` items (20.4) |
+| MCP | session role, `listChanged`, `team_stop` |
