@@ -623,16 +623,18 @@ class Editor:
         return wait_until(check, f"{self.label} {kind} inbox item", timeout)
 
     # -- panel --------------------------------------------------------------
-    def open_panel(self, timeout=WAIT):
+    def open_panel(self, kind=None, timeout=WAIT):
         # The inline choice component borrows the composer window, so make sure
         # the main UI (and its input window) exists before the panel opens.
         self.ensure_choice_mount()
 
         def check():
+            if kind:
+                return self.lua("return require('ade').open_team(...) == true", kind)
             return self.lua("return require('ade').open_team() == true")
 
         try:
-            return wait_until(check, f"{self.label} team panel")
+            return wait_until(check, f"{self.label} team panel {kind or ''}".strip())
         except Failure:
             raise Failure(f"{self.label}: :Ade team did not open with a team present")
 
@@ -1156,7 +1158,9 @@ def scenario_human_first(case):
     """6. A chat prompt cancels a running bus turn on the leader, then completes."""
     editor = case.editor("a", templates=template())
     editor.connect()
-    editor.first_team()
+    # v3 creates a team only when one is asked for: an ordinary chat is solo.
+    editor.submit("spawn-task:do [report]")
+    approve(editor, case, "do [report]")
     editor.open_panel()
     editor.panel_send("leader", "do [slow]")
     case.wait_agent_prompt("do [slow]", "the leader bus prompt")

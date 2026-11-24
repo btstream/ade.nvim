@@ -155,24 +155,35 @@ def wide_editor(editor):
 
 
 def panel_state(editor):
+    """The team panes as the current layout renders them.
+
+    v3 keeps the tree, members and board as independent panes inside the current
+    tabpage (no separate tabpage and no cooked tabline): each pane's buffer and
+    winbar are read directly.
+    """
     return editor.lua(
         """
         local st = require("ade.controller").state()
         local ui = st.view.team_ui
         if not ui then return { open = false } end
-        local out = { open = ui:is_open(), watch_open = ui.watch_buf ~= nil }
-        if ui.watch_buf and vim.api.nvim_buf_is_valid(ui.watch_buf) then
-          out.watch = vim.api.nvim_buf_get_lines(ui.watch_buf, 0, -1, false)
+        local layout = ui.layout
+        local function lines(name)
+          local buf = layout and layout:buf(name)
+          if buf then return vim.api.nvim_buf_get_lines(buf, 0, -1, false) end
+          return nil
         end
-        local impl = ui._impl
-        if impl and impl.tab and impl.tab:is_open() then
-          out.tab = true
-          out.members = vim.api.nvim_buf_get_lines(impl.tab.buffers.members, 0, -1, false)
-          out.board = vim.api.nvim_buf_get_lines(impl.tab.buffers.board, 0, -1, false)
-          out.title = vim.o.tabline
-        elseif ui.buf and vim.api.nvim_buf_is_valid(ui.buf) then
-          out.lines = vim.api.nvim_buf_get_lines(ui.buf, 0, -1, false)
+        local function header(name)
+          local win = layout and layout:win(name)
+          if win then return vim.api.nvim_get_option_value("winbar", { win = win }) end
+          return nil
         end
+        local out = { open = ui:is_open() }
+        out.members_open = layout and layout:is_open_pane("members") or false
+        out.board_open = layout and layout:is_open_pane("board") or false
+        out.tree_open = layout and layout:is_open_pane("tree") or false
+        out.members = lines("members")
+        out.board = lines("board")
+        out.title = header("members") or header("board") or ""
         return out
         """
     )
@@ -200,15 +211,11 @@ def cursor_id(editor, ident):
         local ident = ...
         local st = require("ade.controller").state()
         local ui = st.view.team_ui
-        local impl = ui._impl
+        local layout = ui.layout
         local panel = "members"
-        if ident:sub(1, 5) == "item:" then panel = "inbox"
+        if ident:sub(1, 5) == "item:" then panel = "members"
         elseif ident:sub(1, 5) == "card:" or ident:sub(1, 6) == "stage:" then panel = "board" end
-        local ids, win = ui.ids, ui.win
-        if impl and impl.tab and impl.tab:is_open() then
-          ids = impl.tab.ids[panel]
-          win = impl.tab.panels[panel]
-        end
+        local ids, win = layout.ids[panel], layout:win(panel)
         for line, id in pairs(ids or {}) do
           if id == ident then
             vim.api.nvim_set_current_win(win)
@@ -218,14 +225,15 @@ def cursor_id(editor, ident):
         end
         -- A board row with several cards has no single id; locate the card id
         -- in the rendered line and put the cursor on its cell.
-        if ident:sub(1, 5) == "card:" and impl and impl.tab and impl.tab:is_open() then
+        if ident:sub(1, 5) == "card:" and win then
           local card = ident:sub(6)
-          local lines = vim.api.nvim_buf_get_lines(impl.tab.buffers.board, 0, -1, false)
+          local buf = layout:buf("board")
+          local lines = buf and vim.api.nvim_buf_get_lines(buf, 0, -1, false) or {}
           for index, line in ipairs(lines) do
             local col = line:find(card, 1, true)
             if col then
-              vim.api.nvim_set_current_win(impl.tab.panels.board)
-              vim.api.nvim_win_set_cursor(impl.tab.panels.board, { index, col - 1 })
+              vim.api.nvim_set_current_win(win)
+              vim.api.nvim_win_set_cursor(win, { index, col - 1 })
               return true
             end
           end
@@ -298,16 +306,21 @@ def scenario_workflow_start(case):
     )
     got = board(editor)
     assert got["columns"] == ["todo", "doing"], got
-    editor.open_panel()
+    editor.open_panel("members")
     panel = wait_until(
-        lambda: (lambda value: value if value.get("tab") and any("w1" in line for line in value.get("members", [])) else None)(
+        lambda: (lambda value: value if value.get("members_open") and any("w1" in line for line in value.get("members") or []) else None)(
             panel_state(editor)
         ),
-        "the wide panel with members",
+        "the members pane with workers",
     )
-    assert "流程 dev" in (panel.get("title") or ""), panel
-    assert any("todo" in line or "doing" in line for line in panel["board"]), panel["board"]
-    return "a named workflow started two workers, notified the leader with the task, and showed the board"
+    assert any("w2" in line for line in panel["members"]), panel["members"]
+    editor.open_panel("board")
+    board_panel = wait_until(
+        lambda: (lambda value: value if value.get("board_open") and value.get("board") else None)(panel_state(editor)),
+        "the board pane",
+    )
+    assert any("todo" in line or "doing" in line for line in board_panel["board"]), board_panel["board"]
+    return "a named workflow started two workers, notified the leader with the task, and showed members and the board"
 
 
 def scenario_board_cards(case):
@@ -325,7 +338,7 @@ def scenario_board_cards(case):
     editor.wait_participant("w1", lambda entry: entry["state"] == "idle", "w1 idle")
     editor.submit("[board-create]")
     wait_until(lambda: (board(editor) or {}).get("rev") == 1, "the leader board")
-    editor.open_panel()
+    editor.open_panel("board")
     send_participant(editor, "w1", 'do [card-update {"card":"T1","body":"progress","fields":{"tests":"ok"}}]')
     wait_until(
         lambda: any(
@@ -365,6 +378,7 @@ def scenario_group_approve(case):
     editor.open_panel()
     editor.panel_press("!")
     wait_until(editor.choice_open, "the choice component")
+    # Two spawn requests approved together: the card offers the group action.
     editor.choice_pick("allow")
     editor.wait_participant("w1", lambda entry: entry["sessionId"] is not None, "w1 after allow")
     editor.wait_participant("w2", lambda entry: entry["sessionId"] is not None, "w2 after allow")
@@ -406,14 +420,35 @@ def scenario_watch_leader(case):
         lambda: editor.lua("local w=require('ade.controller').state().view.chat.win; return w ~= nil and vim.api.nvim_win_is_valid(w)"),
         "the original chat window",
     )
-    editor.open_panel()
+    editor.open_panel("members")
     cursor_id(editor, "t1|w1")
     editor.panel_press("<CR>")
-    first = wait_until(
-        lambda: (lambda value: value if value.get("watch_open") and any("Run cargo test" in line for line in value.get("watch", [])) else None)(
-            panel_state(editor)
+    # v3 shows a worker's transcript in the ordinary chat/composer pair; the
+    # watch state carries the replayed tool card.
+    wait_until(
+        lambda: base.normalize(editor.lua(
+            "return require('ade.controller').state().view.team.watching and require('ade.controller').state().view.team.watching.participant"
+        )) == "w1",
+        "the w1 watch",
+    )
+    # The watched worker's transcript (replay included) lives on
+    # `team.watching.session`; the ordinary chat shows it.
+    wait_until(
+        lambda: editor.lua(
+            """
+            local st = require("ade.controller").state()
+            local watch = st.view.team.watching
+            local session = watch and watch.session
+            if not session then return false end
+            for _, block in ipairs(session.blocks or {}) do
+              if block.kind == "tool" and tostring(block.title or ""):find("Run cargo test", 1, true) then
+                return true
+              end
+            end
+            return false
+            """
         ),
-        "the worker watch with a tool card",
+        "the replay to include the tool card",
     )
     cursor_id(editor, "t1|w2")
     editor.panel_press("<CR>")
@@ -423,21 +458,20 @@ def scenario_watch_leader(case):
     )
     cursor_id(editor, "t1|leader")
     editor.panel_press("<CR>")
-    old = editor.lua("return require('ade.controller').state().view.chat.win")
     got = wait_until(
         lambda: editor.lua(
             """
             local st = require("ade.controller").state()
-            local ui = st.view.team_ui
             local chat, input = st.view.chat, st.view.input
-            if not ui._impl or not ui._impl.tab or not ui._impl.tab:is_open() then return nil end
             if not chat.win or not input.win then return nil end
             if vim.api.nvim_win_get_buf(chat.win) ~= chat.buf then return nil end
             if vim.api.nvim_win_get_buf(input.win) ~= input.buf then return nil end
+            local watching = st.view.team.watching
+            if watching then return nil end
             return { chat = chat.win, input = input.win, tab = vim.api.nvim_get_current_tabpage() }
             """
         ),
-        "the leader chat in the right column",
+        "the leader chat back in the ordinary panel",
     )
     editor.lua(
         """
