@@ -44,8 +44,18 @@ function Commands:team()
   return S and S.view and S.view.team or nil
 end
 
+---The cwd commands act on: the current session's project.
+---
+---Both `:Ade team stop` and its completion resolve the target this way, so a
+---session left over from another project can never complete names from one
+---team and stop workers of another.
 ---@return string
 function Commands:cwd()
+  local S = self.deps.state()
+  local session = S and S.sess and S.sess.current or nil
+  if session and type(session.cwd) == "string" and session.cwd ~= "" then
+    return session.cwd
+  end
   local ok, cwd = pcall(self.deps.resolve_cwd)
   if ok and type(cwd) == "string" and cwd ~= "" then
     return cwd
@@ -55,8 +65,9 @@ function Commands:cwd()
 end
 
 ---@param workflow string|nil
-function Commands:start(workflow)
-  self.start_flow:start(workflow)
+---@param session table|nil
+function Commands:start(workflow, session)
+  self.start_flow:start(workflow, session)
 end
 
 ---The team of this cwd. Never another cwd's team: `:Ade team close` must not
@@ -71,14 +82,21 @@ function Commands:current_team()
 end
 
 ---The current session and its service instance.
+---
+---The instance is the one that owns the session (recorded when it was
+---created/loaded); the live client's instance is only a fallback for a session
+---we have not seen attached yet.
 ---@return table|nil session
 ---@return string|nil instance
 function Commands:context()
   local S = self.deps.state()
   local session = S and S.sess and S.sess.current or nil
+  if not session then
+    return nil, nil
+  end
   local client = self.deps.client and self.deps.client() or nil
-  local instance = client and client.proc and client.proc.instance or nil
-  return session, instance
+  local live = client and client.proc and client.proc.instance or nil
+  return session, session.instance or live
 end
 
 ---Turn teams on for the current session (`:Ade team on`).
@@ -92,6 +110,18 @@ function Commands:on()
   team:set_session_teams(instance, session.id, true, false, function(ok, value)
     if not ok then
       self.deps.notify("cannot turn teams on: " .. self.deps.report_error(value), vim.log.levels.WARN)
+    elseif type(value) == "table" and value.reload == true then
+      -- PROTOCOL.md 20.5: the front end runs the load that injects the tools.
+      team:reload_session(instance, session.id, function(reloaded, err)
+        if not reloaded then
+          self.deps.notify(
+            "cannot reload the session's team tools: " .. self.deps.report_error(err),
+            vim.log.levels.WARN
+          )
+        else
+          self.deps.notify("teams are on for this chat", vim.log.levels.INFO)
+        end
+      end)
     else
       self.deps.notify("teams are on for this chat", vim.log.levels.INFO)
     end
@@ -121,6 +151,14 @@ function Commands:off()
           return
         end
         self.deps.notify("cannot turn teams off: " .. self.deps.report_error(value), vim.log.levels.WARN)
+      elseif type(value) == "table" and value.reload == true then
+        team:reload_session(instance, session.id, function(reloaded, err)
+          if not reloaded then
+            self.deps.notify("cannot reload the session: " .. self.deps.report_error(err), vim.log.levels.WARN)
+          else
+            self.deps.notify("teams are off for this chat", vim.log.levels.INFO)
+          end
+        end)
       else
         self.deps.notify("teams are off for this chat", vim.log.levels.INFO)
       end

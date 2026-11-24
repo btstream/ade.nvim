@@ -37,7 +37,8 @@ Team.__index = Team
 ---  on_changed: fun(), on_inbox: fun(item: table)|nil,
 ---  on_watch: fun(session: table|nil, title: string|nil)|nil,
 ---  on_closed: fun(team_id: string)|nil,
----  runtime: fun(): table|nil}
+---  reload_session: (fun(instance: string, session_id: string, cb: fun(ok: boolean, value: any))|nil),
+---  runtime: fun(): table|nil, current: (fun(): table|nil)|nil}
 ---@return table
 function M.new(opts)
   local self = setmetatable({
@@ -52,18 +53,23 @@ function M.new(opts)
     on_closed = opts.on_closed,
     on_turn = opts.on_turn,
     get_runtime = opts.runtime,
+    current = opts.current,
+    reload_session_fn = opts.reload_session,
     teams = {},
     inbox = {},
     -- cwd -> the exact config sent (so a rebuild/hello can re-send it).
     sent_config = {},
     resolved_config = {},
-    configure_inflight = {},
+    configure_jobs = {},
     warned_skipped = {},
     -- cwd -> array of `team.list` entries, newest snapshot only.
     list_by_cwd = {},
     -- "instance\0sessionId" -> {enabled, injected, leader} from session.teams
     -- and `session.teams_changed`.
     session_states = {},
+    session_seq = {},
+    session_applied = {},
+    session_queries = {},
     -- cwd -> {instance, session_id, team} derived from a session state whose
     -- `leader` names a team (router/bootstrap read it).
     bound = {},
@@ -173,8 +179,8 @@ function Team:forget_connection()
       team.stale = true
     end
   end
-  local inflight_config = self.configure_inflight
-  self.configure_inflight = {}
+  local inflight_config = self.configure_jobs
+  self.configure_jobs = {}
   for _, entry in pairs(inflight_config or {}) do
     for _, waiter in ipairs(entry.waiters or {}) do
       pcall(waiter, false, "the service connection was lost")
@@ -182,6 +188,7 @@ function Team:forget_connection()
   end
   self.sent_config = {}
   self.session_states = {}
+  self.session_queries = {}
   self.bound = {}
   -- A board request that was in flight when the connection died may still
   -- call back; bumping its token makes that late reply a no-op while the next
@@ -294,6 +301,32 @@ function Team:leader_instance(cwd)
   local team = self:team_for_cwd(cwd)
   local leader = type(team) == "table" and type(team.leader) == "table" and team.leader or nil
   return leader and leader.instance or nil
+end
+
+---Whether `session` still leads a team, so it must not be closed as idle.
+---@param session table|nil
+---@return boolean
+function Team:leads_team(session)
+  if not session or type(session.id) ~= "string" then
+    return false
+  end
+  for _, team in pairs(self.teams) do
+    local leader = type(team) == "table" and type(team.leader) == "table" and team.leader or nil
+    if
+      leader
+      and leader.sessionId == session.id
+      and team.state ~= "closed"
+      and (leader.instance == nil or session.instance == nil or leader.instance == session.instance)
+    then
+      return true
+    end
+  end
+  for _, state in pairs(self.session_states) do
+    if type(state) == "table" and type(state.leader) == "table" and state.leader.sessionId == session.id then
+      return true
+    end
+  end
+  return false
 end
 
 ---The absolute directory the service creates worker worktrees under (18.12).
@@ -477,6 +510,11 @@ function Team:template_error(cwd)
 end
 
 ---Send `team.configure` for a cwd when the resolved config changed.
+---
+---Requests are serialized per cwd: a configuration that becomes ready while an
+---older one is in flight is sent afterwards, so the last request always carries
+---the newest configuration (PROTOCOL.md 20.2 needs the service to hold it
+---before the session request).
 ---@param cwd string
 ---@param force boolean|nil
 ---@param cb fun(ok: boolean, value: any)|nil
@@ -518,24 +556,49 @@ function Team:configure(cwd, force, cb)
     cb(false, "no usable team templates")
     return
   end
-  if not force and vim.deep_equal(config, self.sent_config[cwd]) then
-    cb(true, nil)
+  local job = self.configure_jobs[cwd]
+  if not job then
+    job = { waiters = {}, generation = 0 }
+    self.configure_jobs[cwd] = job
+  end
+  job.config = config
+  job.force = job.force == true or force == true
+  job.generation = job.generation + 1
+  job.waiters[#job.waiters + 1] = cb
+  self:_flush_configure(cwd)
+end
+
+---Send the newest queued configuration, once per in-flight request.
+---@param cwd string
+function Team:_flush_configure(cwd)
+  local job = self.configure_jobs[cwd]
+  if not job or job.inflight then
     return
   end
-  local inflight = self.configure_inflight[cwd]
-  if inflight then
-    -- Two hello listeners can race, and a session request arriving while the
-    -- hello configure is still in flight must wait for its real result before
-    -- the service can append the session token.
-    inflight.waiters[#inflight.waiters + 1] = cb
+  if not job.force and vim.deep_equal(job.config, self.sent_config[cwd]) then
+    self.configure_jobs[cwd] = nil
+    for _, waiter in ipairs(job.waiters) do
+      pcall(waiter, true, nil)
+    end
     return
   end
-  inflight = { waiters = { cb } }
-  self.configure_inflight[cwd] = inflight
   local raw = self:_raw()
+  if not raw then
+    self.configure_jobs[cwd] = nil
+    for _, waiter in ipairs(job.waiters) do
+      pcall(waiter, false, "teams are not available")
+    end
+    return
+  end
+  local config = job.config
+  job.inflight = true
+  job.force = false
+  job.sent_generation = job.generation
   raw:request_tracked("team.configure", { cwd = cwd, config = config }, function(ok, value)
-    if self.configure_inflight[cwd] == inflight then
-      self.configure_inflight[cwd] = nil
+    job.inflight = false
+    if self.configure_jobs[cwd] ~= job then
+      -- The connection was lost; its waiters were already told.
+      return
     end
     if ok then
       self.sent_config[cwd] = config
@@ -543,7 +606,13 @@ function Team:configure(cwd, force, cb)
       local message = type(value) == "table" and (value.message or value.code) or tostring(value)
       log.warn("team.configure failed: %s", tostring(message))
     end
-    for _, waiter in ipairs(inflight.waiters) do
+    if not vim.deep_equal(job.config, config) then
+      -- A newer configuration arrived while this one was in flight.
+      self:_flush_configure(cwd)
+      return
+    end
+    self.configure_jobs[cwd] = nil
+    for _, waiter in ipairs(job.waiters) do
       pcall(waiter, ok, value)
     end
   end)
@@ -563,17 +632,24 @@ end
 ---configuration must reach the service before it augments `mcpServers`.
 ---
 ---Blocks the session task through the async scope; a cached, unchanged
----configuration returns immediately.
+---configuration returns immediately. A failure is reported but never stops the
+---session request: the session simply gets no team tools (single chat).
 ---@param cwd string
-function Team:prepare(cwd)
+---@param client table|nil the client that will own the session
+function Team:prepare(cwd, client)
+  local attach_cwd = client and client.proc and client.proc.key and client.proc.key.cwd or cwd
   if not self:available() then
     return
   end
-  async.await(function(settled)
-    self:configure(cwd, false, function(ok, value)
-      settled(ok, value)
+  local ok, value = async.await(function(settled)
+    self:configure(attach_cwd, false, function(configured, err)
+      settled(configured, err)
     end)
   end)
+  if not ok then
+    local message = type(value) == "table" and (value.message or value.code) or tostring(value)
+    self.notify("this session will not get team tools: " .. tostring(message), vim.log.levels.WARN)
+  end
 end
 
 ---The known `session.teams` state of a session.
@@ -586,23 +662,50 @@ function Team:session_teams(instance, session_id)
   return type(state) == "table" and state or nil
 end
 
+---Whether the cached state of `(instance, sessionId)` can be acted on.
+---`nil` means "not known yet" and callers must query instead of assuming off.
+---@param instance string|nil
+---@param session_id string|nil
+---@return table|nil
+function Team:known_session_teams(instance, session_id)
+  return self:session_teams(instance, session_id)
+end
+
 ---Record one `session.teams` state and keep the router's leader shortcut warm.
+---
+---`seq` is the request generation for a reply: a reply older than one already
+---applied (a newer notification, or a newer request's reply) is ignored.
 ---@param instance string
 ---@param session_id string
 ---@param value table
-function Team:apply_session_teams(instance, session_id, value)
+---@param seq integer|nil
+function Team:apply_session_teams(instance, session_id, value, seq)
   local key = session_key(instance, session_id)
   if not key or type(value) ~= "table" then
     return
   end
+  local applied = self.session_applied[key] or 0
+  if seq ~= nil then
+    if applied > seq then
+      return
+    end
+  else
+    -- A notification or a locally applied switch is the newest word: bump the
+    -- generation so an outstanding query's reply cannot overwrite it.
+    local next_seq = math.max(applied, self.session_seq[key] or 0) + 1
+    self.session_seq[key] = next_seq
+    seq = next_seq
+  end
+  self.session_applied[key] = seq
   local state = {
     enabled = value.enabled == true,
     injected = value.injected == true,
     leader = type(value.leader) == "table" and value.leader or nil,
+    seq = seq,
   }
   self.session_states[key] = state
   for cwd, bound in pairs(self.bound) do
-    if bound.session_id == session_id then
+    if bound.session_id == session_id and bound.instance == instance then
       self.bound[cwd] = nil
     end
   end
@@ -612,6 +715,9 @@ function Team:apply_session_teams(instance, session_id, value)
       self.bound[cwd] = { instance = instance, session_id = session_id, team = state.leader.id }
     end
   end
+  -- Only the session on screen may auto-start, and only once its authoritative
+  -- team snapshot is in.
+  self:_maybe_auto_start(instance, session_id)
   self:changed()
 end
 
@@ -623,10 +729,18 @@ function Team:on_session_teams_changed(payload)
   self:apply_session_teams(payload.instance, payload.sessionId, payload)
 end
 
----Query the switch and leadership of one session.
+---@param key string
+---@return integer
+function Team:next_session_seq(key)
+  self.session_seq[key] = (self.session_seq[key] or 0) + 1
+  return self.session_seq[key]
+end
+
+---Query the switch and leadership of one session. Pure read: it never starts a
+---team, so browsing the tree cannot create one in the background.
 ---@param instance string|nil
 ---@param session_id string|nil
----@param cwd string|nil known cwd, for the auto-start decision
+---@param cwd string|nil known cwd, for the error text only
 ---@param cb fun(ok: boolean, value: any)|nil
 function Team:query_session_teams(instance, session_id, cwd, cb)
   cb = cb or function() end
@@ -635,12 +749,37 @@ function Team:query_session_teams(instance, session_id, cwd, cb)
     cb(false, "teams are not available")
     return
   end
+  local query = self.session_queries[key]
+  if not query then
+    query = { inflight = false, again = false }
+    self.session_queries[key] = query
+  end
+  if query.inflight then
+    query.again = true
+    query.waiters = query.waiters or {}
+    query.waiters[#query.waiters + 1] = cb
+    return
+  end
+  query.inflight = true
+  local seq = self:next_session_seq(key)
   self:_call("session.teams", { instance = instance, sessionId = session_id }, function(ok, value)
+    query.inflight = false
     if ok and type(value) == "table" then
-      self:apply_session_teams(instance, session_id, value)
-      self:maybe_auto_start(instance, session_id, cwd, value)
+      self:apply_session_teams(instance, session_id, value, seq)
+    elseif self.session_queries[key] == query then
+      -- A failed query must not poison the cache: a later attempt may retry.
+      self.session_queries[key] = nil
     end
     cb(ok, value)
+    for _, waiter in ipairs(query.waiters or {}) do
+      pcall(waiter, ok, value)
+    end
+    query.waiters = nil
+    local again = query.again
+    query.again = false
+    if again and self.session_queries[key] == query then
+      self:query_session_teams(instance, session_id, cwd, function() end)
+    end
   end)
 end
 
@@ -653,10 +792,14 @@ function Team:session_opened(instance, session_id, cwd)
     return
   end
   self:query_session_teams(instance, session_id, cwd, function() end)
-  pcall(require("ade.app.team_start").session_opened, instance, session_id, cwd)
 end
 
 ---Flip the per-session switch (PROTOCOL.md 20.5).
+---
+---`enabled: true` against a session whose tools were never injected answers
+---`reload: true`: the service marks the session one-shot forward and the front
+---end must run its normal load path (`Sessions:load`) to get the tools. The
+---`value` passed to `cb` carries that flag; `Team:reload_session` does the load.
 ---@param instance string
 ---@param session_id string
 ---@param enabled boolean
@@ -664,13 +807,20 @@ end
 ---@param cb fun(ok: boolean, value: any)|nil
 function Team:set_session_teams(instance, session_id, enabled, close, cb)
   cb = cb or function() end
+  local key = session_key(instance, session_id)
   local params = { instance = instance, sessionId = session_id, enabled = enabled }
   if close then
     params.close = true
   end
+  local seq = key and self:next_session_seq(key) or nil
   self:_call("session.teams", params, function(ok, value)
     if ok and type(value) == "table" then
-      self:apply_session_teams(instance, session_id, value)
+      -- `reload: true` means the service marked the session for a forwarded
+      -- load and its `injected` is not true yet; keep that in the cache so the
+      -- tree does not claim the tools are there.
+      if value.reload ~= true then
+        self:apply_session_teams(instance, session_id, value, seq)
+      end
     end
     -- A closed team disappears from the snapshot only after `team.changed`.
     if ok and close then
@@ -678,6 +828,35 @@ function Team:set_session_teams(instance, session_id, enabled, close, cb)
     end
     cb(ok, value)
   end)
+end
+
+---Run the front-end half of the in-place reload (PROTOCOL.md 20.5).
+---
+---The service marks the session one-shot forward and answers `reload: true`;
+---the load must be a real `session/load` (or `session/resume`) so the agent
+---replays and the injection happens. `Sessions:load` is the normal path: it
+---clears and re-renders the transcript, so the reload is visible, not a silent
+---flag flip.
+---@param instance string
+---@param session_id string
+---@param cb fun(ok: boolean, value: any)|nil
+function Team:reload_session(instance, session_id, cb)
+  cb = cb or function() end
+  if not self.reload_session_fn then
+    cb(false, "this front end cannot reload a session")
+    return
+  end
+  local ok, err = pcall(self.reload_session_fn, instance, session_id, function(reloaded, value)
+    if reloaded then
+      -- The load's own bind reports the fresh switch; query it so the cache
+      -- carries `injected: true` rather than the pre-load answer.
+      self:query_session_teams(instance, session_id, nil, function() end)
+    end
+    cb(reloaded, value)
+  end)
+  if not ok then
+    cb(false, tostring(err))
+  end
 end
 
 ---Move a team's leadership to a session (PROTOCOL.md 20.4).
@@ -734,19 +913,53 @@ function Team:start_session(instance, session_id, workflow, task, cb)
   )
 end
 
----Start the configured default workflow after a session's switch comes up on
----a cwd with no team yet. At most once per session.
+---Start the configured default workflow for the session on screen, once its
+---switch is on, tools are injected and the cwd has no team.
+---
+---Triggered only by current-session events (`session.teams_changed` or the
+---current session being opened), never by browsing the tree. The decision waits
+---for the cwd's authoritative `team.list` snapshot: an empty cache means "not
+---known yet", not "no team".
 ---@param instance string|nil
 ---@param session_id string|nil
----@param cwd string|nil
----@param value table the `session.teams` state
-function Team:maybe_auto_start(instance, session_id, cwd, value)
+function Team:_maybe_auto_start(instance, session_id)
   local cfg = self.config() or {}
   local teams = type(cfg.teams) == "table" and cfg.teams or {}
-  if teams.enabled == false or teams.auto_start ~= true or value.enabled ~= true or value.injected ~= true then
+  if teams.enabled == false or teams.auto_start ~= true then
     return
   end
-  if value.leader ~= nil or not cwd then
+  if self.auto_starting then
+    return
+  end
+  local function current()
+    if self.current then
+      local ok, session = pcall(self.current)
+      if ok then
+        return session
+      end
+    end
+    local runtime = self.get_runtime and self.get_runtime() or nil
+    return runtime and runtime.current or nil
+  end
+  local session = current()
+  if not session or session.id ~= session_id then
+    return
+  end
+  if instance and session.instance and session.instance ~= instance then
+    return
+  end
+  local key = session_key(instance, session_id)
+  local state = key and self.session_states[key] or nil
+  if not state or state.enabled ~= true or state.injected ~= true or state.leader ~= nil then
+    return
+  end
+  if not key or self.auto_started[key] then
+    return
+  end
+  local cwd = session.cwd
+  if not cwd or not self.list_by_cwd[cwd] then
+    -- The snapshot has not arrived yet; `refresh`/`team.list` completion will
+    -- re-run this decision.
     return
   end
   if self:team_for_cwd(cwd) then
@@ -755,17 +968,31 @@ function Team:maybe_auto_start(instance, session_id, cwd, value)
   if require("ade.app.team_start").active(cwd) then
     return
   end
-  local key = session_key(instance, session_id)
-  if not key or self.auto_started[key] then
-    return
-  end
   self.auto_started[key] = true
+  self.auto_starting = true
   local workflow = teams.default or "default"
   self:start_session(instance, session_id, workflow, nil, function(ok, err)
+    self.auto_starting = false
     if not ok then
       self.notify("could not start workflow " .. tostring(workflow) .. ": " .. M.error_text(err), vim.log.levels.WARN)
     end
   end)
+end
+
+---Re-evaluate auto-start with the state of the current session.
+function Team:_reconsider_auto_start()
+  local ok, session = pcall(function()
+    if self.current then
+      return self.current()
+    end
+    local runtime = self.get_runtime and self.get_runtime() or nil
+    return runtime and runtime.current or nil
+  end)
+  session = ok and session or nil
+  if not session then
+    return
+  end
+  self:_maybe_auto_start(session.instance, session.id)
 end
 
 ---Refresh the whole team list.
@@ -822,6 +1049,8 @@ function Team:refresh(cb)
           self.inbox[id] = item
         end
       end
+      -- The snapshot is authoritative now: a pending auto-start may decide.
+      self:_reconsider_auto_start()
       self:changed()
     else
       -- A failed refresh means the stored list can no longer be trusted.
@@ -1249,6 +1478,13 @@ function Team:forget_team(team_id)
   for bound_cwd, bound in pairs(self.bound) do
     if bound.team == team_id then
       self.bound[bound_cwd] = nil
+    end
+  end
+  -- Clear the cached leadership too: a switch notification may arrive after
+  -- `team.changed(closed)`, and a stale `leader` would ask to close it again.
+  for _, state in pairs(self.session_states) do
+    if type(state) == "table" and type(state.leader) == "table" and state.leader.id == team_id then
+      state.leader = nil
     end
   end
 end

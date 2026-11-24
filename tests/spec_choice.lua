@@ -776,5 +776,158 @@ return function(t)
       _ = cancelled
       close_window()
     end)
+
+    t.it("shows the handover inbox card with move and refuse, and answers through team.answer", function()
+      local win = window()
+      local answered = {}
+      local team = fake_team({
+        {
+          id = "h1",
+          team = "t1",
+          kind = "handover",
+          from = { instance = "i2", sessionId = "s9" },
+          leader = { instance = "i2", sessionId = "s9" },
+          state = "open",
+          body = "another chat leads",
+        },
+      })
+      team.answer = function(self, id, fields, cb)
+        answered[#answered + 1] = { id = id, fields = fields }
+        if cb then
+          cb(true, {})
+        end
+      end
+      local choices = Choices.new({
+        team = function()
+          return team
+        end,
+        interactions = function()
+          return nil
+        end,
+        notify = function() end,
+        input_win = function()
+          return win
+        end,
+        chat_win = function()
+          return win
+        end,
+        panel_visible = function()
+          return true
+        end,
+      })
+      t.eq({ question = 0, approval = 1 }, choices:pending_counts("t1"))
+      choices:refresh()
+      t.eq(true, choices.view:is_open(), "the handover card is shown")
+      local labels = {}
+      for _, option in ipairs(choices.view.model.questions[1].options) do
+        labels[#labels + 1] = option.label
+      end
+      t.truthy(table.concat(labels, "|"):match("移交"))
+      t.truthy(table.concat(labels, "|"):match("拒绝"))
+      choices.view:select(2)
+      choices.view:submit()
+      vim.wait(30)
+      t.eq(1, #answered)
+      t.eq("h1", answered[1].id)
+      t.eq("refuse", answered[1].fields.option)
+      t.eq(true, choices.handled["team:t1:h1"])
+      close_window()
+    end)
+
+    t.it("keeps a failed handover answer answerable", function()
+      local win = window()
+      local attempts = 0
+      local team = fake_team({
+        {
+          id = "h1",
+          team = "t1",
+          kind = "handover",
+          from = { instance = "i2", sessionId = "s9" },
+          leader = { instance = "i2", sessionId = "s9" },
+          state = "open",
+          body = "another chat leads",
+        },
+      })
+      team.answer = function(self, id, fields, cb)
+        attempts = attempts + 1
+        if cb then
+          cb(false, { message = "the request is gone" })
+        end
+      end
+      local notices = {}
+      local choices = Choices.new({
+        team = function()
+          return team
+        end,
+        interactions = function()
+          return nil
+        end,
+        notify = function(message)
+          notices[#notices + 1] = message
+        end,
+        input_win = function()
+          return win
+        end,
+        chat_win = function()
+          return win
+        end,
+        panel_visible = function()
+          return true
+        end,
+      })
+      choices:refresh()
+      local item = choices:team_entries("t1")[1]
+      choices:show(item, { item })
+      choices.view:select(1)
+      choices.view:submit()
+      vim.wait(30)
+      t.eq(1, attempts)
+      t.eq(nil, choices.handled["team:t1:h1"], "a failed answer is retryable")
+      t.match("cannot answer the handover", table.concat(notices, "\n"))
+      close_window()
+    end)
+
+    t.it("builds a card from Choices:ask instead of throwing", function()
+      local win = window()
+      local choices = Choices.new({
+        team = function()
+          return nil
+        end,
+        interactions = function()
+          return nil
+        end,
+        notify = function() end,
+        input_win = function()
+          return win
+        end,
+        chat_win = function()
+          return win
+        end,
+        panel_visible = function()
+          return true
+        end,
+      })
+      local picked
+      t.eq(
+        true,
+        choices:ask({
+          title = "团队已有 leader",
+          question = "交给本会话？",
+          options = {
+            { label = "移交", value = "move" },
+            { label = "取消", value = "cancel" },
+          },
+          on_choice = function(value)
+            picked = value
+          end,
+        })
+      )
+      t.eq(true, choices.view:is_open())
+      choices.view:select(1)
+      choices.view:submit()
+      vim.wait(20)
+      t.eq("move", picked)
+      close_window()
+    end)
   end)
 end

@@ -191,6 +191,16 @@ local function setup()
         -- removes) one worker, `leader` takes the lead and `close` ends the team
         -- (PROTOCOL.md 20).
         local action, argument = rest:match("^(%S+)%s*(.-)%s*$")
+        -- `:Ade team stop! w1` and `:Ade! team stop w1` mean the same thing.
+        local bang = args.bang == true
+        local stop_bang = false
+        if action then
+          local base, suffix = action:match("^(%a+)(!)$")
+          if base then
+            action, stop_bang = base, true
+          end
+        end
+        bang = bang or stop_bang
         if action == nil or action == "" then
           ade.open_team("tree")
         elseif action == "agents" then
@@ -208,7 +218,7 @@ local function setup()
         elseif action == "off" then
           ade.team_off()
         elseif action == "stop" then
-          ade.team_stop(argument ~= "" and argument or nil, args.bang)
+          ade.team_stop(argument ~= "" and argument or nil, bang)
         elseif action == "leader" then
           ade.team_leader()
         else

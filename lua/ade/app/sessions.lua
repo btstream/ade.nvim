@@ -78,26 +78,68 @@ end
 ---@param cwd string
 ---@param session_id string
 function Sessions:bind_team(client, cwd, session_id)
+  local instance = client and client.proc and client.proc.instance or nil
   if not self.after_session then
+    return instance
+  end
+  local runtime = self.get_runtime()
+  local session = runtime and runtime.sessions and runtime.sessions[session_id] or nil
+  if session and instance then
+    session.instance = instance
+  end
+  self.after_session(cwd, session_id, instance)
+  return instance
+end
+
+---Open a cached or released session the way `:Ade sessions` does.
+---
+---`<CR>` in the team tree must not merely set `current`: a released session has
+---to be loaded/replayed first, exactly as the normal picker would.
+---@param session table|nil
+---@param opts {on_failed: (fun(err: string)|nil)|nil}|nil
+function Sessions:open(session, opts)
+  opts = opts or {}
+  if not session then
     return
   end
-  local instance = client and client.proc and client.proc.instance or nil
-  self.after_session(cwd, session_id, instance)
+  local runtime = self.get_runtime()
+  local cached = runtime and runtime.sessions and runtime.sessions[session.id] or nil
+  if cached and not cached.needs_load and (cached.status ~= "idle" or #(cached.queue or {}) > 0) then
+    runtime:intend()
+    self.activate(cached)
+    self.dispatch_queued(cached)
+    return
+  end
+  self:load(session.id, { kind = "load", on_failed = opts.on_failed })
 end
 
 ---Request a new session from the agent.
 ---@param on_missing fun() invoked when there is no live connection
-function Sessions:create(on_missing)
+---@param opts {on_created: (fun(session: table)|nil)|nil, on_failed: (fun(err: string)|nil)|nil}|nil
+function Sessions:create(on_missing, opts)
+  opts = opts or {}
+  local failed = false
+  local function fail(message)
+    if failed then
+      return
+    end
+    failed = true
+    if opts.on_failed then
+      pcall(opts.on_failed, tostring(message))
+    end
+  end
   if not self:ready() then
     if on_missing then
       on_missing()
     end
+    fail("no agent process is running")
     return
   end
   local cwd = self.resolve_cwd()
   -- Guard against overlapping creations (e.g. a double `new_session` from a
   -- fast toggle): the last response would otherwise win and orphan a session.
   if self.creating then
+    fail("another session is already being created")
     return
   end
   self.creating = true
@@ -122,19 +164,25 @@ function Sessions:create(on_missing)
         return
       end
       local message = type(result) == "table" and (result.message or vim.inspect(result)) or tostring(result)
+      fail("unable to create a session: " .. message)
       self.notify("unable to create a session: " .. message, vim.log.levels.ERROR)
       return
     end
     if type(result) ~= "table" or type(result.sessionId) ~= "string" or result.sessionId == "" then
       runtime:drop_create(token)
+      fail("invalid session/new response")
       error("invalid session/new response")
     end
     self:bind_team(client, cwd, result.sessionId)
+    local instance = client and client.proc and client.proc.instance or nil
     local session, replayed = runtime:commit_create(token, result.sessionId, cwd, result)
     if not session then
       runtime:drop_create(token)
       session = self.new_local(result.sessionId, cwd, result)
       replayed = 0
+    end
+    if instance then
+      session.instance = instance
     end
     self.catalog:cwds()[session.id] = cwd
     if replayed > 0 then
@@ -146,8 +194,12 @@ function Sessions:create(on_missing)
     end
     self.notify("Session started", vim.log.levels.INFO)
     self.catalog:refresh_title(session)
+    if not failed and opts.on_created then
+      pcall(opts.on_created, session)
+    end
   end, function(err)
     runtime:drop_create(token)
+    fail("unable to create a session: " .. tostring(err))
     self.notify("unable to create a session: " .. tostring(err), vim.log.levels.ERROR)
   end, function(_, owned)
     -- Even an abandoned creation must release the guard: a reconnect cancels
@@ -159,6 +211,7 @@ function Sessions:create(on_missing)
     end
     if not owned then
       runtime:drop_create(token)
+      fail("the session creation was abandoned")
     end
   end)
 end
@@ -240,6 +293,7 @@ function Sessions:resume(session_id, opts)
       error("invalid session/resume response")
     end
     self:bind_team(client, cwd, session_id)
+    entry.instance = (client and client.proc and client.proc.instance) or entry.instance
     entry:configure(result)
     entry.needs_load = false
     if not runtime:commit(entry) then
@@ -348,6 +402,7 @@ function Sessions:replay(session_id, opts)
       error("invalid session/load response")
     end
     self:bind_team(client, cwd, session_id)
+    entry.instance = (client and client.proc and client.proc.instance) or entry.instance
     entry:configure(result)
     entry:finish_turn("end_turn")
     if not runtime:commit(entry) then
@@ -444,7 +499,7 @@ end
 ---automatic restore: the user must be able to tell "reopened your conversation"
 ---from "started a new one because X".
 ---@param session_id string
----@param opts {kind: string|nil, on_failed: fun(err: string)|nil, on_restored: fun()|nil}|nil
+---@param opts {kind: string|nil, reload: boolean|nil, on_failed: fun(err: string)|nil, on_restored: fun()|nil}|nil
 function Sessions:load(session_id, opts)
   opts = opts or {}
   local function failed(message)
@@ -459,7 +514,11 @@ function Sessions:load(session_id, opts)
   end
   local runtime = self.get_runtime()
   local cached = runtime.sessions[session_id]
-  if cached and not cached.needs_load and (cached.status ~= "idle" or #cached.queue > 0) then
+  -- A team reload must really reach the agent: the service marks one forwarded
+  -- load and injects the tools on it, so a cached, idle session cannot just be
+  -- re-activated here (PROTOCOL.md 20.5).
+  local forced = opts.reload == true or opts.kind == "reload"
+  if not forced and cached and not cached.needs_load and (cached.status ~= "idle" or #cached.queue > 0) then
     runtime:intend()
     self.activate(cached)
     self.dispatch_queued(cached)

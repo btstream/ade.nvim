@@ -14,6 +14,7 @@ return function(t)
     local session = {
       id = "s1",
       cwd = cwd,
+      instance = "i1",
       blocks = {
         { kind = "user", text = "fix the parser" },
         { kind = "assistant", text = "the parser is in lua/parser.lua" },
@@ -39,7 +40,15 @@ return function(t)
       return states[tostring(instance) .. "\0" .. tostring(id)]
     end
     function fake_team:query_session_teams(instance, id, _, cb)
-      cb(true, states[tostring(instance) .. "\0" .. tostring(id)])
+      local key = tostring(instance) .. "\0" .. tostring(id)
+      local state = states[key]
+      if not state then
+        -- A session the front end has not seen yet: the service answers with
+        -- its stored switch (here: the configured default).
+        state = { enabled = opts.enabled ~= false, injected = true }
+        states[key] = state
+      end
+      cb(true, state)
     end
     function fake_team:set_session_teams(instance, id, enabled, close, cb)
       calls.enables[#calls.enables + 1] = { instance = instance, id = id, enabled = enabled, close = close }
@@ -50,6 +59,12 @@ return function(t)
       end
       if enabled == true and opts.reload_unsupported and state.injected == false then
         cb(false, { code = -32061, data = { reason = "reload_unsupported" } })
+        return
+      end
+      if enabled == true and opts.reload and state.injected == false then
+        state.enabled = true
+        states[tostring(instance) .. "\0" .. tostring(id)] = state
+        cb(true, { enabled = true, injected = false, reload = true })
         return
       end
       state.enabled = enabled
@@ -74,6 +89,19 @@ return function(t)
     end
     function fake_team:team_for_cwd()
       return nil
+    end
+    function fake_team:reload_session(instance, id, cb)
+      calls.reloads = calls.reloads or {}
+      calls.reloads[#calls.reloads + 1] = { instance = instance, id = id }
+      if opts.reload_fails then
+        cb(false, "the agent refused the load")
+        return
+      end
+      local state = states[tostring(instance) .. "\0" .. tostring(id)] or {}
+      state.enabled = true
+      state.injected = true
+      states[tostring(instance) .. "\0" .. tostring(id)] = state
+      cb(true, { reloaded = true })
     end
 
     local choices = { asks = {} }
@@ -105,18 +133,20 @@ return function(t)
         return cwd
       end,
       open = function() end,
-      new_session = function()
+      new_session = function(o)
         calls.news = calls.news + 1
-        local new = { id = "s2", cwd = cwd, blocks = {} }
+        if opts.new_session_fails == true then
+          if o and o.on_failed then
+            o.on_failed("the agent refused")
+          end
+          return
+        end
+        local new = { id = "s2", cwd = cwd, blocks = {}, instance = "i1" }
         all.s2 = new
         S.sess.current = new
-        -- Mirror the front end: the service reports the new session, which
-        -- resumes a pending handover.
-        vim.schedule(function()
-          if opts.new_session_fails ~= true then
-            TeamStart.session_opened("i1", "s2", cwd)
-          end
-        end)
+        if o and o.on_created then
+          o.on_created(new)
+        end
       end,
       connect = function() end,
       pick_agent = function() end,
@@ -141,8 +171,9 @@ return function(t)
       select_session = function(target)
         calls.selected = target and target.id
       end,
-      submit = function(text)
+      submit = function(text, session)
         calls.submitted[#calls.submitted + 1] = text
+        calls.submitted_to = session and session.id or nil
       end,
     })
     return { flow = flow, calls = calls, states = states, choices = choices, all = all, cwd = cwd, session = session }
@@ -221,6 +252,67 @@ return function(t)
       t.eq(1, h.calls.news)
       t.eq("s2", h.calls.starts[1].id)
       t.truthy(h.calls.submitted[1] and h.calls.submitted[1]:match("fix the parser"), "the summary goes first")
+      t.eq("s2", h.calls.submitted_to, "the summary is addressed to the replacement session")
+    end)
+
+    t.it("runs the normal load when the service answers reload: true", function()
+      local h = harness(t, { tag = "reload-true", reload = true })
+      h.states["i1\0s1"] = { enabled = true, injected = false }
+      stub_ui(t, { task = "" })
+      h.flow:start("default")
+      wait_idle(h.flow)
+      t.eq(0, h.calls.news, "no replacement session: the load is in place")
+      t.eq(1, #(h.calls.reloads or {}))
+      t.eq("s1", h.calls.reloads[1].id)
+      t.eq(1, #h.calls.starts)
+      t.eq("s1", h.calls.starts[1].id)
+    end)
+
+    t.it("stops when the in-place reload fails", function()
+      local h = harness(t, { tag = "reload-broken", reload = true, reload_fails = true })
+      h.states["i1\0s1"] = { enabled = true, injected = false }
+      stub_ui(t, { task = "" })
+      local notices = {}
+      h.flow.deps.notify = function(message)
+        notices[#notices + 1] = tostring(message)
+      end
+      h.flow:start("default")
+      wait_idle(h.flow)
+      t.eq(1, #(h.calls.reloads or {}))
+      t.eq(0, #h.calls.starts, "no start after a failed reload")
+      t.truthy(table.concat(notices, "\n"):match("reload"))
+    end)
+
+    t.it("ends the flow when the replacement session cannot be created", function()
+      local h = harness(t, { tag = "reload-fails", reload_unsupported = true, new_session_fails = true })
+      h.states["i1\0s1"] = { enabled = true, injected = false }
+      stub_ui(t, {
+        task = "",
+        select = function(items)
+          return items[1]
+        end,
+      })
+      local notices = {}
+      h.flow.deps.notify = function(message)
+        notices[#notices + 1] = tostring(message)
+      end
+      h.flow:start("default")
+      wait_idle(h.flow)
+      t.eq(0, #h.calls.starts, "no start after a failed replacement")
+      t.truthy(table.concat(notices, "\n"):match("replacement session"))
+    end)
+
+    t.it("summarises agent replies as well as the person's", function()
+      local h = harness(t, { tag = "summary-agent" })
+      local summary = h.flow:summary({
+        blocks = {
+          { kind = "user", text = "do it" },
+          { kind = "agent", text = "done it" },
+          { kind = "assistant", text = "older reply" },
+        },
+      })
+      t.truthy(summary:match("done it"))
+      t.truthy(summary:match("older reply"))
     end)
 
     t.it("turns a led_by error into a choice and retries after the move", function()
@@ -258,12 +350,28 @@ return function(t)
       t.eq(0, #h.calls.starts)
     end)
 
-    t.it("starts on the session the tree selected", function()
+    t.it("starts in an explicitly passed session, not the current one", function()
       local h = harness(t, { tag = "selected" })
       stub_ui(t, { task = "" })
-      h.flow:start("default")
+      local target = { id = "s3", cwd = h.cwd, instance = "i1", blocks = {} }
+      h.all.s3 = target
+      h.flow:start("default", target)
       wait_idle(h.flow)
-      t.eq("s1", h.calls.starts[1].id)
+      t.eq("s3", h.calls.starts[1].id, "the passed session is the start target")
+    end)
+
+    t.it("refuses a target session whose instance is not the live one", function()
+      local h = harness(t, { tag = "foreign-instance" })
+      stub_ui(t, { task = "" })
+      local target = { id = "s4", cwd = h.cwd, instance = "i-other", blocks = {} }
+      h.all.s4 = target
+      local notices = {}
+      h.flow.deps.notify = function(message)
+        notices[#notices + 1] = tostring(message)
+      end
+      h.flow:start("default", target)
+      t.eq(0, #h.calls.starts)
+      t.truthy(table.concat(notices, "\n"):match("instance"))
     end)
   end)
 end

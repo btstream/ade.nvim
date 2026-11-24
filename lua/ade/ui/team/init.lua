@@ -35,7 +35,7 @@ end
 ---  leader_input: (fun(): table|nil)|nil, current_session: (fun(): table|nil)|nil,
 ---  find_session: (fun(id: string): table|nil)|nil, instance: (fun(): string|nil)|nil,
 ---  start_team: (fun(workflow: string, session: table|nil)|nil)|nil, select_session: (fun(session: table)|nil)|nil,
----  sessions: (fun(): table|nil)|nil}
+---  open_session: (fun(session: table)|nil)|nil, sessions: (fun(): table|nil)|nil}
 ---@return table
 function M.dashboard(opts)
   local self = setmetatable({
@@ -47,6 +47,7 @@ function M.dashboard(opts)
     current_session = opts.current_session,
     find_session = opts.find_session,
     select_session = opts.select_session,
+    open_session = opts.open_session,
     sessions = opts.sessions,
     instance_of = opts.instance,
     panel = opts.panel,
@@ -306,10 +307,15 @@ function Dashboard:render_pane(name)
 end
 
 ---Sessions grouped by project, each leader's workers beneath it.
+---
+---Every row carries its own service instance: a session belongs to the
+---instance that created/loaded it (`session.instance`, recorded by
+---`Sessions:bind_team`). The tree must never reuse the live client's instance
+---for a session that belongs to another one.
 ---@return table[]
 function Dashboard:tree_groups()
   local sessions = (self.sessions and self.sessions()) or {}
-  local instance = self.instance_of and self.instance_of() or nil
+  local live = self.instance_of and self.instance_of() or nil
   local by_cwd = {}
   local order = {}
   for _, session in pairs(sessions) do
@@ -318,8 +324,11 @@ function Dashboard:tree_groups()
       by_cwd[cwd] = {}
       order[#order + 1] = cwd
     end
+    local instance = session.instance or nil
     by_cwd[cwd][#by_cwd[cwd] + 1] = {
       session = session,
+      instance = instance,
+      online = instance ~= nil and live ~= nil and instance == live,
       switch = instance and self.team:session_teams(instance, session.id) or nil,
     }
   end
@@ -332,7 +341,11 @@ function Dashboard:tree_groups()
       for _, entry in ipairs(by_cwd[cwd]) do
         entry.team = row
         local leader = type(row.leader) == "table" and row.leader or nil
-        if leader and leader.sessionId == entry.session.id then
+        if
+          leader
+          and leader.sessionId == entry.session.id
+          and (leader.instance == nil or entry.instance == nil or leader.instance == entry.instance)
+        then
           entry.leader = true
           entry.workers = {}
           for _, participant in ipairs(row.participants or {}) do
@@ -361,17 +374,22 @@ function Dashboard:render_tree()
   local win = self.layout:win("tree")
   local width = win and math.max(20, vim.api.nvim_win_get_width(win)) or 60
   local groups = self:tree_groups()
-  -- Read every visible session's switch once, so `[team off]` is real data.
-  local instance = self.instance_of and self.instance_of() or nil
-  if instance then
-    for _, group in ipairs(groups) do
-      for _, entry in ipairs(group.sessions) do
-        if not entry.switch and not self.switch_queried[entry.session.id] then
-          self.switch_queried[entry.session.id] = true
-          self.team:query_session_teams(instance, entry.session.id, group.cwd, function()
-            self:schedule_refresh()
-          end)
-        end
+  -- Read each visible session's switch once its own instance is known, so
+  -- `[team off]` is real data and browsing never guesses an instance.
+  for _, group in ipairs(groups) do
+    for _, entry in ipairs(group.sessions) do
+      if
+        entry.instance
+        and not entry.switch
+        and not self.switch_queried[entry.instance .. "\0" .. entry.session.id]
+      then
+        self.switch_queried[entry.instance .. "\0" .. entry.session.id] = true
+        self.team:query_session_teams(entry.instance, entry.session.id, group.cwd, function(ok)
+          if not ok then
+            self.switch_queried[entry.instance .. "\0" .. entry.session.id] = nil
+          end
+          self:schedule_refresh()
+        end)
       end
     end
   end
@@ -909,18 +927,36 @@ function Dashboard:refuse_suspended(team)
   return false
 end
 
+---Why a tree action cannot act on this row, or nil when it can.
+---@param info table
+---@return string|nil
+function Dashboard:tree_blocked(info)
+  if not info.instance then
+    return "this session's service instance is unknown; open it once so the team layer learns it"
+  end
+  if info.online == false then
+    return "that session's service instance is not the one connected here"
+  end
+  return nil
+end
+
 ---@param key string
 ---@param info table cursor row metadata
 ---@return boolean handled
 function Dashboard:handle_tree_key(key, info)
   local kind = info.kind
   local session = info.session
-  local instance = self.instance_of and self.instance_of() or nil
+  local instance = info.instance
   if key == "help" then
     self:notify("tree: <CR> open · t teams on/off · x stop/close · L take the lead · S start · b board")
     return true
   end
   if key == "b" then
+    -- The board of the row's team, not whichever team was selected before.
+    if info.team then
+      self.board_selected_id = info.team.id
+      self.resolved_cwd = info.cwd
+    end
     self:open("board")
     return true
   end
@@ -929,106 +965,190 @@ function Dashboard:handle_tree_key(key, info)
       self.router:open(info.team, info.participant and info.participant.name)
       return true
     end
-    if kind == "tree_session" and session and self.select_session then
-      self.select_session(session)
-      return true
-    end
-    return true
-  end
-  if key == "S" then
     if kind == "tree_session" and session then
-      if self.start_team then
-        self.start_team(nil, session)
+      if self.open_session then
+        self.open_session(session)
+      elseif self.select_session then
+        self.select_session(session)
       end
       return true
     end
     return true
   end
   if kind == "tree_worker" then
-    if key == "x" and info.team and info.participant and instance then
-      self.team:stop_worker(info.team, info.participant.name, false, function(ok, value)
-        if not ok then
-          self:notify(
-            "cannot stop " .. tostring(info.participant.name) .. ": " .. tostring(value and value.message or value)
-          )
+    if key == "x" then
+      if info.team and info.participant then
+        local blocked = self:tree_blocked(info)
+        if blocked then
+          self:notify(blocked, vim.log.levels.WARN)
+          return true
         end
-      end)
+        self.team:stop_worker(info.team, info.participant.name, false, function(ok, value)
+          if not ok then
+            self:notify(
+              "cannot stop " .. tostring(info.participant.name) .. ": " .. tostring(value and value.message or value)
+            )
+          end
+        end)
+      end
       return true
     end
-    if key == "L" and info.team and session and instance then
-      self.team:set_leader(info.team, instance, session.id, function(ok, value)
-        if not ok then
-          self:notify("cannot move the lead: " .. tostring(value and value.message or value))
+    if key == "L" then
+      if info.team and session then
+        local blocked = self:tree_blocked(info)
+        if blocked then
+          self:notify(blocked, vim.log.levels.WARN)
+          return true
         end
-      end)
+        self.team:set_leader(info.team, instance, session.id, function(ok, value)
+          if not ok then
+            self:notify("cannot move the lead: " .. tostring(value and value.message or value))
+          end
+        end)
+      end
       return true
     end
-    return key == "t" and true or false
+    -- `t` is a session action; a worker row has none.
+    return key == "t" or key == "S"
   end
   if kind ~= "tree_session" or not session then
     return false
   end
-  if key == "t" and instance then
+  if key == "S" then
+    local blocked = self:tree_blocked(info)
+    if blocked then
+      self:notify(blocked, vim.log.levels.WARN)
+      return true
+    end
+    if self.start_team then
+      self:start_team(nil, session)
+    end
+    return true
+  end
+  if key == "t" then
+    local blocked = self:tree_blocked(info)
+    if blocked then
+      self:notify(blocked, vim.log.levels.WARN)
+      return true
+    end
     local state = info.switch
-    if state and state.enabled == false then
-      self.team:set_session_teams(instance, session.id, true, false, function(ok, value)
-        if not ok then
-          self:notify("cannot turn teams on: " .. tostring(value and value.message or value))
+    if not state then
+      -- Unknown is not "off": ask first, then act on the real answer.
+      self.team:query_session_teams(instance, session.id, info.cwd, function(ok, value)
+        if not ok or type(value) ~= "table" then
+          self:notify("cannot read the teams switch", vim.log.levels.WARN)
+          return
+        end
+        if value.enabled then
+          self:set_teams_off(info, session, instance, value)
+        else
+          self:set_teams_on(session, instance)
         end
       end)
       return true
     end
-    local function turn_off(close)
-      self.team:set_session_teams(instance, session.id, false, close, function(ok, value)
-        if not ok then
-          local data = type(value) == "table" and type(value.data) == "table" and value.data or {}
-          if data.reason == "leads_team" and not close then
-            presenter.confirm("This chat leads a team. Close it with the switch?", function(choice)
-              if choice == "yes" then
-                turn_off(true)
-              end
-            end)
-            return
-          end
-          self:notify("cannot turn teams off: " .. tostring(value and value.message or value))
-        end
-      end)
-    end
-    if info.leader then
-      presenter.confirm(
-        "Turn teams off and close team " .. tostring(info.team and info.team.id or "") .. "?",
-        function(choice)
-          if choice == "yes" then
-            turn_off(true)
-          end
-        end
-      )
+    if state.enabled == false then
+      self:set_teams_on(session, instance)
       return true
     end
-    turn_off(false)
+    self:set_teams_off(info, session, instance, state)
     return true
   end
-  if key == "L" and info.team and instance then
-    self.team:set_leader(info.team.id, instance, session.id, function(ok, value)
-      if not ok then
-        self:notify("cannot move the lead: " .. tostring(value and value.message or value))
+  if key == "L" then
+    if info.team then
+      local blocked = self:tree_blocked(info)
+      if blocked then
+        self:notify(blocked, vim.log.levels.WARN)
+        return true
       end
-    end)
+      self.team:set_leader(info.team.id, instance, session.id, function(ok, value)
+        if not ok then
+          self:notify("cannot move the lead: " .. tostring(value and value.message or value))
+        end
+      end)
+    end
     return true
   end
-  if key == "x" and info.team then
+  if key == "x" then
+    -- Only the leader row may close the team.
+    if not info.leader or not info.team then
+      self:notify("press x on the leader row to close the team, or on a worker to stop it", vim.log.levels.INFO)
+      return true
+    end
+    local blocked = self:tree_blocked(info)
+    if blocked then
+      self:notify(blocked, vim.log.levels.WARN)
+      return true
+    end
     presenter.confirm("Close team " .. tostring(info.team.id) .. "?", function(choice)
-      if choice == "yes" then
-        self.team:close(info.team.id, function(ok, value)
-          if not ok then
-            self:notify("cannot close the team: " .. tostring(value and value.message or value))
-          end
-        end)
+      if choice ~= "yes" then
+        return
       end
+      -- A pending start flow would otherwise rebuild the team it just closed.
+      require("ade.app.team_start").cancel_for(info.cwd)
+      self.team:close(info.team.id, function(ok, value)
+        if not ok then
+          self:notify("cannot close the team: " .. tostring(value and value.message or value))
+        end
+      end)
     end)
     return true
   end
   return false
+end
+
+---@param session table
+---@param instance string
+function Dashboard:set_teams_on(session, instance)
+  self.team:set_session_teams(instance, session.id, true, false, function(ok, value)
+    if not ok then
+      self:notify("cannot turn teams on: " .. tostring(value and value.message or value))
+      return
+    end
+    if type(value) == "table" and value.reload == true then
+      self.team:reload_session(instance, session.id, function(reloaded, err)
+        if not reloaded then
+          self:notify("cannot reload the session's team tools: " .. tostring(err and err.message or err))
+        end
+      end)
+    end
+  end)
+end
+
+---@param info table
+---@param session table
+---@param instance string
+---@param state table
+function Dashboard:set_teams_off(info, session, instance, state)
+  local function turn_off(close)
+    self.team:set_session_teams(instance, session.id, false, close, function(ok, value)
+      if not ok then
+        local data = type(value) == "table" and type(value.data) == "table" and value.data or {}
+        if data.reason == "leads_team" and not close then
+          presenter.confirm("This chat leads a team. Close it with the switch?", function(choice)
+            if choice == "yes" then
+              turn_off(true)
+            end
+          end)
+          return
+        end
+        self:notify("cannot turn teams off: " .. tostring(value and value.message or value))
+      end
+    end)
+  end
+  if state and state.leader then
+    presenter.confirm(
+      "Turn teams off and close team " .. tostring(state.leader.id or (info.team and info.team.id) or "") .. "?",
+      function(choice)
+        if choice == "yes" then
+          require("ade.app.team_start").cancel_for(info.cwd)
+          turn_off(true)
+        end
+      end
+    )
+    return
+  end
+  turn_off(false)
 end
 
 function Dashboard:handle_key(key)

@@ -325,7 +325,7 @@ class Editor:
         limits=None,
         max_workers=3,
         restore=True,
-        spawn_from_chat=None,
+        teams_enabled=None,
         idle_timeout=120,
         keep_alive=True,
         backend="service",
@@ -340,7 +340,7 @@ class Editor:
         self.limits = limits or {}
         self.max_workers = max_workers
         self.restore = restore
-        self.spawn_from_chat = spawn_from_chat
+        self.teams_enabled = teams_enabled
         self.idle_timeout = idle_timeout
         self.keep_alive = keep_alive
         self.backend = backend
@@ -390,9 +390,9 @@ class Editor:
         }
         if self.templates:
             teams["templates"] = self.templates
-        if self.spawn_from_chat is not None:
-            teams["enabled"] = self.spawn_from_chat
-            teams["session_default"] = self.spawn_from_chat
+        if self.teams_enabled is not None:
+            teams["enabled"] = self.teams_enabled
+            teams["session_default"] = self.teams_enabled
         opts = {
             "agent": "coder",
             "agents": {
@@ -1321,7 +1321,7 @@ def scenario_close(case):
 
 def scenario_single_agent(case):
     """10. Disabling chat spawn keeps the single-agent path."""
-    editor = case.editor("spawn-off", spawn_from_chat=False)
+    editor = case.editor("spawn-off", teams_enabled=False)
     editor.probe_team_calls()
     editor.connect()
     editor.submit("hello")
@@ -1375,38 +1375,59 @@ def scenario_default_team(case):
 
 
 def scenario_cold_team_start(case):
-    """12. The start command works before any agent or service is connected."""
+    """12. `:Ade team start` needs a session; with one it starts in place."""
     editor = case.editor("cold", use_team_defaults=True)
     editor.lua(
         """
+        _G.ade_e2e_notices = {}
+        local original = vim.notify
+        vim.notify = function(message, level)
+          _G.ade_e2e_notices[#_G.ade_e2e_notices + 1] = tostring(message)
+          return original(message, level)
+        end
+        return true
+        """
+    )
+    editor.lua(
+        """
+        vim.ui.select = function(items, opts, callback) callback(items[1]) end
         vim.ui.input = function(opts, callback)
           _G.ade_e2e_task_prompt = opts.prompt
           callback(nil)
         end
         vim.cmd("Ade team start")
+        return true
         """
     )
-    wait_until(lambda: editor.lua("return _G.ade_e2e_task_prompt"), "the default task prompt")
-    assert "default" in editor.lua("return _G.ade_e2e_task_prompt")
-    assert not case.agent_events(), "cancelling the task started an agent"
+    wait_until(
+        lambda: any("open session" in text for text in editor.lua("return _G.ade_e2e_notices") or []),
+        "the v3 explanation for a start without a session",
+    )
+    assert not case.agent_events(), "a refused start with no session started an agent"
+    assert not editor.lua("return _G.ade_e2e_task_prompt"), "no task prompt without a session"
 
+    # With a live session the command starts the workflow on it, in place.
+    editor.connect()
     editor.lua(
         """
-        vim.ui.input = function(_, callback)
-          callback("plan the cold start task")
+        vim.ui.select = function(items, opts, callback)
+          _G.ade_e2e_workflows = items
+          callback(items[1])
         end
-        vim.cmd("Ade team start")
+        vim.ui.input = function(_, callback) callback("plan the cold start task") end
+        return true
         """
     )
-    case.wait_agent_prompt("plan the cold start task")
+    editor.lua("require('ade.controller').start_team(); return true")
     editor.wait_team(
         lambda value: value["teams"] and any(
             team.get("workflow_name") == "default" for team in value["teams"].values()
         ),
         "the started default workflow",
     )
-    assert len([event for event in case.agent_events() if event.get("event") == "session"]) == 1
-    return "the bare command connected, selected default, and started the Leader only after task input"
+    sessions = [event for event in case.agent_events() if event.get("event") == "session"]
+    assert len(sessions) == 1, sessions
+    return "a bare start explains it needs a session; with one it starts the workflow there"
 
 
 SCENARIOS = [

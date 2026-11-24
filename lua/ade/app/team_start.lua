@@ -26,9 +26,6 @@ local active = {}
 ---cwd -> {flow, generation} for the flow that owns a start right now.
 local running = {}
 
----cwd -> a flow waiting for the replacement session it just asked for.
-local pending_new = {}
-
 ---Whether a start flow is running for `cwd`.
 ---@param cwd string
 ---@return boolean
@@ -48,35 +45,15 @@ function M.cancel_for(cwd)
   return true
 end
 
----A session was opened: continue a flow that asked for a replacement session.
----Called from `app/team.lua` after the service reports the new session.
----@param instance string
----@param session_id string
----@param cwd string|nil
-function M.session_opened(instance, session_id, cwd)
-  if type(cwd) ~= "string" then
-    return
-  end
-  local pending = pending_new[cwd]
-  if not pending then
-    return
-  end
-  pending_new[cwd] = nil
-  local flow = pending.flow
-  if not flow:alive(pending.generation) then
-    return
-  end
-  flow:handover(instance, session_id, pending)
-end
-
 ---@param deps {state: fun(): table, config: fun(): table, notify: fun(message: string, level: integer|nil),
----  resolve_cwd: fun(): string, open: fun(), new_session: fun(), connect: fun(),
+---  resolve_cwd: fun(): string, open: fun(),
+---  new_session: (fun(opts: table)|nil)|nil, connect: fun(),
 ---  pick_agent: fun(name: string)|nil, options: fun(): table|nil,
 ---  client: fun(): table|nil, generation: fun(): integer|nil,
 ---  report_error: fun(value: any), choices: (fun(): table|nil)|nil,
 ---  find_session: (fun(id: string): table|nil)|nil,
 ---  select_session: (fun(session: table)|nil)|nil,
----  submit: (fun(text: string)|nil)|nil}
+---  submit: (fun(text: string, session: table|nil)|nil)|nil}
 ---@return table
 function M.new(deps)
   return setmetatable({ deps = deps, starting = false, generation = 0, cwd = nil }, Flow)
@@ -115,14 +92,27 @@ function Flow:cwd()
 end
 
 ---The session the flow acts on, with its instance.
+---
+---`session` may be passed explicitly (the tree's `S` starts in the row's
+---session); otherwise the session on screen is used. The instance is the one
+---recorded for that session; a session owned by another (offline) instance is
+---refused instead of being addressed through the live one.
+---@param session table|nil
 ---@return table|nil session
 ---@return string|nil instance
-function Flow:context()
+function Flow:context(session)
   local S = self.deps.state()
-  local session = S and S.sess and S.sess.current or nil
+  session = session or (S and S.sess and S.sess.current) or nil
+  if not session then
+    return nil, nil
+  end
   local client = self.deps.client and self.deps.client() or nil
-  local instance = client and client.proc and client.proc.instance or nil
-  return session, instance
+  local live = client and client.proc and client.proc.instance or nil
+  local instance = session.instance
+  if instance and live and instance ~= live then
+    return session, nil
+  end
+  return session, instance or live
 end
 
 function Flow:available()
@@ -147,9 +137,6 @@ function Flow:finish()
   if state and state.flow == self and state.generation == self.registered_generation then
     running[cwd] = nil
     active[cwd] = nil
-  end
-  if pending_new[cwd] and pending_new[cwd].flow == self then
-    pending_new[cwd] = nil
   end
 end
 
@@ -176,7 +163,8 @@ end
 
 ---Entry point. `name` is a workflow name, or nil to select one.
 ---@param name string|nil
-function Flow:start(name)
+---@param target table|nil session to start in (the tree's `S`)
+function Flow:start(name, target)
   local cfg = self:config()
   local teams = cfg.teams or {}
   if teams.enabled == false then
@@ -187,9 +175,16 @@ function Flow:start(name)
     self:notify("team start requires the service backend", vim.log.levels.WARN)
     return
   end
-  local session, instance = self:context()
-  if not session or not instance then
+  local session, instance = self:context(target)
+  if not session then
     self:notify("team start requires an open session connected to the service", vim.log.levels.WARN)
+    return
+  end
+  if not instance then
+    self:notify(
+      "team start requires the service instance that owns that session; open it from the tree's service first",
+      vim.log.levels.WARN
+    )
     return
   end
   local cwd = session.cwd or self:cwd()
@@ -206,6 +201,10 @@ function Flow:start(name)
   self.starting = true
   self.cwd = cwd
   self.registered_generation = generation
+  -- The model switch after a successful start belongs to this session and
+  -- client, even if the person switches chats while `team.start` is in flight.
+  local client = self.deps.client and self.deps.client() or nil
+  self.target = { session = session, client = client }
   active[cwd] = true
   running[cwd] = { flow = self, generation = generation }
   self:load_workflows(name, session, instance, cwd, generation)
@@ -304,26 +303,27 @@ end
 ---@param instance string
 ---@param cwd string
 ---@param generation integer
-function Flow:check_switch(workflow, session, instance, cwd, generation)
+---@param queried boolean|nil
+function Flow:check_switch(workflow, session, instance, cwd, generation, queried)
   local team = self:team()
   local state = team and team:session_teams(instance, session.id) or nil
-  if not state then
+  if not state and not queried then
     team:query_session_teams(instance, session.id, cwd, function(ok, value)
       vim.schedule(function()
         if not self:alive(generation) then
           return
         end
-        if not ok then
+        if not ok or type(value) ~= "table" then
           self:finish()
           self:notify("cannot read the teams switch: " .. self.deps.report_error(value), vim.log.levels.WARN)
           return
         end
-        self:check_switch(workflow, session, instance, cwd, generation)
+        self:check_switch(workflow, session, instance, cwd, generation, true)
       end)
     end)
     return
   end
-  if state.enabled and state.injected ~= false then
+  if state and state.enabled and (state.injected ~= false) then
     self:ask_task(workflow, session, instance, cwd, generation)
     return
   end
@@ -335,11 +335,32 @@ function Flow:check_switch(workflow, session, instance, cwd, generation)
       if not ok then
         local data = type(value) == "table" and type(value.data) == "table" and value.data or {}
         if data.reason == "reload_unsupported" then
-          self:offer_new_session(workflow, session, cwd, generation)
+          self:offer_new_session(workflow, session, instance, cwd, generation)
           return
         end
         self:finish()
         self:notify("cannot enable teams for this session: " .. self.deps.report_error(value), vim.log.levels.WARN)
+        return
+      end
+      if type(value) == "table" and value.reload == true then
+        -- The service marked the session one-shot forward; the front end runs
+        -- the load that makes the agent replay and gets the tools injected.
+        team:reload_session(instance, session.id, function(reloaded, err)
+          vim.schedule(function()
+            if not self:alive(generation) then
+              return
+            end
+            if not reloaded then
+              self:finish()
+              self:notify(
+                "cannot reload the session's team tools: " .. self.deps.report_error(err),
+                vim.log.levels.WARN
+              )
+              return
+            end
+            self:ask_task(workflow, session, instance, cwd, generation)
+          end)
+        end)
         return
       end
       self:ask_task(workflow, session, instance, cwd, generation)
@@ -349,11 +370,16 @@ end
 
 ---A session that cannot reload has to be replaced; carry its conversation
 ---over as a summary.
+---
+---The replacement is bound to this exact `new_session` request: the flow only
+---continues from that request's success callback, and a failure ends the flow
+---with a message instead of leaving it waiting for some other session.
 ---@param workflow table
 ---@param session table
+---@param instance string
 ---@param cwd string
 ---@param generation integer
-function Flow:offer_new_session(workflow, session, cwd, generation)
+function Flow:offer_new_session(workflow, session, instance, cwd, generation)
   local accept = "open a new session and hand over a summary"
   local cancel = "cancel"
   vim.ui.select({ accept, cancel }, {
@@ -370,17 +396,33 @@ function Flow:offer_new_session(workflow, session, cwd, generation)
       return
     end
     local summary = self:summary(session)
-    pending_new[cwd] = {
-      flow = self,
-      generation = generation,
-      workflow = workflow,
-      cwd = cwd,
-      summary = summary,
-    }
     if self.deps.open then
       pcall(self.deps.open)
     end
-    pcall(self.deps.new_session)
+    if not self.deps.new_session then
+      self:finish()
+      self:notify("cannot open a replacement session here", vim.log.levels.WARN)
+      return
+    end
+    self.deps.new_session({
+      on_created = function(created)
+        vim.schedule(function()
+          if not self:alive(generation) then
+            return
+          end
+          self:handover(workflow, created, instance, cwd, generation, summary)
+        end)
+      end,
+      on_failed = function(message)
+        vim.schedule(function()
+          if not self:alive(generation) then
+            return
+          end
+          self:finish()
+          self:notify("cannot open the replacement session: " .. tostring(message), vim.log.levels.WARN)
+        end)
+      end,
+    })
   end)
 end
 
@@ -392,12 +434,13 @@ function Flow:summary(session)
   for index = #(session.blocks or {}), 1, -1 do
     local block = session.blocks[index]
     if type(block) == "table" and type(block.text) == "string" and block.text ~= "" then
-      if block.kind == "user" or block.kind == "assistant" then
+      if block.kind == "user" or block.kind == "agent" or block.kind == "assistant" then
         local text = vim.trim(block.text)
         if #text > 1200 then
           text = text:sub(1, 1200) .. "…"
         end
-        parts[#parts + 1] = (block.kind == "user" and "person: " or "assistant: ") .. text
+        local who = block.kind == "user" and "person: " or "assistant: "
+        parts[#parts + 1] = who .. text
       end
       if #parts >= 12 then
         break
@@ -414,18 +457,20 @@ function Flow:summary(session)
   return "交接摘要（来自上一会话）:\n" .. table.concat(out, "\n\n")
 end
 
----Continue in the replacement session: enable its teams, send the summary,
----ask the task and start.
+---Continue in the replacement session: enable its teams, send the summary
+---there, ask the task and start.
+---@param workflow table
+---@param session table the new session object from `new_session`'s callback
 ---@param instance string
----@param session_id string
----@param pending table
-function Flow:handover(instance, session_id, pending)
-  local generation = pending.generation
+---@param cwd string
+---@param generation integer
+---@param summary string|nil
+function Flow:handover(workflow, session, instance, cwd, generation, summary)
   local team = self:team()
-  if not team then
+  if not team or not session then
     return
   end
-  team:set_session_teams(instance, session_id, true, false, function(ok, value)
+  team:set_session_teams(instance, session.id, true, false, function(ok, value)
     vim.schedule(function()
       if not self:alive(generation) then
         return
@@ -435,17 +480,12 @@ function Flow:handover(instance, session_id, pending)
         self:notify("cannot enable teams in the new session: " .. self.deps.report_error(value), vim.log.levels.WARN)
         return
       end
-      if pending.summary and pending.summary ~= "" and self.deps.submit then
-        pcall(self.deps.submit, pending.summary)
+      if summary and summary ~= "" and self.deps.submit then
+        -- Always addressed to the replacement session: the person may have
+        -- switched elsewhere while the switch RPC was in flight.
+        pcall(self.deps.submit, summary, session)
       end
-      local S = self.deps.state()
-      local session = S and S.sess and S.sess.all and S.sess.all[session_id] or nil
-      if not session then
-        self:finish()
-        self:notify("the replacement session did not open", vim.log.levels.WARN)
-        return
-      end
-      self:ask_task(pending.workflow, session, instance, pending.cwd, generation)
+      self:ask_task(workflow, session, instance, cwd, generation)
     end)
   end)
 end
@@ -486,7 +526,7 @@ function Flow:launch(workflow, session, instance, cwd, generation, task, retried
         return
       end
       if ok then
-        self:apply_leader_model(workflow)
+        self:apply_leader_model(workflow, session, self.target and self.target.client or nil)
         self:finish()
         if self.deps.open_team then
           pcall(self.deps.open_team)
@@ -605,15 +645,20 @@ function Flow:offer_handover(value, workflow, session, instance, cwd, generation
 end
 
 ---Switch the leader's model when the workflow asks for one (2.6).
+---
+---Acts on the session the workflow was started in, with the client that served
+---that request: a slow reply must not retarget a chat the person switched to.
 ---@param workflow table
-function Flow:apply_leader_model(workflow)
+---@param session table|nil the start target
+---@param client table|nil
+function Flow:apply_leader_model(workflow, session, client)
   local leader = type(workflow.leader) == "table" and workflow.leader or {}
   local model = type(leader.model) == "string" and leader.model ~= "" and leader.model or nil
   if not model then
     return
   end
-  local S = self.deps.state()
-  local session = S and S.sess and S.sess.current or nil
+  session = session or (self.target and self.target.session)
+  client = client or (self.target and self.target.client)
   if not session then
     return
   end
@@ -636,10 +681,9 @@ function Flow:apply_leader_model(workflow)
     return
   end
   local options = self.deps.options and self.deps.options() or nil
-  if not options or type(options.apply) ~= "function" then
+  if not options or type(options.apply) ~= "function" or not client then
     return
   end
-  local client = self.deps.client and self.deps.client() or nil
   local generation = self.deps.generation and self.deps.generation() or 0
   options:apply(control, model, client, generation, session)
   self:notify("leader model switched to " .. model, vim.log.levels.INFO)

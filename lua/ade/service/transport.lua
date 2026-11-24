@@ -102,6 +102,14 @@ function M.spawn(opts)
     failed = nil,
   }, Channel)
   self.channel_id = string.format("%s-%d", self.agent_id, tostring(vim.uv.hrtime()))
+  -- The attach key, for callers that need the instance's cwd or agent identity
+  -- (the service fixes injection to `instance.key.cwd`).
+  self.key = {
+    agent = self.agent_id,
+    command = opts.command,
+    args = opts.args or {},
+    cwd = opts.cwd,
+  }
 
   connection:subscribe(self.channel_id, "tunnel.recv", function(payload)
     self:on_recv(payload)
@@ -117,12 +125,7 @@ function M.spawn(opts)
   end)
 
   local params = {
-    key = {
-      agent = self.agent_id,
-      command = opts.command,
-      args = opts.args or {},
-      cwd = opts.cwd,
-    },
+    key = self.key,
     client_capabilities = opts.client_capabilities or {},
     env = M.child_env(opts.env),
   }

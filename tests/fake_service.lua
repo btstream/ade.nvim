@@ -35,8 +35,8 @@ Server.__index = Server
 ---  install_fail?: boolean, install_log?: string, install_delay_ms?: integer,
 ---  install_busy?: boolean, uninstall_busy?: boolean, resolve_delay_ms?: integer,
 ---  policy_delay_ms?: integer, policy_error?: table,
----  teams?: table, team_watch?: table, team_read?: table, team_leader_error?: table,
----  team_bind_error?: table, team_participants?: table, team_spawn_warning?: string,
+---  teams?: table, team_watch?: table, team_read?: table,
+---  team_participants?: table, team_spawn_warning?: string,
 ---  team_spawn_error?: table, team_remove_result?: table, team_remove_error?: table,
 ---  team_start_error?: table, team_start_result?: table,
 ---  team_answer_group_error?: table, team_workflows?: table, team_workflows_error?: table,
@@ -50,6 +50,7 @@ Server.__index = Server
 ---  team_workflows_delay?: integer,
 ---  run_error?: table, uninstall_error?: table, canned_agent?: boolean,
 ---  session_reload_unsupported?: boolean|table<string, boolean>,
+---  team_answer_error?: table,
 ---  session_teams_default?: boolean}|nil
 ---@return FakeService
 function M.new(opts)
@@ -120,8 +121,6 @@ function M.new(opts)
     team_watch = opts.team_watch,
     team_read = opts.team_read,
     replay_inflight = false,
-    team_leader_error = opts.team_leader_error,
-    team_bind_error = opts.team_bind_error,
     team_participants = opts.team_participants,
     team_spawn_warning = opts.team_spawn_warning,
     team_spawn_error = opts.team_spawn_error,
@@ -130,8 +129,6 @@ function M.new(opts)
     team_configure_error = opts.team_configure_error,
     team_configure_delay = opts.team_configure_delay,
     team_list_error = opts.team_list_error,
-    team_resume_on_config = opts.team_resume_on_config == true,
-    pending_resume = nil,
     team_spawns = {},
     team_removals = {},
     team_resets = {},
@@ -156,6 +153,7 @@ function M.new(opts)
     team_board_delay = opts.team_board_delay or 5,
     team_card_history = opts.team_card_history,
     team_card_history_error = opts.team_card_history_error,
+    team_answer_error = opts.team_answer_error,
     session_teams_default = opts.session_teams_default ~= false and true or false,
     session_reload_unsupported = opts.session_reload_unsupported,
     -- "instance\0sessionId" -> {enabled, injected}
@@ -279,23 +277,6 @@ local function error_reply(ident, code, message, data)
   return { jsonrpc = "2.0", id = ident, error = payload }
 end
 
----Resume a stored team and publish the state/instance changes.
----@param team table
----@param instance string
----@param session_id string
-function Server:resume_team(team, instance, session_id)
-  team.state = "active"
-  team.suspended_at = nil
-  team.leader = { instance = instance, sessionId = session_id }
-  self:broadcast("team.changed", { team = vim.deepcopy(team) })
-  for _, participant in ipairs(team.participants or {}) do
-    if participant.state ~= "exited" then
-      participant.instance = "inst-resumed-" .. tostring(participant.name)
-    end
-    self:broadcast("team.changed", { team = vim.deepcopy(team) })
-  end
-end
-
 ---Publish a `team.board_changed` notification (19.2).
 ---@param team_id string
 ---@param rev integer
@@ -339,6 +320,22 @@ function Server:emit_session_teams(instance, session_id)
     injected = switch.injected,
     leader = leader and vim.deepcopy(leader) or nil,
   })
+end
+
+---PROTOCOL.md 20.7: a successful forwarded load/resume of the stored leader
+---session is the only thing that resumes a stored team.
+---@param instance string
+---@param session_id string
+function Server:resume_team_for_load(instance, session_id)
+  for _, team in pairs(self.teams) do
+    local leader = type(team.leader) == "table" and team.leader or nil
+    if team.state == "suspended" and leader and leader.sessionId == session_id and not leader.instance then
+      team.state = "active"
+      team.suspended_at = nil
+      team.leader = { instance = instance, sessionId = session_id }
+      self:broadcast("team.changed", { team = vim.deepcopy(team) })
+    end
+  end
 end
 
 ---@param message table
@@ -477,7 +474,19 @@ function Server:dispatch(message, client)
       if blocked then
         return error_reply(ident, -32061, "reload is unsupported", { reason = "reload_unsupported" })
       end
-      switch.injected = true
+      -- PROTOCOL.md 20.5: mark the session one-shot forward and ask the front
+      -- end to run its own load. Nothing is injected yet.
+      switch.enabled = true
+      self.session_force_forward = self.session_force_forward or {}
+      self.session_force_forward[key] = true
+      vim.defer_fn(function()
+        self:send(client, {
+          jsonrpc = "2.0",
+          id = ident,
+          result = { enabled = true, injected = false, reload = true, leader = leader or nil },
+        })
+      end, 5)
+      return nil
     end
     switch.enabled = true
     self.session_cwds = self.session_cwds or {}
@@ -553,127 +562,8 @@ function Server:dispatch(message, client)
       )
     end
     vim.defer_fn(function()
-      if self.pending_resume and self.pending_resume.team.cwd == params.cwd then
-        local pending = self.pending_resume
-        self.pending_resume = nil
-        self:resume_team(pending.team, pending.instance, pending.sessionId)
-      end
       self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
     end, self.team_configure_delay or 5)
-    return nil
-  end
-  if method == "team.leader_server" then
-    if self.team_leader_error then
-      return error_reply(ident, self.team_leader_error.code, self.team_leader_error.message)
-    end
-    for _, team in pairs(self.teams) do
-      if
-        team.cwd == params.cwd
-        and team.state ~= "closed"
-        and team.state ~= "suspended"
-        and team.leader
-        and team.leader.instance ~= params.instance
-      then
-        -- A leader-only team is what a chat session leaves behind: the service
-        -- allows another session to take it over, so the fake does too. A team
-        -- with any worker, card or inbox item still refuses.
-        local worked = false
-        for _, participant in ipairs(team.participants or {}) do
-          if participant.name ~= "leader" and participant.name ~= "human" then
-            worked = true
-          end
-        end
-        if #(team.inbox or {}) > 0 or (team.board_rev or 0) > 0 or team.workflow_name ~= nil then
-          worked = true
-        end
-        if worked then
-          return error_reply(ident, -32061, "a team already exists for this cwd")
-        end
-      end
-    end
-    local result = {
-      server = {
-        name = "ade-team",
-        command = "/fake/nvim_ade_server",
-        args = { "mcp" },
-        env = { { name = "ADE_TEAM_TOKEN", value = "k-test-token" } },
-      },
-      token_id = "k1",
-    }
-    vim.defer_fn(function()
-      self:send(client, { jsonrpc = "2.0", id = ident, result = result })
-    end, 5)
-    return nil
-  end
-  if method == "team.bind_leader" then
-    if self.team_bind_error then
-      return error_reply(ident, self.team_bind_error.code, self.team_bind_error.message)
-    end
-    self.team_binds[#self.team_binds + 1] = vim.deepcopy(params)
-    local existing = self.teams.t1
-    if existing and existing.state == "suspended" then
-      if existing.leader and existing.leader.sessionId ~= params.sessionId then
-        return error_reply(ident, -32061, "session does not match the suspended team")
-      end
-      if self.team_resume_on_config then
-        -- Simulate a bind that arrives before the configuration: the team
-        -- stays suspended until team.configure reaches the service.
-        self.pending_resume = {
-          team = existing,
-          instance = params.instance,
-          sessionId = params.sessionId,
-        }
-      else
-        self:resume_team(existing, params.instance, params.sessionId)
-      end
-      vim.defer_fn(function()
-        self:send(client, { jsonrpc = "2.0", id = ident, result = { team = self.teams.t1 } })
-      end, 5)
-      return nil
-    end
-    if existing and existing.leader and existing.leader.sessionId ~= params.sessionId then
-      local worked = false
-      for _, participant in ipairs(existing.participants or {}) do
-        if participant.name ~= "leader" and participant.name ~= "human" then
-          worked = true
-        end
-      end
-      if #(existing.inbox or {}) > 0 or (existing.board_rev or 0) > 0 or existing.workflow_name ~= nil then
-        worked = true
-      end
-      if worked then
-        return error_reply(ident, -32061, "another session leads this team")
-      end
-      -- A chat by-product: the new session takes the team over.
-      existing.leader = { instance = params.instance, sessionId = params.sessionId }
-      for _, participant in ipairs(existing.participants or {}) do
-        if participant.name == "leader" then
-          participant.instance = params.instance
-          participant.sessionId = params.sessionId
-        end
-      end
-      self:emit(client, "team.changed", { team = vim.deepcopy(existing) })
-    end
-    local team = existing
-    if not team then
-      -- The service gives every new team a fresh id; reusing `t1` after a
-      -- close would let a start flow mistake the replacement for the team it
-      -- just closed.
-      self.team_seq = (self.team_seq or 0) + 1
-      team = {
-        id = "t" .. self.team_seq,
-        cwd = self.team_cwd or "/",
-        state = "active",
-        leader = { instance = params.instance, sessionId = params.sessionId },
-        participants = vim.deepcopy(self.team_participants or {}),
-        inbox = {},
-        limits = { max_turns_per_task = 30, max_turns_total = 200, turns_total = 0 },
-      }
-      self.teams[team.id] = team
-    end
-    vim.defer_fn(function()
-      self:send(client, { jsonrpc = "2.0", id = ident, result = { team = team } })
-    end, 5)
     return nil
   end
   if method == "team.list" then
@@ -776,6 +666,9 @@ function Server:dispatch(message, client)
   end
   if method == "team.answer" then
     self.team_answers[#self.team_answers + 1] = vim.deepcopy(params)
+    if self.team_answer_error then
+      return error_reply(ident, self.team_answer_error.code, self.team_answer_error.message)
+    end
     vim.defer_fn(function()
       self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
     end, 5)
@@ -1416,11 +1309,26 @@ function Server:track_message(instance, message, result)
     put(params.sessionId)
     self.session_cwds = self.session_cwds or {}
     self.session_cwds[tostring(instance.id) .. "\0" .. params.sessionId] = cwd
-    self:switch_of(instance.id, params.sessionId)
+    local switch = self:switch_of(instance.id, params.sessionId)
+    local key = tostring(instance.id) .. "\0" .. params.sessionId
+    if self.session_force_forward and self.session_force_forward[key] then
+      -- PROTOCOL.md 20.5: the marked load forwards and injects.
+      self.session_force_forward[key] = nil
+      switch.injected = true
+      self:emit_session_teams(instance.id, params.sessionId)
+    end
+    self:resume_team_for_load(instance.id, params.sessionId)
   elseif method == "session/resume" and type(params.sessionId) == "string" then
     self.session_cwds = self.session_cwds or {}
     self.session_cwds[tostring(instance.id) .. "\0" .. params.sessionId] = cwd
-    self:switch_of(instance.id, params.sessionId)
+    local switch = self:switch_of(instance.id, params.sessionId)
+    local key = tostring(instance.id) .. "\0" .. params.sessionId
+    if self.session_force_forward and self.session_force_forward[key] then
+      self.session_force_forward[key] = nil
+      switch.injected = true
+      self:emit_session_teams(instance.id, params.sessionId)
+    end
+    self:resume_team_for_load(instance.id, params.sessionId)
   elseif (method == "session/close" or method == "session/delete") and params.sessionId ~= nil then
     forget(params.sessionId)
   end

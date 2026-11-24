@@ -260,7 +260,11 @@ function M.build(ctx, opts, action)
     end,
     select_session = function(session)
       if S.sess.service then
-        S.sess.service:activate(session)
+        S.sess.service:open(session, {
+          on_failed = function(message)
+            notify("cannot open that session: " .. tostring(message), vim.log.levels.WARN)
+          end,
+        })
       end
     end,
     input_win = function()
@@ -503,6 +507,31 @@ function M.build(ctx, opts, action)
     runtime = function()
       return S.sess.runtime
     end,
+    current = function()
+      return S.sess.current
+    end,
+    -- `session.teams {enabled:true}` answering `reload: true`: the front end
+    -- runs its normal load path so the agent replays under the new injection.
+    reload_session = function(instance, session_id, cb)
+      if not S.sess.service then
+        cb(false, "no session service")
+        return
+      end
+      local ok, err = pcall(S.sess.service.load, S.sess.service, session_id, {
+        kind = "reload",
+        reload = true,
+        on_restored = function()
+          cb(true, { reloaded = true })
+        end,
+        on_failed = function(message)
+          cb(false, message)
+        end,
+      })
+      if not ok then
+        cb(false, tostring(err))
+      end
+      local _ = instance
+    end,
     on_turn = function(session)
       if session == S.sess.current and S.view.chat then
         S.view.chat:schedule_render()
@@ -515,7 +544,11 @@ function M.build(ctx, opts, action)
     ctx.activate_session(session)
     if session and S.view.team then
       local client = S.conn.client
-      local instance = client and client.proc and client.proc.instance or nil
+      local live = client and client.proc and client.proc.instance or nil
+      local instance = session.instance or live
+      if instance and not session.instance then
+        session.instance = live
+      end
       S.view.team:session_opened(instance, session.id, session.cwd or ctx.resolve_cwd())
     end
   end
@@ -1051,6 +1084,22 @@ function M.build(ctx, opts, action)
       return nil
     end,
     select_session = activate_session,
+    -- The tree's `<CR>` opens a session the way `:Ade sessions` does: a released
+    -- or `needs_load` session is replayed first, not merely selected.
+    open_session = function(session)
+      if not session then
+        return
+      end
+      if S.sess.service then
+        S.sess.service:open(session, {
+          on_failed = function(message)
+            notify("cannot open that session: " .. tostring(message), vim.log.levels.WARN)
+          end,
+        })
+      else
+        activate_session(session)
+      end
+    end,
     instance = function()
       local client = S.conn.client
       local instance = client and client.proc and client.proc.instance or nil
@@ -1067,11 +1116,8 @@ function M.build(ctx, opts, action)
       return cwd and S.view.team and S.view.team:leader_instance(cwd) or nil
     end,
     start_team = function(workflow, session)
-      if session and S.sess.service then
-        S.sess.service:activate(session)
-      end
       if S.view.team_commands then
-        S.view.team_commands:start(workflow)
+        S.view.team_commands:start(workflow, session)
       end
     end,
   })
@@ -1086,8 +1132,8 @@ function M.build(ctx, opts, action)
     open = function()
       ctx.open()
     end,
-    new_session = function()
-      ctx.new_session()
+    new_session = function(opts)
+      ctx.new_session(opts)
     end,
     connect = function()
       ctx.connect()
@@ -1114,7 +1160,13 @@ function M.build(ctx, opts, action)
     select_session = function(session)
       return activate_session(session)
     end,
-    submit = function(text)
+    submit = function(text, session)
+      -- Address the replacement session when one is given; never the composer's
+      -- current target, which may have changed while RPCs were in flight.
+      if session and S.sess.prompts then
+        S.sess.prompts:send(session, text, nil)
+        return
+      end
       ctx.submit(text, nil)
     end,
     open_team = function()

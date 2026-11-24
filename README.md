@@ -881,9 +881,12 @@ teams = {
 `default`；`:Ade team stop <Tab>` 补全当前团队的 worker 名。
 
 `:Ade team start` 依次：确定流程 → 读当前会话的开关（未知时先查询；关着或工具未注入时先
-用 `session.teams {enabled:true}` 原地重载）→ 输入任务 → 在当前会话上调用
-`team.start {instance, sessionId, workflow, task?}`。agent 不支持原地重载时，确认后新建
-会话，并把上一段对话的摘要作为首条消息交接。目录已被别的会话领导时，用选择卡片给出
+用 `session.teams {enabled:true}` 打开）→ 输入任务 → 在当前会话上调用
+`team.start {instance, sessionId, workflow, task?}`。`session.teams` 返回 `reload: true`
+时由前端执行一次正常的 `session/load`（清空并按代理回放重载 transcript，服务已为该次
+load 打上一次性转发标记并注入工具），load 成功后才继续；失败则提示并结束。agent 不支持
+原地重载（`reload_unsupported`）时，确认后新建会话，并把上一段对话的摘要作为首条消息
+交接。目录已被别的会话领导时，用选择卡片给出
 “跳到 leader 会话 / 移交到本会话（`team.set_leader`）/ 取消”。取消任务输入时什么都不动。
 旧服务（api_version 5/6）上没有新接口：前端提示“服务版本过旧；空闲后会自动更新，或用
 `:Ade service stop` 手动重启”，不会反复重试看板。
@@ -918,7 +921,9 @@ Space 多选，Enter 确认，Esc 稍后（团队权限也是稍后；只有 age
 **持久化**：团队、参与者、排队消息和每个团队最近 200 条消息正文、看板、卡片历史、
 命名流程写入服务的事件日志数据库（权限 0600）；看板与卡片历史随团队删除，命名流程
 不随团队删除。模板的 `key`/`env`/`launch` 不落盘，恢复时要由前端重新提供配置。
-挂起超过 7 天的团队会被删除（worktree/分支保留）。恢复出的会话不是存储的 leader
+服务重启后未关闭的团队挂起，只有其存储 leader 会话的一次成功 `session/load` /
+`session/resume` 才会恢复（`team.configure` 本身不触发；也可用 `:Ade team on` 的 reload 或
+`team.set_leader` 接手）。挂起超过 7 天的团队会被删除（worktree/分支保留）。恢复出的会话不是存储的 leader
 时，团队保持挂起，在树或成员面板按 `x` 关闭；没有团队的会话照常聊天，不会因为挂起
 团队而被阻塞。`--event-log off` 时 `teams` 特性
 不声明、`team.*` 返回 `-32601`，团队/看板/流程都不落盘也不恢复。

@@ -363,10 +363,20 @@ end
 function Choices:handover_model(team, item, pending)
   local leader = type(item.leader) == "table" and item.leader or {}
   local options = {
-    option("跳到 leader 会话", "jump"),
     option("移交到本会话", "move"),
-    option("取消", "cancel"),
+    option("拒绝", "refuse"),
+    option("跳到 leader 会话", "jump"),
   }
+  local function answer(value)
+    team:answer(item.id, { option = value }, function(ok, err)
+      if not ok then
+        self:notify("cannot answer the handover: " .. tostring(err and err.message or err), vim.log.levels.WARN)
+      else
+        self.handled["team:" .. item.team .. ":" .. item.id] = true
+      end
+      self:refresh()
+    end)
+  end
   return {
     title = "团队移交 · team " .. tostring(item.team),
     status_fn = self:status_fn(item.team),
@@ -380,39 +390,28 @@ function Choices:handover_model(team, item, pending)
       },
     },
     on_cancel = function()
+      -- Esc only puts the item off; neither answer is sent.
       self:refresh()
     end,
     on_submit = function(answers)
-      local answer = answers[1] or {}
-      local index = (answer.selected_index or {})[1]
+      local answer_entry = answers[1] or {}
+      local index = (answer_entry.selected_index or {})[1]
       local picked = index and options[index]
-      local choice = picked and picked.value or answer.selected[1]
+      local choice = picked and picked.value or answer_entry.selected[1]
       if choice == "jump" then
-        local session = self.deps.find_session and self.deps.find_session(leader.sessionId) or nil
-        if session and self.deps.select_session then
-          self.deps.select_session(session)
+        local target = self.deps.find_session and self.deps.find_session(leader.sessionId) or nil
+        if target and self.deps.select_session then
+          self.deps.select_session(target)
         else
           self:notify("leader 会话不在本前端，无法切换", vim.log.levels.WARN)
         end
         self:refresh()
         return
       end
-      if choice == "move" then
-        team:answer(item.id, { option = "move" }, function(ok, value)
-          if not ok then
-            self:notify(
-              "cannot take the team over: " .. tostring(value and value.message or value),
-              vim.log.levels.WARN
-            )
-          end
-          self.handled["team:" .. item.team .. ":" .. item.id] = true
-          self:refresh()
-        end)
-        self.handled["team:" .. item.team .. ":" .. item.id] = true
-        self:refresh()
+      if choice == "move" or choice == "refuse" then
+        answer(choice)
         return
       end
-      -- Cancel keeps the item open (the asker session was already told).
       self:refresh()
     end,
   }
@@ -452,6 +451,9 @@ function Choices:ask(opts)
       end
     end,
   }
+  entry.build = function()
+    return model
+  end
   local open = { entry }
   if self:show(entry, open) then
     return true

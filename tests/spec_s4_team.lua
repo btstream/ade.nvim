@@ -407,6 +407,94 @@ return function(t)
       t.eq("sess_mock", calls_of(service, "team.set_leader")[1].params.sessionId)
     end)
 
+    t.it("runs the front-end reload when session.teams answers reload: true", function()
+      local service, dir = start_service(t, "reload-true")
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #calls_of(service, "session.teams") >= 1
+      end, 5000, "the switch")
+      local inst = instance()
+      -- The session was created before teams were configured: no tools yet.
+      service.session_switches[tostring(inst) .. "\0sess_mock"] = { enabled = true, injected = false }
+      local seen
+      team():set_session_teams(inst, "sess_mock", true, false, function(ok, value)
+        seen = { ok = ok, value = value }
+      end)
+      wait(function()
+        return seen ~= nil
+      end, 5000, "the switch reply")
+      t.eq(true, seen.ok)
+      t.eq(true, seen.value.reload, "the service marks a forwarded load")
+      local before = #sent_frames(service, "session/load")
+      -- The front end must perform the load itself, through its normal path.
+      team():reload_session(inst, "sess_mock", function(ok)
+        t.eq(true, ok)
+      end)
+      wait(function()
+        return #sent_frames(service, "session/load") > before
+      end, 5000, "the forwarded load")
+    end)
+
+    t.it("team.start from {instance, sessionId} answers led_by without an inbox item", function()
+      local service, dir = start_service(t, "led-by-structured")
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #calls_of(service, "session.teams") >= 1
+      end, 5000, "the switch")
+      service.teams.t9 = {
+        id = "t9",
+        cwd = dir,
+        state = "active",
+        leader = { instance = "inst-other", sessionId = "other-session" },
+        participants = { { name = "leader", state = "idle" }, { name = "w1", state = "idle" } },
+        inbox = {},
+      }
+      local seen
+      team():start_session(instance(), "sess_mock", "default", nil, function(ok, value)
+        seen = { ok = ok, value = value }
+      end)
+      wait(function()
+        return seen ~= nil
+      end, 5000, "the structured refusal")
+      t.eq(false, seen.ok)
+      t.eq("led_by", seen.value.data.reason)
+      t.eq("t9", seen.value.data.team.id)
+      t.eq("other-session", seen.value.data.leader.sessionId)
+      t.eq(nil, seen.value.data.handover, "no handover item is created for the front end")
+    end)
+
+    t.it("resumes a stored team only through a successful load of its leader", function()
+      local service, dir = start_service(t, "resume-load")
+      local suspended = {
+        id = "t7",
+        cwd = dir,
+        state = "suspended",
+        leader = { instance = nil, sessionId = "sess_mock" },
+        participants = { { name = "leader", state = "idle" } },
+        inbox = {},
+      }
+      service.teams[suspended.id] = vim.deepcopy(suspended)
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      -- Configure alone must not resume it (PROTOCOL.md 20.7).
+      wait(function()
+        return #calls_of(service, "team.configure") >= 1
+      end, 5000, "the configuration")
+      vim.wait(100)
+      t.eq("suspended", service.teams.t7.state, "configure does not resume a team")
+      -- A real load of the leader session does.
+      state().sess.service:load("sess_mock", { kind = "load" })
+      wait(function()
+        return service.teams.t7 and service.teams.t7.state == "active"
+      end, 8000, "the resumed team")
+      t.eq("sess_mock", service.teams.t7.leader.sessionId)
+    end)
+
     t.it("validates session_default and rejects spawn_from_chat", function()
       local Config = require("ade.config")
       local base = vim.deepcopy(Config.defaults)
@@ -554,6 +642,139 @@ return function(t)
         end, 5000, "the move")
         t.eq("sess_mock", calls_of(service, "team.set_leader")[1].params.sessionId)
       end)
+
+      t.it("refuses t/L/S on a row whose instance is not the live one", function()
+        local service, dir = start_service(t, "tree-instance")
+        setup(t, dir)
+        controller.connect()
+        wait_ready()
+        wait(function()
+          return #calls_of(service, "session.teams") >= 1
+        end, 5000, "the switch")
+        local ui = state().view.team_ui
+        open_tree()
+        local meta = {
+          kind = "tree_session",
+          session = { id = "s-foreign", cwd = dir, instance = "inst-other" },
+          cwd = dir,
+          instance = "inst-other",
+          online = false,
+          team = { id = "t9" },
+        }
+        local notices = {}
+        ui.notify_fn = function(message)
+          notices[#notices + 1] = tostring(message)
+        end
+        for _, key in ipairs({ "t", "L", "S" }) do
+          local before = #service.calls
+          t.eq(true, ui:handle_tree_key(key, meta), key .. " is handled")
+          t.eq(before, #service.calls, key .. " sends no RPC for a foreign instance")
+        end
+        t.truthy(table.concat(notices, "\n"):match("instance"))
+      end)
+
+      t.it("t on an unknown switch queries first and never assumes off", function()
+        local service, dir = start_service(t, "tree-unknown")
+        setup(t, dir)
+        controller.connect()
+        wait_ready()
+        wait(function()
+          return #calls_of(service, "session.teams") >= 1
+        end, 5000, "the switch")
+        local ui = state().view.team_ui
+        open_tree()
+        local meta = {
+          kind = "tree_session",
+          session = { id = "sess_mock", cwd = dir, instance = instance() },
+          cwd = dir,
+          instance = instance(),
+          online = true,
+          switch = nil,
+        }
+        t.eq(true, ui:handle_tree_key("t", meta))
+        -- The service says teams are on: the follow-up must send `enabled: false`
+        -- instead of assuming they were already off and turning them on.
+        local function off_sent()
+          for _, call in ipairs(calls_of(service, "session.teams")) do
+            if call.params.enabled == false then
+              return true
+            end
+          end
+          return false
+        end
+        wait(off_sent, 5000, "the follow-up")
+        for _, call in ipairs(calls_of(service, "session.teams")) do
+          t.falsy(call.params.enabled == true, "no blind enabled:true before the query answered")
+        end
+      end)
+
+      t.it("x closes the team only from the leader row and cancels a start", function()
+        local service, dir = start_service(t, "tree-close")
+        setup(t, dir)
+        yes_confirm()
+        controller.connect()
+        wait_ready()
+        wait(function()
+          return #calls_of(service, "session.teams") >= 1
+        end, 5000, "the switch")
+        start_team()
+        wait(function()
+          return team():team_for_cwd(dir) ~= nil
+        end, 5000, "the team")
+        open_tree()
+        local ui = state().view.team_ui
+        local meta = {
+          kind = "tree_session",
+          session = { id = "sess_mock", cwd = dir, instance = instance() },
+          cwd = dir,
+          instance = instance(),
+          online = true,
+          leader = false,
+          team = team():team_for_cwd(dir),
+        }
+        local notices = {}
+        ui.notify_fn = function(message)
+          notices[#notices + 1] = tostring(message)
+        end
+        t.eq(true, ui:handle_tree_key("x", meta))
+        t.eq(0, #calls_of(service, "team.close"), "a non-leader row does not close the team")
+        t.truthy(table.concat(notices, "\n"):match("leader"))
+        meta.leader = true
+        t.eq(true, ui:handle_tree_key("x", meta))
+        wait(function()
+          return #calls_of(service, "team.close") == 1
+        end, 5000, "the close")
+      end)
+
+      t.it("b opens the board of the row's team", function()
+        local service, dir = start_service(t, "tree-board")
+        setup(t, dir)
+        controller.connect()
+        wait_ready()
+        wait(function()
+          return #calls_of(service, "session.teams") >= 1
+        end, 5000, "the switch")
+        start_team()
+        wait(function()
+          return team():team_for_cwd(dir) ~= nil
+        end, 5000, "the team")
+        open_tree()
+        local ui = state().view.team_ui
+        local row = team():team_for_cwd(dir)
+        local meta = {
+          kind = "tree_session",
+          session = { id = "sess_mock", cwd = dir, instance = instance() },
+          cwd = dir,
+          instance = instance(),
+          online = true,
+          team = row,
+        }
+        t.eq(true, ui:handle_tree_key("b", meta))
+        wait(function()
+          return ui:is_open("board")
+        end, 5000, "the board pane")
+        t.eq(row.id, ui.board_selected_id)
+      end)
     end)
   end)
 
@@ -562,6 +783,95 @@ return function(t)
       local notices = capture(t)
       vim.cmd("Ade team nope")
       t.truthy(notices[1] and tostring(notices[1].message):match("unknown team command"))
+    end)
+
+    t.it("supports both stop! syntaxes and completes the team's workers", function()
+      local service, dir = start_service(t, "stop-syntax")
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #calls_of(service, "session.teams") >= 1
+      end, 5000, "the switch")
+      start_team()
+      wait(function()
+        return team():team_for_cwd(dir) ~= nil
+      end, 5000, "the team")
+      local row = team():team_for_cwd(dir)
+      table.insert(service.teams[row.id].participants, { name = "w1", state = "idle" })
+      table.insert(service.teams[row.id].participants, { name = "w2", state = "idle" })
+      team():refresh()
+      wait(function()
+        return team():participant(row.id, "w1") ~= nil and team():participant(row.id, "w2") ~= nil
+      end, 5000, "the workers")
+
+      -- Completion runs against the real `:Ade` command.
+      local candidates = vim.fn.getcompletion("Ade team stop ", "cmdline")
+      local names = table.concat(candidates, ",")
+      t.truthy(names:find("w1", 1, true), "w1 is completed")
+      t.truthy(names:find("w2", 1, true), "w2 is completed")
+
+      vim.cmd("Ade team stop w1")
+      wait(function()
+        return #calls_of(service, "team.stop_worker") == 1
+      end, 5000, "the plain stop")
+      t.falsy(calls_of(service, "team.stop_worker")[1].params.remove, "no remove without a bang")
+      vim.cmd("Ade team stop! w2")
+      wait(function()
+        return #calls_of(service, "team.stop_worker") == 2
+      end, 5000, "the trailing bang")
+      t.eq(true, calls_of(service, "team.stop_worker")[2].params.remove)
+    end)
+
+    t.it("accepts the leading bang too", function()
+      local service, dir = start_service(t, "stop-leading-bang")
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #calls_of(service, "session.teams") >= 1
+      end, 5000, "the switch")
+      start_team()
+      wait(function()
+        return team():team_for_cwd(dir) ~= nil
+      end, 5000, "the team")
+      local row = team():team_for_cwd(dir)
+      table.insert(service.teams[row.id].participants, { name = "w1", state = "idle" })
+      team():refresh()
+      wait(function()
+        return team():participant(row.id, "w1") ~= nil
+      end, 5000, "the worker")
+      vim.cmd("Ade! team stop w1")
+      wait(function()
+        return #calls_of(service, "team.stop_worker") == 1
+      end, 5000, "the leading-bang stop")
+      t.eq(true, calls_of(service, "team.stop_worker")[1].params.remove)
+    end)
+
+    t.it("closes a led team through :Ade team off and :Ade team close", function()
+      local service, dir = start_service(t, "commands-off")
+      setup(t, dir)
+      yes_confirm()
+      controller.connect()
+      wait_ready()
+      wait(function()
+        return #calls_of(service, "session.teams") >= 1
+      end, 5000, "the switch")
+      start_team()
+      wait(function()
+        return team():team_for_cwd(dir) ~= nil
+      end, 5000, "the team")
+      vim.cmd("Ade team off")
+      wait(function()
+        return team():team_for_cwd(dir) == nil
+      end, 5000, "the closed team")
+      local off
+      for _, call in ipairs(calls_of(service, "session.teams")) do
+        if call.params.enabled == false then
+          off = call.params
+        end
+      end
+      t.eq(true, off and off.close)
     end)
   end)
 end

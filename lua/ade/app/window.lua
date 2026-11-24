@@ -52,7 +52,10 @@ function M:select_session(session)
     and #(previous.queue or {}) == 0
     and S.sess.service
   then
-    pcall(S.sess.service.close, S.sess.service, previous.id)
+    local protected = S.view.team ~= nil and S.view.team:leads_team(previous)
+    if not protected then
+      pcall(S.sess.service.close, S.sess.service, previous.id)
+    end
   end
   if S.view.chat then
     S.view.chat:set_session(session)

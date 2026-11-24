@@ -69,6 +69,11 @@ function M.lines(groups, opts)
       elseif entry.switch and entry.switch.enabled == false then
         line:add("  [team off]", "AdeMuted")
       end
+      if entry.instance == nil then
+        line:add("  [?]", "AdeMuted")
+      elseif entry.online == false then
+        line:add("  [offline]", "AdeMuted")
+      end
       add(lines, ids, meta, marks, line, "session:" .. tostring(session.id), {
         kind = "tree_session",
         session = session,
@@ -76,6 +81,8 @@ function M.lines(groups, opts)
         switch = entry.switch,
         leader = entry.leader,
         team = entry.team,
+        instance = entry.instance,
+        online = entry.online,
       })
       for _, participant in ipairs(entry.workers or {}) do
         local worker = Text.new_line()
@@ -95,8 +102,12 @@ function M.lines(groups, opts)
         add(lines, ids, meta, marks, worker, "worker:" .. tostring(participant.name), {
           kind = "tree_worker",
           team = entry.team and entry.team.id,
+          team_row = entry.team,
           participant = participant,
           session = session,
+          cwd = group.cwd,
+          instance = entry.instance,
+          online = entry.online,
         })
       end
     end

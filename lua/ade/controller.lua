@@ -445,12 +445,13 @@ function M.pick_config()
 end
 
 ---Create a new session with the current agent.
-function M.new_session()
+---@param opts {on_created: (fun(session: table)|nil)|nil, on_failed: (fun(err: string)|nil)|nil}|nil
+function M.new_session(opts)
   if S.sess.service then
     S.sess.service:create(function()
       S.conn.skip_auto_restore = true
       M.connect()
-    end)
+    end, opts)
   end
 end
 
@@ -459,6 +460,17 @@ end
 function M.load_session(session_id)
   if S.sess.service then
     S.sess.service:load(session_id)
+  end
+end
+
+---Create a new session, optionally reporting the outcome to the caller.
+---@param opts {on_created: (fun(session: table)|nil)|nil, on_failed: (fun(err: string)|nil)|nil}|nil
+function M.new_session(opts)
+  if S.sess.service then
+    S.sess.service:create(function()
+      S.conn.skip_auto_restore = true
+      M.connect()
+    end, opts)
   end
 end
 

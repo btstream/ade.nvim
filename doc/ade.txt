@@ -1335,7 +1335,9 @@ teams.templates = { worker = { agent = "inherit", worktree = true } }。
 
 1. 没给流程名时先选一个，默认流程排在第一。
 2. 读当前会话的开关；未知时先查询。开关关着或工具未注入时先调
-   session.teams {enabled: true}，由服务原地重载会话工具。
+   session.teams {enabled: true}。返回 reload: true 时由前端执行一次正常的
+   session/load（清空并按代理回放重载 transcript；服务已为这次 load 打上
+   一次性转发标记并注入工具），成功后再继续；失败则提示并结束。
 3. 输入这次的任务（可留空）。取消输入时什么都不动。
 4. 在当前会话上调用 team.start {instance, sessionId, workflow, task}。
    会话已经在领导该目录的团队或目录还没有团队时，服务直接创建/返回团队。
@@ -1534,13 +1536,17 @@ leader 的 token；leader 收到的汇报里应当包含做决定需要的细节
 随团队删除。模板的 key/env/launch 不落盘，恢复时要由前端重新提供配置。
 
 服务重启后未关闭的团队变为挂起（suspended）：面板照常显示，标注挂起时间和
-“等待 leader 会话恢复”。恢复 leader 的会话后团队自动继续，worker 按存储
-的 session 和 worktree 恢复，恢复 notice 作为 bus 回合出现在 leader 聊天
-里。挂起期间可以 m 发消息（排队）、回答 question/message/limit、R 重置回
-合上限、D 删除已退出 worker 的 worktree、x 关闭团队；w/s/p/r/c 提示团队
-已挂起。挂起超过 7 天的团队会在服务启动或每小时检查时删除（worktree 与分支
-保留）。如果恢复出的会话不是存储的 leader，团队保持挂起，并提示在树或成员
-面板按 x 关闭；没有团队的会话照常聊天，不会被挂起团队阻塞。
+“等待 leader 会话恢复”。恢复只发生在其存储 leader 会话的一次成功
+session/load 或 session/resume 上（该请求拿到会话 token、cwd 与 agent 都
+匹配）；此后团队自动继续，worker 按存储的 session 和 worktree 恢复，恢复
+notice 作为 bus 回合出现在 leader 聊天里。team.configure 本身不触发恢复，
+前端不要依赖“配置后自动恢复”；也可以用 :Ade team on 的 reload 或
+team.set_leader 手动接手。挂起期间可以 m 发消息（排队）、回答
+question/message/limit、R 重置回合上限、D 删除已退出 worker 的 worktree、
+x 关闭团队；w/s/p/r/c 提示团队已挂起。挂起超过 7 天的团队会在服务启动或每
+小时检查时删除（worktree 与分支保留）。如果恢复出的会话不是存储的 leader，
+团队保持挂起，并提示在树或成员面板按 x 关闭；没有团队的会话照常聊天，不会
+被挂起团队阻塞。
 
 --event-log off 时不声明 teams 特性，team.* 返回 -32601，团队、看板和命名
 流程都不会落盘或恢复；此时 workflow_save 返回 -32061（no database）。
