@@ -378,6 +378,10 @@ class Editor:
             "TEAM_AGENT_LOG": str(self.case.agent_log),
             "TEAM_AGENT_GATE": str(self.case.gate),
             "TEAM_AGENT_TEMPLATE": "coder",
+            # A real agent keeps the injected `ade-team` MCP process for the
+            # whole session; the one-shot default would make the service see
+            # the server disconnect right after each handshake (20.5).
+            "ADE_FIXTURE_PERSISTENT_MCP": "1",
         }
         agent_env.update(self.agent_env)
         teams = {
