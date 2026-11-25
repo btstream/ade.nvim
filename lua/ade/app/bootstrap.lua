@@ -567,8 +567,8 @@ function M.build(ctx, opts, action)
   })
   -- Switching a session is also when the per-session team switch is read, so
   -- the tree can mark a session `[team off]` before the person acts on it.
-  local function activate_session(session)
-    ctx.activate_session(session)
+  local function activate_session(session, opts)
+    ctx.activate_session(session, opts)
     if session and S.view.team then
       local client = S.conn.client
       local live = client and client.proc and client.proc.instance or nil

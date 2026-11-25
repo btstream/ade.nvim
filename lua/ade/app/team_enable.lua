@@ -55,6 +55,8 @@ function M.error(value, outcome)
   local message
   if outcome == "off" then
     message = "teams were turned off for this chat; run :Ade team on to turn them back on"
+  elseif outcome == "wrote_off" then
+    message = "teams were turned off while the session was reloading; run :Ade team on again"
   else
     message = "the agent did not inject the team tools (its MCP server never connected)"
   end
@@ -116,6 +118,11 @@ function M._settle(team, key, ok, value)
   if state[key] == entry then
     state[key] = nil
   end
+  -- Release the injection wait a successful load may have started.
+  if entry.stop then
+    pcall(entry.stop)
+    entry.stop = nil
+  end
   if entry.hint then
     pcall(function()
       entry.hint:stop()
@@ -136,6 +143,34 @@ end
 function M.pending(team, instance, session_id)
   local state = state_of(team)
   return state[M.key(instance, session_id) or ""] ~= nil
+end
+
+---Mark a pending enable as overtaken by a write of the opposite switch. The
+---enable still waits for the load it started to end, but that load's success
+---must not be reported as "teams are on".
+---@param team table
+---@param instance string|nil
+---@param session_id string|nil
+---@param reason string
+function M.supersede(team, instance, session_id, reason)
+  local state = state_of(team)
+  local entry = state[M.key(instance, session_id) or ""]
+  if entry then
+    entry.superseded = entry.superseded or reason
+  end
+end
+
+---Clear a supersede mark (the opposite write failed, so the enable still owns
+---the outcome).
+---@param team table
+---@param instance string|nil
+---@param session_id string|nil
+function M.resume(team, instance, session_id)
+  local state = state_of(team)
+  local entry = state[M.key(instance, session_id) or ""]
+  if entry then
+    entry.superseded = nil
+  end
 end
 
 ---Settle a pending enable as cancelled (the switch went off, the pair is gone).
@@ -183,7 +218,8 @@ end
 ---@param instance string
 ---@param session_id string
 ---@param cb fun(ok: boolean, value: any)|nil
----@param opts {notify: fun(message: string, level: integer|nil)|nil, join: boolean|nil}|nil
+---@param opts {notify: fun(message: string, level: integer|nil)|nil, join: boolean|nil,
+---  wait_ms: integer|nil}|nil
 function M.run(team, instance, session_id, cb, opts)
   cb = cb or function() end
   opts = opts or {}
@@ -221,7 +257,122 @@ function M.run(team, instance, session_id, cb, opts)
     if state_of(team)[key] ~= entry then
       return
     end
+    entry.settled = true
     M._settle(team, key, ok, value)
+  end
+  ---Finish an enable whose write asked for a reload.
+  ---
+  ---The load only restarts the transcript: the agent's MCP process may connect
+  ---after it (or never). The listener is registered **before** the load starts,
+  ---because the service may publish `session.teams_changed` before the load
+  ---reply reaches this callback.
+  local latest = nil
+  local function state_now()
+    return latest or (team.session_teams and team:session_teams(instance, session_id)) or nil
+  end
+  local function terminal(state)
+    return state and (state.injected == true or state.enabled == false)
+  end
+  local settle_reload
+  local function on_state(state)
+    if not state then
+      return
+    end
+    latest = state
+    if settle_reload and terminal(state) then
+      settle_reload(state)
+    end
+  end
+  local unsubscribe
+  if type(team.watch_session_state) == "function" then
+    unsubscribe = team:watch_session_state(instance, session_id, on_state)
+  end
+  local function release_wait()
+    if unsubscribe then
+      unsubscribe()
+      unsubscribe = nil
+    end
+    if entry.stop then
+      pcall(entry.stop)
+      entry.stop = nil
+    end
+  end
+  settle_reload = function(state)
+    if state_of(team)[key] ~= entry then
+      return
+    end
+    release_wait()
+    if entry.superseded then
+      settle(false, M.error({}, "wrote_off"))
+      return
+    end
+    if state.enabled == false then
+      settle(false, M.error(state, "off"))
+      return
+    end
+    if state.injected == true then
+      settle(true, state)
+      return
+    end
+    settle(false, M.error(state, "uninjected"))
+  end
+  local function after_load()
+    if state_of(team)[key] ~= entry then
+      release_wait()
+      return
+    end
+    if entry.superseded then
+      release_wait()
+      settle(false, M.error({}, "wrote_off"))
+      return
+    end
+    local now = state_now()
+    if terminal(now) then
+      settle_reload(now)
+      return
+    end
+    -- Ask the service for the real switch once; the cache may still hold the
+    -- pre-load answer if the notification raced the reply.
+    if type(team.query_session_teams) == "function" then
+      team:query_session_teams(instance, session_id, nil, function(ok, value)
+        if ok and type(value) == "table" then
+          latest = {
+            enabled = value.enabled == true,
+            injected = value.injected == true,
+            pending = value.pending == true,
+          }
+          if terminal(latest) then
+            settle_reload(latest)
+            return
+          end
+        end
+        if entry.stop then
+          return
+        end
+        -- Not injected yet: wait for the notification, bounded like the
+        -- service's own hold (ten seconds), then tell the truth.
+        local timer
+        entry.stop = function()
+          if timer then
+            pcall(function()
+              timer:stop()
+              timer:close()
+            end)
+            timer = nil
+          end
+        end
+        timer = vim.defer_fn(function()
+          timer = nil
+          if state_of(team)[key] ~= entry then
+            return
+          end
+          settle_reload(state_now() or { enabled = true, injected = false })
+        end, opts.wait_ms or 10000)
+      end, { source = "session" })
+      return
+    end
+    -- No way to ask: do not claim the tools are there.
+    settle_reload(now or { enabled = true, injected = false })
   end
   local function on_answer(ok, value)
     if state_of(team)[key] ~= entry then
@@ -233,10 +384,8 @@ function M.run(team, instance, session_id, cb, opts)
     end
     local outcome = M.outcome(value)
     if outcome == "reload" then
-      -- A forwarded load that answered successfully restarts the session's log
-      -- and injects the tools, so a successful load is the terminal success of
-      -- this enable. A failed load leaves the session as it was: report it as
-      -- a failure, never as "teams are on".
+      -- A failed load leaves the session as it was: report it, never "teams are
+      -- on". A successful one still has to prove the tools were injected.
       team:reload_session(instance, session_id, function(reloaded, err)
         if not reloaded then
           settle(false, {
@@ -245,7 +394,7 @@ function M.run(team, instance, session_id, cb, opts)
           })
           return
         end
-        settle(true, { enabled = true, injected = true, reloaded = true })
+        after_load()
       end)
       return
     end

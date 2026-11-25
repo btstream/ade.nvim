@@ -805,8 +805,9 @@ end
 ---@param session table|nil
 ---@param focus boolean|nil
 ---@param previous table|nil
+---@param opts {no_close: boolean|nil}|nil
 ---@return boolean
-function Router:_present(session, focus, previous)
+function Router:_present(session, focus, previous, opts)
   previous = previous or self.saved_leader
   local was_worker = self.target ~= nil
   if focus then
@@ -822,7 +823,7 @@ function Router:_present(session, focus, previous)
       if self.select_session then
         -- Let the app switch, so `S.sess.current`, the transcript and the
         -- composer all follow the same session instead of drifting apart.
-        pcall(self.select_session, session)
+        pcall(self.select_session, session, opts)
       end
       if self.chat and self.chat.session ~= session then
         self.chat:set_session(session)
@@ -858,14 +859,20 @@ end
 ---The team-closed path uses this: the closed team is already out of `team.list`,
 ---but its leader conversation must stay on screen (or come back after a worker
 ---was being watched).
+---
+---`opts.no_close` keeps the previous session alive: a close is not a session
+---switch the person asked for, and an idle close there would release a
+---conversation they never left.
 ---@param session table|nil
 ---@param focus boolean|nil
+---@param opts {no_close: boolean|nil}|nil
 ---@return boolean
-function Router:show_session(session, focus)
+function Router:show_session(session, focus, opts)
+  opts = opts or {}
   if not session then
-    return self:leave_worker(focus)
+    return self:leave_worker(focus, opts)
   end
-  return self:_present(session, focus)
+  return self:_present(session, focus, nil, opts)
 end
 
 ---Drop the worker target without touching which session the chat shows.
@@ -1222,9 +1229,20 @@ end
 ---Leave the worker transcript and go back to the ordinary session it replaced
 ---(`gl`). Unlike `L`, this makes no claim that the session is the team leader.
 ---@param focus boolean|nil
+---@param opts {no_close: boolean|nil}|nil
 ---@return boolean
-function Router:leave_worker(focus)
-  return self:restore_leader(focus, self.target and self.target.team or nil, "previous")
+function Router:leave_worker(focus, opts)
+  local previous = self.saved_leader
+  local session
+  if previous and previous.session then
+    if not (self.find_session and not self.find_session(previous.session.id)) then
+      session = previous.session
+    end
+  end
+  if not session then
+    session = self.current_session and self.current_session() or nil
+  end
+  return self:_present(session, focus, previous, opts)
 end
 
 ---Compatibility entry the panes and older callers use: open a participant.

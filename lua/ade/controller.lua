@@ -180,8 +180,8 @@ turn = Turn.new({
 local window
 
 ---@param session AdeSessionState|nil
-local function activate_session(session)
-  window:select_session(session)
+local function activate_session(session, opts)
+  window:select_session(session, opts)
 end
 
 ---------------------------------------------------------------------------
