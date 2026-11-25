@@ -248,6 +248,9 @@ function Auth:run(method, retry, on_failed)
   local client = self.get_client()
   if type(method) ~= "table" or type(method.id) ~= "string" then
     self.notify("the agent did not offer a usable login method", vim.log.levels.WARN)
+    if on_failed then
+      pcall(on_failed, "the agent did not offer a usable login method")
+    end
     return
   end
   local meta = type(method._meta) == "table" and method._meta["terminal-auth"] or nil
@@ -256,6 +259,9 @@ function Auth:run(method, retry, on_failed)
   if not terminal then
     if not client then
       self.notify("the agent is not connected", vim.log.levels.WARN)
+      if on_failed then
+        pcall(on_failed, "the agent is not connected")
+      end
       return
     end
     self.running = true
@@ -370,6 +376,9 @@ function Auth:login(methods, retry, on_failed)
       "this agent did not report a login method; see its documentation to sign in, then reconnect",
       vim.log.levels.WARN
     )
+    if on_failed then
+      pcall(on_failed, "this agent did not report a login method")
+    end
     return false
   end
   if #methods == 1 then
@@ -389,6 +398,17 @@ function Auth:login(methods, retry, on_failed)
     items = items,
     on_choice = function(method)
       self:run(method, retry, on_failed)
+    end,
+    -- Esc / a dismissed prompt is a cancelled login, not a silent no-op: a
+    -- caller waiting on the failed operation (a `session/new` replacement for
+    -- a start flow) has to learn that nothing will happen.
+    on_cancel = function()
+      self.running = false
+      self.on_changed()
+      self.notify("login cancelled", vim.log.levels.INFO)
+      if on_failed then
+        pcall(on_failed, "the login was cancelled")
+      end
     end,
   })
   return true
