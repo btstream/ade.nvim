@@ -793,6 +793,21 @@ function Router:restore_leader(focus, team, mode)
       return false
     end
   end
+  return self:_present(session, focus, previous)
+end
+
+---Show `session` in the shared chat/composer pair, leaving any worker view.
+---
+---`previous` is the leader slot captured before the worker took the panel over;
+---it is only used when `session` is nil. An explicit session is required when
+---the team that owned the worker is already gone from the caches: looking it up
+---through `team.list` would find nothing and strand the panel on the worker.
+---@param session table|nil
+---@param focus boolean|nil
+---@param previous table|nil
+---@return boolean
+function Router:_present(session, focus, previous)
+  previous = previous or self.saved_leader
   local was_worker = self.target ~= nil
   if focus then
     self:ensure_panel()
@@ -836,6 +851,21 @@ function Router:restore_leader(focus, team, mode)
     self:changed()
   end
   return true
+end
+
+---Show one ordinary session, whatever the team caches say.
+---
+---The team-closed path uses this: the closed team is already out of `team.list`,
+---but its leader conversation must stay on screen (or come back after a worker
+---was being watched).
+---@param session table|nil
+---@param focus boolean|nil
+---@return boolean
+function Router:show_session(session, focus)
+  if not session then
+    return self:leave_worker(focus)
+  end
+  return self:_present(session, focus)
 end
 
 ---Drop the worker target without touching which session the chat shows.

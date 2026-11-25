@@ -635,7 +635,11 @@ return function(t)
       UI:close()
     end)
 
-    t.it("a team closing elsewhere does not close the panes", function()
+    -- Teams v3.1 (review item A): a team closed by someone else must not leave
+    -- its panes behind. The members/board panes follow this project, and this
+    -- project no longer has a team, so they close. The ordinary chat/composer
+    -- pair and the current session stay exactly as they were.
+    t.it("a team closing elsewhere closes the panes that showed it", function()
       wide(t)
       local service, dir = start_service(t, "remote-close", { team_board = sample_board() })
       setup(t, "remote-close", service, dir)
@@ -650,15 +654,53 @@ return function(t)
       wait(function()
         return pane_win(UI, "members") ~= nil and pane_win(UI, "board") ~= nil
       end, 5000, "both panes")
+      local current = controller.state().sess.current
+      local chat_win = controller.state().chat.win
+      local input_win = controller.state().input.win
       service:team_changed(vim.tbl_extend("force", base_team(dir), { state = "closed" }))
       wait(function()
         return team():team("t1") == nil
       end, 5000, "the closed team")
-      vim.wait(120)
-      t.eq(true, UI:is_open(), "an idle pane stays open with its empty state")
       wait(function()
-        return pane_text(UI, "members"):find("还没有团队", 1, true) ~= nil
-      end, 5000, "the members empty state after the close")
+        return pane_win(UI, "members") == nil and pane_win(UI, "board") == nil and pane_win(UI, "tree") == nil
+      end, 5000, "the panes of the closed team")
+      t.falsy(UI.layout:is_open(), "no team pane is left on screen")
+      -- The ordinary panel and its session are untouched.
+      t.eq(chat_win, controller.state().chat.win, "the chat window is unchanged")
+      t.eq(input_win, controller.state().input.win, "the composer window is unchanged")
+      t.eq(current, controller.state().sess.current, "the current session is unchanged")
+    end)
+
+    -- The complement of the rule above: the tree lists every project, so a
+    -- close in one project must not tear down a tree that still has another
+    -- project's team to show.
+    t.it("keeps the tree while another project still has a team", function()
+      wide(t)
+      local other_dir = tmpdir("remote-close-other")
+      local service, dir = start_service(t, "remote-close-multi")
+      setup(t, "remote-close-multi", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed(base_team(dir))
+      local other = vim.tbl_extend("force", base_team(other_dir, { id = "t9" }), {
+        leader = { instance = "inst-other", sessionId = "sess-other" },
+      })
+      service:team_changed(other)
+      wait(function()
+        return team():team("t1") ~= nil and team():team("t9") ~= nil
+      end, 5000, "both teams")
+      ade.open_team("tree")
+      local UI = ui()
+      wait(function()
+        return pane_win(UI, "tree") ~= nil
+      end, 5000, "the tree")
+      service:team_changed(vim.tbl_extend("force", base_team(dir), { state = "closed" }))
+      wait(function()
+        return team():team("t1") == nil
+      end, 5000, "the closed team")
+      vim.wait(150)
+      t.truthy(pane_win(UI, "tree"), "the tree still lists the other project's team")
+      t.truthy(UI.layout:is_open("tree"))
       UI:close()
     end)
 

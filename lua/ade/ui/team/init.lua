@@ -111,6 +111,14 @@ function Dashboard:report(ok, value)
   return false
 end
 
+---The explanation for a failed enable (a failed reload keeps its own sentence).
+---@param value any
+---@return string
+function Dashboard:report_text(value)
+  local Team = require("ade.app.team")
+  return Team.enable_error_text(value, nil)
+end
+
 ---@param kind string|nil "members", "board", "all" or nil (members)
 ---@return boolean
 function Dashboard:is_open(kind)
@@ -648,18 +656,10 @@ end
 ---@return boolean
 function Dashboard:close(kind)
   if kind == "all" or kind == nil then
-    if self.refresh_timer then
-      pcall(function()
-        self.refresh_timer:stop()
-        self.refresh_timer:close()
-      end)
-      self.refresh_timer = nil
-    end
-    self.pending = false
     if self.router and self.router:is_worker() then
       self.router:restore_leader(false)
     end
-    self.layout:close()
+    self:hide_panes()
     return true
   end
   if self.layout:is_open_pane(kind) then
@@ -843,15 +843,31 @@ function Dashboard:load_workflows()
 end
 
 ---A team disappeared: closed here, by another front end, or by the service.
+---
+---The rule (teams v3.1, review A): a closed team must not leave its panes
+---behind, but it must not take an unrelated chat with it either.
+---
+---  1. If the shared transcript shows one of *this* team's workers, go back to
+---     the team's leader session — the last known row is passed in because the
+---     caches no longer carry it.
+---  2. Close the team panes (tree/members/board) **only** when they can no
+---     longer show a live project: the pane is pinned to this team or its
+---     project has no other team. A pane showing another project's team (the
+---     tree lists every project) stays open.
+---  3. Never touch the ordinary chat/composer windows or the current session
+---     when they are unrelated to the closed team; a session that is not this
+---     team's leader is left exactly as it was.
 ---@param team_id string
-function Dashboard:team_closed(team_id)
+---@param entry table|nil the closed team's last known row
+function Dashboard:team_closed(team_id, entry)
   if type(team_id) ~= "string" then
     return
   end
+  entry = type(entry) == "table" and entry or {}
+  local cwd = type(entry.cwd) == "string" and entry.cwd or nil
   local router = self.router
-  if router:current() and router:current().team == team_id then
-    router:restore_leader(false)
-  end
+  local watching = router:current()
+  local was_watching = watching ~= nil and watching.team == team_id
   -- Drop the closed team from the kept rows so it cannot come back as stale.
   if self.snapshot then
     local kept = {}
@@ -862,23 +878,125 @@ function Dashboard:team_closed(team_id)
     end
     self.snapshot = #kept > 0 and kept or nil
   end
-  if not self.layout:is_open() then
-    return
+  if was_watching then
+    -- Back to the leader conversation. Do not use `team.list`: the closed team
+    -- is already gone from it. Prefer the row's leader, then the app's current
+    -- session when it is the leader's cwd, and only then the previous slot.
+    local session = self:closed_leader_session(entry)
+    if session then
+      router:show_session(session, false)
+    else
+      router:leave_worker(false)
+    end
   end
-  local rows = self:paint_rows()
-  if #rows == 0 then
-    self:refresh()
-    return
-  end
-  if self.selected_id and self.selected_id ~= team_id and self:team_by_id(self.selected_id) then
-    return
-  end
-  self.index = math.max(1, math.min(self.index or 1, #rows))
-  self.selected_id = rows[self.index].id
   if self.board_selected_id == team_id then
     self.board_selected_id = nil
   end
-  self:refresh()
+  if self.open_board_target == team_id then
+    self.open_board_target = nil
+  end
+  if self.selected_id == team_id then
+    self.selected_id = nil
+  end
+  if not self.layout:is_open() or self:panes_still_relevant(cwd) then
+    if self.layout:is_open() then
+      -- Keep the surviving panes on a live row instead of a closed one.
+      local rows = self:paint_rows()
+      if #rows > 0 then
+        self.index = math.max(1, math.min(self.index or 1, #rows))
+        self.selected_id = rows[self.index].id
+      end
+      -- `cwd` lost its team: resolve the project again so the next members
+      -- decision follows the sessions, not the stale snapshot.
+      self.resolved_cwd = self:project_cwd()
+      self:refresh()
+    end
+    return
+  end
+  self:hide_panes()
+end
+
+---The leader session of a team that is already out of the caches.
+---@param entry table the closed team's last known row
+---@return table|nil
+function Dashboard:closed_leader_session(entry)
+  local leader = type(entry.leader) == "table" and entry.leader or nil
+  local session_id = leader and type(leader.sessionId) == "string" and leader.sessionId or nil
+  if session_id and self.find_session then
+    local found = self.find_session(session_id)
+    if found then
+      return found
+    end
+  end
+  local current = self.current_session and self.current_session() or nil
+  if not current then
+    return nil
+  end
+  -- Only when it really was this team's conversation: the same session id, or
+  -- the same project and agent. Anything else is an unrelated chat.
+  if session_id and current.id == session_id then
+    return current
+  end
+  if entry.cwd and current.cwd == entry.cwd then
+    return current
+  end
+  return nil
+end
+
+---Whether the open panes can still show a live team after `cwd` lost one.
+---
+---The tree lists every project, so it keeps working as long as any team exists.
+---Members and board follow the project cwd (or an explicit pin): they are only
+---relevant while *their* team is still in the list.
+---@param cwd string|nil the project whose team closed
+---@return boolean
+function Dashboard:panes_still_relevant(cwd)
+  local rows = self:paint_rows()
+  if #rows == 0 then
+    return false
+  end
+  local project = cwd or self:project_cwd()
+  local project_team
+  for _, row in ipairs(rows) do
+    if project and row.cwd == project and row.state ~= "closed" then
+      project_team = row
+      break
+    end
+  end
+  if self.layout:is_open_pane("members") or self.layout:is_open_pane("board") then
+    if self.layout:is_open_pane("board") then
+      local pinned = self.open_board_target and self:team_by_id(self.open_board_target) or nil
+      if self.open_board_target and not pinned then
+        -- The board is pinned to a team that no longer exists.
+        return false
+      end
+      if not self.open_board_target and not project_team then
+        return false
+      end
+    end
+    if self.layout:is_open_pane("members") and not project_team then
+      return false
+    end
+  end
+  -- Only a tree that still has a live team to list is worth keeping.
+  return self.layout:is_open_pane("tree") and #rows > 0
+end
+
+---Close every team pane, keeping the ordinary chat/composer pair.
+function Dashboard:hide_panes()
+  if self.refresh_timer then
+    pcall(function()
+      self.refresh_timer:stop()
+      self.refresh_timer:close()
+    end)
+    self.refresh_timer = nil
+  end
+  self.pending = false
+  self.layout:close()
+  -- External layout managers (edgy) own the geometry: re-run their layout so a
+  -- closed pane cannot leave the ordinary chat/composer pair sized for it.
+  self.layout:release_external()
+  self:sync_aliases()
 end
 
 ---The cursor's target in whichever pane is focused.
@@ -1158,19 +1276,17 @@ end
 ---@param session table
 ---@param instance string
 function Dashboard:set_teams_on(session, instance)
-  self.team:set_session_teams(instance, session.id, true, false, function(ok, value)
+  local function notify(message, level)
+    self:notify(message, level)
+  end
+  self.team:enable_session(instance, session.id, function(ok, value)
     if not ok then
-      self:notify("cannot turn teams on: " .. tostring(value and value.message or value))
+      notify("cannot turn teams on: " .. self:report_text(value), vim.log.levels.WARN)
       return
     end
-    if type(value) == "table" and value.reload == true then
-      self.team:reload_session(instance, session.id, function(reloaded, err)
-        if not reloaded then
-          self:notify("cannot reload the session's team tools: " .. tostring(err and err.message or err))
-        end
-      end)
-    end
-  end)
+    -- The tree has no success notice of its own: the refreshed row shows
+    -- `injected` now, so silence is correct.
+  end, { notify = notify, join = false })
 end
 
 ---@param info table

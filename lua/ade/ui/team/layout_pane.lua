@@ -414,6 +414,31 @@ function Pane:remove_events()
   end
 end
 
+---Tell an external layout manager that the pane windows are gone.
+---
+---The team panes are ordinary splits/floats with their own filetypes, so edgy
+---never owns them; but closing them changes the window layout edgy has to lay
+---out, and a stale update would leave the ordinary chat/composer pair sized for
+---the old split. Only a loaded edgy is touched (never a lazy-load), and an
+---update failure is not the panel's to report.
+function Pane:release_external()
+  local cfg = self.dashboard and self.dashboard.config and self.dashboard.config() or {}
+  local layout = type(cfg) == "table" and cfg.layout or nil
+  if type(layout) ~= "table" or layout.backend ~= "external" then
+    return
+  end
+  if package.loaded["edgy.layout"] == nil and package.loaded["edgy"] == nil then
+    return
+  end
+  local ok, module = pcall(require, "edgy.layout")
+  if not ok or type(module) ~= "table" or type(module.update) ~= "function" then
+    return
+  end
+  vim.schedule(function()
+    pcall(module.update)
+  end)
+end
+
 ---@param name string
 ---@param lines string[]
 ---@param marks table[]

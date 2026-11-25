@@ -160,6 +160,8 @@ function M.new(opts)
     -- Tests that need the "tools still connecting" state start here.
     session_injected_default = opts.session_injected_default ~= false,
     session_reload_unsupported = opts.session_reload_unsupported,
+    session_teams_hold = opts.session_teams_hold,
+    session_teams_hold_answers = opts.session_teams_hold_answers,
     -- "instance\0sessionId" -> {enabled, injected}
     session_switches = {},
     team_counter = 0,
@@ -482,6 +484,38 @@ function Server:dispatch(message, client)
           { jsonrpc = "2.0", id = ident, result = { enabled = false, injected = switch.injected, leader = nil } }
         )
       end, 5)
+      return nil
+    end
+    if type(self.session_teams_hold) == "number" then
+      -- PROTOCOL.md 20.5: the service may hold a fresh session's enable while it
+      -- waits for the agent's MCP process. A test needs a held reply it can
+      -- inspect (and, for coalescing, one that stays unanswered).
+      local hold = self.session_teams_hold
+      self.session_teams_holds = self.session_teams_holds or {}
+      self.session_teams_holds[#self.session_teams_holds + 1] = {
+        instance = params.instance,
+        sessionId = params.sessionId,
+        client = client,
+        ident = ident,
+      }
+      local answers = self.session_teams_hold_answers
+      local scripted = type(answers) == "table" and table.remove(answers, 1) or nil
+      vim.defer_fn(function()
+        local reply = scripted
+        if type(reply) == "string" then
+          -- "off" / "uninjected": the hold ended because the person turned the
+          -- switch off elsewhere, or the agent exited. The service answers with
+          -- the state as it is then and marks nothing.
+          reply = { enabled = false, injected = switch.injected, reload = false }
+        end
+        reply = reply or { enabled = true, injected = true }
+        if reply.enabled == true and reply.injected == true then
+          switch.enabled = true
+          switch.injected = true
+          self:emit_session_teams(params.instance, params.sessionId)
+        end
+        self:send(client, { jsonrpc = "2.0", id = ident, result = reply })
+      end, hold)
       return nil
     end
     if not switch.injected then
