@@ -160,6 +160,21 @@ function M.new(opts)
     -- Tests that need the "tools still connecting" state start here.
     session_injected_default = opts.session_injected_default ~= false,
     session_reload_unsupported = opts.session_reload_unsupported,
+    session_teams_hold = opts.session_teams_hold,
+    session_teams_hold_answers = opts.session_teams_hold_answers,
+    -- A canned `session/new` that fails with auth_required and offers these
+    -- login methods: the front end's auth flow (picker → cancel) runs for real.
+    canned_auth_methods = opts.canned_auth_methods,
+    session_new_auth_error = opts.session_new_auth_error == true,
+    -- Fail only the Nth and later `session/new` (1 = every one). The first
+    -- creation must succeed, or the panel never gets going.
+    session_new_auth_after = opts.session_new_auth_after or 0,
+    session_new_calls = 0,
+    -- A canned `session/load` that takes this long (a slow agent replay).
+    canned_load_delay_ms = opts.canned_load_delay_ms,
+    -- A forwarded load that answers but never injects the tools: the MCP
+    -- process simply never connects.
+    session_load_never_injects = opts.session_load_never_injects == true,
     -- "instance\0sessionId" -> {enabled, injected}
     session_switches = {},
     team_counter = 0,
@@ -482,6 +497,38 @@ function Server:dispatch(message, client)
           { jsonrpc = "2.0", id = ident, result = { enabled = false, injected = switch.injected, leader = nil } }
         )
       end, 5)
+      return nil
+    end
+    if type(self.session_teams_hold) == "number" then
+      -- PROTOCOL.md 20.5: the service may hold a fresh session's enable while it
+      -- waits for the agent's MCP process. A test needs a held reply it can
+      -- inspect (and, for coalescing, one that stays unanswered).
+      local hold = self.session_teams_hold
+      self.session_teams_holds = self.session_teams_holds or {}
+      self.session_teams_holds[#self.session_teams_holds + 1] = {
+        instance = params.instance,
+        sessionId = params.sessionId,
+        client = client,
+        ident = ident,
+      }
+      local answers = self.session_teams_hold_answers
+      local scripted = type(answers) == "table" and table.remove(answers, 1) or nil
+      vim.defer_fn(function()
+        local reply = scripted
+        if type(reply) == "string" then
+          -- "off" / "uninjected": the hold ended because the person turned the
+          -- switch off elsewhere, or the agent exited. The service answers with
+          -- the state as it is then and marks nothing.
+          reply = { enabled = false, injected = switch.injected, reload = false }
+        end
+        reply = reply or { enabled = true, injected = true }
+        if reply.enabled == true and reply.injected == true then
+          switch.enabled = true
+          switch.injected = true
+          self:emit_session_teams(params.instance, params.sessionId)
+        end
+        self:send(client, { jsonrpc = "2.0", id = ident, result = reply })
+      end, hold)
       return nil
     end
     if not switch.injected then
@@ -1263,6 +1310,16 @@ function Server:on_tunnel_send(params, client)
       end
     end
   end
+  -- The relay's half of PROTOCOL.md 20.5: a load/resume marked one-shot
+  -- forward injects the tools and publishes the new switch. This happens for a
+  -- real agent child too, so it must not live in the canned reply path.
+  if
+    (message.method == "session/load" or message.method == "session/resume")
+    and type(message.params) == "table"
+    and type(message.params.sessionId) == "string"
+  then
+    self:consume_forward_mark(params.instance, message.params.sessionId)
+  end
   -- Writing to a child's stdin uses Vimscript (`chansend`), which libuv's fast
   -- event context forbids, and socket reads arrive there. One scheduled hop is
   -- enough and keeps the frame order.
@@ -1274,7 +1331,7 @@ function Server:on_tunnel_send(params, client)
         initialize = {
           protocolVersion = 1,
           agentCapabilities = vim.tbl_deep_extend("force", vim.deepcopy(capabilities), self.agent_capabilities or {}),
-          authMethods = {},
+          authMethods = vim.deepcopy(self.canned_auth_methods or {}),
         },
         ["session/new"] = { sessionId = "sess_mock", configOptions = {} },
         ["session/load"] = { configOptions = {} },
@@ -1286,6 +1343,26 @@ function Server:on_tunnel_send(params, client)
       if not self.canned_resume then
         replies["session/resume"] = nil
       end
+      if message.method == "session/new" and message.id ~= nil then
+        self.session_new_calls = self.session_new_calls + 1
+      end
+      if
+        self.session_new_auth_error
+        and message.method == "session/new"
+        and message.id ~= nil
+        and self.session_new_calls > self.session_new_auth_after
+      then
+        self:deliver(instance, {
+          jsonrpc = "2.0",
+          id = message.id,
+          error = {
+            code = -32000,
+            message = "Authentication required",
+            data = { authMethods = vim.deepcopy(self.canned_auth_methods or {}) },
+          },
+        })
+        return
+      end
       local result = message.method and replies[message.method]
       if message.method == "session/load" and self.canned_load_error and message.id ~= nil then
         self:deliver(instance, {
@@ -1293,6 +1370,19 @@ function Server:on_tunnel_send(params, client)
           id = message.id,
           error = vim.deepcopy(self.canned_load_error),
         })
+        return
+      end
+      if message.method == "session/load" and self.canned_load_delay_ms and message.id ~= nil then
+        -- A slow replay: the front end's load is still in flight while the
+        -- person may turn the switch off.
+        vim.defer_fn(function()
+          self:track_message(instance, message, result or { configOptions = {} })
+          self:deliver(instance, {
+            jsonrpc = "2.0",
+            id = message.id,
+            result = vim.deepcopy(result or { configOptions = {} }),
+          })
+        end, self.canned_load_delay_ms)
         return
       end
       if result and message.id ~= nil then
@@ -1396,29 +1486,36 @@ function Server:track_message(instance, message, result)
     put(params.sessionId)
     self.session_cwds = self.session_cwds or {}
     self.session_cwds[tostring(instance.id) .. "\0" .. params.sessionId] = cwd
-    local switch = self:switch_of(instance.id, params.sessionId)
-    local key = tostring(instance.id) .. "\0" .. params.sessionId
-    if self.session_force_forward and self.session_force_forward[key] then
-      -- PROTOCOL.md 20.5: the marked load forwards and injects.
-      self.session_force_forward[key] = nil
-      switch.injected = true
-      self:emit_session_teams(instance.id, params.sessionId)
-    end
     self:resume_team_for_load(instance.id, params.sessionId)
   elseif method == "session/resume" and type(params.sessionId) == "string" then
     self.session_cwds = self.session_cwds or {}
     self.session_cwds[tostring(instance.id) .. "\0" .. params.sessionId] = cwd
-    local switch = self:switch_of(instance.id, params.sessionId)
-    local key = tostring(instance.id) .. "\0" .. params.sessionId
-    if self.session_force_forward and self.session_force_forward[key] then
-      self.session_force_forward[key] = nil
-      switch.injected = true
-      self:emit_session_teams(instance.id, params.sessionId)
-    end
     self:resume_team_for_load(instance.id, params.sessionId)
   elseif (method == "session/close" or method == "session/delete") and params.sessionId ~= nil then
     forget(params.sessionId)
   end
+end
+
+---Consume a session's one-shot forward mark when its load/resume is relayed
+---(PROTOCOL.md 20.5): a forwarded load injects the tools and publishes the new
+---switch. Only a marked load does this; an ordinary load never injects.
+---@param instance string
+---@param session_id string
+---@return boolean injected
+function Server:consume_forward_mark(instance, session_id)
+  local key = tostring(instance) .. "\0" .. tostring(session_id)
+  if not (self.session_force_forward and self.session_force_forward[key]) then
+    return false
+  end
+  self.session_force_forward[key] = nil
+  if self.session_load_never_injects then
+    return false
+  end
+  local switch = self:switch_of(instance, session_id)
+  switch.enabled = true
+  switch.injected = true
+  self:emit_session_teams(instance, session_id)
+  return true
 end
 
 ---Give an instance a tracked session, as the relay would (PROTOCOL 11).

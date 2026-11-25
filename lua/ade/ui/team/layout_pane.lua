@@ -39,7 +39,10 @@ function M.new(dashboard)
     group = nil,
     closing = false,
     floats = {},
-    members_width = nil,
+    -- The person-dragged width, if any. Kept apart from `members_width()`
+    -- below: a field of the same name would be read back as the method through
+    -- `__index`, and `nvim_win_set_width` would silently reject a function.
+    adopted_width = nil,
     resizing = false,
     resize_token = 0,
   }, Pane)
@@ -56,8 +59,8 @@ end
 
 ---@return integer
 function Pane:members_width()
-  if self.members_width then
-    return self.members_width
+  if tonumber(self.adopted_width) then
+    return self.adopted_width
   end
   local cfg = self.dashboard.config() or {}
   return math.max(16, math.min(120, tonumber(((cfg.teams or {}).dashboard or {}).members_width) or 32))
@@ -156,10 +159,47 @@ function Pane:float_geometry(names)
   return out
 end
 
+---The window a new pane splits from.
+---
+---Always the widest ordinary window, never another pane and never a narrow
+---leftover split: `:botright vsplit` from inside the members window puts the
+---new pane *beside* it (squeezing members to its minimum and leaving the board
+---a sliver), and splitting a thin stray window has the same effect.
+---@return integer
+function Pane:split_base()
+  local widest
+  local width = 0
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if self:name_of(win) == nil and vim.api.nvim_win_get_config(win).relative == "" then
+      local w = vim.api.nvim_win_get_width(win)
+      if w > width then
+        widest, width = win, w
+      end
+    end
+  end
+  return widest or vim.api.nvim_get_current_win()
+end
+
 ---@param name string
 ---@return integer|nil win
 function Pane:create_split(name)
   local previous = vim.api.nvim_get_current_win()
+  local base = self:split_base()
+  if base and base ~= previous and vim.api.nvim_win_is_valid(base) then
+    pcall(vim.api.nvim_set_current_win, base)
+  end
+  -- Open panes carry `winfixwidth`, and Vim honours it while dividing the
+  -- screen: the split would hand the new pane whatever columns are left over
+  -- instead of its configured width. Release the pins for this one split.
+  local fixed = {}
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if vim.wo[win].winfixwidth then
+      fixed[#fixed + 1] = win
+      pcall(function()
+        vim.wo[win].winfixwidth = false
+      end)
+    end
+  end
   local equalalways = vim.o.equalalways
   vim.o.equalalways = false
   local ok = pcall(vim.cmd, "botright vsplit")
@@ -171,6 +211,29 @@ function Pane:create_split(name)
   if name == "members" or name == "tree" then
     pcall(vim.api.nvim_win_set_width, win, self:members_width())
     vim.wo[win].winfixwidth = true
+  end
+  -- Pin the older panes again at their own width: the split is free to shrink
+  -- a pane while its pin is released, so restoring the pin alone would keep the
+  -- shrunken pane. Then the new pane takes every column they do not use.
+  for _, fixed_win in ipairs(fixed) do
+    if fixed_win ~= win and vim.api.nvim_win_is_valid(fixed_win) then
+      local pane_name = self:name_of(fixed_win)
+      pcall(vim.api.nvim_win_set_width, fixed_win, self:members_width())
+      if pane_name then
+        pcall(function()
+          vim.wo[fixed_win].winfixwidth = true
+        end)
+      end
+    end
+  end
+  if name ~= "members" and name ~= "tree" then
+    local used = 0
+    for _, other in ipairs(vim.api.nvim_list_wins()) do
+      if other ~= win then
+        used = used + vim.api.nvim_win_get_width(other)
+      end
+    end
+    pcall(vim.api.nvim_win_set_width, win, math.max(24, vim.o.columns - used))
   end
   vim.o.equalalways = equalalways
   if not (previous and vim.api.nvim_win_is_valid(previous)) then
@@ -353,7 +416,7 @@ function Pane:install_events()
       end
       local win = self:win("members")
       if win and vim.api.nvim_win_get_width(win) ~= self:members_width() then
-        self.members_width = vim.api.nvim_win_get_width(win)
+        self.adopted_width = vim.api.nvim_win_get_width(win)
       end
       vim.schedule(function()
         if not self.closing then
@@ -412,6 +475,31 @@ function Pane:remove_events()
     pcall(vim.api.nvim_del_augroup_by_id, self.group)
     self.group = nil
   end
+end
+
+---Tell an external layout manager that the pane windows are gone.
+---
+---The team panes are ordinary splits/floats with their own filetypes, so edgy
+---never owns them; but closing them changes the window layout edgy has to lay
+---out, and a stale update would leave the ordinary chat/composer pair sized for
+---the old split. Only a loaded edgy is touched (never a lazy-load), and an
+---update failure is not the panel's to report.
+function Pane:release_external()
+  local cfg = self.dashboard and self.dashboard.config and self.dashboard.config() or {}
+  local layout = type(cfg) == "table" and cfg.layout or nil
+  if type(layout) ~= "table" or layout.backend ~= "external" then
+    return
+  end
+  if package.loaded["edgy.layout"] == nil and package.loaded["edgy"] == nil then
+    return
+  end
+  local ok, module = pcall(require, "edgy.layout")
+  if not ok or type(module) ~= "table" or type(module.update) ~= "function" then
+    return
+  end
+  vim.schedule(function()
+    pcall(module.update)
+  end)
 end
 
 ---@param name string

@@ -635,7 +635,11 @@ return function(t)
       UI:close()
     end)
 
-    t.it("a team closing elsewhere does not close the panes", function()
+    -- Teams v3.1 (review item A): a team closed by someone else must not leave
+    -- its panes behind. The members/board panes follow this project, and this
+    -- project no longer has a team, so they close. The ordinary chat/composer
+    -- pair and the current session stay exactly as they were.
+    t.it("a team closing elsewhere closes the panes that showed it", function()
       wide(t)
       local service, dir = start_service(t, "remote-close", { team_board = sample_board() })
       setup(t, "remote-close", service, dir)
@@ -650,15 +654,53 @@ return function(t)
       wait(function()
         return pane_win(UI, "members") ~= nil and pane_win(UI, "board") ~= nil
       end, 5000, "both panes")
+      local current = controller.state().sess.current
+      local chat_win = controller.state().chat.win
+      local input_win = controller.state().input.win
       service:team_changed(vim.tbl_extend("force", base_team(dir), { state = "closed" }))
       wait(function()
         return team():team("t1") == nil
       end, 5000, "the closed team")
-      vim.wait(120)
-      t.eq(true, UI:is_open(), "an idle pane stays open with its empty state")
       wait(function()
-        return pane_text(UI, "members"):find("还没有团队", 1, true) ~= nil
-      end, 5000, "the members empty state after the close")
+        return pane_win(UI, "members") == nil and pane_win(UI, "board") == nil and pane_win(UI, "tree") == nil
+      end, 5000, "the panes of the closed team")
+      t.falsy(UI.layout:is_open(), "no team pane is left on screen")
+      -- The ordinary panel and its session are untouched.
+      t.eq(chat_win, controller.state().chat.win, "the chat window is unchanged")
+      t.eq(input_win, controller.state().input.win, "the composer window is unchanged")
+      t.eq(current, controller.state().sess.current, "the current session is unchanged")
+    end)
+
+    -- The complement of the rule above: the tree lists every project, so a
+    -- close in one project must not tear down a tree that still has another
+    -- project's team to show.
+    t.it("keeps the tree while another project still has a team", function()
+      wide(t)
+      local other_dir = tmpdir("remote-close-other")
+      local service, dir = start_service(t, "remote-close-multi")
+      setup(t, "remote-close-multi", service, dir)
+      controller.connect()
+      wait_ready()
+      service:team_changed(base_team(dir))
+      local other = vim.tbl_extend("force", base_team(other_dir, { id = "t9" }), {
+        leader = { instance = "inst-other", sessionId = "sess-other" },
+      })
+      service:team_changed(other)
+      wait(function()
+        return team():team("t1") ~= nil and team():team("t9") ~= nil
+      end, 5000, "both teams")
+      ade.open_team("tree")
+      local UI = ui()
+      wait(function()
+        return pane_win(UI, "tree") ~= nil
+      end, 5000, "the tree")
+      service:team_changed(vim.tbl_extend("force", base_team(dir), { state = "closed" }))
+      wait(function()
+        return team():team("t1") == nil
+      end, 5000, "the closed team")
+      vim.wait(150)
+      t.truthy(pane_win(UI, "tree"), "the tree still lists the other project's team")
+      t.truthy(UI.layout:is_open("tree"))
       UI:close()
     end)
 
@@ -972,7 +1014,16 @@ return function(t)
       local recall = keys["<c-p>"] or keys["<up>"]
       t.truthy(recall, "the composer binds a history key")
       vim.api.nvim_buf_set_lines(input.buf, 0, -1, false, { "" })
-      recall()
+      -- Some keymap backends arm the mapping through the typeahead queue rather
+      -- than calling it synchronously. Press it the way the person does, then
+      -- drain the queue so the keystroke cannot surface in a later case.
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-p>", true, false, true), "x", false)
+      while true do
+        local ok, ch = pcall(vim.fn.getchar, 0)
+        if not ok or ch == 0 then
+          break
+        end
+      end
       local text = table.concat(vim.api.nvim_buf_get_lines(input.buf, 0, -1, false), "\n")
       t.falsy(text:find("leader-only prompt", 1, true), "the leader's prompts do not leak into the worker")
       UI:close()
@@ -1061,9 +1112,17 @@ return function(t)
       })
       setup(t, "workflow-list", service, dir)
       local started
-      controller.state().view.team_commands.start = function(_, name)
+      -- Patch the command *class*, not one instance: connecting may rebuild the
+      -- controller (and with it `team_commands`), and an instance-level stub
+      -- can then belong to an object nothing calls any more.
+      local Commands = require("ade.app.team_commands").Commands
+      local original_start = Commands.start
+      Commands.start = function(_, name)
         started = name
       end
+      t.cleanup(function()
+        Commands.start = original_start
+      end)
       controller.connect()
       wait_ready()
       t.eq(true, controller.open_team())
@@ -1071,15 +1130,29 @@ return function(t)
       wait(function()
         return pane_text(UI, "members"):find("dev", 1, true) ~= nil
       end, 5000, "the empty-state workflow list")
+      -- The pane's workflow list arrives asynchronously; wait for the row to
+      -- appear in the ids the pane is actually showing, then press the key on
+      -- it. (The list was empty when the pane opened.)
+      wait(function()
+        for _, id in pairs(UI.layout.ids.members or {}) do
+          if id == "workflow:dev" then
+            return true
+          end
+        end
+        return false
+      end, 5000, "the workflow row in the members pane")
       local line
       for index, id in pairs(UI.layout.ids.members or {}) do
         if id == "workflow:dev" then
           line = index
         end
       end
-      t.truthy(line)
+      t.truthy(line, "the workflow row has an id")
       vim.api.nvim_set_current_win(pane_win(UI, "members"))
       vim.api.nvim_win_set_cursor(pane_win(UI, "members"), { line, 0 })
+      local kind, _, _, info = UI.layout:current()
+      t.eq("workflow", kind, "the workflow row is under the cursor")
+      t.eq("dev", info.workflow.name)
       vim.api.nvim_feedkeys("S", "x", false)
       t.eq("dev", started)
       UI:close()
@@ -1158,7 +1231,17 @@ return function(t)
       setup(t, "v2-style", service, dir)
       controller.connect()
       wait_ready()
+      local dashboard_width = controller.state().config.teams.dashboard.members_width
       controller.state().config.teams.dashboard.members_width = 80
+      t.cleanup(function()
+        -- The width is read from the live configuration every time a pane is
+        -- created, so leaving it at 80 would size the panes of every later
+        -- case in this file (and hide the board's second column).
+        local cfg = controller.state().config
+        if cfg and cfg.teams and cfg.teams.dashboard then
+          cfg.teams.dashboard.members_width = dashboard_width
+        end
+      end)
       local entry = base_team(dir)
       entry.participants[2].label = "coder"
       entry.participants[2].agent = "opencode"

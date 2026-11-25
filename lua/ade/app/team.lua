@@ -28,6 +28,50 @@ function M.error_text(value)
   return tostring(message)
 end
 
+---Turn-on rules shared with the start flow and the tree (`ade.app.team_enable`).
+---
+---They live in their own module because the flow must not `require` this one
+---(the flow reads the team module through the controller: a require cycle).
+local Enable = require("ade.app.team_enable")
+
+---What one `session.teams {enabled: true}` answer means (PROTOCOL.md 20.5).
+---@param value any
+---@return "reload"|"on"|"off"|"uninjected"
+function M.enable_outcome(value)
+  return Enable.outcome(value)
+end
+
+---The error value for a failed enable.
+---@param value any
+---@param outcome string|nil
+---@return table
+function M.enable_error(value, outcome)
+  return Enable.error(value, outcome)
+end
+
+---The text to show for a failed enable.
+---@param value any
+---@param report fun(value: any): string|nil
+---@param prefix string|nil
+---@return string
+function M.enable_error_text(value, report, prefix)
+  return Enable.error_text(value, report, prefix)
+end
+
+---The notice shown while `session.teams` is still unanswered.
+M.ENABLE_WAIT_TEXT = Enable.WAIT_TEXT
+
+---Turn one session's tools on, coalescing a pending enable (see
+---`ade.app.team_enable`). Module form so it can be injected into the start flow.
+---@param team table
+---@param instance string
+---@param session_id string
+---@param cb fun(ok: boolean, value: any)|nil
+---@param opts {notify: fun(message: string, level: integer|nil)|nil, join: boolean|nil}|nil
+function M.enable_session(team, instance, session_id, cb, opts)
+  return Enable.run(team, instance, session_id, cb, opts)
+end
+
 local Team = {}
 Team.__index = Team
 
@@ -89,6 +133,9 @@ function M.new(opts)
     -- team id -> the board_rev whose fetch was already attempted (19.2): a
     -- failed or unavailable board must not be refetched on every team.changed.
     board_requested = {},
+    -- "instance\0sessionId" -> list of one-shot state listeners. Used by an
+    -- enable waiting for the MCP injection (`session.teams_changed`).
+    session_listeners = {},
     watching = nil,
     raw = nil,
   }, Team)
@@ -199,6 +246,10 @@ function Team:forget_connection()
   self.auto_eligible = {}
   self.bound = {}
   self.list_ready = false
+  self.session_listeners = {}
+  -- A held enable reply from the old connection will never arrive; settle its
+  -- callers instead of leaving a start flow waiting forever.
+  Enable.cancel_all(self, "the service connection was lost")
   -- A board request that was in flight when the connection died may still
   -- call back; bumping its token makes that late reply a no-op while the next
   -- `team.changed` can start a fresh request.
@@ -721,6 +772,12 @@ function Team:apply_session_teams(instance, session_id, value, seq, opts)
     seq = seq,
   }
   self.session_states[key] = state
+  -- Tell an enable that is waiting for the injection (a forwarded load only
+  -- restarts the log; the MCP process may still be connecting).
+  local listeners = self.session_listeners and self.session_listeners[key]
+  for _, listener in ipairs(listeners or {}) do
+    pcall(listener, state)
+  end
   for cwd, bound in pairs(self.bound) do
     if bound.session_id == session_id and bound.instance == instance then
       self.bound[cwd] = nil
@@ -859,12 +916,48 @@ function Team:session_opened(instance, session_id, cwd)
   self:query_session_teams(instance, session_id, cwd, function() end)
 end
 
+---The raw `session.teams` write, without coalescing or outcome evaluation.
+---@param team table
+---@param instance string
+---@param session_id string
+---@param enabled boolean
+---@param close boolean|nil
+---@param cb fun(ok: boolean, value: any)
+local function _write_session_teams(team, instance, session_id, enabled, close, cb)
+  local key = session_key(instance, session_id)
+  local params = { instance = instance, sessionId = session_id, enabled = enabled }
+  if close then
+    params.close = true
+  end
+  local seq = key and team:next_session_seq(key) or nil
+  team:_call("session.teams", params, function(ok, value)
+    if ok and type(value) == "table" then
+      -- `reload: true` means the service marked the session for a forwarded
+      -- load and its `injected` is not true yet; keep that in the cache so the
+      -- tree does not claim the tools are there.
+      if value.reload ~= true then
+        team:apply_session_teams(instance, session_id, value, seq)
+      end
+    end
+    -- A closed team disappears from the snapshot only after `team.changed`.
+    if ok and close then
+      team:refresh()
+    end
+    cb(ok, value)
+  end)
+end
+
 ---Flip the per-session switch (PROTOCOL.md 20.5).
 ---
 ---`enabled: true` against a session whose tools were never injected answers
 ---`reload: true`: the service marks the session one-shot forward and the front
 ---end must run its normal load path (`Sessions:load`) to get the tools. The
 ---`value` passed to `cb` carries that flag; `Team:reload_session` does the load.
+---
+---This is the raw write: exactly one request per call and the reply passed
+---through untouched. The user-facing "turn teams on" paths go through
+---`M.enable_session`, which coalesces concurrent enables and evaluates the
+---three outcomes.
 ---@param instance string
 ---@param session_id string
 ---@param enabled boolean
@@ -872,27 +965,36 @@ end
 ---@param cb fun(ok: boolean, value: any)|nil
 function Team:set_session_teams(instance, session_id, enabled, close, cb)
   cb = cb or function() end
-  local key = session_key(instance, session_id)
-  local params = { instance = instance, sessionId = session_id, enabled = enabled }
-  if close then
-    params.close = true
+  if enabled and close then
+    -- Only an enable that also closes a led team is a write of its own: settle
+    -- a pending plain enable so both replies cannot race a reload. A plain
+    -- enable here is `team_enable`'s own write and must not cancel itself.
+    Enable.cancel(self, instance, session_id, { message = "superseded by a closing enable" })
   end
-  local seq = key and self:next_session_seq(key) or nil
-  self:_call("session.teams", params, function(ok, value)
-    if ok and type(value) == "table" then
-      -- `reload: true` means the service marked the session for a forwarded
-      -- load and its `injected` is not true yet; keep that in the cache so the
-      -- tree does not claim the tools are there.
-      if value.reload ~= true then
-        self:apply_session_teams(instance, session_id, value, seq)
+  if enabled == false then
+    -- The person explicitly turned the tools off while an enable→reload is in
+    -- flight. Do not cancel the enable (its load is still running and the
+    -- session must settle), but mark it: the late load must not report success
+    -- and a start flow must not continue. A failed off restore the enable.
+    Enable.supersede(self, instance, session_id, "off")
+    _write_session_teams(self, instance, session_id, enabled, close, function(ok, value)
+      if not ok then
+        Enable.resume(self, instance, session_id)
       end
-    end
-    -- A closed team disappears from the snapshot only after `team.changed`.
-    if ok and close then
-      self:refresh()
-    end
-    cb(ok, value)
-  end)
+      cb(ok, value)
+    end)
+    return
+  end
+  _write_session_teams(self, instance, session_id, enabled, close, cb)
+end
+
+---Turn this session's tools on, coalescing a pending enable (`team_enable`).
+---@param instance string
+---@param session_id string
+---@param cb fun(ok: boolean, value: any)|nil
+---@param opts {notify: fun(message: string, level: integer|nil)|nil, join: boolean|nil}|nil
+function Team:enable_session(instance, session_id, cb, opts)
+  return M.enable_session(self, instance, session_id, cb, opts)
 end
 
 ---Run the front-end half of the in-place reload (PROTOCOL.md 20.5).
@@ -902,6 +1004,56 @@ end
 ---replays and the injection happens. `Sessions:load` is the normal path: it
 ---clears and re-renders the transcript, so the reload is visible, not a silent
 ---flag flip.
+---Watch one `(instance, sessionId)` switch until `cb` is called once.
+---
+---The enable that follows a forwarded load needs the *real* injection state:
+---a successful load restarts the transcript, but the agent's MCP process may
+---connect later (or never). This registers a one-shot listener fed by
+---`apply_session_teams`; the caller races it against its own timeout.
+---@param instance string
+---@param session_id string
+---@param cb fun(state: table)
+---@return fun() unsubscribe
+function Team:watch_session_state(instance, session_id, cb)
+  local key = session_key(instance, session_id)
+  if not key then
+    return function() end
+  end
+  self.session_listeners = self.session_listeners or {}
+  local list = self.session_listeners[key] or {}
+  self.session_listeners[key] = list
+  local listener = function(state)
+    if self.session_listeners[key] == list then
+      for index, entry in ipairs(list) do
+        if entry == listener then
+          table.remove(list, index)
+          break
+        end
+      end
+      if #list == 0 then
+        self.session_listeners[key] = nil
+      end
+    end
+    pcall(cb, state)
+  end
+  list[#list + 1] = listener
+  return function()
+    local current = self.session_listeners and self.session_listeners[key]
+    if not current then
+      return
+    end
+    for index, entry in ipairs(current) do
+      if entry == listener then
+        table.remove(current, index)
+        break
+      end
+    end
+    if #current == 0 and self.session_listeners then
+      self.session_listeners[key] = nil
+    end
+  end
+end
+
 ---@param instance string
 ---@param session_id string
 ---@param cb fun(ok: boolean, value: any)|nil
@@ -1257,10 +1409,15 @@ end
 ---A team disappeared: closed here, by another front end, or by the service.
 ---The local caches are already updated; the panel uses this to close or move
 ---to the next team.
+---
+---`entry` is the closed team's last known row. The caches no longer have it, so
+---the panel needs it to know which project lost its team and which session was
+---its leader (the router has to return there before the pane goes away).
 ---@param team_id string
-function Team:closed(team_id)
+---@param entry table|nil
+function Team:closed(team_id, entry)
   if type(self.on_closed) == "function" then
-    pcall(self.on_closed, team_id)
+    pcall(self.on_closed, team_id, entry)
   end
 end
 
@@ -1271,17 +1428,25 @@ function Team:on_changed_payload(payload)
     return
   end
   if team.state == "closed" then
+    local entry = vim.deepcopy(self.teams[team.id] or team)
     self:forget_team(team.id)
-    for cwd, entry in pairs(self.bound) do
-      if entry.team == team.id or team.cwd == cwd then
+    for cwd, bound in pairs(self.bound) do
+      if bound.team == team.id or team.cwd == cwd then
         self.bound[cwd] = nil
       end
     end
     if self.watching and self.watching.team_id == team.id then
       -- The team is gone; there is nothing left to unwatch on the service.
-      self:unwatch(true)
+      -- Release the subscription **silently**: `team_closed` below is the one
+      -- UI event that settles routing. A generic `on_watch(nil)` would first
+      -- restore whichever chat the panel showed before the worker (often not
+      -- the team's leader) and clear the router target, so the close handler
+      -- could no longer tell that a worker of this team was on screen.
+      self:unwatch(true, true)
     end
-    self:closed(team.id)
+    -- One event with the team id and its last known row (leader pair, cwd):
+    -- the panel returns to that leader and decides about its panes.
+    self:closed(team.id, entry)
   else
     self.teams[team.id] = team
     -- Keep the per-cwd snapshot in step with the notification stream so the
@@ -1612,8 +1777,14 @@ function Team:close(team, cb)
     if ok then
       -- The reply may arrive before `team.changed(closed)`; the local state
       -- must not keep a team that is already gone (19.7 "start over").
+      local entry = vim.deepcopy(self.teams[team] or { id = team })
       self:forget_team(team)
-      self:closed(team)
+      if self.watching and self.watching.team_id == team then
+        -- Same single-event rule as `team.changed(closed)`: release the watch
+        -- silently and let `team_closed` settle the routing.
+        self:unwatch(true, true)
+      end
+      self:closed(team, entry)
       self:changed()
     end
     if cb then
@@ -2009,7 +2180,8 @@ function Team:watch(team, participant, replay, cb)
 end
 
 ---@param quiet boolean|nil no team.unwatch request (connection already gone)
-function Team:unwatch(quiet)
+---@param silent boolean|nil do not fire `on_watch(nil)`; the caller owns routing.
+function Team:unwatch(quiet, silent)
   local entry = self.watching
   if not entry then
     return
@@ -2023,7 +2195,7 @@ function Team:unwatch(quiet)
   if not quiet and raw and entry.team_id and entry.participant then
     raw:request_tracked("team.unwatch", { team = entry.team_id, participant = entry.participant }, function() end)
   end
-  if self.on_watch then
+  if self.on_watch and not silent then
     pcall(self.on_watch, nil, nil)
   end
 end

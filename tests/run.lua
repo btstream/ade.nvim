@@ -169,5 +169,6 @@ require("tests.spec_v3_restore_recover")(t)
 require("tests.spec_v3_restore_entries")(t)
 require("tests.spec_v3_restore_reload")(t)
 require("tests.spec_v3_restore_close")(t)
+require("tests.spec_v31_frontend")(t)
 
 t.run()

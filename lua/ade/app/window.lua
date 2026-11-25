@@ -61,8 +61,14 @@ end
 ---release the resources, but never while a turn is still in flight: closing a
 ---running session would kill work the user only meant to leave in the
 ---background. Agents without `session/close` simply ignore the request.
+---
+---`opts.no_close` suppresses the idle close entirely. The team-closed path uses
+---it: returning from a worker to the team's leader must never close whichever
+---unrelated chat happened to be on screen before.
 ---@param session table|nil
-function M:select_session(session)
+---@param opts {no_close: boolean|nil}|nil
+function M:select_session(session, opts)
+  opts = opts or {}
   local S = self:state()
   local previous = S.sess.current
   -- A team worker transcript is only a view of a worker session; switching the
@@ -89,7 +95,8 @@ function M:select_session(session)
   -- direct backend never has one) is owned by whatever client is live.
   local owned = owner == nil or (live ~= nil and owner == live)
   if
-    previous
+    not opts.no_close
+    and previous
     and owned
     and not same_session(previous, session)
     and previous.status == "idle"
