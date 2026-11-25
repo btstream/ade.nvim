@@ -183,6 +183,8 @@ return function(t)
   ---------------------------------------------------------------------------
 
   t.describe("teams v3.1 close", function()
+    local State = require("ade.session.state")
+
     local function wise(t)
       local old = vim.o.columns
       vim.o.columns = 170
@@ -202,41 +204,31 @@ return function(t)
       end)
     end
 
-    t.it("`:Ade team close` closes the panes and keeps the leader chat", function()
-      wise(t)
-      local service, dir = start_service(t, "close-panes")
-      setup(t, dir)
-      confirm_yes(t)
-      controller.connect()
-      wait_ready()
-      seed_team(service, dir)
-      t.eq(true, controller.open_team("all"))
-      local UI = ui()
-      wait(function()
-        return pane_win("tree") and pane_win("members") and pane_win("board")
-      end, 5000, "all three panes")
-      local chat_win = state().chat.win
-      local input_win = state().input.win
-      local session = state().sess.current
-      vim.cmd("Ade team close")
-      wait(function()
-        return team():team("t1") == nil
-      end, 5000, "the closed team")
-      wait(function()
-        return not UI.layout:is_open()
-      end, 5000, "the panes to go away")
-      t.eq(nil, pane_win("tree"))
-      t.eq(nil, pane_win("members"))
-      t.eq(nil, pane_win("board"))
-      -- The ordinary pair survives, unchanged, on the same session.
-      t.eq(chat_win, state().chat.win, "the chat window is unchanged")
-      t.eq(input_win, state().input.win, "the composer window is unchanged")
-      t.eq(session, state().sess.current, "the leader session stays on screen")
-    end)
+    local function sent_frames(service, method)
+      local out = {}
+      for _, entry in ipairs(service.sent) do
+        if type(entry.message) == "table" and entry.message.method == method then
+          out[#out + 1] = entry.message
+        end
+      end
+      return out
+    end
 
-    t.it("closing while a worker is watched returns to the leader", function()
+    ---A second ordinary chat of the same project, loaded and idle.
+    local function add_chat(id, dir, instance)
+      local session = State.new(id, dir)
+      session.agent_name = "opencode"
+      session.instance = instance or own_instance()
+      session.needs_load = false
+      session.status = "idle"
+      session.blocks = { { kind = "user", text = "chat " .. id } }
+      state().sess.all[id] = session
+      return session
+    end
+
+    t.it("a remote close of a watched worker returns to L, never closes A", function()
       wise(t)
-      local service, dir = start_service(t, "close-worker", {
+      local service, dir = start_service(t, "close-remote-leader", {
         team_watch = {
           instance = "inst-w",
           sessionId = "sess-w",
@@ -244,10 +236,18 @@ return function(t)
         },
       })
       setup(t, dir)
-      confirm_yes(t)
       controller.connect()
       wait_ready()
-      seed_team(service, dir)
+      -- A is the ordinary chat on screen; L is a different chat of the same
+      -- project and leads the team. The worker was opened from A, so the
+      -- generic "restore the previous chat" path would go back to A.
+      local a = state().sess.current
+      t.eq("sess_mock", a.id)
+      a.status = "idle"
+      local inst = own_instance()
+      service:track_session(inst, { sessionId = "sess_mock", cwd = dir })
+      local l = add_chat("sess_leader", dir, inst)
+      seed_team(service, dir, { leader = { instance = inst, sessionId = "sess_leader" } })
       local UI = ui()
       t.eq(true, controller.open_team("all"))
       local watched
@@ -261,33 +261,45 @@ return function(t)
       wait(function()
         return UI.router.target ~= nil and UI.router.target.participant == "w1"
       end, 5000, "the worker transcript")
-      local leader = state().sess.current
-      vim.cmd("Ade team close")
+      local closes_before = #sent_frames(service, "session/close")
+      -- A different front end closes the team.
+      service:team_changed({
+        id = "t1",
+        cwd = dir,
+        state = "closed",
+        leader = { instance = inst, sessionId = "sess_leader" },
+        participants = {},
+        inbox = {},
+        limits = {},
+      })
       wait(function()
         return team():team("t1") == nil
       end, 5000, "the closed team")
       wait(function()
         return UI.router.target == nil
       end, 5000, "the chat to leave the worker")
-      t.eq(leader, state().sess.current, "back on the leader conversation")
-      t.eq(leader, state().chat.session, "the transcript shows the leader")
+      t.eq(l, state().sess.current, "the leader conversation is shown, not A")
+      t.eq(l, state().chat.session, "the transcript shows L")
+      -- Leaving a worker is not a session switch the person asked for.
+      t.eq(closes_before, #sent_frames(service, "session/close"), "A was not idle-closed")
       wait(function()
         return not UI.layout:is_open()
       end, 5000, "the panes to go away")
-      t.eq(nil, team().watching, "the watch is released with the team")
     end)
 
-    t.it("a close notification from another front end behaves the same way", function()
+    t.it("falls back to the previous chat when the leader is not local", function()
       wise(t)
-      local service, dir = start_service(t, "close-remote-worker", {
+      local service, dir = start_service(t, "close-remote-foreign", {
         team_watch = { instance = "inst-w", sessionId = "sess-w" },
       })
       setup(t, dir)
       controller.connect()
       wait_ready()
-      seed_team(service, dir)
-      t.eq(true, controller.open_team("all"))
+      local a = state().sess.current
+      a.status = "idle"
+      seed_team(service, dir, { leader = { instance = "inst-elsewhere", sessionId = "sess_foreign" } })
       local UI = ui()
+      t.eq(true, controller.open_team("all"))
       local watched
       team():watch("t1", "w1", true, function(ok)
         watched = ok
@@ -299,27 +311,197 @@ return function(t)
       wait(function()
         return UI.router.target ~= nil
       end, 5000, "the worker transcript")
-      local leader = state().sess.current
-      -- The service says the team is gone; nothing in this front end asked.
-      service:team_changed(vim.tbl_extend("force", {
+      local notices = {}
+      UI.notify_fn = function(message, level)
+        notices[#notices + 1] = { message = tostring(message), level = level }
+      end
+      local closes_before = #sent_frames(service, "session/close")
+      service:team_changed({
         id = "t1",
         cwd = dir,
         state = "closed",
-        leader = { instance = own_instance(), sessionId = "sess_mock" },
+        leader = { instance = "inst-elsewhere", sessionId = "sess_foreign" },
         participants = {},
         inbox = {},
         limits = {},
-      }, {}))
+      })
       wait(function()
-        return team():team("t1") == nil and UI.router.target == nil
-      end, 5000, "the chat back on the leader")
-      t.eq(leader, state().sess.current)
+        return UI.router.target == nil
+      end, 5000, "the chat to leave the worker")
+      t.eq(a, state().sess.current, "back on the chat that was there before")
+      t.eq(closes_before, #sent_frames(service, "session/close"), "and it is not closed")
+      local text = {}
+      for _, note in ipairs(notices) do
+        text[#text + 1] = note.message
+      end
+      t.match("leader", table.concat(text, "\n"))
       wait(function()
         return not UI.layout:is_open()
       end, 5000, "the panes to go away")
     end)
 
-    t.it("edgy's external layout keeps the chat pair when the panes close", function()
+    t.it("the tree's `x` closes the team and its panes", function()
+      wise(t)
+      local service, dir = start_service(t, "close-tree-x", {
+        team_watch = { instance = "inst-w", sessionId = "sess-w" },
+      })
+      setup(t, dir)
+      confirm_yes(t)
+      controller.connect()
+      wait_ready()
+      local a = state().sess.current
+      a.status = "idle"
+      local inst = own_instance()
+      local l = add_chat("sess_leader", dir, inst)
+      seed_team(service, dir, { leader = { instance = inst, sessionId = "sess_leader" } })
+      local UI = ui()
+      t.eq(true, controller.open_team("all"))
+      local watched
+      team():watch("t1", "w1", true, function(ok)
+        watched = ok
+      end)
+      wait(function()
+        return watched
+      end, 10000, "the watch")
+      UI:watch(team().watching.session, "t1/w1")
+      wait(function()
+        return UI.router.target ~= nil
+      end, 5000, "the worker transcript")
+      local closes_before = #sent_frames(service, "session/close")
+      -- Real key on the tree's leader row.
+      local meta = {
+        kind = "tree_session",
+        session = l,
+        cwd = dir,
+        instance = inst,
+        online = true,
+        leader = true,
+        team = { id = "t1", cwd = dir },
+      }
+      t.eq(true, UI:handle_tree_key("x", meta))
+      wait(function()
+        return team():team("t1") == nil
+      end, 5000, "the closed team")
+      wait(function()
+        return UI.router.target == nil
+      end, 5000, "back from the worker")
+      t.eq(l, state().sess.current, "the tree close lands on L")
+      t.eq(closes_before, #sent_frames(service, "session/close"), "A was not closed")
+      wait(function()
+        return not UI.layout:is_open()
+      end, 5000, "the panes to go away")
+    end)
+
+    t.it("`:Ade team off` with the close confirmation ends the panes", function()
+      wise(t)
+      local service, dir = start_service(t, "close-off")
+      setup(t, dir)
+      confirm_yes(t)
+      controller.connect()
+      wait_ready()
+      local inst = own_instance()
+      service.session_switches[tostring(inst) .. "\0sess_mock"] = { enabled = true, injected = true }
+      seed_team(service, dir)
+      local UI = ui()
+      t.eq(true, controller.open_team("all"))
+      local current = state().sess.current
+      vim.cmd("Ade team off")
+      wait(function()
+        return team():team("t1") == nil
+      end, 8000, "the team closed by the switch")
+      wait(function()
+        return not UI.layout:is_open()
+      end, 5000, "the panes to go away")
+      t.eq(current, state().sess.current, "the leader's chat stays on screen")
+      t.eq(nil, pane_win("members"))
+      t.eq(nil, pane_win("board"))
+      t.eq(nil, pane_win("tree"))
+    end)
+
+    t.it("a board showing another project's team survives that close", function()
+      wise(t)
+      local other_dir = tmpdir("keep-board-other")
+      local service, dir = start_service(t, "keep-board")
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      seed_team(service, dir)
+      local other = {
+        id = "t9",
+        cwd = other_dir,
+        state = "active",
+        leader = { instance = "inst-other", sessionId = "sess-other" },
+        participants = { { name = "leader", state = "idle", task = "_", queued = 0, turns = {} } },
+        inbox = {},
+        limits = {},
+      }
+      service.teams.t9 = vim.deepcopy(other)
+      service:team_changed(other)
+      wait(function()
+        return team():team("t9") ~= nil
+      end, 5000, "the other team")
+      local UI = ui()
+      t.eq(true, controller.open_team("members"))
+      wait(function()
+        return pane_win("members") ~= nil
+      end, 5000, "the members pane")
+      -- `b` on the other project's row pins its board.
+      t.eq(true, UI:handle_tree_key("b", { kind = "tree_project", cwd = other_dir }))
+      wait(function()
+        return pane_win("board") ~= nil
+      end, 5000, "the board of the other project")
+      wait(function()
+        return UI.board_team_id == "t9"
+      end, 5000, "the board's real target")
+      -- Now this project's team closes. Its members pane loses its subject,
+      -- but the board shows t9 and must stay.
+      service:team_changed(vim.tbl_extend("force", {
+        id = "t1",
+        cwd = dir,
+        state = "closed",
+        participants = {},
+        inbox = {},
+        limits = {},
+      }, { leader = nil }))
+      wait(function()
+        return team():team("t1") == nil
+      end, 5000, "the closed team")
+      wait(function()
+        return UI.board_team_id == "t9"
+      end, 3000, "the board keeps showing t9")
+      t.truthy(pane_win("board"), "the board showing another team stays")
+      t.truthy(pane_win("members"), "the members pane survives while a team exists")
+      UI:close()
+    end)
+
+    t.it("a members pane on this project closes with its only team", function()
+      wise(t)
+      local service, dir = start_service(t, "close-members-only")
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      seed_team(service, dir)
+      local UI = ui()
+      t.eq(true, controller.open_team("members"))
+      wait(function()
+        return pane_win("members") ~= nil and UI.members_team_id == "t1"
+      end, 5000, "the members pane")
+      service:team_changed(vim.tbl_extend("force", {
+        id = "t1",
+        cwd = dir,
+        state = "closed",
+        participants = {},
+        inbox = {},
+        limits = {},
+      }, { leader = nil }))
+      wait(function()
+        return pane_win("members") == nil
+      end, 5000, "the members pane to close with its team")
+      t.eq(nil, pane_win("board"))
+      t.eq(nil, pane_win("tree"))
+    end)
+
+    t.it("edgy's external mode keeps the chat pair when the panes close", function()
       wise(t)
       local service, dir = start_service(t, "close-edgy")
       setup(t, dir, { layout = { backend = "external", input_height = 6 } })
@@ -334,7 +516,6 @@ return function(t)
       end, 5000, "the members pane")
       local chat_win = state().chat.win
       local input_win = state().input.win
-      t.truthy(chat_win, "the panel was open before the team panes")
       service:team_changed({
         id = "t1",
         cwd = dir,
@@ -349,8 +530,8 @@ return function(t)
       end, 5000, "the panes to go away under the external backend")
       t.eq(chat_win, state().chat.win, "the chat window is unchanged")
       t.eq(input_win, state().input.win, "the composer window is unchanged")
-      t.truthy(state().chat.win and vim.api.nvim_win_is_valid(state().chat.win), "the chat window is live")
-      t.truthy(state().input.win and vim.api.nvim_win_is_valid(state().input.win), "the composer window is live")
+      t.truthy(chat_win and vim.api.nvim_win_is_valid(chat_win), "the chat window is live")
+      t.truthy(input_win and vim.api.nvim_win_is_valid(input_win), "the composer window is live")
     end)
   end)
 
@@ -374,13 +555,12 @@ return function(t)
       local service, dir = start_service(t, "on-cancelled", {
         session_teams_hold = 150,
         session_teams_hold_answers = { "off", "off" },
+        session_injected_default = false,
       })
       setup(t, dir)
       controller.connect()
       wait_ready()
       local notices = capture(t)
-      local key = tostring(own_instance()) .. "\0sess_mock"
-      service.session_switches[key] = { enabled = true, injected = true }
       vim.cmd("Ade team on")
       wait(function()
         return joined(notices):find("cannot turn teams on", 1, true) ~= nil
@@ -393,6 +573,7 @@ return function(t)
       local service, dir = start_service(t, "on-uninjected", {
         session_teams_hold = 100,
         session_teams_hold_answers = { { enabled = true, injected = false, reload = false } },
+        session_injected_default = false,
       })
       setup(t, dir)
       controller.connect()
@@ -423,7 +604,8 @@ return function(t)
     t.it("the tree's `t` explains a cancelled enable instead of staying silent", function()
       local service, dir = start_service(t, "tree-cancelled", {
         session_teams_hold = 100,
-        session_teams_hold_answers = { { enabled = true, injected = false, reload = false } },
+        session_teams_hold_answers = { "off", "off" },
+        session_injected_default = false,
       })
       setup(t, dir)
       controller.connect()
@@ -447,7 +629,7 @@ return function(t)
       wait(function()
         return table.concat(notices, "\n"):find("cannot turn teams on", 1, true) ~= nil
       end, 8000, "the tree failure notice")
-      t.truthy(table.concat(notices, "\n"):find("did not inject", 1, true))
+      t.truthy(table.concat(notices, "\n"):find("turned off", 1, true))
     end)
   end)
 
@@ -457,7 +639,10 @@ return function(t)
 
   t.describe("teams v3.1 coalesced enable", function()
     t.it("two `:Ade team on` calls send one write and wait once", function()
-      local service, dir = start_service(t, "coalesce", { session_teams_hold = 1200 })
+      local service, dir = start_service(t, "coalesce", {
+        session_teams_hold = 1200,
+        session_injected_default = false,
+      })
       setup(t, dir)
       controller.connect()
       wait_ready()
@@ -476,8 +661,11 @@ return function(t)
       t.eq(before + 1, enable_writes(service), "still one write after the reply")
     end)
 
-    t.it("a second start joins the enable in flight and starts once it lands", function()
-      local service, dir = start_service(t, "coalesce-start", { session_teams_hold = 900 })
+    t.it("a second `:Ade team start` joins the first start's enable", function()
+      local service, dir = start_service(t, "coalesce-two-starts", {
+        session_teams_hold = 900,
+        session_injected_default = false,
+      })
       setup(t, dir)
       controller.connect()
       wait_ready()
@@ -497,19 +685,24 @@ return function(t)
       local before = enable_writes(service)
       vim.cmd("Ade team start default")
       vim.wait(150)
-      t.eq(true, require("ade.app.team_start").active(dir), "the start is waiting on the enable")
-      vim.cmd("Ade team on")
+      t.eq(true, require("ade.app.team_start").active(dir), "the first start waits on the enable")
+      -- A second start of the same project supersedes the first flow but must
+      -- join the enable in flight instead of sending another held write.
+      vim.cmd("Ade team start default")
       wait(function()
         return prompted > 0
-      end, 15000, "the task prompt after the shared enable")
-      t.eq(before + 1, enable_writes(service), "the on click joined the start's enable")
+      end, 20000, "the task prompt after the shared enable")
+      t.eq(before + 1, enable_writes(service), "the second start joined the first enable")
       wait(function()
         return #calls_of(service, "team.start") == 1
-      end, 5000, "the start")
+      end, 5000, "one team.start")
     end)
 
     t.it("a lost connection settles a held enable instead of waiting", function()
-      local service, dir = start_service(t, "coalesce-lost", { session_teams_hold = 3000 })
+      local service, dir = start_service(t, "coalesce-lost", {
+        session_teams_hold = 8000,
+        session_injected_default = false,
+      })
       setup(t, dir)
       controller.connect()
       wait_ready()
@@ -520,13 +713,103 @@ return function(t)
       vim.wait(150)
       t.falsy(done, "the enable is still held")
       -- The held reply will never arrive on a connection that is gone: the
-      -- waiting start flow must be told, not left hanging.
-      team():forget_connection()
+      -- waiting start flow must be told, not left hanging. This closes the real
+      -- socket, so the front end's own disconnect path runs.
+      service:close()
       wait(function()
         return done
-      end, 5000, "the cancelled enable")
+      end, 6000, "the cancelled enable")
       t.eq(false, ok)
       t.match("connection", tostring(type(value) == "string" and value or value.message))
+    end)
+  end)
+
+  ---------------------------------------------------------------------------
+  -- 2b. What settles an enable whose load asked for a reload
+  ---------------------------------------------------------------------------
+
+  t.describe("teams v3.1 reload settlement", function()
+    local function start_canned(t, tag, opts)
+      return start_service(
+        t,
+        tag,
+        vim.tbl_extend("force", {
+          canned_capabilities = { loadSession = true, sessionCapabilities = { close = {}, resume = {} } },
+        }, opts or {})
+      )
+    end
+
+    t.it("does not invent `injected` when the MCP process never connects", function()
+      local service, dir = start_canned(t, "reload-never", { session_load_never_injects = true })
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      local notices = capture(t)
+      local inst = own_instance()
+      service.session_switches[tostring(inst) .. "\0sess_mock"] = { enabled = true, injected = false }
+      state().view.team.session_states[tostring(inst) .. "\0sess_mock"] = nil
+      local done, ok, value
+      team():enable_session(inst, "sess_mock", function(result, reason)
+        done, ok, value = true, result, reason
+      end, { wait_ms = 600 })
+      wait(function()
+        return done
+      end, 10000, "the enable to settle")
+      t.eq(false, ok, "a load alone is not an injected session")
+      t.match("did not inject", tostring(type(value) == "table" and value.message or value))
+      t.falsy(joined(notices):find("teams are on for this chat", 1, true))
+    end)
+
+    t.it("waits for `session.teams_changed` and succeeds once it injects", function()
+      local service, dir = start_canned(t, "reload-late")
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      local inst = own_instance()
+      service.session_switches[tostring(inst) .. "\0sess_mock"] = { enabled = true, injected = false }
+      state().view.team.session_states[tostring(inst) .. "\0sess_mock"] = nil
+      local done, ok, value
+      team():enable_session(inst, "sess_mock", function(result, reason)
+        done, ok, value = true, result, reason
+      end, { wait_ms = 8000 })
+      -- The load succeeds; the MCP handshake arrives afterwards.
+      wait(function()
+        return team():session_teams(inst, "sess_mock") ~= nil
+      end, 5000, "the load")
+      vim.defer_fn(function()
+        local key = tostring(inst) .. "\0sess_mock"
+        service.session_switches[key] = { enabled = true, injected = true }
+        service:emit_session_teams(inst, "sess_mock")
+      end, 250)
+      wait(function()
+        return done
+      end, 10000, "the enable to settle on the injection")
+      t.eq(true, ok, "the late injection settles it as success")
+      t.eq(true, type(value) == "table" and value.injected == true)
+    end)
+
+    t.it("a successful off during a slow load wins over the enable", function()
+      local service, dir = start_canned(t, "reload-off", { canned_load_delay_ms = 700 })
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      local inst = own_instance()
+      service.session_switches[tostring(inst) .. "\0sess_mock"] = { enabled = true, injected = false }
+      state().view.team.session_states[tostring(inst) .. "\0sess_mock"] = nil
+      local done, ok, value
+      team():enable_session(inst, "sess_mock", function(result, reason)
+        done, ok, value = true, result, reason
+      end, { wait_ms = 5000 })
+      wait(function()
+        return #(service.sent or {}) > 0
+      end, 3000, "the reload")
+      -- The person turns the switch off while the load is still replaying.
+      team():set_session_teams(inst, "sess_mock", false, false, function() end)
+      wait(function()
+        return done
+      end, 12000, "the enable to settle after the off")
+      t.eq(false, ok, "the late load must not report success")
+      t.match("turned off", tostring(type(value) == "table" and value.message or value))
     end)
   end)
 
@@ -624,6 +907,61 @@ return function(t)
         failed = message
       end))
       t.truthy(failed, "the caller was told nothing will happen")
+    end)
+    t.it("a real `session/new` auth failure ends the start when the picker is cancelled", function()
+      -- The start flow needs a replacement session (the agent cannot reload in
+      -- place) and that `session/new` fails with auth_required while offering
+      -- two login methods. Esc in the picker must end the start instead of
+      -- leaving it parked: no task prompt, no team.start.
+      local service, dir = start_service(t, "auth-real", {
+        canned_auth_methods = {
+          { id = "claude", name = "claude.ai" },
+          { id = "console", name = "Console", type = "terminal", args = { "login" } },
+        },
+        session_new_auth_error = true,
+        session_new_auth_after = 1,
+        session_reload_unsupported = true,
+      })
+      setup(t, dir)
+      controller.connect()
+      wait(function()
+        local S = state()
+        return S.conn.phase == "ready" and S.sess.current ~= nil
+      end, 25000, "the panel to be ready")
+      local TeamStart = require("ade.app.team_start")
+      local original_select, original_input = vim.ui.select, vim.ui.input
+      t.cleanup(function()
+        vim.ui.select, vim.ui.input = original_select, original_input
+      end)
+      local picker_seen = false
+      vim.ui.select = function(items, opts, cb)
+        local prompt = tostring(opts and opts.prompt or "")
+        if prompt == "Log in" then
+          picker_seen = true
+          cb(nil)
+          return
+        end
+        cb(items[1])
+      end
+      local prompted = false
+      vim.ui.input = function(_, cb)
+        prompted = true
+        cb("")
+      end
+      -- The session's tools are not injected: the flow must try an in-place
+      -- reload, learn it is unsupported, and create a replacement.
+      service.session_switches[tostring(own_instance()) .. "\0sess_mock"] = { enabled = true, injected = false }
+      state().view.team.session_states[tostring(own_instance()) .. "\0sess_mock"] = nil
+      vim.cmd("Ade team start default")
+      wait(function()
+        return picker_seen
+      end, 20000, "the login picker raised by the replacement session")
+      wait(function()
+        return TeamStart.active(dir) == false
+      end, 15000, "the start to end after the cancelled login")
+      vim.wait(200)
+      t.falsy(prompted, "the cancelled login must not reach the task prompt")
+      t.eq(0, #calls_of(service, "team.start"), "no workflow started after a cancelled login")
     end)
   end)
 end

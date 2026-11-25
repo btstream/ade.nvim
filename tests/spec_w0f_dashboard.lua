@@ -1014,7 +1014,16 @@ return function(t)
       local recall = keys["<c-p>"] or keys["<up>"]
       t.truthy(recall, "the composer binds a history key")
       vim.api.nvim_buf_set_lines(input.buf, 0, -1, false, { "" })
-      recall()
+      -- Some keymap backends arm the mapping through the typeahead queue rather
+      -- than calling it synchronously. Press it the way the person does, then
+      -- drain the queue so the keystroke cannot surface in a later case.
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-p>", true, false, true), "x", false)
+      while true do
+        local ok, ch = pcall(vim.fn.getchar, 0)
+        if not ok or ch == 0 then
+          break
+        end
+      end
       local text = table.concat(vim.api.nvim_buf_get_lines(input.buf, 0, -1, false), "\n")
       t.falsy(text:find("leader-only prompt", 1, true), "the leader's prompts do not leak into the worker")
       UI:close()
@@ -1103,9 +1112,17 @@ return function(t)
       })
       setup(t, "workflow-list", service, dir)
       local started
-      controller.state().view.team_commands.start = function(_, name)
+      -- Patch the command *class*, not one instance: connecting may rebuild the
+      -- controller (and with it `team_commands`), and an instance-level stub
+      -- can then belong to an object nothing calls any more.
+      local Commands = require("ade.app.team_commands").Commands
+      local original_start = Commands.start
+      Commands.start = function(_, name)
         started = name
       end
+      t.cleanup(function()
+        Commands.start = original_start
+      end)
       controller.connect()
       wait_ready()
       t.eq(true, controller.open_team())
@@ -1113,15 +1130,29 @@ return function(t)
       wait(function()
         return pane_text(UI, "members"):find("dev", 1, true) ~= nil
       end, 5000, "the empty-state workflow list")
+      -- The pane's workflow list arrives asynchronously; wait for the row to
+      -- appear in the ids the pane is actually showing, then press the key on
+      -- it. (The list was empty when the pane opened.)
+      wait(function()
+        for _, id in pairs(UI.layout.ids.members or {}) do
+          if id == "workflow:dev" then
+            return true
+          end
+        end
+        return false
+      end, 5000, "the workflow row in the members pane")
       local line
       for index, id in pairs(UI.layout.ids.members or {}) do
         if id == "workflow:dev" then
           line = index
         end
       end
-      t.truthy(line)
+      t.truthy(line, "the workflow row has an id")
       vim.api.nvim_set_current_win(pane_win(UI, "members"))
       vim.api.nvim_win_set_cursor(pane_win(UI, "members"), { line, 0 })
+      local kind, _, _, info = UI.layout:current()
+      t.eq("workflow", kind, "the workflow row is under the cursor")
+      t.eq("dev", info.workflow.name)
       vim.api.nvim_feedkeys("S", "x", false)
       t.eq("dev", started)
       UI:close()
@@ -1200,7 +1231,17 @@ return function(t)
       setup(t, "v2-style", service, dir)
       controller.connect()
       wait_ready()
+      local dashboard_width = controller.state().config.teams.dashboard.members_width
       controller.state().config.teams.dashboard.members_width = 80
+      t.cleanup(function()
+        -- The width is read from the live configuration every time a pane is
+        -- created, so leaving it at 80 would size the panes of every later
+        -- case in this file (and hide the board's second column).
+        local cfg = controller.state().config
+        if cfg and cfg.teams and cfg.teams.dashboard then
+          cfg.teams.dashboard.members_width = dashboard_width
+        end
+      end)
       local entry = base_team(dir)
       entry.participants[2].label = "coder"
       entry.participants[2].agent = "opencode"
