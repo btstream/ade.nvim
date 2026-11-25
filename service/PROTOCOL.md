@@ -1871,7 +1871,8 @@ and `config.session_default` (boolean, default true). The front end calls
 
 When a front end's `session/new`, `session/load` (forwarded, not emulated) or
 `session/resume` for an instance whose `key.cwd` has an enabled
-configuration passes through the relay, the service appends to
+configuration, **and whose session switch is on** (20.5; `config.session_default`
+when it has none), passes through the relay, the service appends to
 `params.mcpServers` (creating the array if absent) the entry
 `{"name": "ade-team", "command": <absolute path of the service binary>,
 "args": ["mcp"], "env": [{"name": "ADE_TEAM_TOKEN", "value": <token>}]}`
@@ -1940,42 +1941,75 @@ Callers of `ensure_team`:
   `"refuse"`, 18.5 rules) and the tool result is `isError: true`, text: the
   team is led by another chat and the person was asked to hand it over.
   `"move"` runs `team.set_leader` for the requesting session and sends it a
-  `notice`; `"refuse"` sends it a `notice` too.
+  `notice`. `"refuse"` sends **no** notice: the requesting chat is not a
+  participant of that team, so the refusal is remembered and reported on its
+  **next** `bus.spawn` as `isError: true` ("the previous handover request was
+  refused; ask the person again"). The requesting chat must not wait for a
+  refusal notice that will not arrive.
 - `team.spawn` and `team.start` accept **either** `team` **or**
   `{instance, sessionId}` (exactly one form, `-32060`); the second form calls
   `ensure_team` first. Their results gain `team`.
 
 `team.set_leader {team, instance, sessionId}` `<- {}`: moves the leader of a
 live, leaderless or suspended team to that session. The session must be in
-the team's cwd, hold a bound session token and have its switch on
-(`-32061`, `data.reason` as in 20.4). The previous leader's tools fall back
+the team's cwd (`-32060` when it is not), hold a bound session token and have
+its switch on (`-32061`, `data.reason` as in 20.4). The previous leader's tools
+fall back
 to the non-leader set; the new leader receives one `notice` from `human`
 with the base instructions and the current `bus_status` text. A suspended
 team is resumed by it (18.15 resume, with this session as leader).
 
 ### 20.5 Per-session switch
 
-`session.teams {instance, sessionId, enabled?}` `<- {enabled, injected,
-leader: team|null}`:
+`session.teams {instance, sessionId, enabled?, close?}` `<- {enabled, injected,
+leader: team|null, reload?, pending?}`:
 
-- without `enabled`: query only;
+- without `enabled`: query only; the result has `pending` (see below) and no
+  `reload`;
 - `enabled: false`: tools disappear for the session. If the session leads a
   team the call fails with `-32061` `data.reason = "leads_team"` unless
   `close: true` is also given, in which case the team is closed first
-  (`team.close`);
-- `enabled: true` and `injected: false` (the session was created before teams
-  were configured, under the direct backend, or the server process died): the
-  result carries `reload: true` and the service marks the session **one-shot
-  forward**: the next `session/load` (or `session/resume`) of that session from
-  any front end is forwarded to the agent (never emulated, section 12) and gets
-  the injection of 20.2 like any forwarded load. The **front end** then performs
-  that load through its normal load path (it clears and re-renders the
-  transcript from the agent's replay). The service never sends a load itself and
-  never swallows or filters any frame. If the agent advertised neither
-  `loadSession` nor `sessionCapabilities.resume` (either a boolean `true` or an
-  object), the call fails with `-32061`, `data.reason = "reload_unsupported"`,
-  and nothing is marked. A failed forwarded load leaves the session as it was
-  (the fresh token is revoked; the old binding and server list stay).
+  (`team.close`, and 20.9 tells the leader). The result is
+  `{enabled: false, injected, leader: null}`;
+- `enabled: true`: see the two branches below. The result always carries
+  `reload` (`true` only when the front end must load, `false` otherwise).
+
+**Waiting branch.** If the session holds a bound token whose MCP process has
+never connected — the server was injected but the agent's process is simply
+not up yet — the call does not answer at once. It is **held** until that
+token's MCP process connects (the reply then has `injected: true`,
+`reload: false`, and the switch is stored), or for at most 10 s
+(`NVIM_ADE_SERVER_TEAM_INJECT_TIMEOUT_MS` shortens it in tests). This is the
+normal case of a brand-new chat: `session/new` just returned and the agent is
+still starting its MCP process, so enabling teams for the first time costs no
+reload. A read-only query never waits but gains `pending: true` in that same
+situation.
+
+While a reply is held, a change to what it waits on answers it immediately
+with the state as it is then (`reload: false`, nothing written): the token is
+revoked (any path, including a rejected in-flight load), the instance exits,
+the session is closed/deleted, the cwd is disabled, or the switch is turned
+off. Both the "connected" and the "timed out" endings re-check the cwd
+configuration and that the awaited token is still bound to this session
+before they write anything. A front end that disconnects simply loses its
+held reply (nothing is sent to a closed connection). An enable request that
+arrives while another one is held is held separately, so each request gets
+exactly one answer.
+
+**Reload fallback.** `enabled: true` with no connection after the wait (or
+with no token to wait for: the session was created before teams were
+configured, under the direct backend, or the server process died): the result
+carries `reload: true` and the service marks the session **one-shot
+forward**: the next `session/load` (or `session/resume`) of that session from
+any front end is forwarded to the agent (never emulated, section 12) and gets
+the injection of 20.2 like any forwarded load. The **front end** then performs
+that load through its normal load path (it clears and re-renders the
+transcript from the agent's replay). The service never sends a load itself and
+never swallows or filters any frame. If the agent advertised neither
+`loadSession` nor `sessionCapabilities.resume` (either a boolean `true` or an
+object), the call fails with `-32061`, `data.reason = "reload_unsupported"`,
+and nothing is marked. A failed forwarded load leaves the session as it was
+(the fresh token is revoked; the old binding and server list stay).
 
 A forwarded load or resume that was marked one-shot and answered successfully
 restarts that session's log from this load: earlier recorded events are never
@@ -1986,26 +2020,7 @@ forwarded instead of emulated).
 The switch defaults to `config.session_default`, is stored per
 `(agent, sessionId)` in the service database, and survives restarts. Every
 change sends `session.teams_changed {instance, sessionId, enabled, injected,
-leader}` to every connection.
-
-A read-only query (no `enabled`) never waits. It gains `pending: true` when
-the session holds a bound token whose MCP process has never connected: the
-server was injected, the agent's MCP process is simply not up yet. The next
-`session.teams {enabled: true}` for such a session does not answer at once:
-it is **held** until that token's MCP process connects (the reply then has
-`injected: true` and no `reload`, so the front end does not reload), or for
-at most 10 s (`NVIM_ADE_SERVER_TEAM_INJECT_TIMEOUT_MS` shortens it in tests),
-after which it decides as before: still no connection means the one-shot
-forward mark and `reload: true`. This is the normal case of a brand-new chat:
-`session/new` just returned and the agent is still starting its MCP process,
-so enabling teams for the first time does not cost a reload.
-
-While a reply is held, a change to what it waits on answers it immediately
-with the state as it is then: the token is revoked, the instance exits, or
-the session is closed/deleted/switched off. A front end that disconnects
-simply loses its held reply (nothing is sent to a closed connection). An
-enable request that arrives while another one is held is held separately, so
-each request gets exactly one answer.
+leader}` to every **front-end** connection (never to a participant socket).
 
 ### 20.6 Stopping one worker
 

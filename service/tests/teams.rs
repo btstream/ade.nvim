@@ -7773,3 +7773,201 @@ fn the_first_prompt_of_a_new_chat_shares_one_spawn_group() {
     );
     assert!(!group.is_empty(), "a real group id");
 }
+
+
+
+
+/// A held enable whose awaited token is revoked by a rejected in-flight load
+/// answers at once with the state then (20.5, review minor 3): it must not
+/// wait out its timeout and mark a reload for a token that no longer exists.
+#[test]
+fn a_held_enable_is_released_when_its_token_is_revoked() {
+    let server = TestServer::start("held-enable-token-revoked");
+    let work = server.dir().join("work");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let log = server.dir().join("team-agent.log");
+    let gate = server.dir().join("team-agent.gate");
+    let mut env = child_env(&server, &log, &gate);
+    env["TEAM_AGENT_LOAD_FAIL"] = json!("1");
+    env["TEAM_AGENT_LOAD_DELAY"] = json!("1.0");
+    let token_file = server.dir().join("session-tokens");
+    let mut client = server.connect();
+    client.hello(&server.token(), nvim_ade_server::API_VERSION);
+    let attached = client.request(
+        1,
+        "agent.attach",
+        json!({
+            "key": {"agent": "team-test", "command": "python3", "args": [agent()], "cwd": work.to_string_lossy()},
+            "client_capabilities": {},
+            "env": env,
+        }),
+    );
+    let instance = attached["result"]["instance"].as_str().unwrap().to_string();
+    tunnel_call(
+        &mut client,
+        &instance,
+        10,
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    let configured = client.request(
+        2,
+        "team.configure",
+        json!({
+            "cwd": work.to_string_lossy(),
+            "config": {"templates": {"dev": {"key": {"agent": "team-test", "command": "python3", "args": [agent()]}}}},
+        }),
+    );
+    assert!(configured["result"].is_object(), "{configured}");
+    // A slow load binds its token immediately and is refused later.
+    client.notify(
+        "tunnel.send",
+        json!({
+            "instance": instance,
+            "message": {
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "session/load",
+                "params": {
+                    "sessionId": "slow-load",
+                    "cwd": work.to_string_lossy(),
+                    "mcpServers": [],
+                },
+            },
+        }),
+    );
+    let token = wait_for(
+        || {
+            std::fs::read_to_string(&token_file)
+                .ok()?
+                .lines()
+                .rev()
+                .find_map(|line| {
+                    let (session, token) = line.split_once(' ')?;
+                    (session == "slow-load").then(|| token.to_string())
+                })
+        },
+        "the in-flight load's token",
+    );
+    // The enable waits for that token's MCP process; it never connects.
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 12,
+        "method": "session.teams",
+        "params": {"instance": instance, "sessionId": "slow-load", "enabled": true},
+    }));
+    let early = client.try_recv(Duration::from_millis(200));
+    assert!(early.is_none(), "the enable is held: {early:?}");
+    // The load is refused: its token is revoked, which must release the wait
+    // long before the 10 s default timeout.
+    let started = Instant::now();
+    let answered = wait_for(
+        || {
+            while let Some(frame) = client.try_recv(Duration::from_millis(100)) {
+                if frame.get("method").is_none() && frame.get("id") == Some(&json!(12)) {
+                    return Some(frame);
+                }
+            }
+            None
+        },
+        "the held enable released by the token revocation",
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "released by the revocation, not the timeout: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(answered["result"]["reload"], false, "{answered}");
+    assert_eq!(answered["result"]["injected"], false, "{answered}");
+    // The revoked token is gone: no bound, never-connected token is left for
+    // the session, so a later enable cannot be held on a dead token.
+    let query = client.request(
+        13,
+        "session.teams",
+        json!({"instance": instance, "sessionId": "slow-load"}),
+    );
+    assert_eq!(query["result"]["pending"], false, "{query}");
+    let _ = token;
+}
+
+/// The `Connected` path re-validates the cwd configuration: a wait whose cwd
+/// was disabled meanwhile must not persist the switch (20.5, review minor 3).
+#[test]
+fn a_held_enable_rechecks_the_cwd_before_committing() {
+    let mut harness = Harness::new_with_agent_env(
+        "held-enable-cwd-off",
+        json!({}),
+        &[("NVIM_ADE_SERVER_TEAM_INJECT_TIMEOUT_MS", "8000")],
+        json!({"TEAM_AGENT_SKIP_MCP_LIST": "1"}),
+    );
+    let session = session_new(&mut harness, 230);
+    let token = harness_token(&harness, &session);
+    // Turn the switch off first: the answer of the held enable must not turn it
+    // back on. Its bound token stays (only requests are gated by the switch).
+    let off_switch = harness.client.request(
+        229,
+        "session.teams",
+        json!({"instance": harness.instance, "sessionId": session, "enabled": false}),
+    );
+    assert_eq!(off_switch["result"]["enabled"], false, "{off_switch}");
+    // Hold the enable on the fresh session's never-connected token.
+    harness.client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 231,
+        "method": "session.teams",
+        "params": {"instance": harness.instance, "sessionId": session, "enabled": true},
+    }));
+    let early = harness.client.try_recv(Duration::from_millis(300));
+    assert!(early.is_none(), "the enable is held: {early:?}");
+    // The cwd is disabled while the wait runs, then the process connects.
+    let off = harness.client.request(
+        232,
+        "team.configure",
+        json!({
+            "cwd": harness.work.to_string_lossy(),
+            "config": {
+                "enabled": false,
+                "templates": {"dev": {"key": {"agent": "team-test", "command": "python3", "args": [agent()]}}},
+            },
+        }),
+    );
+    assert!(off.get("error").is_none(), "{off}");
+    let mut child = mcp_child_hold(&harness.server, &token);
+    let answered = wait_for(
+        || {
+            while let Some(frame) = harness.client.try_recv(Duration::from_millis(100)) {
+                if frame.get("method").is_none() && frame.get("id") == Some(&json!(231)) {
+                    return Some(frame);
+                }
+            }
+            None
+        },
+        "the held enable after the cwd was disabled",
+    );
+    assert_eq!(answered["result"]["enabled"], false, "{answered}");
+    assert_eq!(answered["result"]["reload"], false, "{answered}");
+    // Re-enabling the cwd must not surface a switch this wait wrote.
+    let on = harness.client.request(
+        233,
+        "team.configure",
+        json!({
+            "cwd": harness.work.to_string_lossy(),
+            "config": {
+                "enabled": true,
+                "templates": {"dev": {"key": {"agent": "team-test", "command": "python3", "args": [agent()]}}},
+            },
+        }),
+    );
+    assert!(on.get("error").is_none(), "{on}");
+    let query = harness.client.request(
+        234,
+        "session.teams",
+        json!({"instance": harness.instance, "sessionId": session}),
+    );
+    assert_eq!(
+        query["result"]["enabled"], false,
+        "the released wait must not have written the switch: {query}"
+    );
+    drop(child.stdin.take());
+    let _ = child.wait();
+}

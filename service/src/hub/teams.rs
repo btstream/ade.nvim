@@ -447,12 +447,20 @@ impl Hub {
     /// Revoke a request's token and forget the connection that held it.
     pub(crate) fn drop_pending_session_value(&mut self, pending: PendingSession) {
         if !pending.token_id.is_empty() {
-            self.teams.revoke(&pending.token_id);
+            self.revoke_session_token(&pending.token_id);
         }
         // The request's source connection may have handshaked with that token
         // already; nothing else refers to it now.
         self.conn_tokens
             .retain(|_, token| token != &pending.token_id);
+    }
+
+    /// Revoke one session token and release every held enable that waited for
+    /// it, answering with the state at that moment (20.5). This is the single
+    /// revocation path for tokens a held enable may be waiting on.
+    pub(crate) fn revoke_session_token(&mut self, token_id: &str) {
+        self.release_pending_enables_of_token(token_id);
+        self.teams.revoke(token_id);
     }
 
     /// `injected` from the single source of truth: a connection holds a token
@@ -1785,10 +1793,21 @@ impl Hub {
 
     /// Answer a held `session.teams` and forget its record. `decision` is what
     /// the wait ended with (20.5).
+    ///
+    /// Both terminal paths re-validate what the wait depended on: the cwd must
+    /// still be enabled and the awaited token must still be bound to this very
+    /// session. A revocation that raced the wait (a rejected in-flight load, a
+    /// switch off, an instance exit) is reported as [`EnableDecision::Changed`]
+    /// instead of writing the switch or marking a reload.
     fn answer_pending_enable(&mut self, pending: PendingEnable, decision: EnableDecision) {
         if !self.conns.contains_key(&pending.conn) {
             return;
         }
+        let decision = if self.pending_enable_valid(&pending) {
+            decision
+        } else {
+            EnableDecision::Changed
+        };
         match decision {
             EnableDecision::Connected => {
                 let value = self.enable_session_teams(
@@ -1801,14 +1820,6 @@ impl Hub {
                 self.send_to(pending.conn, &success(&pending.id, value));
             }
             EnableDecision::TimedOut => {
-                if !self.teams.has_config(&pending.cwd)
-                    || !self.teams.config_for(&pending.cwd).enabled
-                {
-                    let mut error = TeamError::not_allowed("teams are disabled for this cwd");
-                    error.data = Some(json!({ "reason": "off" }));
-                    self.send_error(pending.conn, &pending.id, &error);
-                    return;
-                }
                 // The wait ran out with no connection: fall back to the
                 // documented answer, which needs a reload the agent must
                 // support (20.5).
@@ -1829,9 +1840,10 @@ impl Hub {
             }
             EnableDecision::Changed => {
                 // The premise of the wait went away (the token was revoked, the
-                // instance exited, the session closed or the switch was turned
-                // off): answer with the state as it is now, without touching
-                // the switch and without marking a reload (20.5).
+                // instance exited, the session closed, the cwd was disabled or
+                // the switch was turned off): answer with the state as it is
+                // now, without touching the switch and without marking a
+                // reload (20.5).
                 let leader = self
                     .teams
                     .session_team_entry(&pending.instance, &pending.session);
@@ -1853,6 +1865,19 @@ impl Hub {
                 );
             }
         }
+    }
+
+    /// Whether a held enable may still end with its own decision: the cwd is
+    /// enabled and the awaited token is still bound to this session (20.5).
+    fn pending_enable_valid(&self, pending: &PendingEnable) -> bool {
+        if !self.teams.has_config(&pending.cwd) || !self.teams.config_for(&pending.cwd).enabled {
+            return false;
+        }
+        matches!(
+            self.teams.session_auth(&pending.token_id),
+            Some((instance, session, _))
+                if instance == pending.instance && session == pending.session
+        )
     }
 
     /// A held enable's wait expired: decide by the state now (20.5).
@@ -1892,6 +1917,23 @@ impl Hub {
                 continue;
             };
             self.answer_pending_enable(pending, EnableDecision::Connected);
+        }
+    }
+
+    /// A token a held enable waited for is gone: answer that wait with the
+    /// state now (20.5). Every revocation path goes through here.
+    pub(crate) fn release_pending_enables_of_token(&mut self, token_id: &str) {
+        let waiting: Vec<u64> = self
+            .pending_enables
+            .iter()
+            .filter(|(_, pending)| pending.token_id == token_id)
+            .map(|(generation, _)| *generation)
+            .collect();
+        for generation in waiting {
+            let Some(pending) = self.pending_enables.remove(&generation) else {
+                continue;
+            };
+            self.answer_pending_enable(pending, EnableDecision::Changed);
         }
     }
 
@@ -2245,7 +2287,8 @@ impl Hub {
             self.cancel_held_session(&instance, &session);
             // A re-created team may bind the same leader session; its next bus
             // turn must be able to hold and cancel afresh.
-            self.held_timed_out.remove(&(instance, session));
+            self.held_timed_out
+                .remove(&(instance.clone(), session.clone()));
         }
         self.interrupt_queue
             .retain(|(id, _), _| id.as_str() != team);

@@ -3109,23 +3109,39 @@ impl Teams {
             self.events.push(TeamEvent::Changed(team_id.clone()));
         }
         if leader || name == "leader" {
-            // A prompt from the front end opens a spawn group too (19.6).
-            self.begin_leader_group(&team_id);
+            // A prompt from the front end opens a spawn group too (19.6), but
+            // only the real leader pair touches the team-level group.
+            if self.is_leader_pair(instance, session) {
+                self.begin_leader_group(&team_id);
+            }
         }
     }
 
     fn finish_session_group(&mut self, instance: &str, session: &str) {
         self.session_groups
             .remove(&(instance.to_string(), session.to_string()));
-        let Some((team_id, name)) = self.by_instance.get(instance).cloned() else {
-            return;
-        };
-        if name != "leader" {
+        // The team-level group belongs to the actual leader pair: another chat
+        // running in the same agent instance must not end it (19.6).
+        if !self.is_leader_pair(instance, session) {
             return;
         }
-        if let Some(team) = self.teams.get_mut(&team_id) {
-            team.current_group = None;
+        if let Some(team_id) = self.by_instance.get(instance).map(|(team, _)| team.clone()) {
+            if let Some(team) = self.teams.get_mut(&team_id) {
+                team.current_group = None;
+            }
         }
+    }
+
+    /// Whether `(instance, session)` is the leader pair of its cwd's team.
+    fn is_leader_pair(&self, instance: &str, session: &str) -> bool {
+        self.by_instance
+            .get(instance)
+            .and_then(|(team_id, name)| self.teams.get(team_id).map(|team| (team, name)))
+            .is_some_and(|(team, name)| {
+                name == "leader"
+                    && team.leader_instance.as_deref() == Some(instance)
+                    && team.leader_session.as_deref() == Some(session)
+            })
     }
 
     /// Forget the open turns of an instance: its prompts can never finish (a
@@ -3165,7 +3181,9 @@ impl Teams {
             .get(&name)
             .is_some_and(|participant| participant.role == Role::Leader);
         self.events.push(TeamEvent::Changed(team_id.clone()));
-        if leader || name == "leader" {
+        // Only the real leader pair ends the team's group; a prompt of another
+        // chat in the same instance must not (19.6).
+        if (leader || name == "leader") && self.is_leader_pair(instance, session) {
             self.finish_leader_group(&team_id);
         }
     }
@@ -6810,6 +6828,59 @@ mod tests {
         };
         let after = teams.item(&team, &request).unwrap().group;
         assert_ne!(after, groups[0], "the next turn gets its own group");
+    }
+
+    /// Only the real leader pair drives the team-level spawn group (19.6,
+    /// review minor 4): another chat's prompt in the same agent instance must
+    /// neither open nor close it.
+    #[test]
+    fn only_the_leader_pair_drives_the_team_group() {
+        let (mut teams, team) = fixture(json!({"spawn_confirm": {"auto": []}}));
+        // A second session of the same instance: a plain chat, no team.
+        let other = session(&mut teams, "i1", "/p", "s2");
+        assert!(teams.session_auth(&other).is_some());
+        // A bus prompt opens the leader's group.
+        teams
+            .send_message(&team, "human", "leader", Kind::Task, "do", None, vec![])
+            .unwrap();
+        teams.take_deliveries(&HashSet::new());
+        let leader_group = teams
+            .team(&team)
+            .unwrap()
+            .current_group
+            .clone()
+            .expect("the bus prompt opens a group");
+        // The other chat runs and ends a prompt: the leader's group stays.
+        teams.frontend_prompt_started("i1", "s2");
+        assert_eq!(
+            teams.team(&team).unwrap().current_group.as_deref(),
+            Some(leader_group.as_str()),
+            "another chat's prompt start must not replace the leader group"
+        );
+        teams.frontend_prompt_finished("i1", "s2");
+        assert_eq!(
+            teams.team(&team).unwrap().current_group.as_deref(),
+            Some(leader_group.as_str()),
+            "another chat's prompt end must not clear the leader group"
+        );
+        // Spawns still share it.
+        let SpawnOutcome::Awaiting { request, .. } = teams
+            .request_spawn(&team, "dev", Some("w1"), None, None, None)
+            .expect("spawn")
+        else {
+            panic!("expected approval");
+        };
+        assert_eq!(
+            teams.item(&team, &request).unwrap().group.as_deref(),
+            Some(leader_group.as_str())
+        );
+        // The leader's own prompt end does close it.
+        teams.frontend_prompt_started("i1", "s1");
+        teams.frontend_prompt_finished("i1", "s1");
+        assert!(
+            teams.team(&team).unwrap().current_group.is_none(),
+            "the leader's prompt end closes the group"
+        );
     }
 
     #[test]
