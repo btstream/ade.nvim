@@ -215,8 +215,17 @@ def mcp_command(entry):
 
 
 def persistent_for(session):
+    """The session's live child, dropping one that already exited."""
     with PERSISTENT_LOCK:
-        return PERSISTENT.get(session)
+        child = PERSISTENT.get(session)
+        if child is None:
+            return None
+        if not child.closed:
+            return child
+        # The child died (service restart, handshake refusal): forget it so the
+        # caller rebuilds from the current entry instead of failing forever.
+        PERSISTENT.pop(session, None)
+        return None
 
 
 def start_persistent(session):
@@ -745,10 +754,14 @@ def serve():
             else:
                 session = params.get("sessionId", "team_sess")
             SESSIONS[session] = True
+            # The injected entry is only a candidate until the request is
+            # answered: a failed load must not replace the entry (and token) the
+            # session's running MCP child still uses.
+            candidate = None
             for entry in params.get("mcpServers") or []:
                 if entry.get("name") == "ade-team":
-                    MCP[session] = entry
-            entry = MCP.get(session)
+                    candidate = entry
+            entry = candidate or MCP.get(session)
             safe_entry = None
             if entry:
                 safe_entry = {
@@ -758,7 +771,8 @@ def serve():
                     "env_names": [item.get("name") for item in entry.get("env") or []],
                 }
                 # The token must never reach the agent log: write it to a
-                # side file the tests read back.
+                # side file the tests read back. This happens for a refused load
+                # too: the service can have handshaked it before the refusal.
                 token_path = os.environ.get("TEAM_AGENT_TOKEN_FILE")
                 if token_path:
                     for item in entry.get("env") or []:
@@ -787,6 +801,8 @@ def serve():
                 log({"event": "load-failed", "session": params.get("sessionId")})
                 error(ident, "load failed")
                 continue
+            if candidate is not None:
+                MCP[session] = candidate
             new_delay = os.environ.get("TEAM_AGENT_NEW_DELAY")
             if new_delay and method == "session/new":
                 # The token was written above: answer late so the MCP process can
