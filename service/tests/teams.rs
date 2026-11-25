@@ -3743,9 +3743,10 @@ fn team_close_cancels_a_running_leader_bus_prompt() {
     );
 }
 
+/// Human first (20.9): a running front-end prompt is never cancelled by close.
 #[test]
-fn team_close_cancels_a_running_leader_frontend_prompt() {
-    let mut harness = Harness::new("team-close-frontend-cancel", json!({}), None);
+fn team_close_does_not_cancel_a_running_leader_frontend_prompt() {
+    let mut harness = Harness::new("team-close-frontend-keep", json!({}), None);
     harness.client.notify(
         "tunnel.send",
         json!({
@@ -3769,15 +3770,13 @@ fn team_close_cancels_a_running_leader_frontend_prompt() {
     harness
         .client
         .request(111, "team.close", json!({"team": harness.team}));
-    wait_for(
-        || {
-            harness
-                .events()
-                .iter()
-                .any(|event| event["event"] == "cancel" && event["session"] == harness.session)
-                .then_some(())
-        },
-        "session/cancel for the leader front-end prompt",
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        !harness
+            .events()
+            .iter()
+            .any(|event| event["event"] == "cancel" && event["session"] == harness.session),
+        "a human prompt is never cancelled by close"
     );
 }
 
@@ -3798,7 +3797,7 @@ fn team_close_does_not_cancel_an_idle_leader() {
 }
 
 #[test]
-fn team_close_drops_a_prompt_held_for_the_leader() {
+fn team_close_releases_a_prompt_held_for_the_leader() {
     let mut harness = Harness::new("team-close-held", json!({}), None);
     // The bus prompt ignores `session/cancel` (mimicking an agent that is slow
     // to stop), so the person's prompt stays held until the team closes.
@@ -3839,15 +3838,18 @@ fn team_close_drops_a_prompt_held_for_the_leader() {
     harness
         .client
         .request(113, "team.close", json!({"team": harness.team}));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut dropped = false;
-    while Instant::now() < deadline && !dropped {
-        let frame = harness.client.next_notification(Duration::from_millis(500));
-        dropped = frame["method"] == "tunnel.recv"
-            && frame["params"]["message"]["id"] == 60
-            && frame["params"]["message"]["error"]["code"] == -32800;
-    }
-    assert!(dropped, "the held prompt is rejected by close");
+    // Human first (20.9): the held prompt is released, never refused, once the
+    // bus turn's cancel is answered (or the grace period expires).
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .any(|event| event["event"] == "prompt" && event["text"] == "idle")
+                .then_some(())
+        },
+        "the held human prompt released after close",
+    );
 }
 
 #[test]
@@ -7792,7 +7794,7 @@ fn closing_a_team_notifies_the_leader() {
                     && event["session"] == harness.session
                     && event["text"]
                         .as_str()
-                        .is_some_and(|text| text.contains("已被关闭"))
+                        .is_some_and(|text| text.contains("已关闭"))
             })
         },
         "the closing notice prompt to the leader",
@@ -7814,12 +7816,12 @@ fn closing_a_team_notifies_the_leader() {
     );
 }
 
-/// The notice waits for a running front-end prompt on the leader instead of
-/// interrupting the person (20.9).
+/// Closing a team never cancels a human prompt: the running one finishes and
+/// the notice follows it (20.9).
 #[test]
 fn a_closing_notice_waits_for_the_leaders_running_prompt() {
     let mut harness = Harness::new("close-notice-after-prompt", json!({}), None);
-    // A slow prompt keeps the session busy while the team is closed.
+    // A slow human prompt keeps the session busy while the team is closed.
     harness.client.notify(
         "tunnel.send",
         json!({
@@ -7840,8 +7842,16 @@ fn a_closing_notice_waits_for_the_leaders_running_prompt() {
         .client
         .request(211, "team.close", json!({"team": harness.team}));
     assert!(closed["result"].is_object(), "{closed}");
-    // The running prompt is cancelled, as before (19.4/20.9): the fixture ends
-    // it on `session/cancel`, and only then does the notice go out.
+    // The human prompt is not cancelled: no `session/cancel` reached the agent,
+    // and the notice only goes out after that prompt ends on its own.
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        !harness
+            .events()
+            .iter()
+            .any(|event| event["event"] == "cancel"),
+        "closing a team must not cancel the human prompt"
+    );
     let order = wait_for(
         || {
             let events = harness.events();
@@ -7857,9 +7867,8 @@ fn a_closing_notice_waits_for_the_leaders_running_prompt() {
                     && event["session"] == harness.session
                     && event["text"]
                         .as_str()
-                        .is_some_and(|text| text.contains("已被关闭"))
+                        .is_some_and(|text| text.contains("已关闭"))
             })?;
-            // The slow prompt's own `done` (not the notice's) must precede it.
             let done = events
                 .iter()
                 .enumerate()
@@ -7872,9 +7881,102 @@ fn a_closing_notice_waits_for_the_leaders_running_prompt() {
                 .map(|(index, _)| index)?;
             Some((slow, done, notice))
         },
-        "the closing notice only after the cancelled prompt finished",
+        "the closing notice only after the human prompt finished",
     );
     assert!(order.0 < order.1 && order.1 < order.2, "{order:?}");
+}
+
+/// A real bus turn on the leader is cancelled first; once its response arrives
+/// it is the queued human prompt that goes next, and only after that the
+/// closing notice (20.9).
+#[test]
+fn closing_a_team_cancels_the_bus_turn_and_keeps_the_queued_human_prompt() {
+    let mut harness = Harness::new("close-bus-turn-held", json!({}), None);
+    // A bus turn on the leader that never ends on its own: it only stops on
+    // cancel. A queued task to the leader becomes its next bus prompt.
+    let queued = harness.send("leader", "task", "do [slow]");
+    assert!(queued.get("error").is_none(), "{queued}");
+    // Deliver it as the leader's bus turn.
+    let delivered = wait_for(
+        || {
+            harness.events().into_iter().find(|event| {
+                event["event"] == "prompt"
+                    && event["session"] == harness.session
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("[slow]"))
+            })
+        },
+        "the leader bus turn",
+    );
+    assert!(delivered["pid"].is_number());
+    // A human prompt arrives while the bus turn runs: it is held, not sent.
+    harness.client.notify(
+        "tunnel.send",
+        json!({
+            "instance": harness.instance,
+            "message": {
+                "jsonrpc": "2.0",
+                "id": 240,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": harness.session,
+                    "prompt": [{"type": "text", "text": "human first"}],
+                },
+            },
+        }),
+    );
+    // The human prompt arrived while the bus turn ran: the service must cancel
+    // that bus turn (18.11) rather than send two prompts at once. The final
+    // order assertion below checks it was released, never refused.
+    std::thread::sleep(Duration::from_millis(300));
+    // Closing cancels only the bus turn.
+    let closed = harness
+        .client
+        .request(241, "team.close", json!({"team": harness.team}));
+    assert!(closed["result"].is_object(), "{closed}");
+    // Order: bus prompt -> cancel -> bus done -> human prompt -> human done ->
+    // notice. The held human prompt is released, never refused with -32800.
+    let order = wait_for(
+        || {
+            let events = harness.events();
+            let index_of = |predicate: &dyn Fn(&Value) -> bool| events.iter().position(predicate);
+            let bus = index_of(&|event| {
+                event["event"] == "prompt"
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("[slow]"))
+            })?;
+            let cancel = index_of(&|event| event["event"] == "cancel")?;
+            let human = index_of(&|event| {
+                event["event"] == "prompt"
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("human first"))
+            })?;
+            let notice = index_of(&|event| {
+                event["event"] == "prompt"
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("已关闭"))
+            })?;
+            (bus < cancel && cancel < human && human < notice)
+                .then_some((bus, cancel, human, notice))
+        },
+        "cancel the bus turn, release the human prompt, then notify",
+    );
+    assert!(
+        order.0 < order.1 && order.1 < order.2 && order.2 < order.3,
+        "{order:?}"
+    );
+    // The held prompt was forwarded to the agent, not answered with -32800.
+    assert!(
+        harness
+            .client
+            .try_recv(Duration::from_millis(50))
+            .is_none_or(|frame| frame["error"]["code"] != json!(-32800)),
+        "the held human prompt must not be refused"
+    );
 }
 
 /// A closed team's notice is not sent when the leader instance is gone (20.9).
@@ -8017,38 +8119,148 @@ fn a_held_enable_is_released_when_its_token_is_revoked() {
     let _ = token;
 }
 
-/// The `Connected` path re-validates the cwd configuration: a wait whose cwd
-/// was disabled meanwhile must not persist the switch (20.5, review minor 3).
 #[test]
-fn a_held_enable_rechecks_the_cwd_before_committing() {
+fn disabling_the_switch_with_close_notifies_the_leader() {
+    let mut harness = Harness::new("close-via-session-switch", json!({}), None);
+    let before = harness.events().len();
+    let off = harness.client.request(
+        250,
+        "session.teams",
+        json!({
+            "instance": harness.instance,
+            "sessionId": harness.session,
+            "enabled": false,
+            "close": true,
+        }),
+    );
+    assert_eq!(off["result"]["enabled"], false, "{off}");
+    let prompt = wait_for(
+        || {
+            harness.events().into_iter().skip(before).find(|event| {
+                event["event"] == "prompt"
+                    && event["session"] == harness.session
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("已关闭"))
+            })
+        },
+        "the closing notice after the switch was turned off",
+    );
+    let text = prompt["text"].as_str().expect("notice text");
+    assert!(
+        text.contains("team 工具已关闭"),
+        "the notice mentions the switch: {text}"
+    );
+    assert_eq!(
+        harness.client.request(251, "team.list", json!({}))["result"]["teams"],
+        json!([]),
+        "the team is closed"
+    );
+}
+
+/// A successful close sends exactly one notice (20.9).
+#[test]
+fn a_close_sends_exactly_one_notice() {
+    let mut harness = Harness::new("close-one-notice", json!({}), None);
+    let before = harness.events().len();
+    let closed = harness
+        .client
+        .request(260, "team.close", json!({"team": harness.team}));
+    assert!(closed["result"].is_object(), "{closed}");
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .skip(before)
+                .any(|event| {
+                    event["event"] == "prompt"
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("已关闭"))
+                })
+                .then_some(())
+        },
+        "the closing notice",
+    );
+    // Let any second delivery have a chance to appear.
+    std::thread::sleep(Duration::from_millis(500));
+    let notices = harness
+        .events()
+        .into_iter()
+        .skip(before)
+        .filter(|event| {
+            event["event"] == "prompt"
+                && event["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("已关闭"))
+        })
+        .count();
+    assert_eq!(notices, 1, "exactly one closing notice");
+}
+
+/// Closing reports `{}` even when the leader session has no bound token:
+/// no notice is sent, and the success does not depend on one (20.9).
+#[test]
+fn a_session_without_a_token_gets_no_closing_notice() {
+    let mut harness = Harness::new("close-no-token", json!({}), None);
+    // Close the team while the leader's token is gone but the instance lives.
+    let session = harness.session.clone();
+    let token = harness.token.clone();
+    // The MCP process of the session holds the token; drop it and revoke the
+    // token from the service side by closing the session's token record: the
+    // simplest real path is `team.configure` with the cwd disabled, which stops
+    // new injection, after `session/close` of the old one.
+    let closed_session = tunnel_call(
+        &mut harness.client,
+        &harness.instance,
+        290,
+        "session/close",
+        json!({ "sessionId": session }),
+    );
+    assert!(closed_session.get("error").is_none(), "{closed_session}");
+    // The old team still exists (closing the session does not close it here);
+    // closing it now has no live token to notify.
+    let before = harness.events().len();
+    let closed = harness
+        .client
+        .request(291, "team.close", json!({"team": harness.team}));
+    assert_eq!(closed["result"], json!({}), "{closed}");
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        !harness
+            .events()
+            .into_iter()
+            .skip(before)
+            .any(|event| event["event"] == "prompt"),
+        "no notice without a bound token"
+    );
+    let _ = token;
+}
+
+/// Disabling a cwd releases its held enables at once, and re-enabling does not
+/// revive them (20.5).
+#[test]
+fn disabling_the_cwd_releases_a_held_enable_immediately() {
     let mut harness = Harness::new_with_agent_env(
-        "held-enable-cwd-off",
+        "held-enable-cwd-disabled",
         json!({}),
         &[("NVIM_ADE_SERVER_TEAM_INJECT_TIMEOUT_MS", "8000")],
         json!({"TEAM_AGENT_SKIP_MCP_LIST": "1"}),
     );
-    let session = session_new(&mut harness, 230);
-    let token = harness_token(&harness, &session);
-    // Turn the switch off first: the answer of the held enable must not turn it
-    // back on. Its bound token stays (only requests are gated by the switch).
-    let off_switch = harness.client.request(
-        229,
-        "session.teams",
-        json!({"instance": harness.instance, "sessionId": session, "enabled": false}),
-    );
-    assert_eq!(off_switch["result"]["enabled"], false, "{off_switch}");
-    // Hold the enable on the fresh session's never-connected token.
+    let session = session_new(&mut harness, 280);
     harness.client.send(&json!({
         "jsonrpc": "2.0",
-        "id": 231,
+        "id": 281,
         "method": "session.teams",
         "params": {"instance": harness.instance, "sessionId": session, "enabled": true},
     }));
     let early = harness.client.try_recv(Duration::from_millis(300));
     assert!(early.is_none(), "the enable is held: {early:?}");
-    // The cwd is disabled while the wait runs, then the process connects.
+    // Disabling the cwd answers the wait at once, not at the 8 s deadline.
+    let started = Instant::now();
     let off = harness.client.request(
-        232,
+        282,
         "team.configure",
         json!({
             "cwd": harness.work.to_string_lossy(),
@@ -8059,23 +8271,103 @@ fn a_held_enable_rechecks_the_cwd_before_committing() {
         }),
     );
     assert!(off.get("error").is_none(), "{off}");
-    let mut child = mcp_child_hold(&harness.server, &token);
+    // The reply may already be buffered behind the configure response.
     let answered = wait_for(
-        || {
-            while let Some(frame) = harness.client.try_recv(Duration::from_millis(100)) {
-                if frame.get("method").is_none() && frame.get("id") == Some(&json!(231)) {
-                    return Some(frame);
-                }
-            }
-            None
-        },
-        "the held enable after the cwd was disabled",
+        || harness.client.take_response(281),
+        "the held enable released by disabling the cwd",
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "released by the configuration change: {:?}",
+        started.elapsed()
     );
     assert_eq!(answered["result"]["enabled"], false, "{answered}");
     assert_eq!(answered["result"]["reload"], false, "{answered}");
-    // Re-enabling the cwd must not surface a switch this wait wrote.
+    // Enabling it again must not revive the old wait.
     let on = harness.client.request(
-        233,
+        283,
+        "team.configure",
+        json!({
+            "cwd": harness.work.to_string_lossy(),
+            "config": {
+                "enabled": true,
+                "templates": {"dev": {"key": {"agent": "team-test", "command": "python3", "args": [agent()]}}},
+            },
+        }),
+    );
+    assert!(on.get("error").is_none(), "{on}");
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        harness
+            .client
+            .try_recv(Duration::from_millis(200))
+            .is_none(),
+        "no second answer to the released wait"
+    );
+    // The released wait wrote no switch: with the cwd enabled again the
+    // session falls back to `session_default` (on) and is merely not injected.
+    let query = harness.client.request(
+        284,
+        "session.teams",
+        json!({"instance": harness.instance, "sessionId": session}),
+    );
+    assert_eq!(query["result"]["injected"], false, "{query}");
+    assert_eq!(query["result"]["reload"], Value::Null, "{query}");
+}
+
+/// A released wait's late MCP handshake must not write the switch or start a
+/// reload: the wait is over (20.5).
+#[test]
+fn a_late_handshake_after_release_writes_nothing() {
+    let mut harness = Harness::new_with_agent_env(
+        "held-enable-late-handshake",
+        json!({}),
+        &[("NVIM_ADE_SERVER_TEAM_INJECT_TIMEOUT_MS", "8000")],
+        json!({"TEAM_AGENT_SKIP_MCP_LIST": "1"}),
+    );
+    let session = session_new(&mut harness, 300);
+    let token = harness_token(&harness, &session);
+    // The switch starts off; the held enable must not turn it back on after it
+    // is released by the cwd being disabled.
+    let off = harness.client.request(
+        301,
+        "session.teams",
+        json!({"instance": harness.instance, "sessionId": session, "enabled": false}),
+    );
+    assert_eq!(off["result"]["enabled"], false, "{off}");
+    harness.client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 302,
+        "method": "session.teams",
+        "params": {"instance": harness.instance, "sessionId": session, "enabled": true},
+    }));
+    assert!(
+        harness
+            .client
+            .try_recv(Duration::from_millis(300))
+            .is_none(),
+        "the enable is held"
+    );
+    let disabled = harness.client.request(
+        303,
+        "team.configure",
+        json!({
+            "cwd": harness.work.to_string_lossy(),
+            "config": {
+                "enabled": false,
+                "templates": {"dev": {"key": {"agent": "team-test", "command": "python3", "args": [agent()]}}},
+            },
+        }),
+    );
+    assert!(disabled.get("error").is_none(), "{disabled}");
+    let answered = wait_for(|| harness.client.take_response(302), "the released wait");
+    assert_eq!(answered["result"]["enabled"], false, "{answered}");
+    assert_eq!(answered["result"]["reload"], false, "{answered}");
+    // The process connects afterwards: no switch write, no reload mark.
+    let mut child = mcp_child_hold(&harness.server, &token);
+    std::thread::sleep(Duration::from_millis(300));
+    let on = harness.client.request(
+        304,
         "team.configure",
         json!({
             "cwd": harness.work.to_string_lossy(),
@@ -8087,13 +8379,13 @@ fn a_held_enable_rechecks_the_cwd_before_committing() {
     );
     assert!(on.get("error").is_none(), "{on}");
     let query = harness.client.request(
-        234,
+        305,
         "session.teams",
         json!({"instance": harness.instance, "sessionId": session}),
     );
     assert_eq!(
         query["result"]["enabled"], false,
-        "the released wait must not have written the switch: {query}"
+        "the late handshake must not write the switch: {query}"
     );
     drop(child.stdin.take());
     let _ = child.wait();

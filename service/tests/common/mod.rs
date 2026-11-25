@@ -420,6 +420,23 @@ impl Client {
         }
     }
 
+    /// Take a response already buffered by an earlier `request` (or read a new
+    /// frame), by id. Used when another request's reply is interleaved.
+    pub fn take_response(&mut self, id: i64) -> Option<Value> {
+        if let Some(index) = self.pending.iter().position(|frame| {
+            frame.get("method").is_none() && frame.get("id") == Some(&serde_json::json!(id))
+        }) {
+            return Some(self.pending.remove(index));
+        }
+        while let Some(frame) = self.try_recv(Duration::from_millis(100)) {
+            if frame.get("method").is_none() && frame.get("id") == Some(&serde_json::json!(id)) {
+                return Some(frame);
+            }
+            self.pending.push(frame);
+        }
+        None
+    }
+
     /// Send a notification.
     pub fn notify(&mut self, method: &str, params: Value) {
         self.send(&serde_json::json!({

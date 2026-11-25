@@ -714,6 +714,16 @@ impl Relay {
         });
     }
 
+    /// Whether any `session/prompt` of this session is still in flight, from
+    /// any connection (attached, detached/orphan) or the service itself
+    /// (20.9 delivery gate).
+    pub fn session_prompt_active(&self, session_id: &str) -> bool {
+        self.outgoing.values().any(|outgoing| {
+            outgoing.method == "session/prompt"
+                && outgoing.session_id.as_deref() == Some(session_id)
+        })
+    }
+
     /// Whether `conn` has a `session/prompt` in flight for this session.
     pub fn prompt_active(&self, conn: ConnId, session_id: &str) -> bool {
         self.outgoing.values().any(|outgoing| {

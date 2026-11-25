@@ -2747,25 +2747,32 @@ impl Hub {
         // turn stops counting (PROTOCOL.md 13).
         if had_prompt_finished {
             // A human prompt on the leader ended: bus messages that queued
-            // behind it may now be delivered (18.4), and a closed team's notice
-            // may finally reach the leader (20.9).
+            // behind it may now be delivered (18.4).
             if let Some(finished) = &outcome.prompt_finished {
                 self.teams
                     .frontend_prompt_finished(instance_id, &finished.session_id);
-                self.deliver_closing_notices(instance_id, &finished.session_id);
             }
             self.drain_team_events();
             self.team_deliveries();
         }
-        if let Some(finished) = finished_turn {
+        if let Some(finished) = &finished_turn {
             if finished.adoption {
                 if let Some(instance) = self.instances.get_mut(instance_id) {
                     instance.relay.forget_turn(&finished.session_id);
                 }
             }
             if !service_response {
-                self.send_turn_finished(instance_id, &finished);
+                self.send_turn_finished(instance_id, finished);
             }
+        }
+        // A closed team's notice waits for every human prompt of the session
+        // (20.9). It is attempted only after the turn's own bookkeeping above:
+        // `forget_turn` drops every prompt record of the session, including a
+        // notice just started, so the old turn must be finished first.
+        if let Some(finished) = outcome.prompt_finished.as_ref() {
+            self.deliver_closing_notices(instance_id, &finished.session_id);
+        } else if let Some(finished) = finished_turn.as_ref() {
+            self.deliver_closing_notices(instance_id, &finished.session_id);
         }
     }
 

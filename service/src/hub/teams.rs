@@ -1308,6 +1308,23 @@ impl Hub {
             .ok_or_else(|| TeamError::invalid("config is required"))?;
         let identities = self.sessions_of_cwd(&cwd);
         self.with_session_changes(identities, |hub| hub.teams.configure(&cwd, config.clone()))?;
+        // Disabling a cwd answers its held enables at once (20.5): a wait must
+        // not survive the configuration it depended on, and re-enabling later
+        // must not revive it.
+        if !self.teams.has_config(&cwd) || !self.teams.config_for(&cwd).enabled {
+            let waiting: Vec<u64> = self
+                .pending_enables
+                .iter()
+                .filter(|(_, pending)| pending.cwd == cwd)
+                .map(|(generation, _)| *generation)
+                .collect();
+            for generation in waiting {
+                let Some(pending) = self.pending_enables.remove(&generation) else {
+                    continue;
+                };
+                self.answer_pending_enable(pending, EnableDecision::Changed);
+            }
+        }
         Ok(json!({}))
     }
 
@@ -1704,7 +1721,7 @@ impl Hub {
         let session = session.to_string();
         let value = self.with_session_changes(vec![identity.clone()], |hub| {
             if let Some(team) = close_team {
-                hub.close_team(&team)?;
+                hub.close_team_with(&team, Some(true))?;
             }
             hub.remember_switch(&agent, &session, false);
             hub.forward_loads.remove(&identity);
@@ -2252,9 +2269,15 @@ impl Hub {
     }
 
     fn close_team(&mut self, team: &str) -> Result<Value, TeamError> {
+        self.close_team_with(team, None)
+    }
+
+    /// `disabled` is `Some(true)` when the same call also turned the session's
+    /// switch off (`session.teams {enabled:false, close:true}`), so the notice
+    /// says the team tools are gone for this session (20.9).
+    fn close_team_with(&mut self, team: &str, disabled: Option<bool>) -> Result<Value, TeamError> {
         // Capture the leader before `teams.close` removes the team. Its session
-        // and instance stay alive, but a running prompt (bus or front end) is
-        // cancelled like any other turn; held front-end prompts are dropped.
+        // and instance stay alive.
         let leader = self
             .teams
             .team(team)
@@ -2270,18 +2293,10 @@ impl Hub {
         self.publish_session_changes(before);
         let mut closing_leader = None;
         if let Some((instance, session)) = leader {
-            let running = self
-                .instances
-                .get(&instance)
-                .map(|handle| {
-                    self.bus_prompt_active(&instance, &session)
-                        || handle
-                            .attached
-                            .iter()
-                            .any(|conn| handle.relay.prompt_active(*conn, &session))
-                })
-                .unwrap_or(false);
-            if running {
+            // Human first (20.9): only the team's own bus turn is cancelled. A
+            // front-end prompt keeps running, and a prompt held behind that bus
+            // turn is released — not dropped — once the cancel is answered.
+            if self.bus_prompt_active(&instance, &session) {
                 if let Some(handle) = self.instances.get(&instance) {
                     handle.control.send_frame(json!({
                         "jsonrpc": "2.0",
@@ -2290,7 +2305,6 @@ impl Hub {
                     }));
                 }
             }
-            self.cancel_held_session(&instance, &session);
             // A re-created team may bind the same leader session; its next bus
             // turn must be able to hold and cancel afresh.
             self.held_timed_out
@@ -2314,8 +2328,9 @@ impl Hub {
         if let Some((instance, session)) = closing_leader {
             // 20.9: tell the leader the team is gone. The session keeps living
             // as a plain chat, so the notice is a one-shot service prompt, not a
-            // bus turn of a team that no longer exists.
-            self.queue_closing_notice(&instance, &session, team);
+            // bus turn of a team that no longer exists. It waits for the human
+            // prompts to finish.
+            self.queue_closing_notice(&instance, &session, team, disabled);
         }
         Ok(json!({}))
     }
@@ -2323,17 +2338,31 @@ impl Hub {
     /// Queue the "team closed" notice for a leader session and deliver it as
     /// soon as the session is free (20.9). Nothing is sent when the session's
     /// instance is gone or it no longer holds a bound session token.
-    fn queue_closing_notice(&mut self, instance: &str, session: &str, team: &str) {
+    ///
+    /// `disabled` says the session's own switch was turned off with the close
+    /// (`session.teams {enabled:false, close:true}`), which drops the team tools
+    /// for good; a plain `team.close` only ends this team.
+    fn queue_closing_notice(
+        &mut self,
+        instance: &str,
+        session: &str,
+        team: &str,
+        disabled: Option<bool>,
+    ) {
         if !self.instances.contains_key(instance) {
             return;
         }
         if self.teams.session_token_of(instance, session).is_none() {
             return;
         }
-        let body = format!(
-            "团队 {team} 已被关闭，所有 worker 已停止。你现在是普通单聊，不再有 team 工具\
-             （team_spawn 等），不要再调用它们；如果用户再次要求组队，再使用 team_spawn。"
-        );
+        let body = match disabled {
+            Some(true) => format!(
+                "团队 {team} 已关闭，正在停止 worker。此会话的 team 工具已关闭；只有用户再次要求时才重新组队。"
+            ),
+            _ => format!(
+                "团队 {team} 已关闭，正在停止 worker。你不再领导这个团队；只有用户再次要求时才重新组队。"
+            ),
+        };
         let text = crate::team::format_message(&crate::team::Message {
             id: 0,
             to: "leader".to_string(),
@@ -2353,22 +2382,22 @@ impl Hub {
         self.deliver_closing_notices(instance, session);
     }
 
-    /// Send the queued closing notices of a session whose prompt just ended.
+    /// Send the next queued closing notice of a session whose prompts just
+    /// ended. One notice at a time: an in-flight notice keeps the session busy,
+    /// so a second close waits for it (20.9).
     pub(crate) fn deliver_closing_notices(&mut self, instance: &str, session: &str) {
         let key = (instance.to_string(), session.to_string());
         if self.closing_notices.get(&key).is_none_or(Vec::is_empty) {
             return;
         }
-        // A running prompt (front end or bus) takes precedence: the notice
-        // waits like any other service prompt (18.11/20.9).
-        if self.bus_prompt_active(instance, session)
-            || self.instances.get(instance).is_some_and(|handle| {
-                handle
-                    .attached
-                    .iter()
-                    .any(|conn| handle.relay.prompt_active(*conn, session))
-            })
-            || self.held_prompts.contains_key(&key)
+        // Human first: a running prompt anywhere on this session (including an
+        // orphan turn of a detached front end) and any held human prompt take
+        // precedence; the notice waits like any other service prompt (18.11).
+        if self.held_prompts.contains_key(&key)
+            || self
+                .instances
+                .get(instance)
+                .is_some_and(|handle| handle.relay.session_prompt_active(session))
         {
             return;
         }
@@ -2381,9 +2410,14 @@ impl Hub {
         let Some(queued) = self.closing_notices.remove(&key) else {
             return;
         };
+        // Take exactly one notice; the rest stay queued for the next free slot.
+        let (_, blocks) = queued[0].clone();
+        if queued.len() > 1 {
+            self.closing_notices.insert(key, queued[1..].to_vec());
+        }
         let params = json!({
             "sessionId": session,
-            "prompt": queued[0].1.clone(),
+            "prompt": blocks.clone(),
         });
         let Some((agent_id, frame, seq, event)) = self
             .instances
@@ -2417,7 +2451,7 @@ impl Hub {
             "params": {
                 "sessionId": session,
                 "origin": "bus",
-                "prompt": queued[0].1,
+                "prompt": blocks,
             },
         });
         for conn in self.delivery_conns(instance) {
@@ -4154,18 +4188,19 @@ impl Hub {
         session: &str,
         message: &Value,
     ) -> bool {
-        // Only a leader of a live team waits behind a bus prompt. After
-        // `team.close` the conversation continues as a plain session (there
-        // is no bus turn left whose completion could release the prompt),
-        // and the held prompts were already dropped by close.
+        // A human prompt waits behind any bus-shaped turn of its session: a
+        // team's bus turn while a team exists, or a closing notice after the
+        // team is gone (20.9, human first).
+        let leader_bus = self.bus_prompt_active(instance, session);
+        if !leader_bus {
+            return false;
+        }
         if !self
             .teams
             .team_of_instance(instance)
             .is_some_and(|team| team.is_leader_instance(instance))
+            && !self.is_closing_notice_active(instance, session)
         {
-            return false;
-        }
-        if !self.bus_prompt_active(instance, session) {
             return false;
         }
         let key = (instance.to_string(), session.to_string());
@@ -4416,7 +4451,23 @@ impl Hub {
     fn bus_prompt_active(&self, instance: &str, session: &str) -> bool {
         self.driver.iter().any(|((owner, _), call)| {
             owner == instance
-                && matches!(call, ServiceCall::Prompt { session: current, .. } if current == session)
+                && match call {
+                    ServiceCall::Prompt {
+                        session: current, ..
+                    } => current == session,
+                    // A closing notice is a bus-shaped turn too (20.9), and it
+                    // exists independently of any team.
+                    ServiceCall::ClosingNotice { session: current } => current == session,
+                    _ => false,
+                }
+        })
+    }
+
+    /// Whether a closing notice's turn is running for this session (20.9).
+    fn is_closing_notice_active(&self, instance: &str, session: &str) -> bool {
+        self.driver.iter().any(|((owner, _), call)| {
+            owner == instance
+                && matches!(call, ServiceCall::ClosingNotice { session: current } if current == session)
         })
     }
 

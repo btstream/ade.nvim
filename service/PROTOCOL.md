@@ -1223,11 +1223,13 @@ name for `team_spawn` takes the lowest free `w<n>`.
 leader are dropped, then the last `team.changed`. The stop of each worker is
 initiated before that notification; the command does not wait for the processes
 to exit, and the team is gone from `team.list` afterwards. The leader's session
-and instance stay (the person keeps the conversation), but a prompt of the
-leader's session that is running when the team closes is cancelled
-(`session/cancel`, as in 18.11), whether it came from the bus or from a front
-end, and prompts held for it are dropped. `team.bind_leader` for an existing team with a
-different session is `-32061`: to change the leader, close the team.
+and instance stay (the person keeps the conversation). **Human first:** only
+the team's own bus turn is cancelled (`session/cancel`, as in 18.11 above). A
+prompt the person sent (a front-end prompt) is never cancelled, and a prompt
+held behind that bus turn is released — not dropped — when the cancel is
+answered; both run to completion. The leader is then told the team is gone
+(20.9). `team.bind_leader` for an existing team with a different session is
+`-32061`: to change the leader, close the team.
 
 **Watchers.** For a worker instance the watchers play the role of the attached
 connections of sections 5.3–5.4 and 14: every pending agent request is sent to
@@ -1971,19 +1973,24 @@ leader: team|null, reload?, pending?}`:
   `close: true` is also given, in which case the team is closed first
   (`team.close`, and 20.9 tells the leader). The result is
   `{enabled: false, injected, leader: null}`;
-- `enabled: true`: see the two branches below. The result always carries
-  `reload` (`true` only when the front end must load, `false` otherwise).
+- `enabled: true`, already injected: the call answers at once with
+  `injected: true`, `reload: false` and the switch stored — nothing to load;
+- `enabled: true`, not injected: see the waiting branch and the reload fallback
+  below. The result always carries `reload` (`true` only when the front end
+  must load, `false` otherwise).
 
-**Waiting branch.** If the session holds a bound token whose MCP process has
-never connected — the server was injected but the agent's process is simply
-not up yet — the call does not answer at once. It is **held** until that
-token's MCP process connects (the reply then has `injected: true`,
-`reload: false`, and the switch is stored), or for at most 10 s
-(`NVIM_ADE_SERVER_TEAM_INJECT_TIMEOUT_MS` shortens it in tests). This is the
-normal case of a brand-new chat: `session/new` just returned and the agent is
-still starting its MCP process, so enabling teams for the first time costs no
-reload. A read-only query never waits but gains `pending: true` in that same
-situation.
+**Waiting branch.** Only when the result would otherwise be `injected: false`
+*and* the session holds a bound token whose MCP process has never connected —
+the server was injected but the agent's process is simply not up yet — the
+call does not answer at once. (A session that is already injected answers
+immediately, even if another token of it has not handshaked: `injected` is the
+sole condition.) The reply is **held** until that token's MCP process connects
+(then `injected: true`, `reload: false`, and the switch is stored), or for at
+most 10 s (`NVIM_ADE_SERVER_TEAM_INJECT_TIMEOUT_MS` shortens it in tests).
+This is the normal case of a brand-new chat: `session/new` just returned and
+the agent is still starting its MCP process, so enabling teams for the first
+time costs no reload. A read-only query never waits but gains `pending: true`
+in that same situation.
 
 While a reply is held, a change to what it waits on answers it immediately
 with the state as it is then (`reload: false`, nothing written): the token is
@@ -2063,31 +2070,47 @@ requests, 20.2); the person can still use `:Ade team on` (20.5 reload) or
 ### 20.9 Closing notifies the leader
 
 `team.close` — from the `team.close` RPC or from `session.teams {enabled:
-false, close: true}` — first cancels the leader's running prompt (bus or front
-end, as in 19.4) and degrades its tools
-(`notifications/tools/list_changed`). Many agents ignore that notification and
-keep calling team tools, so closing also **tells the leader in words**.
+false, close: true}` — first ends the team (18.11) and degrades the leader's
+tools (`notifications/tools/list_changed`). Many agents ignore that
+notification and keep calling team tools, so closing also **tells the leader
+in words**.
+
+**Human first.** Closing cancels only the team's own bus turn (18.11). A
+front-end prompt that is running keeps running — it is never cancelled — and a
+front-end prompt held behind that bus turn is released (not refused) when the
+cancel is answered. The notice below is sent only after all of those prompts
+have finished.
 
 When the leader session still exists (its instance is running and it holds a
 bound session token), the service sends it one service prompt in the bus
 notice shape the front end already renders as a bus turn:
 
 ```
-<bus from="human" kind="notice">团队 t3 已被关闭，所有 worker 已停止。你现在是普通单聊，不再有 team 工具（team_spawn 等），不要再调用它们；如果用户再次要求组队，再使用 team_spawn。</bus>
+<bus from="human" kind="notice">团队 t3 已关闭，正在停止 worker。你不再领导这个团队；只有用户再次要求时才重新组队。</bus>
 ```
 
-- **Order.** The cancel comes first. The notice is sent only once the leader's
-  prompt has actually ended (its response or the cancel's), never in the
-  middle of it. A human prompt that is running (or held behind a bus turn)
-  keeps precedence: the notice waits until the session is free, like any other
-  service prompt (18.11), and does not interrupt the person.
+When the same call also turned the session's switch off (`session.teams
+{enabled: false, close: true}`), the text says the team tools are gone too
+(`…已关闭，正在停止 worker。此会话的 team 工具已关闭；只有用户再次要求时才重新组队。`).
+
+- **Order.** Cancel the bus turn first; the notice goes out only once the
+  leader's prompts have ended (their responses or the cancel's), never in the
+  middle of one. A human prompt keeps precedence.
+- **One at a time.** Notices of one session queue; exactly one is sent per free
+  slot, and the in-flight notice counts as the session's running turn. While a
+  notice runs, a new human prompt is held behind it exactly like a normal bus
+  turn (18.11), so the session never has two prompts at once. The delivery gate
+  uses the relay's session-wide in-flight check, so a prompt of a detached front
+  end (an orphan turn) still blocks it; a turn's own bookkeeping (adoption
+  clean-up) always completes before the notice starts.
 - **Not a bus turn of a team.** The team is already deleted when the notice is
   sent, so it belongs to no team, is not queued in any team mailbox, and
   counts toward no turn limit. It is recorded and rendered like a notice turn
-  (`_ade/turn_started` / `_ade/turn_finished`, `origin: "bus"`).
+  (`_ade/turn_started` / `_ade/turn_finished`, `origin: "bus"`), and it works
+  without the team or its mapping (`bus_prompt_active` counts it).
 - **When it is not sent.** If the leader's instance has exited, or the session
   no longer holds a bound session token (closed/deleted, or its instance
-  died), nothing is sent: there is no agent conversation left to inform.
+  died), nothing is sent: there is no agent conversation left to inform. The
+  close itself still succeeds and answers `{}`.
 - **`team_stop` of one worker** (20.6) does not close the team and sends no
   such notice; the team's leader only hears the usual "worker stopped" notice.
-
