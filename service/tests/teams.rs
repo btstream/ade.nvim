@@ -8390,3 +8390,269 @@ fn a_late_handshake_after_release_writes_nothing() {
     drop(child.stdin.take());
     let _ = child.wait();
 }
+
+/// A human prompt that arrives after close but before the old bus turn's reply
+/// is still held, not forwarded (20.9): close only cancels that turn once, and
+/// the session never has two prompts at once.
+#[test]
+fn a_human_prompt_arriving_between_close_and_the_bus_reply_is_held() {
+    let mut harness = Harness::new("close-then-human-hold", json!({}), None);
+    // A bus turn that only stops on cancel, so it stays in flight across the
+    // close and its reply can be delayed.
+    harness.send("leader", "task", "[slow-ignore-cancel]");
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .any(|event| {
+                    event["event"] == "prompt"
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("[slow-ignore-cancel]"))
+                })
+                .then_some(())
+        },
+        "the running bus turn",
+    );
+    let closed = harness
+        .client
+        .request(700, "team.close", json!({"team": harness.team}));
+    assert!(closed["result"].is_object(), "{closed}");
+    // Close succeeded; the bus turn is still unanswered. A new human prompt
+    // must not reach the agent now.
+    harness.client.notify(
+        "tunnel.send",
+        json!({
+            "instance": harness.instance,
+            "message": {
+                "jsonrpc": "2.0", "id": 701, "method": "session/prompt",
+                "params": {"sessionId": harness.session, "prompt": [{"type":"text","text":"human after close"}]},
+            },
+        }),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !harness.events().iter().any(|event| {
+            event["event"] == "prompt"
+                && event["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("human after close"))
+        }),
+        "the prompt must be held, not forwarded, before the bus reply"
+    );
+    // Release it: the grace period relays it without a second cancel.
+    std::fs::write(harness.server.dir().join("team-agent.gate"), b"go").expect("gate");
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .any(|event| {
+                    event["event"] == "prompt"
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("human after close"))
+                })
+                .then_some(())
+        },
+        "the held human prompt released once the gate opens",
+    );
+    // Exactly one cancel: close's own, not a second one from the hold.
+    let cancels = harness
+        .events()
+        .iter()
+        .filter(|event| event["event"] == "cancel")
+        .count();
+    assert_eq!(cancels, 1, "one cancel for the in-flight turn");
+}
+
+/// While a closing notice runs, held human prompts are released one at a time,
+/// and the grace period never forwards one around the notice (20.9).
+#[test]
+fn held_human_prompts_are_released_one_at_a_time_around_a_notice() {
+    let mut harness = Harness::new_with_agent_env(
+        "notice-serialized",
+        json!({}),
+        &[("NVIM_ADE_SERVER_HELD_TIMEOUT_MS", "200")],
+        json!({"TEAM_AGENT_NOTICE_SLOW": "1"}),
+    );
+    let before = harness.events().len();
+    let closed = harness
+        .client
+        .request(720, "team.close", json!({"team": harness.team}));
+    assert!(closed["result"].is_object(), "{closed}");
+    // The notice starts (and ignores cancel).
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .skip(before)
+                .any(|event| {
+                    event["event"] == "prompt"
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("已关闭"))
+                })
+                .then_some(())
+        },
+        "the closing notice",
+    );
+    // Two humans arrive from two connections while the notice runs.
+    let mut second = harness.server.connect();
+    second.hello(&harness.server.token(), nvim_ade_server::API_VERSION);
+    for (client, id, text) in [
+        (&mut harness.client, 721, "first held"),
+        (&mut second, 722, "second held"),
+    ] {
+        client.notify(
+            "tunnel.send",
+            json!({
+                "instance": harness.instance,
+                "message": {
+                    "jsonrpc": "2.0", "id": id, "method": "session/prompt",
+                    "params": {"sessionId": harness.session, "prompt": [{"type":"text","text": text}]},
+                },
+            }),
+        );
+    }
+    // Past the 200 ms grace: neither may reach the agent while the notice runs.
+    std::thread::sleep(Duration::from_millis(600));
+    let forwarded = |harness: &Harness, needle: &str| {
+        harness.events().iter().any(|event| {
+            event["event"] == "prompt"
+                && event["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(needle))
+        })
+    };
+    assert!(
+        !forwarded(&harness, "first held") && !forwarded(&harness, "second held"),
+        "the grace period must not forward around a closing notice"
+    );
+    // End the notice: exactly one of the two goes, and only one.
+    std::fs::write(harness.server.dir().join("team-agent.gate"), b"go").expect("gate");
+    let first = wait_for(
+        || {
+            let events = harness.events();
+            let first_pos = events.iter().position(|event| {
+                event["event"] == "prompt"
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("first held"))
+            });
+            let second_pos = events.iter().position(|event| {
+                event["event"] == "prompt"
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("second held"))
+            });
+            first_pos
+                .or(second_pos)
+                .map(|position| (first_pos, second_pos, position))
+        },
+        "the first released held prompt",
+    );
+    // Before that prompt's own reply, the other must still wait.
+    let (first_pos, second_pos, released) = first;
+    let (_released_pos, still_waiting) = if first_pos == Some(released) {
+        (released, second_pos)
+    } else {
+        (released, first_pos)
+    };
+    assert!(
+        still_waiting.is_none(),
+        "only one held prompt may be in flight at a time: {first_pos:?}/{second_pos:?}"
+    );
+}
+
+/// A second close does not cancel the first team's still-running closing
+/// notice: only a team's own bus turn is cancelled (20.9).
+#[test]
+fn a_second_close_does_not_cancel_a_running_closing_notice() {
+    let mut harness = Harness::new_with_agent_env(
+        "second-close-keeps-notice",
+        json!({}),
+        &[("NVIM_ADE_SERVER_TEAM_INJECT_TIMEOUT_MS", "8000")],
+        json!({"TEAM_AGENT_NOTICE_SLOW": "1"}),
+    );
+    let before = harness.events().len();
+    let closed = harness
+        .client
+        .request(730, "team.close", json!({"team": harness.team}));
+    assert!(closed["result"].is_object(), "{closed}");
+    wait_for(
+        || {
+            harness
+                .events()
+                .iter()
+                .skip(before)
+                .any(|event| {
+                    event["event"] == "prompt"
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("已关闭"))
+                })
+                .then_some(())
+        },
+        "the first closing notice",
+    );
+    let cancels_before = harness
+        .events()
+        .iter()
+        .filter(|event| event["event"] == "cancel")
+        .count();
+    // A new team for the same pair, then close it while the notice runs.
+    let created = harness.client.request(
+        731,
+        "team.start",
+        json!({
+            "instance": harness.instance,
+            "sessionId": harness.session,
+            "workflow": "no-such-workflow",
+        }),
+    );
+    assert_eq!(created["error"]["code"], -32060, "{created}");
+    let listed = harness.client.request(732, "team.list", json!({}));
+    let team = listed["result"]["teams"]
+        .as_array()
+        .and_then(|teams| teams.first())
+        .and_then(|team| team["id"].as_str())
+        .map(str::to_string)
+        .expect("a re-created team");
+    let second = harness
+        .client
+        .request(733, "team.close", json!({"team": team}));
+    assert!(second["result"].is_object(), "{second}");
+    std::thread::sleep(Duration::from_millis(400));
+    // The running notice was not cancelled: no new `session/cancel`.
+    let cancels_after = harness
+        .events()
+        .iter()
+        .filter(|event| event["event"] == "cancel")
+        .count();
+    assert_eq!(
+        cancels_after, cancels_before,
+        "the second close must not cancel the running notice"
+    );
+    // The notice runs to completion and the queued second notice follows.
+    std::fs::write(harness.server.dir().join("team-agent.gate"), b"go").expect("gate");
+    wait_for(
+        || {
+            let notices = harness
+                .events()
+                .into_iter()
+                .skip(before)
+                .filter(|event| {
+                    event["event"] == "prompt"
+                        && event["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("已关闭"))
+                })
+                .count();
+            (notices >= 2).then_some(())
+        },
+        "both closing notices delivered",
+    );
+}

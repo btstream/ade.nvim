@@ -276,7 +276,7 @@ impl Client {
         #[cfg(unix)]
         {
             let stream = std::os::unix::net::UnixStream::connect(path)?;
-            stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+            stream.set_read_timeout(Some(Duration::from_secs(30)))?;
             let reader = stream.try_clone()?;
             Ok(Self {
                 reader: BufReader::new(Box::new(reader)),
@@ -325,7 +325,11 @@ impl Client {
     }
 
     /// Read one response line. `None` means the server closed the connection.
+    ///
+    /// Polling helpers narrow the socket timeout and do not restore it, so a
+    /// blocking read always puts the default back first.
     pub fn recv(&mut self) -> Option<Value> {
+        self.reset_read_timeout();
         let mut line = String::new();
         match self.reader.read_line(&mut line) {
             Ok(0) => None,
@@ -334,7 +338,7 @@ impl Client {
                     .unwrap_or_else(|error| panic!("invalid JSON response {line:?}: {error}")),
             ),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                panic!("timed out waiting for a response")
+                panic!("timed out waiting for a response ({line:?})")
             }
             // A named pipe client sees a closed server as a broken pipe rather
             // than an end of file.
@@ -504,7 +508,7 @@ impl Client {
 
     /// Restore the blocking read timeout after polling helpers narrowed it.
     pub fn reset_read_timeout(&mut self) {
-        self.set_read_timeout(Duration::from_secs(10));
+        self.set_read_timeout(Duration::from_secs(30));
     }
 
     fn recv_with_timeout(&mut self, timeout: Duration) -> ReadOutcome {

@@ -724,6 +724,17 @@ impl Relay {
         })
     }
 
+    /// Whether a prompt the *person* started is still in flight for this
+    /// session: a front-end prompt of any connection (attached or orphan). A
+    /// service-sent prompt (bus turn, closing notice) is not "foreign" here.
+    pub fn foreign_prompt_active(&self, session_id: &str) -> bool {
+        self.outgoing.values().any(|outgoing| {
+            outgoing.method == "session/prompt"
+                && outgoing.session_id.as_deref() == Some(session_id)
+                && matches!(outgoing.origin, Origin::Frontend { .. })
+        })
+    }
+
     /// Whether `conn` has a `session/prompt` in flight for this session.
     pub fn prompt_active(&self, conn: ConnId, session_id: &str) -> bool {
         self.outgoing.values().any(|outgoing| {

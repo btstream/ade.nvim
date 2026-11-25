@@ -538,6 +538,10 @@ pub struct Hub {
     held_generation: HashMap<(String, String), u64>,
     held_timed_out: HashSet<(String, String)>,
     next_held_generation: u64,
+    /// `(instance, session)` whose session-level `session/cancel` was already
+    /// sent for the turn that is still in flight: a second close must not
+    /// cancel it again (a human prompt may have started in between).
+    cancel_sent: HashSet<(String, String)>,
     /// (team, participant) -> generation of the latest human interrupt (19.14).
     interrupt_generation: HashMap<(String, String), (u64, Option<u64>)>,
     next_interrupt_generation: u64,
@@ -622,6 +626,7 @@ impl Hub {
             held_generation: HashMap::new(),
             held_timed_out: HashSet::new(),
             next_held_generation: 0,
+            cancel_sent: HashSet::new(),
             interrupt_generation: HashMap::new(),
             next_interrupt_generation: 0,
             interrupt_queue: HashMap::new(),
@@ -2747,10 +2752,12 @@ impl Hub {
         // turn stops counting (PROTOCOL.md 13).
         if had_prompt_finished {
             // A human prompt on the leader ended: bus messages that queued
-            // behind it may now be delivered (18.4).
+            // behind it may now be delivered (18.4), and the next held human
+            // prompt may go (one at a time, 20.9).
             if let Some(finished) = &outcome.prompt_finished {
                 self.teams
                     .frontend_prompt_finished(instance_id, &finished.session_id);
+                self.release_held_prompts(instance_id, &finished.session_id, false);
             }
             self.drain_team_events();
             self.team_deliveries();

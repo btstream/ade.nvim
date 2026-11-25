@@ -2293,10 +2293,16 @@ impl Hub {
         self.publish_session_changes(before);
         let mut closing_leader = None;
         if let Some((instance, session)) = leader {
-            // Human first (20.9): only the team's own bus turn is cancelled. A
+            // Human first (20.9): only this team's own bus turn is cancelled. A
             // front-end prompt keeps running, and a prompt held behind that bus
             // turn is released — not dropped — once the cancel is answered.
-            if self.bus_prompt_active(&instance, &session) {
+            // Another team's closing notice (or one of this session's notices)
+            // is left alone: it is its own turn and keeps running.
+            let key = (instance.clone(), session.clone());
+            if self.team_bus_turn_active(&instance, &session, team)
+                && !self.cancel_sent.contains(&key)
+            {
+                self.cancel_sent.insert(key.clone());
                 if let Some(handle) = self.instances.get(&instance) {
                     handle.control.send_frame(json!({
                         "jsonrpc": "2.0",
@@ -4188,19 +4194,17 @@ impl Hub {
         session: &str,
         message: &Value,
     ) -> bool {
-        // A human prompt waits behind any bus-shaped turn of its session: a
-        // team's bus turn while a team exists, or a closing notice after the
-        // team is gone (20.9, human first).
-        let leader_bus = self.bus_prompt_active(instance, session);
-        if !leader_bus {
-            return false;
-        }
-        if !self
-            .teams
-            .team_of_instance(instance)
-            .is_some_and(|team| team.is_leader_instance(instance))
-            && !self.is_closing_notice_active(instance, session)
-        {
+        // A human prompt waits behind any prompt of its session that the
+        // service did not send itself — whether a team still exists or not
+        // (20.9, human first). A closing notice and a team's bus turn are both
+        // "not the person", and so is an old turn still running right after
+        // close (`bus_prompt_active` sees it even with the team gone).
+        let ours = self.bus_prompt_active(instance, session);
+        let foreign_in_flight = self
+            .instances
+            .get(instance)
+            .is_some_and(|handle| handle.relay.foreign_prompt_active(session));
+        if !ours && !foreign_in_flight {
             return false;
         }
         let key = (instance.to_string(), session.to_string());
@@ -4217,7 +4221,10 @@ impl Hub {
             .held_prompts
             .get(&key)
             .is_some_and(|queue| queue.len() == 1);
-        if first {
+        if first && !self.cancel_sent.contains(&key) {
+            // One cancel per in-flight turn: a close may have cancelled the
+            // turn that this prompt now waits for.
+            self.cancel_sent.insert(key.clone());
             self.next_held_generation += 1;
             let generation = self.next_held_generation;
             self.held_generation.insert(key.clone(), generation);
@@ -4246,6 +4253,31 @@ impl Hub {
                     })
                     .await;
             });
+        } else if first {
+            // The turn is already being cancelled: the reply will release the
+            // queue, so make sure the grace timer exists for it.
+            if !self.held_generation.contains_key(&key) {
+                self.next_held_generation += 1;
+                let generation = self.next_held_generation;
+                self.held_generation.insert(key.clone(), generation);
+                let sender = self.command_sender.clone();
+                let instance = instance.to_string();
+                let session = session.to_string();
+                let timeout = std::env::var("NVIM_ADE_SERVER_HELD_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .unwrap_or(30_000);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(timeout)).await;
+                    let _ = sender
+                        .send(Command::TeamDeadline {
+                            instance,
+                            session,
+                            generation,
+                        })
+                        .await;
+                });
+            }
         }
         true
     }
@@ -4256,6 +4288,12 @@ impl Hub {
             return;
         }
         if !self.bus_prompt_active(instance, session) {
+            return;
+        }
+        // A closing notice must never overlap a human prompt (20.9): the grace
+        // period only applies to a team's own bus turn, whose documented
+        // fallback is to relay anyway (18.11).
+        if self.notice_active(instance, session) {
             return;
         }
         self.held_timed_out.insert(key);
@@ -4295,24 +4333,44 @@ impl Hub {
         self.team_deliveries();
     }
 
-    fn release_held_prompts(&mut self, instance: &str, session: &str, timed_out: bool) {
+    /// Release the next held prompt of a session whose blocking turn ended.
+    /// One at a time (20.9): the released prompt becomes the session's new
+    /// in-flight turn, so the queue's next entry must wait for its own reply.
+    pub(crate) fn release_held_prompts(&mut self, instance: &str, session: &str, timed_out: bool) {
         let key = (instance.to_string(), session.to_string());
         self.held_generation.remove(&key);
         if !timed_out {
-            // The bus prompt answered normally: a later bus turn may cancel
-            // and hold again with a fresh generation.
-            self.held_timed_out.remove(&key);
+            // The bus prompt answered normally: a later bus turn may cancel and
+            // hold again with a fresh generation. These only clear once the
+            // session has no prompt in flight at all, so a prompt released by
+            // the grace path never provokes a second cancel for the same turn.
+            let idle = !self
+                .instances
+                .get(instance)
+                .is_some_and(|handle| handle.relay.session_prompt_active(session));
+            if idle {
+                self.held_timed_out.remove(&key);
+                self.cancel_sent.remove(&key);
+            }
         }
-        let Some(queue) = self.held_prompts.remove(&key) else {
+        let Some(queue) = self.held_prompts.get_mut(&key) else {
             return;
         };
-        for (conn, message) in queue {
-            if !self.conns.contains_key(&conn) {
-                continue;
-            }
-            let params = json!({ "instance": instance, "message": message });
-            self.tunnel_send_inner(conn, &params, false);
+        while queue
+            .front()
+            .is_some_and(|(conn, _)| !self.conns.contains_key(conn))
+        {
+            queue.pop_front();
         }
+        let Some((conn, message)) = queue.pop_front() else {
+            self.held_prompts.remove(&key);
+            return;
+        };
+        if queue.is_empty() {
+            self.held_prompts.remove(&key);
+        }
+        let params = json!({ "instance": instance, "message": message });
+        self.tunnel_send_inner(conn, &params, false);
     }
 
     fn send_held_error(&mut self, conn: u64, instance: &str, message: &Value) {
@@ -4463,8 +4521,21 @@ impl Hub {
         })
     }
 
+    /// Whether this exact team's own bus turn is running on the session: a
+    /// closing notice, another team's bus turn or a human prompt is not it.
+    fn team_bus_turn_active(&self, instance: &str, session: &str, team: &str) -> bool {
+        self.driver.iter().any(|((owner, _), call)| {
+            owner == instance
+                && matches!(
+                    call,
+                    ServiceCall::Prompt { team: current, session: current_session, .. }
+                        if current == team && current_session == session
+                )
+        })
+    }
+
     /// Whether a closing notice's turn is running for this session (20.9).
-    fn is_closing_notice_active(&self, instance: &str, session: &str) -> bool {
+    fn notice_active(&self, instance: &str, session: &str) -> bool {
         self.driver.iter().any(|((owner, _), call)| {
             owner == instance
                 && matches!(call, ServiceCall::ClosingNotice { session: current } if current == session)

@@ -2098,11 +2098,19 @@ When the same call also turned the session's switch off (`session.teams
   middle of one. A human prompt keeps precedence.
 - **One at a time.** Notices of one session queue; exactly one is sent per free
   slot, and the in-flight notice counts as the session's running turn. While a
-  notice runs, a new human prompt is held behind it exactly like a normal bus
-  turn (18.11), so the session never has two prompts at once. The delivery gate
-  uses the relay's session-wide in-flight check, so a prompt of a detached front
-  end (an orphan turn) still blocks it; a turn's own bookkeeping (adoption
-  clean-up) always completes before the notice starts.
+  notice runs, a human prompt is held behind it exactly like a normal bus turn
+  (18.11), so the session never has two prompts at once. The 30 s grace
+  fallback of 18.11 is **not** applied to a notice (it exists only for a team's
+  own bus turn): a held human prompt is released only when the notice ends.
+  Held human prompts are also released **one at a time** — each becomes the
+  session's in-flight turn and the next waits for its reply. The delivery gate
+  and the hold both use the relay's session-wide check, so a prompt of a
+  detached front end (an orphan turn) still blocks them, including a prompt
+  that was already running when the team closed; a turn's own bookkeeping
+  (adoption clean-up) always completes before the notice starts. A close only
+  cancels the closing team's own bus turn: a previously queued closing notice
+  that is still running is left to finish (a second close queues its own
+  notice behind it).
 - **Not a bus turn of a team.** The team is already deleted when the notice is
   sent, so it belongs to no team, is not queued in any team mailbox, and
   counts toward no turn limit. It is recorded and rendered like a notice turn

@@ -401,6 +401,13 @@ def mcp_list(session):
 
 def run_prompt(ident, text, session):
     log({"event": "prompt", "session": session, "text": text})
+    if "已关闭" in text and os.environ.get("TEAM_AGENT_NOTICE_SLOW") == "1":
+        # A closing notice that ignores `session/cancel` for a while: the test
+        # needs the notice to stay in flight past the held grace period.
+        wait_gate_ignore_cancel()
+        result(ident, {"stopReason": "end_turn"})
+        log({"event": "done", "session": session})
+        return
     send({
         "jsonrpc": "2.0",
         "method": "session/update",
