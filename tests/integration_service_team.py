@@ -1313,7 +1313,8 @@ def scenario_limits(case):
 
 
 def scenario_close(case):
-    """9. team.close stops the worker and leaves the members pane empty."""
+    """9. team.close stops the worker, tells the leader, closes the team panes
+    and keeps the leader's chat on screen (PROTOCOL.md 20.9)."""
     editor = case.editor("a", templates=template())
     editor.connect()
     editor.submit("spawn-task:do [report]")
@@ -1321,18 +1322,39 @@ def scenario_close(case):
     worker = case.wait_worker_prompt("do [report]", "the worker prompt")
     editor.wait_participant("w1", lambda entry: entry["state"] in ("working", "idle"))
     editor.wait_bus_text("worker report", "the worker report")
+    leader_session = editor.state()["session"]["id"]
     editor.open_panel()
     editor.panel_cursor_participant("leader")
     editor.queue_answer("Close the team")
     editor.panel_press("x")
     editor.wait_team(lambda value: not value["teams"], "the closed team")
 
-    editor.wait_panel(
-        lambda panel: panel["open"] and any("还没有团队" in line for line in panel["lines"]),
-        "the empty members pane",
+    # The team panes close; the ordinary chat stays, still on the leader.
+    editor.wait_panel(lambda panel: not panel["open"], "the team panes to close")
+    chat = normalize(
+        editor.lua(
+            """
+            local wins = {}
+            for _, win in ipairs(vim.api.nvim_list_wins()) do
+              wins[#wins + 1] = vim.bo[vim.api.nvim_win_get_buf(win)].filetype
+            end
+            local st = require("ade.controller").state()
+            return { filetypes = wins, session = st.session and st.session.id or nil }
+            """
+        )
     )
+    assert "ade_chat" in chat["filetypes"], chat
+    assert chat["session"] == leader_session, (chat, leader_session)
+    # The leader agent is told, once, that its team is gone.
+    case.wait_agent_prompt("已关闭", "the closing notice to the leader")
+    notices = [
+        event
+        for event in case.agent_events()
+        if event.get("event") == "prompt" and "已关闭" in (event.get("text") or "")
+    ]
+    assert len(notices) == 1, notices
     wait_until(lambda: not pid_alive(worker["pid"]), "the worker process to exit")
-    return "team.close stopped the worker process and the members pane returned to its empty state"
+    return "team.close stopped the worker, told the leader once, closed the team panes and kept the leader chat"
 
 
 def scenario_single_agent(case):
