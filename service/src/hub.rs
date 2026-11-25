@@ -563,6 +563,9 @@ pub struct Hub {
     /// process to connect, by wait generation (20.5).
     pending_enables: HashMap<u64, teams::PendingEnable>,
     next_pending_enable: u64,
+    /// A closed team's one notice to its leader session, waiting for that
+    /// session's running prompt to end (20.9). Keyed by (instance, session).
+    closing_notices: HashMap<(String, String), Vec<(u64, Value)>>,
 }
 
 impl Hub {
@@ -631,6 +634,7 @@ impl Hub {
             conn_tokens: HashMap::new(),
             pending_enables: HashMap::new(),
             next_pending_enable: 0,
+            closing_notices: HashMap::new(),
         }
     }
 
@@ -2743,10 +2747,12 @@ impl Hub {
         // turn stops counting (PROTOCOL.md 13).
         if had_prompt_finished {
             // A human prompt on the leader ended: bus messages that queued
-            // behind it may now be delivered (18.4).
+            // behind it may now be delivered (18.4), and a closed team's notice
+            // may finally reach the leader (20.9).
             if let Some(finished) = &outcome.prompt_finished {
                 self.teams
                     .frontend_prompt_finished(instance_id, &finished.session_id);
+                self.deliver_closing_notices(instance_id, &finished.session_id);
             }
             self.drain_team_events();
             self.team_deliveries();
@@ -2829,6 +2835,9 @@ impl Hub {
         self.teams.forget_session_groups(instance_id);
         // Held `session.teams` replies answer now: their token is gone (20.5).
         self.release_pending_enables_of(instance_id);
+        // A closed team's notice cannot be delivered to a dead session (20.9).
+        self.closing_notices
+            .retain(|(owner, _), _| owner != instance_id);
         // Publish once, comparing the pre-exit snapshot with the state after the
         // whole cleanup: a session that was injected hears `injected:false` and
         // a leader change (20.5/A).

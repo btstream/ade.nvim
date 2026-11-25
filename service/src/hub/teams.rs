@@ -145,6 +145,11 @@ pub enum ServiceCall {
         team: String,
         participant: String,
     },
+    /// A terminal notice to a leader session after its team closed (20.9): its
+    /// response ends the bus-shaped turn and releases waiting front-end prompts.
+    ClosingNotice {
+        session: String,
+    },
     Prompt {
         team: String,
         participant: String,
@@ -2263,6 +2268,7 @@ impl Hub {
             .unwrap_or_default();
         let (_entry, workers) = self.teams.close(team)?;
         self.publish_session_changes(before);
+        let mut closing_leader = None;
         if let Some((instance, session)) = leader {
             let running = self
                 .instances
@@ -2289,6 +2295,7 @@ impl Hub {
             // turn must be able to hold and cancel afresh.
             self.held_timed_out
                 .remove(&(instance.clone(), session.clone()));
+            closing_leader = Some((instance, session));
         }
         self.interrupt_queue
             .retain(|(id, _), _| id.as_str() != team);
@@ -2304,7 +2311,118 @@ impl Hub {
                 control.stop(false, timeouts).await;
             });
         }
+        if let Some((instance, session)) = closing_leader {
+            // 20.9: tell the leader the team is gone. The session keeps living
+            // as a plain chat, so the notice is a one-shot service prompt, not a
+            // bus turn of a team that no longer exists.
+            self.queue_closing_notice(&instance, &session, team);
+        }
         Ok(json!({}))
+    }
+
+    /// Queue the "team closed" notice for a leader session and deliver it as
+    /// soon as the session is free (20.9). Nothing is sent when the session's
+    /// instance is gone or it no longer holds a bound session token.
+    fn queue_closing_notice(&mut self, instance: &str, session: &str, team: &str) {
+        if !self.instances.contains_key(instance) {
+            return;
+        }
+        if self.teams.session_token_of(instance, session).is_none() {
+            return;
+        }
+        let body = format!(
+            "团队 {team} 已被关闭，所有 worker 已停止。你现在是普通单聊，不再有 team 工具\
+             （team_spawn 等），不要再调用它们；如果用户再次要求组队，再使用 team_spawn。"
+        );
+        let text = crate::team::format_message(&crate::team::Message {
+            id: 0,
+            to: "leader".to_string(),
+            at: 0,
+            from: "human".to_string(),
+            kind: Kind::Notice,
+            body,
+            task: "_".to_string(),
+            refs: Vec::new(),
+        });
+        let blocks = vec![json!({ "type": "text", "text": text })];
+        let key = (instance.to_string(), session.to_string());
+        self.closing_notices
+            .entry(key)
+            .or_default()
+            .push((0, json!(blocks)));
+        self.deliver_closing_notices(instance, session);
+    }
+
+    /// Send the queued closing notices of a session whose prompt just ended.
+    pub(crate) fn deliver_closing_notices(&mut self, instance: &str, session: &str) {
+        let key = (instance.to_string(), session.to_string());
+        if self.closing_notices.get(&key).is_none_or(Vec::is_empty) {
+            return;
+        }
+        // A running prompt (front end or bus) takes precedence: the notice
+        // waits like any other service prompt (18.11/20.9).
+        if self.bus_prompt_active(instance, session)
+            || self.instances.get(instance).is_some_and(|handle| {
+                handle
+                    .attached
+                    .iter()
+                    .any(|conn| handle.relay.prompt_active(*conn, session))
+            })
+            || self.held_prompts.contains_key(&key)
+        {
+            return;
+        }
+        if !self.instances.contains_key(instance)
+            || self.teams.session_token_of(instance, session).is_none()
+        {
+            self.closing_notices.remove(&key);
+            return;
+        }
+        let Some(queued) = self.closing_notices.remove(&key) else {
+            return;
+        };
+        let params = json!({
+            "sessionId": session,
+            "prompt": queued[0].1.clone(),
+        });
+        let Some((agent_id, frame, seq, event)) = self
+            .instances
+            .get_mut(instance)
+            .map(|handle| handle.relay.service_prompt(session, params))
+        else {
+            return;
+        };
+        let Some(handle) = self.instances.get_mut(instance) else {
+            return;
+        };
+        if !handle.control.send_frame(frame) {
+            // Nothing to put back: a lost notice is not a team state error, and
+            // this session is a plain chat from now on.
+            return;
+        }
+        if let Some(event) = event {
+            self.record_events(instance, vec![event]);
+        }
+        self.driver.insert(
+            (instance.to_string(), agent_id),
+            ServiceCall::ClosingNotice {
+                session: session.to_string(),
+            },
+        );
+        // 20.9: the notice is a bus-shaped turn for the front end, so it renders
+        // like any other notice.
+        let started = json!({
+            "jsonrpc": "2.0",
+            "method": "_ade/turn_started",
+            "params": {
+                "sessionId": session,
+                "origin": "bus",
+                "prompt": queued[0].1,
+            },
+        });
+        for conn in self.delivery_conns(instance) {
+            self.send_tunnel_recv(conn, instance, seq, &started);
+        }
     }
 
     /// `team.watch` answers later when a replay is requested.
@@ -3878,6 +3996,14 @@ impl Hub {
                 self.team_deliveries();
                 self.drain_team_events();
             }
+            ServiceCall::ClosingNotice { session } => {
+                // 20.9: the notice's turn is over. Unblock whatever waited for
+                // this session and let queued notices follow.
+                self.release_held_prompts(instance, &session, false);
+                self.deliver_closing_notices(instance, &session);
+                self.team_deliveries();
+                self.drain_team_events();
+            }
             ServiceCall::Prompt {
                 team,
                 participant,
@@ -3889,9 +4015,11 @@ impl Hub {
                     // or the team closed while it was running: its late
                     // completion must not end the next turn. Prompts held
                     // behind it must not wait forever, unless a newer bus
-                    // turn for this session is already running.
+                    // turn for this session is already running. A team closed
+                    // during the turn still owes its leader the notice (20.9).
                     if !self.bus_prompt_active(instance, &session) {
                         self.release_held_prompts(instance, &session, false);
+                        self.deliver_closing_notices(instance, &session);
                     }
                     return;
                 }
@@ -3911,6 +4039,9 @@ impl Hub {
                 self.teams.clear_prompt_seq(&team, &participant);
                 self.drain_team_events();
                 self.release_held_prompts(instance, &session, false);
+                // A team closed while this turn ran still owes its leader the
+                // closing notice (20.9).
+                self.deliver_closing_notices(instance, &session);
                 self.team_deliveries();
             }
         }
@@ -4419,6 +4550,8 @@ impl Hub {
         self.forward_loads.remove(&identity);
         // A held enable answers now: its token is gone (20.5).
         self.release_pending_enable(instance, session);
+        // A closed team's notice for a closed session is dropped too (20.9).
+        self.closing_notices.remove(&identity);
         if let Some(agent) = agent {
             self.recorder.delete_session_switch(&agent, session);
         }

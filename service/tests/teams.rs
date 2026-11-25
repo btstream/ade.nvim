@@ -7774,8 +7774,135 @@ fn the_first_prompt_of_a_new_chat_shares_one_spawn_group() {
     assert!(!group.is_empty(), "a real group id");
 }
 
+/// `team.close` tells the still-living leader that its team is gone (20.9):
+/// one service prompt in the bus notice shape, so an agent that ignores
+/// tools/list_changed stops calling team tools.
+#[test]
+fn closing_a_team_notifies_the_leader() {
+    let mut harness = Harness::new("close-notifies-leader", json!({}), None);
+    let before = harness.events().len();
+    let closed = harness
+        .client
+        .request(200, "team.close", json!({"team": harness.team}));
+    assert!(closed["result"].is_object(), "{closed}");
+    let prompt = wait_for(
+        || {
+            harness.events().into_iter().skip(before).find(|event| {
+                event["event"] == "prompt"
+                    && event["session"] == harness.session
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("已被关闭"))
+            })
+        },
+        "the closing notice prompt to the leader",
+    );
+    let text = prompt["text"].as_str().expect("notice text");
+    assert!(
+        text.contains("<bus from=\"human\" kind=\"notice\">"),
+        "the notice uses the bus shape: {text}"
+    );
+    assert!(
+        prompt["text"].as_str().unwrap().contains(&harness.team),
+        "{prompt}"
+    );
+    // The session is still a plain chat with team tools: no error, no stop.
+    let listed = harness.client.request(201, "agent.list", json!({}));
+    assert_eq!(
+        listed["result"]["instances"][0]["pid"], prompt["pid"],
+        "{listed}"
+    );
+}
 
+/// The notice waits for a running front-end prompt on the leader instead of
+/// interrupting the person (20.9).
+#[test]
+fn a_closing_notice_waits_for_the_leaders_running_prompt() {
+    let mut harness = Harness::new("close-notice-after-prompt", json!({}), None);
+    // A slow prompt keeps the session busy while the team is closed.
+    harness.client.notify(
+        "tunnel.send",
+        json!({
+            "instance": harness.instance,
+            "message": {
+                "jsonrpc": "2.0",
+                "id": 210,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": harness.session,
+                    "prompt": [{"type": "text", "text": "do [slow]"}],
+                },
+            },
+        }),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let closed = harness
+        .client
+        .request(211, "team.close", json!({"team": harness.team}));
+    assert!(closed["result"].is_object(), "{closed}");
+    // The running prompt is cancelled, as before (19.4/20.9): the fixture ends
+    // it on `session/cancel`, and only then does the notice go out.
+    let order = wait_for(
+        || {
+            let events = harness.events();
+            let slow = events.iter().position(|event| {
+                event["event"] == "prompt"
+                    && event["session"] == harness.session
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("[slow]"))
+            })?;
+            let notice = events.iter().position(|event| {
+                event["event"] == "prompt"
+                    && event["session"] == harness.session
+                    && event["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("已被关闭"))
+            })?;
+            // The slow prompt's own `done` (not the notice's) must precede it.
+            let done = events
+                .iter()
+                .enumerate()
+                .find(|(index, event)| {
+                    *index > slow
+                        && *index < notice
+                        && event["event"] == "done"
+                        && event["session"] == harness.session
+                })
+                .map(|(index, _)| index)?;
+            Some((slow, done, notice))
+        },
+        "the closing notice only after the cancelled prompt finished",
+    );
+    assert!(order.0 < order.1 && order.1 < order.2, "{order:?}");
+}
 
+/// A closed team's notice is not sent when the leader instance is gone (20.9).
+#[test]
+fn closing_a_team_does_not_notify_a_dead_leader() {
+    let mut harness = Harness::new("close-notice-dead-leader", json!({}), None);
+    let stopped = harness.client.request(
+        220,
+        "agent.stop",
+        json!({"instance": harness.instance, "force": true}),
+    );
+    assert!(stopped["result"].is_object(), "{stopped}");
+    let before = harness.events().len();
+    let closed = harness
+        .client
+        .request(221, "team.close", json!({"team": harness.team}));
+    // The team itself is still there (or gone): either way no notice prompt.
+    let _ = closed;
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !harness
+            .events()
+            .into_iter()
+            .skip(before)
+            .any(|event| event["event"] == "prompt"),
+        "a dead leader gets no closing notice"
+    );
+}
 
 /// A held enable whose awaited token is revoked by a rejected in-flight load
 /// answers at once with the state then (20.5, review minor 3): it must not

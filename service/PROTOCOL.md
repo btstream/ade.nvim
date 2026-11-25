@@ -2059,3 +2059,35 @@ requests, 20.2); the person can still use `:Ade team on` (20.5 reload) or
 | `session.teams` | new (20.5); notification `session.teams_changed` |
 | `team.answer` | handles `handover` items (20.4) |
 | MCP | session role, `listChanged`, `team_stop` |
+
+### 20.9 Closing notifies the leader
+
+`team.close` — from the `team.close` RPC or from `session.teams {enabled:
+false, close: true}` — first cancels the leader's running prompt (bus or front
+end, as in 19.4) and degrades its tools
+(`notifications/tools/list_changed`). Many agents ignore that notification and
+keep calling team tools, so closing also **tells the leader in words**.
+
+When the leader session still exists (its instance is running and it holds a
+bound session token), the service sends it one service prompt in the bus
+notice shape the front end already renders as a bus turn:
+
+```
+<bus from="human" kind="notice">团队 t3 已被关闭，所有 worker 已停止。你现在是普通单聊，不再有 team 工具（team_spawn 等），不要再调用它们；如果用户再次要求组队，再使用 team_spawn。</bus>
+```
+
+- **Order.** The cancel comes first. The notice is sent only once the leader's
+  prompt has actually ended (its response or the cancel's), never in the
+  middle of it. A human prompt that is running (or held behind a bus turn)
+  keeps precedence: the notice waits until the session is free, like any other
+  service prompt (18.11), and does not interrupt the person.
+- **Not a bus turn of a team.** The team is already deleted when the notice is
+  sent, so it belongs to no team, is not queued in any team mailbox, and
+  counts toward no turn limit. It is recorded and rendered like a notice turn
+  (`_ade/turn_started` / `_ade/turn_finished`, `origin: "bus"`).
+- **When it is not sent.** If the leader's instance has exited, or the session
+  no longer holds a bound session token (closed/deleted, or its instance
+  died), nothing is sent: there is no agent conversation left to inform.
+- **`team_stop` of one worker** (20.6) does not close the team and sends no
+  such notice; the team's leader only hears the usual "worker stopped" notice.
+
