@@ -28,6 +28,50 @@ function M.error_text(value)
   return tostring(message)
 end
 
+---Turn-on rules shared with the start flow and the tree (`ade.app.team_enable`).
+---
+---They live in their own module because the flow must not `require` this one
+---(the flow reads the team module through the controller: a require cycle).
+local Enable = require("ade.app.team_enable")
+
+---What one `session.teams {enabled: true}` answer means (PROTOCOL.md 20.5).
+---@param value any
+---@return "reload"|"on"|"off"|"uninjected"
+function M.enable_outcome(value)
+  return Enable.outcome(value)
+end
+
+---The error value for a failed enable.
+---@param value any
+---@param outcome string|nil
+---@return table
+function M.enable_error(value, outcome)
+  return Enable.error(value, outcome)
+end
+
+---The text to show for a failed enable.
+---@param value any
+---@param report fun(value: any): string|nil
+---@param prefix string|nil
+---@return string
+function M.enable_error_text(value, report, prefix)
+  return Enable.error_text(value, report, prefix)
+end
+
+---The notice shown while `session.teams` is still unanswered.
+M.ENABLE_WAIT_TEXT = Enable.WAIT_TEXT
+
+---Turn one session's tools on, coalescing a pending enable (see
+---`ade.app.team_enable`). Module form so it can be injected into the start flow.
+---@param team table
+---@param instance string
+---@param session_id string
+---@param cb fun(ok: boolean, value: any)|nil
+---@param opts {notify: fun(message: string, level: integer|nil)|nil, join: boolean|nil}|nil
+function M.enable_session(team, instance, session_id, cb, opts)
+  return Enable.run(team, instance, session_id, cb, opts)
+end
+
 local Team = {}
 Team.__index = Team
 
@@ -199,6 +243,9 @@ function Team:forget_connection()
   self.auto_eligible = {}
   self.bound = {}
   self.list_ready = false
+  -- A held enable reply from the old connection will never arrive; settle its
+  -- callers instead of leaving a start flow waiting forever.
+  Enable.cancel_all(self, "the service connection was lost")
   -- A board request that was in flight when the connection died may still
   -- call back; bumping its token makes that late reply a no-op while the next
   -- `team.changed` can start a fresh request.
@@ -859,12 +906,48 @@ function Team:session_opened(instance, session_id, cwd)
   self:query_session_teams(instance, session_id, cwd, function() end)
 end
 
+---The raw `session.teams` write, without coalescing or outcome evaluation.
+---@param team table
+---@param instance string
+---@param session_id string
+---@param enabled boolean
+---@param close boolean|nil
+---@param cb fun(ok: boolean, value: any)
+local function _write_session_teams(team, instance, session_id, enabled, close, cb)
+  local key = session_key(instance, session_id)
+  local params = { instance = instance, sessionId = session_id, enabled = enabled }
+  if close then
+    params.close = true
+  end
+  local seq = key and team:next_session_seq(key) or nil
+  team:_call("session.teams", params, function(ok, value)
+    if ok and type(value) == "table" then
+      -- `reload: true` means the service marked the session for a forwarded
+      -- load and its `injected` is not true yet; keep that in the cache so the
+      -- tree does not claim the tools are there.
+      if value.reload ~= true then
+        team:apply_session_teams(instance, session_id, value, seq)
+      end
+    end
+    -- A closed team disappears from the snapshot only after `team.changed`.
+    if ok and close then
+      team:refresh()
+    end
+    cb(ok, value)
+  end)
+end
+
 ---Flip the per-session switch (PROTOCOL.md 20.5).
 ---
 ---`enabled: true` against a session whose tools were never injected answers
 ---`reload: true`: the service marks the session one-shot forward and the front
 ---end must run its normal load path (`Sessions:load`) to get the tools. The
 ---`value` passed to `cb` carries that flag; `Team:reload_session` does the load.
+---
+---This is the raw write: exactly one request per call and the reply passed
+---through untouched. The user-facing "turn teams on" paths go through
+---`M.enable_session`, which coalesces concurrent enables and evaluates the
+---three outcomes.
 ---@param instance string
 ---@param session_id string
 ---@param enabled boolean
@@ -872,27 +955,22 @@ end
 ---@param cb fun(ok: boolean, value: any)|nil
 function Team:set_session_teams(instance, session_id, enabled, close, cb)
   cb = cb or function() end
-  local key = session_key(instance, session_id)
-  local params = { instance = instance, sessionId = session_id, enabled = enabled }
-  if close then
-    params.close = true
+  if enabled and close then
+    -- Only an enable that also closes a led team is a write of its own: settle
+    -- a pending plain enable so both replies cannot race a reload. A plain
+    -- enable here is `team_enable`'s own write and must not cancel itself.
+    Enable.cancel(self, instance, session_id, { message = "superseded by a closing enable" })
   end
-  local seq = key and self:next_session_seq(key) or nil
-  self:_call("session.teams", params, function(ok, value)
-    if ok and type(value) == "table" then
-      -- `reload: true` means the service marked the session for a forwarded
-      -- load and its `injected` is not true yet; keep that in the cache so the
-      -- tree does not claim the tools are there.
-      if value.reload ~= true then
-        self:apply_session_teams(instance, session_id, value, seq)
-      end
-    end
-    -- A closed team disappears from the snapshot only after `team.changed`.
-    if ok and close then
-      self:refresh()
-    end
-    cb(ok, value)
-  end)
+  _write_session_teams(self, instance, session_id, enabled, close, cb)
+end
+
+---Turn this session's tools on, coalescing a pending enable (`team_enable`).
+---@param instance string
+---@param session_id string
+---@param cb fun(ok: boolean, value: any)|nil
+---@param opts {notify: fun(message: string, level: integer|nil)|nil, join: boolean|nil}|nil
+function Team:enable_session(instance, session_id, cb, opts)
+  return M.enable_session(self, instance, session_id, cb, opts)
 end
 
 ---Run the front-end half of the in-place reload (PROTOCOL.md 20.5).
@@ -1257,10 +1335,15 @@ end
 ---A team disappeared: closed here, by another front end, or by the service.
 ---The local caches are already updated; the panel uses this to close or move
 ---to the next team.
+---
+---`entry` is the closed team's last known row. The caches no longer have it, so
+---the panel needs it to know which project lost its team and which session was
+---its leader (the router has to return there before the pane goes away).
 ---@param team_id string
-function Team:closed(team_id)
+---@param entry table|nil
+function Team:closed(team_id, entry)
   if type(self.on_closed) == "function" then
-    pcall(self.on_closed, team_id)
+    pcall(self.on_closed, team_id, entry)
   end
 end
 
@@ -1271,9 +1354,10 @@ function Team:on_changed_payload(payload)
     return
   end
   if team.state == "closed" then
+    local entry = vim.deepcopy(self.teams[team.id] or team)
     self:forget_team(team.id)
-    for cwd, entry in pairs(self.bound) do
-      if entry.team == team.id or team.cwd == cwd then
+    for cwd, bound in pairs(self.bound) do
+      if bound.team == team.id or team.cwd == cwd then
         self.bound[cwd] = nil
       end
     end
@@ -1281,7 +1365,10 @@ function Team:on_changed_payload(payload)
       -- The team is gone; there is nothing left to unwatch on the service.
       self:unwatch(true)
     end
-    self:closed(team.id)
+    -- Tell the panel with what was still known about the closed team: the
+    -- caches are already gone, but it has to return the chat to that team's
+    -- leader and decide whether its panes still show a live project.
+    self:closed(team.id, entry)
   else
     self.teams[team.id] = team
     -- Keep the per-cwd snapshot in step with the notification stream so the
@@ -1612,8 +1699,9 @@ function Team:close(team, cb)
     if ok then
       -- The reply may arrive before `team.changed(closed)`; the local state
       -- must not keep a team that is already gone (19.7 "start over").
+      local entry = vim.deepcopy(self.teams[team] or { id = team })
       self:forget_team(team)
-      self:closed(team)
+      self:closed(team, entry)
       self:changed()
     end
     if cb then

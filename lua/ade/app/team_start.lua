@@ -343,7 +343,14 @@ end
 
 ---Enable the session's tools, running the front-end reload the service asks for
 ---(PROTOCOL.md 20.5). Shared by the pre-check and the `off`/`no_tools` retry so
----both apply the same `reload: true` rule.
+---both apply the same rules: only `reload: true` asks for a load, and a reply
+---that does not end with `enabled: true, injected: true` is a failure.
+---
+---The controller injects `enable_session` (the coalescing helper from
+---`ade.app.team`): a start that joins an enable already in flight (a second
+---`:Ade team start`, or `:Ade team on` right before) waits for that attempt's
+---terminal state instead of sending another held write. It is injected rather
+---than required so the flow module stays free of a require cycle.
 ---
 ---`cb(ok, err, handled)`: `handled` means the flow already reported the
 ---outcome (a replacement session took over, or a known dead end) and the caller
@@ -358,7 +365,20 @@ function Flow:enable_tools(session, instance, cb, ctx)
     cb(false, "teams are not available")
     return
   end
-  team:set_session_teams(instance, session.id, true, false, function(ok, value)
+  local function notify(message, level)
+    self:notify(message, level)
+  end
+  local enable = self.deps.enable_session
+  if not enable then
+    -- The flow only needs `set_session_teams` + `reload_session`, so its
+    -- stand-in team and a real Team both work here. The controller injects the
+    -- real coalescing helper; this fallback keeps a bare flow usable.
+    local Enable = require("ade.app.team_enable")
+    enable = function(t, inst, id, handler)
+      Enable.run(t, inst, id, handler)
+    end
+  end
+  enable(team, instance, session.id, function(ok, value)
     vim.schedule(function()
       if not self:alive(ctx.generation) then
         -- A newer start owns the flow: ignore silently, do not finish it.
@@ -394,26 +414,9 @@ function Flow:enable_tools(session, instance, cb, ctx)
         cb(false, value)
         return
       end
-      if type(value) == "table" and value.reload == true then
-        -- The service marked the session one-shot forward; the front end runs
-        -- the load that makes the agent replay and gets the tools injected.
-        team:reload_session(instance, session.id, function(reloaded, err)
-          vim.schedule(function()
-            if not self:alive(ctx.generation) then
-              return
-            end
-            if reloaded then
-              cb(true, nil)
-              return
-            end
-            cb(false, "cannot reload the session's team tools: " .. self.deps.report_error(err))
-          end)
-        end)
-        return
-      end
       cb(true, nil)
     end)
-  end)
+  end, { notify = notify })
 end
 
 ---Whether new sessions of this cwd start with their team switch off.

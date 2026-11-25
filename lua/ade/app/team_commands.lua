@@ -36,6 +36,7 @@ function M.new(deps)
     select_session = deps.select_session,
     submit = deps.submit,
     canonical_session = deps.canonical_session,
+    enable_session = deps.enable_session,
   })
   return self
 end
@@ -101,6 +102,11 @@ function Commands:context()
 end
 
 ---Turn teams on for the current session (`:Ade team on`).
+---
+---The three outcomes of `session.teams {enabled: true}` are explained the same
+---way as the start flow and the tree do (PROTOCOL.md 20.5): only `reload:true`
+---asks for a load, and nothing else counts as success unless the reply says the
+---tools are enabled **and** injected.
 function Commands:on()
   local team = self:team()
   local session, instance = self:context()
@@ -108,25 +114,16 @@ function Commands:on()
     self.deps.notify("team on requires an open session", vim.log.levels.WARN)
     return
   end
-  team:set_session_teams(instance, session.id, true, false, function(ok, value)
+  local function notify(message, level)
+    self.deps.notify(message, level)
+  end
+  team:enable_session(instance, session.id, function(ok, value)
     if not ok then
-      self.deps.notify("cannot turn teams on: " .. self.deps.report_error(value), vim.log.levels.WARN)
-    elseif type(value) == "table" and value.reload == true then
-      -- PROTOCOL.md 20.5: the front end runs the load that injects the tools.
-      team:reload_session(instance, session.id, function(reloaded, err)
-        if not reloaded then
-          self.deps.notify(
-            "cannot reload the session's team tools: " .. self.deps.report_error(err),
-            vim.log.levels.WARN
-          )
-        else
-          self.deps.notify("teams are on for this chat", vim.log.levels.INFO)
-        end
-      end)
-    else
-      self.deps.notify("teams are on for this chat", vim.log.levels.INFO)
+      notify("cannot turn teams on: " .. self.deps.report_error(value), vim.log.levels.WARN)
+      return
     end
-  end)
+    notify("teams are on for this chat", vim.log.levels.INFO)
+  end, { notify = notify, join = false })
 end
 
 ---Turn teams off for the current session (`:Ade team off`). A session that

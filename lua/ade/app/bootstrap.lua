@@ -494,10 +494,10 @@ function M.build(ctx, opts, action)
         end
       end)
     end,
-    on_closed = function(team_id)
+    on_closed = function(team_id, entry)
       vim.schedule(function()
         if S.view.team_ui then
-          pcall(S.view.team_ui.team_closed, S.view.team_ui, team_id)
+          pcall(S.view.team_ui.team_closed, S.view.team_ui, team_id, entry)
         end
         if S.view.choices then
           S.view.choices:refresh()
@@ -1213,6 +1213,10 @@ function M.build(ctx, opts, action)
       end
       return activate_session(session)
     end,
+    -- One enable in flight per `(instance, sessionId)`: a start joining a
+    -- `:Ade team on` (or another start) waits for that attempt instead of
+    -- sending a second held `session.teams` write (PROTOCOL.md 20.5).
+    enable_session = Team.enable_session,
     canonical_session = function(instance, session_id)
       -- The runtime holds one canonical object per session id; a reload
       -- replaces it, so a flow must look it up again for (instance, id).
