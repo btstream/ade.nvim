@@ -634,6 +634,107 @@ return function(t)
   end)
 
   ---------------------------------------------------------------------------
+  -- 0c. Pane split widths must not disturb ordinary windows
+  ---------------------------------------------------------------------------
+
+  t.describe("teams v3.1 pane layout", function()
+    local function sidebar(t, width)
+      local win = vim.api.nvim_get_current_win()
+      vim.cmd("vsplit")
+      local side = vim.api.nvim_get_current_win()
+      vim.api.nvim_win_set_width(side, width)
+      vim.wo[side].winfixwidth = true
+      t.cleanup(function()
+        if vim.api.nvim_win_is_valid(side) then
+          pcall(function()
+            vim.wo[side].winfixwidth = false
+          end)
+        end
+        if win and vim.api.nvim_win_is_valid(win) then
+          pcall(vim.api.nvim_set_current_win, win)
+        end
+      end)
+      return side
+    end
+
+    t.it("opens in the current tab without touching fixed ordinary sidebars", function()
+      local old = vim.o.columns
+      vim.o.columns = 200
+      t.cleanup(function()
+        vim.o.columns = old
+        -- Leave the shared window layout sized for the restored screen: a test
+        -- that widened it must not hand the next case windows wider than fit.
+        pcall(vim.cmd, "wincmd =")
+      end)
+      local service, dir = start_service(t, "pane-layout")
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      local here = vim.api.nvim_get_current_tabpage()
+      local current_side = sidebar(t, 30)
+      local current_width = vim.api.nvim_win_get_width(current_side)
+      -- Another tab with its own fixed-width sidebar.
+      vim.cmd("tabnew")
+      local other = vim.api.nvim_get_current_tabpage()
+      local other_side = sidebar(t, 24)
+      local other_width = vim.api.nvim_win_get_width(other_side)
+      vim.api.nvim_set_current_tabpage(here)
+      local UI = ui()
+      t.eq(true, controller.open_team("members"))
+      wait(function()
+        return pane_win("members") ~= nil
+      end, 5000, "the members pane")
+      t.eq(here, vim.api.nvim_win_get_tabpage(pane_win("members")), "the pane opens in the tab it was asked from")
+      t.eq(current_width, vim.api.nvim_win_get_width(current_side), "the current tab's sidebar keeps its width")
+      t.eq(true, vim.wo[current_side].winfixwidth, "and its fixed-width option")
+      t.eq(other_width, vim.api.nvim_win_get_width(other_side), "the other tab's sidebar keeps its width")
+      t.eq(true, vim.wo[other_side].winfixwidth, "and its fixed-width option")
+      t.eq(other, vim.api.nvim_win_get_tabpage(other_side))
+      UI:close()
+    end)
+
+    t.it("a failed `vsplit` restores the team pane's fixed option", function()
+      local old = vim.o.columns
+      vim.o.columns = 200
+      t.cleanup(function()
+        vim.o.columns = old
+        pcall(vim.cmd, "wincmd =")
+      end)
+      local service, dir = start_service(t, "pane-layout-fail")
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      local UI = ui()
+      t.eq(true, controller.open_team("members"))
+      wait(function()
+        return pane_win("members") ~= nil
+      end, 5000, "the members pane")
+      local members = pane_win("members")
+      local width = vim.api.nvim_win_get_width(members)
+      t.eq(true, vim.wo[members].winfixwidth)
+      local real_cmd = vim.cmd
+      vim.cmd = function(...)
+        local arg = ...
+        if arg == "botright vsplit" then
+          error("simulated split failure")
+        end
+        return real_cmd(...)
+      end
+      t.cleanup(function()
+        vim.cmd = real_cmd
+      end)
+      t.eq(false, UI.layout:show("board"), "the failed split reports itself")
+      t.eq(true, vim.api.nvim_win_is_valid(members), "the existing pane is still there")
+      t.eq(true, vim.wo[members].winfixwidth, "its fixed-width option is restored")
+      -- `wincmd =` may legitimately rebalance while the test widens the screen;
+      -- what matters is that the pane still holds its configured width.
+      t.eq(UI.layout:members_width(), vim.api.nvim_win_get_width(members), "and its configured width")
+      t.eq(nil, pane_win("board"))
+      UI:close()
+    end)
+  end)
+
+  ---------------------------------------------------------------------------
   -- 1. What `session.teams {enabled:true}` means
   ---------------------------------------------------------------------------
 

@@ -159,17 +159,25 @@ function Pane:float_geometry(names)
   return out
 end
 
+---The windows of the current tabpage.
+---@return integer[]
+local function tab_windows()
+  local ok, wins = pcall(vim.api.nvim_tabpage_list_wins, vim.api.nvim_get_current_tabpage())
+  return ok and wins or vim.api.nvim_list_wins()
+end
+
 ---The window a new pane splits from.
 ---
----Always the widest ordinary window, never another pane and never a narrow
----leftover split: `:botright vsplit` from inside the members window puts the
----new pane *beside* it (squeezing members to its minimum and leaving the board
----a sliver), and splitting a thin stray window has the same effect.
+---Always the widest ordinary window **of this tabpage**, never another pane and
+---never a narrow leftover split: `:botright vsplit` from inside the members
+---window puts the new pane *beside* it (squeezing members to its minimum and
+---leaving the board a sliver), and splitting a thin stray window has the same
+---effect. Another tab's widest window would put the new pane in the wrong tab.
 ---@return integer
 function Pane:split_base()
   local widest
   local width = 0
-  for _, win in ipairs(vim.api.nvim_list_wins()) do
+  for _, win in ipairs(tab_windows()) do
     if self:name_of(win) == nil and vim.api.nvim_win_get_config(win).relative == "" then
       local w = vim.api.nvim_win_get_width(win)
       if w > width then
@@ -190,50 +198,71 @@ function Pane:create_split(name)
   end
   -- Open panes carry `winfixwidth`, and Vim honours it while dividing the
   -- screen: the split would hand the new pane whatever columns are left over
-  -- instead of its configured width. Release the pins for this one split.
+  -- instead of its configured width. Release the pins for this one split — but
+  -- only this tab's team panes, and remember each one's width to restore.
   local fixed = {}
-  for _, win in ipairs(vim.api.nvim_list_wins()) do
-    if vim.wo[win].winfixwidth then
-      fixed[#fixed + 1] = win
+  for _, win in ipairs(tab_windows()) do
+    if self:name_of(win) ~= nil and vim.wo[win].winfixwidth then
+      fixed[#fixed + 1] = { win = win, width = vim.api.nvim_win_get_width(win) }
       pcall(function()
         vim.wo[win].winfixwidth = false
       end)
     end
   end
-  local equalalways = vim.o.equalalways
-  vim.o.equalalways = false
-  local ok = pcall(vim.cmd, "botright vsplit")
-  if not ok then
-    vim.o.equalalways = equalalways
-    return nil
-  end
-  local win = vim.api.nvim_get_current_win()
-  if name == "members" or name == "tree" then
-    pcall(vim.api.nvim_win_set_width, win, self:members_width())
-    vim.wo[win].winfixwidth = true
-  end
-  -- Pin the older panes again at their own width: the split is free to shrink
-  -- a pane while its pin is released, so restoring the pin alone would keep the
-  -- shrunken pane. Then the new pane takes every column they do not use.
-  for _, fixed_win in ipairs(fixed) do
-    if fixed_win ~= win and vim.api.nvim_win_is_valid(fixed_win) then
-      local pane_name = self:name_of(fixed_win)
-      pcall(vim.api.nvim_win_set_width, fixed_win, self:members_width())
-      if pane_name then
+  local function restore_fixed(skip, reset_width)
+    for _, entry in ipairs(fixed) do
+      local fixed_win = entry.win
+      if fixed_win ~= skip and vim.api.nvim_win_is_valid(fixed_win) then
+        if reset_width then
+          -- Its own width, not the configured one: the split may have run a
+          -- `WinResized` handler that adopted the squeezed width meanwhile.
+          pcall(vim.api.nvim_win_set_width, fixed_win, entry.width)
+        end
         pcall(function()
           vim.wo[fixed_win].winfixwidth = true
         end)
       end
     end
   end
+  local equalalways = vim.o.equalalways
+  vim.o.equalalways = false
+  local ok = pcall(vim.cmd, "botright vsplit")
+  if not ok then
+    -- No new pane: only the pin is ours to restore; no width was touched.
+    -- Restore it while 'equalalways' is still off, or re-pinning would make
+    -- Vim rebalance and move the very width we are preserving.
+    restore_fixed(nil, false)
+    vim.o.equalalways = equalalways
+    if previous and vim.api.nvim_win_is_valid(previous) then
+      pcall(vim.api.nvim_set_current_win, previous)
+    end
+    return nil
+  end
+  local win = vim.api.nvim_get_current_win()
+  if name == "members" or name == "tree" then
+    -- The width setting only applies to the team pane; a failed width call must
+    -- not leave the option unset and the Pane unharmed.
+    pcall(vim.api.nvim_win_set_width, win, self:members_width())
+    vim.wo[win].winfixwidth = true
+  end
+  -- Pin the older panes again at their own width: the split is free to shrink
+  -- a pane while its pin is released, so restoring the pin alone would keep the
+  -- shrunken pane. Then the new pane takes every column they do not use.
+  restore_fixed(win, true)
   if name ~= "members" and name ~= "tree" then
+    -- Fill the columns the pinned panes leave free, but never shrink below the
+    -- width the split itself gave: the ordinary chat may carry `winfixwidth`,
+    -- so a smaller target could only squeeze this pane into a sliver.
     local used = 0
-    for _, other in ipairs(vim.api.nvim_list_wins()) do
+    for _, other in ipairs(tab_windows()) do
       if other ~= win then
         used = used + vim.api.nvim_win_get_width(other)
       end
     end
-    pcall(vim.api.nvim_win_set_width, win, math.max(24, vim.o.columns - used))
+    local target = math.max(24, vim.o.columns - used)
+    if target > vim.api.nvim_win_get_width(win) then
+      pcall(vim.api.nvim_win_set_width, win, target)
+    end
   end
   vim.o.equalalways = equalalways
   if not (previous and vim.api.nvim_win_is_valid(previous)) then
