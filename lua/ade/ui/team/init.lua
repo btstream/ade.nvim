@@ -949,12 +949,13 @@ function Dashboard:apply_closed(team_id, showed, cwd)
       return next(live) ~= nil
     end
     if shown == team_id then
-      -- It showed the closed team; take over another live team if the pane
-      -- follows this project, otherwise close it.
+      -- It showed the closed team. The board may follow another team of this
+      -- project; the members pane follows its selection and must not be
+      -- repointed at an unrelated team, so it closes with its subject.
       if pane == "board" then
         return self:board_has_live_target(live, cwd)
       end
-      return self:members_has_live_target(live, cwd)
+      return false
     end
     return live[shown] ~= nil
   end
@@ -993,24 +994,6 @@ function Dashboard:apply_closed(team_id, showed, cwd)
   end
   self.resolved_cwd = self:project_cwd()
   self:refresh()
-end
-
----Whether the members pane can follow a live team of this project.
----@param live table<string, table>
----@param cwd string|nil
----@return boolean
-function Dashboard:members_has_live_target(live, cwd)
-  local project = cwd or self:project_cwd()
-  if project then
-    for _, row in pairs(live) do
-      if row.cwd == project then
-        return true
-      end
-    end
-  end
-  -- The pane follows `selected_id`, so any surviving selection it can show
-  -- keeps it meaningful.
-  return next(live) ~= nil
 end
 
 ---Whether the board pane can follow a live team of this project.

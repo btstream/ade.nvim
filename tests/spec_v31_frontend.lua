@@ -566,7 +566,9 @@ return function(t)
         return UI.board_team_id == "t9"
       end, 3000, "the board keeps showing t9")
       t.truthy(pane_win("board"), "the board showing another team stays")
-      t.truthy(pane_win("members"), "the members pane survives while a team exists")
+      wait(function()
+        return pane_win("members") == nil
+      end, 3000, "the members pane showing the closed team to close")
       UI:close()
     end)
 
