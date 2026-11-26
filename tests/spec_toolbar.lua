@@ -457,8 +457,31 @@ return function(t)
       highlights.setup()
       local layout = require("ade.layout")
       local config = require("ade.config")
+      -- `apply_window_options` writes window-local options on the window it is
+      -- given (including `winfixwidth` for a chat). This case runs on the
+      -- harness's ordinary window, so put everything back afterwards: a pinned
+      -- leftover window would change how later cases lay out their splits.
+      local win = vim.api.nvim_get_current_win()
+      local saved = {
+        winfixwidth = vim.wo[win].winfixwidth,
+        winfixheight = vim.wo[win].winfixheight,
+        winhighlight = vim.wo[win].winhighlight,
+        conceallevel = vim.wo[win].conceallevel,
+        concealcursor = vim.wo[win].concealcursor,
+        cursorline = vim.wo[win].cursorline,
+        scrolloff = vim.wo[win].scrolloff,
+        smoothscroll = vim.wo[win].smoothscroll,
+      }
+      t.cleanup(function()
+        if not vim.api.nvim_win_is_valid(win) then
+          return
+        end
+        for key, value in pairs(saved) do
+          pcall(vim.api.nvim_set_option_value, key, value, { win = win })
+        end
+      end)
       layout.setup(config.merge(config.defaults, {}))
-      layout.apply_window_options(vim.api.nvim_get_current_win(), "chat")
+      layout.apply_window_options(win, "chat")
       local winhl = vim.api.nvim_get_option_value("winhighlight", { win = vim.api.nvim_get_current_win() })
       t.match("WinBar:AdeNormal", winhl, "the transcript WinBar must map to AdeNormal")
       t.match("WinBarNC:AdeNormal", winhl, "the transcript WinBarNC must map to AdeNormal")

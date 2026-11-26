@@ -45,6 +45,11 @@ function M.new(dashboard)
     adopted_width = nil,
     resizing = false,
     resize_token = 0,
+    -- Columns borrowed from ade's own chat/composer, per pane name, so closing
+    -- the pane can give them back.
+    loans = {},
+    -- The panel's width before each pane opened.
+    panel_before = {},
   }, Pane)
   -- `Dashboard` and its callers read `layout.panels`/`layout.buffers`.
   self.panels = self.windows
@@ -206,10 +211,158 @@ function Pane:split_base()
   return widest or vim.api.nvim_get_current_win()
 end
 
+---The width ade's own panel (chat/composer) is configured to have here.
+---
+---This is the floor a team split may borrow down to: ade's panel may give up
+---columns to a teammate pane, but never shrink below the size the person's
+---layout gives it.
+---@return integer|nil
+local function configured_panel_width()
+  local ok_cfg, cfg = pcall(require, "ade.config")
+  if not ok_cfg then
+    return nil
+  end
+  local ok_w, w = pcall(function()
+    return cfg.panel_width(cfg.effective(), vim.o.columns)
+  end)
+  if ok_w and type(w) == "number" and w > 0 then
+    return w
+  end
+  return nil
+end
+
+---Whether a layout manager (edgy) owns window placement here.
+---
+---Under the external backend the plugin must not borrow or narrow ade's own
+---windows: edgy decides where every window goes, and touching widths behind its
+---back fights it.
+---@return boolean
+local function external_layout()
+  local ok, layout = pcall(require, "ade.layout")
+  if not ok then
+    return false
+  end
+  local ok_b, backend = pcall(layout.backend)
+  return ok_b and backend ~= "native"
+end
+
+---Columns a pane of `name` needs at minimum: the members width for the side
+---panes, and enough for a board column for the board.
+---@param name string
+---@return integer
+function Pane:pane_min_width(name)
+  if name == "board" then
+    -- `board.COLUMN_MIN` is 24 content cells and the board only lays out the
+    -- columns that fit; below roughly 56 a two-column board drops its second
+    -- column, and its cards silently disappear. This is the floor, not a
+    -- target: more space still shows more columns.
+    return 56
+  end
+  local ok, width = pcall(self.members_width, self)
+  return ok and tonumber(width) or 32
+end
+
+---Remember how wide ade's own panel is before a split, so closing the pane can
+---put it back.
+---
+---The split itself, and 'equalalways' coming back on, can both leave the panel
+---narrower than the person had it. Nothing here touches a user's window.
+---@param skip integer|nil the window about to be split (it is not a panel)
+---@return table[] before
+function Pane:remember_panel(skip)
+  local before = {}
+  for _, win in ipairs(tab_windows()) do
+    if win ~= skip and self:name_of(win) == nil and is_ade_window(win) then
+      before[#before + 1] = { win = win, width = vim.api.nvim_win_get_width(win) }
+    end
+  end
+  return before
+end
+
+---Put ade's own panel back to the width it had before the split, unless the
+---person changed it in the meantime.
+---@param before table[]
+---@param panes table<string, integer> the team panes still open
+function Pane:restore_panel(before, panes)
+  if type(before) ~= "table" then
+    return
+  end
+  for _, entry in ipairs(before) do
+    local win = entry.win
+    if win and vim.api.nvim_win_is_valid(win) and is_ade_window(win) then
+      -- A pane still open is using these columns; give them back only when the
+      -- team panes are gone.
+      if next(panes) == nil and vim.api.nvim_win_get_width(win) < entry.width then
+        pcall(vim.api.nvim_win_set_width, win, entry.width)
+      end
+    end
+  end
+end
+
+---Borrow at most `want` columns from ade's own pinned windows, never past the
+---panel's configured width, and remember the loan so the pane can give it back
+---when it closes. A user's window is never touched.
+---@param want integer
+---@return table[] loans
+function Pane:borrow_columns(want)
+  if want <= 0 or external_layout() then
+    return {}
+  end
+  local panel_width = configured_panel_width()
+  if not panel_width then
+    return {}
+  end
+  local loans = {}
+  local remaining = want
+  for _, win in ipairs(tab_windows()) do
+    if remaining <= 0 then
+      break
+    end
+    if self:name_of(win) == nil and is_ade_window(win) then
+      local width = vim.api.nvim_win_get_width(win)
+      -- The panel keeps its own size: only the columns above the configured
+      -- width may be lent, and only as many as the new pane is short of.
+      local floor = math.min(width, panel_width)
+      local spare = width - floor
+      if spare > 0 then
+        local take = math.min(spare, remaining)
+        -- Chat and composer are stacked, so they share one column band; one
+        -- entry per window is enough to give each its own width back.
+        pcall(vim.api.nvim_win_set_width, win, width - take)
+        loans[#loans + 1] = { win = win, width = width, taken = take }
+        remaining = remaining - take
+      end
+    end
+  end
+  return loans
+end
+
+---Give borrowed columns back to ade's own windows, unless the person has
+---changed the width themselves in the meantime.
+---@param loans table[]
+function Pane:return_columns(loans)
+  if type(loans) ~= "table" then
+    return
+  end
+  for _, loan in ipairs(loans) do
+    local win = loan.win
+    if win and vim.api.nvim_win_is_valid(win) and (loan.taken or 0) > 0 then
+      local lent = loan.width - (loan.taken or 0)
+      -- Only undo our own narrowing: if the width is no longer what we left it
+      -- at, the person (or the layout manager) owns it now.
+      if vim.api.nvim_win_get_width(win) == lent then
+        pcall(vim.api.nvim_win_set_width, win, loan.width)
+      end
+    end
+  end
+end
+
 ---@param name string
 ---@return integer|nil win
 function Pane:create_split(name)
   local previous = vim.api.nvim_get_current_win()
+  -- The panel's width before any split: closing the pane puts it back.
+  local panel_before = self:remember_panel()
   local base = self:split_base()
   if base and base ~= previous and vim.api.nvim_win_is_valid(base) then
     pcall(vim.api.nvim_set_current_win, base)
@@ -221,16 +374,16 @@ function Pane:create_split(name)
   -- the chat is pinned under the native backend and would otherwise keep the
   -- split down to its minimum. A user's window is never unlocked or resized.
   local fixed = {}
+  -- ade's own chat/composer are kept apart: they go back to the width the panel
+  -- layout gives them, never to whatever they happened to span while the person
+  -- had no document open.
   local ade_own = {}
   for _, win in ipairs(tab_windows()) do
     if vim.wo[win].winfixwidth and (self:name_of(win) ~= nil or is_ade_window(win)) then
       local entry = { win = win, width = vim.api.nvim_win_get_width(win) }
       if self:name_of(win) ~= nil then
-        -- An existing team pane keeps its own width across the split.
         fixed[#fixed + 1] = entry
       else
-        -- ade's own chat/composer may give up columns to the new pane, the way
-        -- any unpinned window would; only the pin goes back.
         ade_own[#ade_own + 1] = entry
       end
       pcall(function()
@@ -238,20 +391,8 @@ function Pane:create_split(name)
       end)
     end
   end
-  ---The width the panel layout gives ade's chat/composer at this screen size.
-  local panel_width
-  do
-    local ok_cfg, cfg = pcall(require, "ade.config")
-    if ok_cfg then
-      local ok_w, w = pcall(function()
-        return cfg.panel_width(cfg.effective(), vim.o.columns)
-      end)
-      if ok_w and type(w) == "number" and w > 0 then
-        panel_width = w
-      end
-    end
-  end
-  ---Put every released ade window back to what it should keep after the split.
+  local panel_width = configured_panel_width()
+  ---Put every released window back to its own width and pin, except the new one.
   ---@param skip integer|nil
   ---@param reset_width boolean
   local function restore_fixed(skip, reset_width)
@@ -263,22 +404,29 @@ function Pane:create_split(name)
           -- `WinResized` handler that adopted the squeezed width meanwhile.
           pcall(vim.api.nvim_win_set_width, fixed_win, entry.width)
         end
-        pcall(function()
-          vim.wo[fixed_win].winfixwidth = true
-        end)
+        -- Only pin what is still one of our panes. A window can be reused for
+        -- an ordinary buffer after the pane closed, and pinning that would lock
+        -- the person's own document at an ade width.
+        if self:name_of(fixed_win) ~= nil then
+          pcall(function()
+            vim.wo[fixed_win].winfixwidth = true
+          end)
+        end
       end
     end
     for _, entry in ipairs(ade_own) do
-      if entry.win ~= skip and vim.api.nvim_win_is_valid(entry.win) then
-        if reset_width and panel_width and vim.api.nvim_win_get_width(entry.win) > panel_width then
-          -- ade's own panel goes back to the width the layout gives it when
-          -- the split left it hogging the tab; the columns beyond that belong
-          -- to the new pane. It is only ever narrowed, never widened.
-          pcall(vim.api.nvim_win_set_width, entry.win, panel_width)
+      local own = entry.win
+      if own ~= skip and vim.api.nvim_win_is_valid(own) then
+        if reset_width and vim.api.nvim_win_get_width(own) ~= entry.width then
+          -- Put back the width it had: ade's own panel is only ever narrowed by
+          -- `borrow_columns`, and only as far as the new pane needs.
+          pcall(vim.api.nvim_win_set_width, own, entry.width)
         end
-        pcall(function()
-          vim.wo[entry.win].winfixwidth = true
-        end)
+        if is_ade_window(own) then
+          pcall(function()
+            vim.wo[own].winfixwidth = true
+          end)
+        end
       end
     end
   end
@@ -297,6 +445,10 @@ function Pane:create_split(name)
     return nil
   end
   local win = vim.api.nvim_get_current_win()
+  self.panel_before = self.panel_before or {}
+  if self.panel_before[name] == nil then
+    self.panel_before[name] = panel_before
+  end
   if name == "members" or name == "tree" then
     -- The width setting only applies to this new team pane; a failed width call
     -- must not skip the restore below, so both are guarded and nothing throws.
@@ -308,15 +460,9 @@ function Pane:create_split(name)
       vim.wo[win].winfixwidth = true
     end)
   end
-  -- Pin the older panes again at their own width: the split is free to shrink
-  -- a pane while its pin is released, so restoring the pin alone would keep the
-  -- shrunken pane. Then the new pane takes every column they do not use.
-  restore_fixed(win, true)
-  if name ~= "members" and name ~= "tree" then
-    -- Fill the columns the pinned panes leave free, but never shrink below the
-    -- width the split itself gave: the ordinary chat may carry `winfixwidth`,
-    -- so a smaller target could only squeeze this pane into a sliver.
-    --
+  ---Fill the columns the pinned panes leave free, but never shrink below the
+  ---width the split itself gave.
+  local function fill_columns()
     -- Count columns, not windows: the chat and its composer are stacked, and
     -- summing their widths would double-count the same columns.
     local spans = {}
@@ -338,10 +484,20 @@ function Pane:create_split(name)
       end
       edge = math.max(edge, span[2])
     end
-    local target = math.max(24, vim.o.columns - used)
-    if target > vim.api.nvim_win_get_width(win) then
+    -- Every column the pinned windows do not hold is this pane's, but never
+    -- below the readable floor. 'equalalways' may already have shared the
+    -- space with an ordinary document window, and that split is left alone:
+    -- only a pane squeezed under the floor is widened back to it.
+    local floor = self:pane_min_width(name)
+    local target = math.max(floor, vim.o.columns - used)
+    local now = vim.api.nvim_win_get_width(win)
+    if target > now then
       pcall(vim.api.nvim_win_set_width, win, target)
     end
+  end
+  local fills = name ~= "members" and name ~= "tree"
+  if fills then
+    fill_columns()
   end
   vim.o.equalalways = equalalways
   if equalalways then
@@ -349,6 +505,30 @@ function Pane:create_split(name)
     -- widths just restored; assert our own panes' widths once more with the
     -- option already back, so the final layout is the one promised above.
     restore_fixed(win, true)
+    -- The rebalance also squeezes the new pane back down, so give it its
+    -- columns again while everyone else keeps the width just restored.
+    if fills then
+      fill_columns()
+    end
+  end
+  -- Our own resizes above (restore, 'equalalways', the fill) fire `WinResized`
+  -- and would be read as the person dragging the members pane, freezing its
+  -- width at whatever the rebalance produced. Keep treating them as ours.
+  self:begin_resize()
+  -- Only now, with every pin and width back in place, can the pane tell whether
+  -- it is short: when it is, it borrows the gap from ade's own panel and nothing
+  -- else moves. With room to spare the panel is left exactly as it was.
+  local need = self:pane_min_width(name)
+  local short = need - vim.api.nvim_win_get_width(win)
+  if short > 0 then
+    local loans = self:borrow_columns(short)
+    if #loans > 0 then
+      pcall(vim.api.nvim_win_set_width, win, vim.api.nvim_win_get_width(win) + short)
+      self.loans[name] = self.loans[name] or {}
+      for _, loan in ipairs(loans) do
+        self.loans[name][#self.loans[name] + 1] = loan
+      end
+    end
   end
   if not (previous and vim.api.nvim_win_is_valid(previous)) then
     previous = win
@@ -462,6 +642,12 @@ end
 ---@param name string
 ---@return boolean closed
 function Pane:close_pane(name)
+  local by_pane = {}
+  for _, other_name in ipairs(PANES) do
+    if other_name ~= name and self:is_open_pane(other_name) then
+      by_pane[other_name] = self:win(other_name)
+    end
+  end
   local win = self:win(name)
   if not win then
     return false
@@ -471,6 +657,17 @@ function Pane:close_pane(name)
   self.last_lines[name] = nil
   if vim.api.nvim_win_is_valid(win) then
     pcall(vim.api.nvim_win_close, win, true)
+  end
+  -- Give back any columns this pane borrowed from ade's own panel.
+  local loans = self.loans and self.loans[name]
+  self.loans[name] = nil
+  self:return_columns(loans)
+  -- And the width the panel had before this pane opened, once no team pane is
+  -- left to use it.
+  local before = self.panel_before and self.panel_before[name]
+  self.panel_before[name] = nil
+  if by_pane then
+    self:restore_panel(before, by_pane)
   end
   if not self:is_open() then
     self:remove_events()
@@ -495,6 +692,19 @@ function Pane:close()
     if win and vim.api.nvim_win_is_valid(win) then
       pcall(vim.api.nvim_win_close, win, true)
     end
+  end
+  -- Every pane is gone, so every borrowed column goes back too.
+  local loans = self.loans
+  local before = self.panel_before
+  self.loans = {}
+  self.panel_before = {}
+  for _, name in ipairs(PANES) do
+    self:return_columns(loans[name])
+  end
+  -- With no team pane left, the panel returns to the width it had before any
+  -- of them opened.
+  for _, name in ipairs(PANES) do
+    self:restore_panel(before[name], {})
   end
   self:remove_events()
   for _, name in ipairs(PANES) do

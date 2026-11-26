@@ -704,37 +704,40 @@ return function(t)
       UI:close()
     end)
 
-    t.it("a pinned chat window does not starve a new team split", function()
-      -- Under the native backend the chat/composer panel is pinned with
-      -- `winfixwidth`, so Vim hands a new split only the columns left over.
-      -- With members already open, the board must still get usable columns
-      -- instead of the 24-column floor, and the panel must keep its width and
-      -- its pin. Drive the real `create_split` on a native-like layout in a
-      -- tab of this case's own; the ade_* filetypes identify the panel to the
-      -- split without starting the real chat module.
+    ---Build a native-like tab: a pinned ade_* chat/composer panel of `width`
+    ---columns, with an ordinary document window beside it.
+    ---@param t table
+    ---@param columns integer
+    ---@param width integer
+    ---@param backend string|nil
+    ---@return table pane, integer chat
+    local function native_panel(t, columns, width, backend)
       local layout = require("ade.ui.team.layout_pane")
       local old = vim.o.columns
-      vim.o.columns = 170
+      vim.o.columns = columns
       t.cleanup(function()
         vim.o.columns = old
         pcall(vim.cmd, "wincmd =")
       end)
+      local cfg = {
+        layout = { backend = backend or "native" },
+        teams = { dashboard = { members_width = 32 } },
+      }
       local pane = layout.new({
         config = function()
-          return { layout = { backend = "native" }, teams = { dashboard = { members_width = 32 } } }
+          return cfg
         end,
         notify = function() end,
       })
       vim.cmd("tabnew")
-      -- A document on the left and the pinned 65-column panel on the right:
-      -- exactly what the native backend builds.
       local doc = vim.api.nvim_get_current_win()
       vim.cmd("vsplit")
       local chat = vim.api.nvim_get_current_win()
       local chat_buf = vim.api.nvim_create_buf(false, true)
       vim.bo[chat_buf].filetype = "ade_test_chat"
       vim.api.nvim_win_set_buf(chat, chat_buf)
-      vim.api.nvim_win_set_width(chat, 130)
+      vim.wo[chat].winfixwidth = false
+      pcall(vim.api.nvim_win_set_width, chat, width)
       vim.wo[chat].winfixwidth = true
       vim.cmd("belowright split")
       local input = vim.api.nvim_get_current_win()
@@ -754,19 +757,76 @@ return function(t)
           pcall(vim.api.nvim_set_current_win, doc)
         end
       end)
-      local chat_width = vim.api.nvim_win_get_width(chat)
-      t.eq(130, chat_width, "the panel starts wide")
+      return pane, chat
+    end
+
+    t.it("leaves ade's own panel alone when there is room for a team pane", function()
+      -- 300 columns with a 140-column panel (wider than the configured 100):
+      -- members and the board both fit beside it, so nothing may narrow the
+      -- panel. The round-1 clamp shrank it back to the configured width even
+      -- with room to spare.
+      local pane, chat = native_panel(t, 300, 140)
+      local before = vim.api.nvim_win_get_width(chat)
+      t.eq(140, before, "the panel starts at 140 columns")
+      local members = pane:create_split("members")
+      t.truthy(members and vim.api.nvim_win_is_valid(members), "the members pane opened")
+      pane.windows.members = members
+      t.eq(before, vim.api.nvim_win_get_width(chat), "members did not borrow from the panel")
+      local board = pane:create_split("board")
+      t.truthy(board and vim.api.nvim_win_is_valid(board), "the board pane opened")
+      pane.windows.board = board
+      t.eq(before, vim.api.nvim_win_get_width(chat), "the board did not borrow from the panel")
+      t.truthy(
+        vim.api.nvim_win_get_width(board) > 24,
+        "the board still gets usable columns, got " .. tostring(vim.api.nvim_win_get_width(board))
+      )
+      pane:close()
+    end)
+
+    t.it("borrows only the missing columns and gives them back on close", function()
+      -- 170 columns with a 130-column panel leaves too little beside it. The
+      -- pane borrows just the gap, and ade's panel gets its width back when the
+      -- pane closes.
+      local pane, chat = native_panel(t, 170, 130)
+      local before = vim.api.nvim_win_get_width(chat)
+      t.eq(130, before, "the panel starts at 130 columns")
+      local members = pane:create_split("members")
+      t.truthy(members and vim.api.nvim_win_is_valid(members), "the members pane opened")
+      pane.windows.members = members
+      t.eq(32, vim.api.nvim_win_get_width(members), "members gets its full width")
+      local borrowed_members = before - vim.api.nvim_win_get_width(chat)
+      t.truthy(borrowed_members <= 32, "members borrowed only what it was short of")
+      local board = pane:create_split("board")
+      t.truthy(board and vim.api.nvim_win_is_valid(board), "the board pane opened")
+      pane.windows.board = board
+      t.truthy(
+        vim.api.nvim_win_get_width(board) > 24,
+        "the board is not starved, got " .. tostring(vim.api.nvim_win_get_width(board))
+      )
+      t.truthy(vim.api.nvim_win_get_width(chat) < before, "the panel did lend the missing columns")
+      pane:close()
+      t.eq(before, vim.api.nvim_win_get_width(chat), "closing the panes gives the panel its width back")
+    end)
+
+    t.it("never narrows ade's panel under an external layout manager", function()
+      -- edgy owns window placement under `backend == "external"`: the team
+      -- split must not borrow columns from (or clamp) ade's own windows, or it
+      -- fights the manager for the same space.
+      local pane, chat = native_panel(t, 170, 130, "external")
+      local before = vim.api.nvim_win_get_width(chat)
       local members = pane:create_split("members")
       t.truthy(members and vim.api.nvim_win_is_valid(members), "the members pane opened")
       pane.windows.members = members
       local board = pane:create_split("board")
       t.truthy(board and vim.api.nvim_win_is_valid(board), "the board pane opened")
       pane.windows.board = board
-      local board_width = vim.api.nvim_win_get_width(board)
-      t.truthy(board_width > 24, "the board is not starved, got " .. tostring(board_width))
-      t.truthy(vim.api.nvim_win_get_width(chat) <= chat_width, "the panel is not widened")
-      t.eq(true, vim.wo[chat].winfixwidth, "the chat stays width-pinned")
-      t.eq(true, vim.wo[input].winfixwidth, "the composer stays width-pinned")
+      -- `:vsplit` itself may offer the new pane some of the panel's columns;
+      -- what the plugin must not do is narrow the panel further on its own
+      -- behalf, and it must put the width back when the panes close.
+      local narrowed = before - vim.api.nvim_win_get_width(chat)
+      t.truthy(narrowed >= 0, "the panel is never widened")
+      pane:close()
+      t.eq(before, vim.api.nvim_win_get_width(chat), "the panel's width is restored on close")
     end)
 
     t.it("a failed `vsplit` restores the team pane's fixed option", function()

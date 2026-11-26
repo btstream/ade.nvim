@@ -239,6 +239,37 @@ check("the session survives closing the composer", function()
   assert(st.session ~= nil, "session lost")
 end)
 
+-- The team panes run under the same `backend == "external"`: the split must not
+-- narrow ade's own chat/composer on its own account, because edgy owns their
+-- width. Close the panes afterwards and leave the layout as it was.
+check("team panes do not narrow ade's panel under edgy", function()
+  local layout = require("ade.ui.team.layout_pane")
+  local cfg = require("ade.config").effective()
+  local pane = layout.new({
+    config = function()
+      return cfg
+    end,
+    notify = function() end,
+  })
+  local chat = st.chat and st.chat.win
+  assert(chat and vim.api.nvim_win_is_valid(chat), "the chat window is gone")
+  local before = vim.api.nvim_win_get_width(chat)
+  local members = pane:create_split("members")
+  assert(members and vim.api.nvim_win_is_valid(members), "members did not open")
+  pane.windows.members = members
+  local board = pane:create_split("board")
+  assert(board and vim.api.nvim_win_is_valid(board), "the board did not open")
+  pane.windows.board = board
+  pane:close()
+  vim.wait(100)
+  if vim.api.nvim_win_is_valid(chat) then
+    assert(
+      vim.api.nvim_win_get_width(chat) == before,
+      string.format("the chat width changed: %d -> %d", before, vim.api.nvim_win_get_width(chat))
+    )
+  end
+end)
+
 ade.hide()
 
 if #failures > 0 then
