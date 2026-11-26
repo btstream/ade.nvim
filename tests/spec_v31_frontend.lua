@@ -537,10 +537,11 @@ return function(t)
         return team():team("t9") ~= nil
       end, 5000, "the other team")
       local UI = ui()
-      t.eq(true, controller.open_team("members"))
+      -- Open the tree too, so the assert below proves it is kept.
+      t.eq(true, controller.open_team("all"))
       wait(function()
-        return pane_win("members") ~= nil
-      end, 5000, "the members pane")
+        return pane_win("members") ~= nil and pane_win("tree") ~= nil
+      end, 5000, "the members and tree panes")
       -- `b` on the other project's row pins its board.
       t.eq(true, UI:handle_tree_key("b", { kind = "tree_project", cwd = other_dir }))
       wait(function()
@@ -566,6 +567,7 @@ return function(t)
         return UI.board_team_id == "t9"
       end, 3000, "the board keeps showing t9")
       t.truthy(pane_win("board"), "the board showing another team stays")
+      t.truthy(pane_win("tree"), "the project tree stays while another team exists")
       wait(function()
         return pane_win("members") == nil
       end, 3000, "the members pane showing the closed team to close")
@@ -670,6 +672,10 @@ return function(t)
       setup(t, dir)
       controller.connect()
       wait_ready()
+      -- A tab of this test's own: earlier cases leave pinned ade windows in
+      -- the shared tab, and this case is about ordinary sidebars only. The
+      -- harness closes every tab but the first after the case.
+      vim.cmd("tabnew")
       local here = vim.api.nvim_get_current_tabpage()
       local current_side = sidebar(t, 30)
       local current_width = vim.api.nvim_win_get_width(current_side)
@@ -693,6 +699,71 @@ return function(t)
       UI:close()
     end)
 
+    t.it("a pinned chat window does not starve a new team split", function()
+      -- Under the native backend the chat/composer panel is pinned with
+      -- `winfixwidth`, so Vim hands a new split only the columns left over.
+      -- With members already open, the board must still get usable columns
+      -- instead of the 24-column floor, and the panel must keep its width and
+      -- its pin. Drive the real `create_split` on a native-like layout in a
+      -- tab of this case's own; the ade_* filetypes identify the panel to the
+      -- split without starting the real chat module.
+      local layout = require("ade.ui.team.layout_pane")
+      local old = vim.o.columns
+      vim.o.columns = 170
+      t.cleanup(function()
+        vim.o.columns = old
+        pcall(vim.cmd, "wincmd =")
+      end)
+      local pane = layout.new({
+        config = function()
+          return { layout = { backend = "native" }, teams = { dashboard = { members_width = 32 } } }
+        end,
+        notify = function() end,
+      })
+      vim.cmd("tabnew")
+      -- A document on the left and the pinned 65-column panel on the right:
+      -- exactly what the native backend builds.
+      local doc = vim.api.nvim_get_current_win()
+      vim.cmd("vsplit")
+      local chat = vim.api.nvim_get_current_win()
+      local chat_buf = vim.api.nvim_create_buf(false, true)
+      vim.bo[chat_buf].filetype = "ade_test_chat"
+      vim.api.nvim_win_set_buf(chat, chat_buf)
+      vim.api.nvim_win_set_width(chat, 130)
+      vim.wo[chat].winfixwidth = true
+      vim.cmd("belowright split")
+      local input = vim.api.nvim_get_current_win()
+      local input_buf = vim.api.nvim_create_buf(false, true)
+      vim.bo[input_buf].filetype = "ade_test_input"
+      vim.api.nvim_win_set_buf(input, input_buf)
+      vim.wo[input].winfixwidth = true
+      t.cleanup(function()
+        for _, win in ipairs({ chat, input }) do
+          if vim.api.nvim_win_is_valid(win) then
+            pcall(function()
+              vim.wo[win].winfixwidth = false
+            end)
+          end
+        end
+        if doc and vim.api.nvim_win_is_valid(doc) then
+          pcall(vim.api.nvim_set_current_win, doc)
+        end
+      end)
+      local chat_width = vim.api.nvim_win_get_width(chat)
+      t.eq(130, chat_width, "the panel starts wide")
+      local members = pane:create_split("members")
+      t.truthy(members and vim.api.nvim_win_is_valid(members), "the members pane opened")
+      pane.windows.members = members
+      local board = pane:create_split("board")
+      t.truthy(board and vim.api.nvim_win_is_valid(board), "the board pane opened")
+      pane.windows.board = board
+      local board_width = vim.api.nvim_win_get_width(board)
+      t.truthy(board_width > 24, "the board is not starved, got " .. tostring(board_width))
+      t.truthy(vim.api.nvim_win_get_width(chat) <= chat_width, "the panel is not widened")
+      t.eq(true, vim.wo[chat].winfixwidth, "the chat stays width-pinned")
+      t.eq(true, vim.wo[input].winfixwidth, "the composer stays width-pinned")
+    end)
+
     t.it("a failed `vsplit` restores the team pane's fixed option", function()
       local old = vim.o.columns
       vim.o.columns = 200
@@ -704,6 +775,10 @@ return function(t)
       setup(t, dir)
       controller.connect()
       wait_ready()
+      vim.cmd("tabnew")
+      -- An ordinary fixed sidebar that the failed split must leave untouched.
+      local side = sidebar(t, 26)
+      local side_width = vim.api.nvim_win_get_width(side)
       local UI = ui()
       t.eq(true, controller.open_team("members"))
       wait(function()
@@ -712,6 +787,10 @@ return function(t)
       local members = pane_win("members")
       local width = vim.api.nvim_win_get_width(members)
       t.eq(true, vim.wo[members].winfixwidth)
+      -- Focus the members pane, exactly as `:Ade team board` would be run from
+      -- it; the failed split must put the cursor back here.
+      pcall(vim.api.nvim_set_current_win, members)
+      t.eq(members, vim.api.nvim_get_current_win(), "the members pane has the cursor")
       local real_cmd = vim.cmd
       vim.cmd = function(...)
         local arg = ...
@@ -726,10 +805,11 @@ return function(t)
       t.eq(false, UI.layout:show("board"), "the failed split reports itself")
       t.eq(true, vim.api.nvim_win_is_valid(members), "the existing pane is still there")
       t.eq(true, vim.wo[members].winfixwidth, "its fixed-width option is restored")
-      -- `wincmd =` may legitimately rebalance while the test widens the screen;
-      -- what matters is that the pane still holds its configured width.
-      t.eq(UI.layout:members_width(), vim.api.nvim_win_get_width(members), "and its configured width")
+      t.eq(width, vim.api.nvim_win_get_width(members), "and its width is unchanged")
       t.eq(nil, pane_win("board"))
+      t.eq(members, vim.api.nvim_get_current_win(), "the cursor returns to where it was")
+      t.eq(side_width, vim.api.nvim_win_get_width(side), "the ordinary sidebar keeps its width")
+      t.eq(true, vim.wo[side].winfixwidth, "and its fixed-width option")
       UI:close()
     end)
   end)
@@ -1007,8 +1087,13 @@ return function(t)
     t.it("waits for `session.teams_changed` and succeeds once it injects", function()
       -- After a successful load the service may still be waiting for the MCP
       -- process: the query says `pending: true`, so the enable waits for the
-      -- notification instead of settling.
-      local service, dir = start_canned(t, "reload-late", { session_teams_query_pending = true })
+      -- notification instead of settling. `session_load_never_injects` keeps the
+      -- fake from injecting on the load frame, so this really exercises the
+      -- waiting branch instead of the cache-already-injected shortcut.
+      local service, dir = start_canned(t, "reload-late", {
+        session_load_never_injects = true,
+        session_teams_query_pending = true,
+      })
       setup(t, dir)
       controller.connect()
       wait_ready()
@@ -1090,6 +1175,56 @@ return function(t)
       local elapsed = vim.uv.now() - started
       t.eq(false, ok, "no tools means no success")
       t.truthy(elapsed < 5000, "`pending: false` must not wait the whole ten seconds")
+    end)
+
+    t.it("a failed switch query fails at once instead of waiting", function()
+      local service, dir = start_canned(t, "reload-query-error", {
+        session_load_never_injects = true,
+        session_teams_query_error = true,
+      })
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      local inst = own_instance()
+      service.session_switches[tostring(inst) .. "\0sess_mock"] = { enabled = true, injected = false }
+      state().view.team.session_states[tostring(inst) .. "\0sess_mock"] = nil
+      local done, ok, value
+      team():enable_session(inst, "sess_mock", function(result, reason)
+        done, ok, value = true, result, reason
+      end, { wait_ms = 8000 })
+      local started = vim.uv.now()
+      wait(function()
+        return done
+      end, 4000, "the failed query to settle the enable")
+      local elapsed = vim.uv.now() - started
+      t.eq(false, ok, "an unreadable switch means the tools are not proven")
+      t.match("cannot read", tostring(type(value) == "table" and value.message or value))
+      t.truthy(elapsed < 5000, "a failed query must not wait out the hold")
+    end)
+
+    t.it("`pending: true` that never handshakes fails after `wait_ms`", function()
+      local service, dir = start_canned(t, "reload-pending-timeout", {
+        session_load_never_injects = true,
+        session_teams_query_pending = true,
+      })
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      local inst = own_instance()
+      service.session_switches[tostring(inst) .. "\0sess_mock"] = { enabled = true, injected = false }
+      state().view.team.session_states[tostring(inst) .. "\0sess_mock"] = nil
+      local done, ok, value
+      team():enable_session(inst, "sess_mock", function(result, reason)
+        done, ok, value = true, result, reason
+      end, { wait_ms = 400 })
+      local started = vim.uv.now()
+      wait(function()
+        return done
+      end, 5000, "the pending wait to time out")
+      local elapsed = vim.uv.now() - started
+      t.eq(false, ok, "a handshake that never comes is a failure")
+      t.match("did not inject", tostring(type(value) == "table" and value.message or value))
+      t.truthy(elapsed >= 300, "it must actually wait for the handshake first")
     end)
 
     t.it("a successful off during a slow load wins over the enable", function()

@@ -166,6 +166,8 @@ function M.new(opts)
     -- while nothing is injected, as PROTOCOL.md 20.5 says. Off by default so
     -- existing cases keep their "no handshake is coming" reading.
     session_teams_query_pending = opts.session_teams_query_pending == true,
+    -- A read-only query fails: the front end must report it, not wait.
+    session_teams_query_error = opts.session_teams_query_error,
     -- Refuse an `enabled: false` write (a switch the service will not flip).
     session_teams_off_error = opts.session_teams_off_error,
     -- Delay that refusal so a test can let the in-flight load settle first.
@@ -477,6 +479,9 @@ function Server:dispatch(message, client)
     local switch = self:switch_of(params.instance, params.sessionId)
     local leader = self:team_led_by(params.sessionId)
     if params.enabled == nil then
+      if self.session_teams_query_error then
+        return error_reply(ident, -32000, "cannot read the switch", { reason = "query_failed" })
+      end
       return {
         jsonrpc = "2.0",
         id = ident,

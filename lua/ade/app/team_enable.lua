@@ -160,19 +160,6 @@ function M.supersede(team, instance, session_id, reason)
   end
 end
 
----Clear a supersede mark (the opposite write failed, so the enable still owns
----the outcome).
----@param team table
----@param instance string|nil
----@param session_id string|nil
-function M.resume(team, instance, session_id)
-  local state = state_of(team)
-  local entry = state[M.key(instance, session_id) or ""]
-  if entry then
-    entry.superseded = nil
-  end
-end
-
 ---Settle a pending enable as cancelled (the switch went off, the pair is gone).
 ---@param team table
 ---@param instance string|nil

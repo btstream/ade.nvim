@@ -166,6 +166,24 @@ local function tab_windows()
   return ok and wins or vim.api.nvim_list_wins()
 end
 
+---Whether `win` shows one of ade.nvim's own buffers (chat, composer, a pane).
+---
+---These are this plugin's windows, so a team split may borrow their columns and
+---put the pin back afterwards. A user's window is never treated this way: its
+---width and `winfixwidth` must stay exactly as the person left them.
+---@param win integer
+---@return boolean
+local function is_ade_window(win)
+  local ok, buf = pcall(vim.api.nvim_win_get_buf, win)
+  if not ok then
+    return false
+  end
+  local ok_ft, ft = pcall(function()
+    return vim.bo[buf].filetype
+  end)
+  return ok_ft and type(ft) == "string" and ft:sub(1, 4) == "ade_"
+end
+
 ---The window a new pane splits from.
 ---
 ---Always the widest ordinary window **of this tabpage**, never another pane and
@@ -198,17 +216,44 @@ function Pane:create_split(name)
   end
   -- Open panes carry `winfixwidth`, and Vim honours it while dividing the
   -- screen: the split would hand the new pane whatever columns are left over
-  -- instead of its configured width. Release the pins for this one split — but
-  -- only this tab's team panes, and remember each one's width to restore.
+  -- instead of its configured width. Release the pins for this one split. The
+  -- set is the current tab's team panes plus ade's own chat/composer windows:
+  -- the chat is pinned under the native backend and would otherwise keep the
+  -- split down to its minimum. A user's window is never unlocked or resized.
   local fixed = {}
+  local ade_own = {}
   for _, win in ipairs(tab_windows()) do
-    if self:name_of(win) ~= nil and vim.wo[win].winfixwidth then
-      fixed[#fixed + 1] = { win = win, width = vim.api.nvim_win_get_width(win) }
+    if vim.wo[win].winfixwidth and (self:name_of(win) ~= nil or is_ade_window(win)) then
+      local entry = { win = win, width = vim.api.nvim_win_get_width(win) }
+      if self:name_of(win) ~= nil then
+        -- An existing team pane keeps its own width across the split.
+        fixed[#fixed + 1] = entry
+      else
+        -- ade's own chat/composer may give up columns to the new pane, the way
+        -- any unpinned window would; only the pin goes back.
+        ade_own[#ade_own + 1] = entry
+      end
       pcall(function()
         vim.wo[win].winfixwidth = false
       end)
     end
   end
+  ---The width the panel layout gives ade's chat/composer at this screen size.
+  local panel_width
+  do
+    local ok_cfg, cfg = pcall(require, "ade.config")
+    if ok_cfg then
+      local ok_w, w = pcall(function()
+        return cfg.panel_width(cfg.effective(), vim.o.columns)
+      end)
+      if ok_w and type(w) == "number" and w > 0 then
+        panel_width = w
+      end
+    end
+  end
+  ---Put every released ade window back to what it should keep after the split.
+  ---@param skip integer|nil
+  ---@param reset_width boolean
   local function restore_fixed(skip, reset_width)
     for _, entry in ipairs(fixed) do
       local fixed_win = entry.win
@@ -220,6 +265,19 @@ function Pane:create_split(name)
         end
         pcall(function()
           vim.wo[fixed_win].winfixwidth = true
+        end)
+      end
+    end
+    for _, entry in ipairs(ade_own) do
+      if entry.win ~= skip and vim.api.nvim_win_is_valid(entry.win) then
+        if reset_width and panel_width and vim.api.nvim_win_get_width(entry.win) > panel_width then
+          -- ade's own panel goes back to the width the layout gives it when
+          -- the split left it hogging the tab; the columns beyond that belong
+          -- to the new pane. It is only ever narrowed, never widened.
+          pcall(vim.api.nvim_win_set_width, entry.win, panel_width)
+        end
+        pcall(function()
+          vim.wo[entry.win].winfixwidth = true
         end)
       end
     end
@@ -240,10 +298,15 @@ function Pane:create_split(name)
   end
   local win = vim.api.nvim_get_current_win()
   if name == "members" or name == "tree" then
-    -- The width setting only applies to the team pane; a failed width call must
-    -- not leave the option unset and the Pane unharmed.
-    pcall(vim.api.nvim_win_set_width, win, self:members_width())
-    vim.wo[win].winfixwidth = true
+    -- The width setting only applies to this new team pane; a failed width call
+    -- must not skip the restore below, so both are guarded and nothing throws.
+    local width_ok, width = pcall(self.members_width, self)
+    if width_ok then
+      pcall(vim.api.nvim_win_set_width, win, width)
+    end
+    pcall(function()
+      vim.wo[win].winfixwidth = true
+    end)
   end
   -- Pin the older panes again at their own width: the split is free to shrink
   -- a pane while its pin is released, so restoring the pin alone would keep the
@@ -253,11 +316,27 @@ function Pane:create_split(name)
     -- Fill the columns the pinned panes leave free, but never shrink below the
     -- width the split itself gave: the ordinary chat may carry `winfixwidth`,
     -- so a smaller target could only squeeze this pane into a sliver.
-    local used = 0
+    --
+    -- Count columns, not windows: the chat and its composer are stacked, and
+    -- summing their widths would double-count the same columns.
+    local spans = {}
     for _, other in ipairs(tab_windows()) do
       if other ~= win then
-        used = used + vim.api.nvim_win_get_width(other)
+        local ok, pos = pcall(vim.api.nvim_win_get_position, other)
+        local col = ok and pos[2] or 0
+        spans[#spans + 1] = { col, col + vim.api.nvim_win_get_width(other) }
       end
+    end
+    table.sort(spans, function(a, b)
+      return a[1] < b[1]
+    end)
+    local used, edge = 0, 0
+    for _, span in ipairs(spans) do
+      local first = math.max(span[1], edge)
+      if span[2] > first then
+        used = used + span[2] - first
+      end
+      edge = math.max(edge, span[2])
     end
     local target = math.max(24, vim.o.columns - used)
     if target > vim.api.nvim_win_get_width(win) then
@@ -265,6 +344,12 @@ function Pane:create_split(name)
     end
   end
   vim.o.equalalways = equalalways
+  if equalalways then
+    -- Turning 'equalalways' back on rebalances every window and can undo the
+    -- widths just restored; assert our own panes' widths once more with the
+    -- option already back, so the final layout is the one promised above.
+    restore_fixed(win, true)
+  end
   if not (previous and vim.api.nvim_win_is_valid(previous)) then
     previous = win
   end
