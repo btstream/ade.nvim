@@ -7,6 +7,7 @@
 local icons = require("ade.ui.icons")
 local highlights = require("ade.ui.highlights")
 local picker = require("ade.ui.picker")
+local time = require("ade.ui.time")
 
 local HL = highlights.picker
 
@@ -20,19 +21,11 @@ local function fuzzy(needle, haystack)
   return picker.fuzzy_ranges(needle, haystack) ~= nil
 end
 
----Format an ISO-ish timestamp for display.
+---Format an ISO-style timestamp in local time for display.
 ---@param value any
 ---@return string
 local function short_time(value)
-  if type(value) ~= "string" or value == "" then
-    return ""
-  end
-  -- "2026-11-07T10:49:33.899Z" -> "2026-11-07 10:49"
-  local date, time = value:match("^(%d%d%d%d%-%d%d%-%d%d)T(%d%d:%d%d)")
-  if date and time then
-    return date .. " " .. time
-  end
-  return value:sub(1, 16)
+  return time.short(value)
 end
 
 ---@class AdeSessionPickerOpts

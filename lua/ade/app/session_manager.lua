@@ -83,6 +83,12 @@ function M.new(deps)
     connection = nil,
     ui = nil,
     status = nil,
+    -- Each opening of the window owns one round; callbacks from an older round
+    -- (or from before a close) are dropped instead of mutating the new window.
+    round = 0,
+    -- Every `refresh` owns a sequence: a late reply must not settle the header
+    -- of a newer refresh.
+    refresh_seq = 0,
   }, Manager)
 end
 
@@ -206,6 +212,9 @@ function Manager:view()
     on_refresh = function()
       self:refresh()
     end,
+    on_close = function()
+      self:window_closed()
+    end,
     is_dir = self.deps.is_dir or function(path)
       return vim.fn.isdirectory(path) == 1
     end,
@@ -216,6 +225,36 @@ function Manager:refresh_view()
   if self.ui then
     self.ui:update(self:view())
   end
+end
+
+---Drop the listener and invalidate every callback of the current round.
+---
+---Called whenever the window goes away: the service keeps answering requests
+---long after the browser closed, and those answers must not reach (or reopen)
+---anything.
+function Manager:release()
+  self.round = self.round + 1
+  self.refreshing = {}
+  local connection = self.connection
+  self.connection = nil
+  if connection then
+    ServiceSessions.unsubscribe(connection, self.channel)
+  end
+end
+
+---The window closed on its own (q, <Esc>, or losing focus).
+function Manager:window_closed()
+  if self.ui == nil then
+    -- `close_window` detached the handle and releases itself.
+    return
+  end
+  self.ui = nil
+  self:release()
+end
+
+---Forget this manager: used when a reconfiguration replaces it.
+function Manager:dispose()
+  self:close_window()
 end
 
 ---Open the browser and start loading the catalog.
@@ -272,6 +311,8 @@ end
 ---@param cfg table
 function Manager:start(connection, cfg)
   self.connection = connection
+  self.round = self.round + 1
+  local round = self.round
   self.agents, self.params, self.unavailable = self:resolve_agents(cfg)
   self.configured = {}
   for _, id in ipairs(self.agents) do
@@ -283,13 +324,16 @@ function Manager:start(connection, cfg)
   self.updated_agents = {}
 
   ServiceSessions.subscribe(connection, self.channel, function(payload)
+    if round ~= self.round then
+      return
+    end
     self:on_updated(payload)
   end)
 
   local ui = self.deps.ui or require("ade.ui.session_manager")
   self.ui = ui.open(self:view())
 
-  self:request_cached()
+  self:request_cached(round)
   self:refresh()
 end
 
@@ -307,13 +351,14 @@ function Manager:filter_entries(entries)
   return kept
 end
 
-function Manager:request_cached()
+---@param round integer the open round this request belongs to
+function Manager:request_cached(round)
   local connection = self.connection
   if not connection then
     return
   end
   ServiceSessions.cached(connection, function(ok, value)
-    if not ok or not self.connection then
+    if not ok or round ~= self.round or not self.connection then
       return
     end
     value = type(value) == "table" and value or {}
@@ -334,11 +379,15 @@ function Manager:request_cached()
       kept[#kept + 1] = entry
     end
     self.entries = kept
+    -- Merge the cached agent states without losing one a failed refresh (or an
+    -- earlier successful listing) already delivered.
     local states = type(value.agents) == "table" and value.agents or {}
-    self.agent_states = {}
-    for agent, agent_state in pairs(states) do
-      if self.configured[agent] and not self.updated_agents[agent] then
-        self.agent_states[agent] = agent_state
+    for agent, cached_state in pairs(states) do
+      if self.configured[agent] and not self.updated_agents[agent] and type(cached_state) == "table" then
+        local state = self.agent_states[agent] or {}
+        state.error = state.error or cached_state.error
+        state.listed_at = state.listed_at or cached_state.listed_at
+        self.agent_states[agent] = state
       end
     end
     self:refresh_view()
@@ -351,6 +400,9 @@ function Manager:refresh()
   if not connection then
     return
   end
+  local round = self.round
+  self.refresh_seq = self.refresh_seq + 1
+  local seq = self.refresh_seq
   self.status = nil
   self.refreshing = {}
   for _, entry in ipairs(self.params) do
@@ -359,6 +411,9 @@ function Manager:refresh()
   -- Refresh notifications for this call replace the rows of one agent at a
   -- time; the reply only settles the header.
   ServiceSessions.refresh(connection, self.params, function(ok, value)
+    if round ~= self.round or seq ~= self.refresh_seq then
+      return
+    end
     self:on_refresh_reply(ok, value)
   end)
   self:refresh_view()
@@ -374,16 +429,18 @@ function Manager:on_updated(payload)
   if not self.configured[agent] then
     return
   end
-  self.updated_agents[agent] = true
   self.refreshing[agent] = nil
   local state = self.agent_states[agent] or {}
   if payload.error then
-    -- A failed refresh keeps the cached rows visible; the header says why.
+    -- A failed refresh keeps the cached rows visible and must not count as
+    -- fresh rows: a late `sessions.cached` reply still has to fill them in.
+    self.updated_agents[agent] = nil
     state.error = payload.error
     self.agent_states[agent] = state
     self:refresh_view()
     return
   end
+  self.updated_agents[agent] = true
   local kept = {}
   for _, entry in ipairs(self.entries) do
     if entry.agent ~= agent then
@@ -427,11 +484,16 @@ function Manager:on_refresh_reply(ok, value)
   self:refresh_view()
 end
 
----Close the browser, ignoring any refresh that is still in flight.
+---Close the browser and drop the listener, ignoring any request still in flight.
 function Manager:close_window()
-  if self.ui then
-    self.ui:close()
+  local ui = self.ui
+  -- Detach the handle first: the window's own close notification must not try
+  -- to release a second time (and double-bump the round).
+  self.ui = nil
+  if ui then
+    pcall(ui.close, ui)
   end
+  self:release()
 end
 
 ---Whether the panel's live connection already runs in `cwd` for `agent`.
@@ -520,15 +582,17 @@ function Manager:load_with_new_connection(entry, cwd, cfg)
     -- The panel is a global singleton: editor and agent must agree on one
     -- directory, so this is a plain `:cd`, not a window-local change.
     pcall(vim.cmd, "cd " .. vim.fn.fnameescape(cwd))
-    -- One-shot: `on_ready` loads this session instead of auto-restoring
-    -- another one or creating an empty session.
-    S.conn.pending_load = { id = entry.sessionId, cwd = cwd }
+    -- One-shot, carried by the setup action: `on_ready` loads this session
+    -- instead of auto-restoring another one or creating an empty session, and
+    -- any other reconfiguration drops the intent. It is scoped to the agent and
+    -- directory the new connection must have.
+    local intent = { agent = entry.agent, cwd = cwd, id = entry.sessionId }
     pcall(function()
       require("ade.inline").stop()
     end)
     local opts = vim.deepcopy(cfg)
     opts.agent = entry.agent
-    self.deps.setup(opts, { discard_queued = true })
+    self.deps.setup(opts, { discard_queued = true, pending_load = intent })
     self.deps.open()
   end
 
@@ -542,6 +606,12 @@ function Manager:load_with_new_connection(entry, cwd, cfg)
     -- The confirmation picker takes focus; keep the manager open until it
     -- answers (its BufLeave would close it otherwise).
     self.ui:set_busy(true)
+  end
+  local function finish_confirmation()
+    if self.ui then
+      self.ui:set_busy(false)
+    end
+    self:refresh_view()
   end
   local ok = pcall(presenter.select, {
     title = string.format(
@@ -557,15 +627,18 @@ function Manager:load_with_new_connection(entry, cwd, cfg)
     },
     filter = false,
     on_choice = function(choice)
-      if self.ui then
-        self.ui:set_busy(false)
-      end
       if choice == "switch" then
+        if self.ui then
+          self.ui:set_busy(false)
+        end
         switch()
-      else
-        self:refresh_view()
+        return
       end
+      finish_confirmation()
     end,
+    -- Dismissing the picker (Esc, <C-c>, leaving the float) is a Cancel: the
+    -- browser must not stay busy forever.
+    on_cancel = finish_confirmation,
   })
   if not ok then
     if self.ui then

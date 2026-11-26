@@ -8,6 +8,7 @@
 local icons = require("ade.ui.icons")
 local highlights = require("ade.ui.highlights")
 local picker = require("ade.ui.picker")
+local time = require("ade.ui.time")
 
 local HL = highlights.picker
 
@@ -21,19 +22,11 @@ local function fuzzy(needle, haystack)
   return picker.fuzzy_ranges(needle, haystack) ~= nil
 end
 
----Format an ISO-ish timestamp for display.
+---Format an ISO-ish timestamp in local time for display.
 ---@param value any
 ---@return string
 local function short_time(value)
-  if type(value) ~= "string" or value == "" then
-    return ""
-  end
-  -- "2026-11-07T10:49:33.899Z" -> "2026-11-07 10:49"
-  local date, time = value:match("^(%d%d%d%d%-%d%d%-%d%d)T(%d%d:%d%d)")
-  if date and time then
-    return date .. " " .. time
-  end
-  return value:sub(1, 16)
+  return time.short(value)
 end
 
 ---@param entry table
@@ -228,6 +221,11 @@ function M.open(view)
     end
     settled = true
     close()
+    -- Tell the owner the window is gone before running a load callback: the
+    -- manager must drop its listener and in-flight requests either way.
+    if type(state.on_close) == "function" then
+      pcall(state.on_close)
+    end
     if fn then
       fn(...)
     end
@@ -319,7 +317,14 @@ function M.open(view)
       agent_width = math.max(agent_width, math.min(12, vim.fn.strdisplaywidth(tostring(entry.agent or ""))))
     end
     agent_width = math.min(12, agent_width) + 2
-    local cwd_width = math.max(16, math.min(40, math.floor(content * 0.34)))
+    -- The title is what the user reads; the cwd is supporting context. Cap the
+    -- path column at roughly a third of the row and give the rest to the title,
+    -- so an 80-column editor does not truncate every title to a dozen chars.
+    local cwd_width = math.max(12, math.min(32, math.floor(content * 0.30)))
+    local title_room = content - (2 + agent_width + cwd_width + 1 + 18)
+    if title_room < 12 then
+      cwd_width = math.max(8, cwd_width - (12 - title_room))
+    end
 
     for _, entry in ipairs(visible) do
       local current = entry.agent == state.current_agent and entry.sessionId == state.current_id

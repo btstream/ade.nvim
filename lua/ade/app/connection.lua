@@ -380,6 +380,9 @@ end
 ---Stop the agent process without closing the panel.
 function Connection:disconnect()
   local S = self.state()
+  -- An explicit disconnect cancels any pending session manager load: the next
+  -- connection is a fresh decision, not the interrupted switch.
+  S.conn.pending_load = nil
   self.reset_operations()
   self.runtime_lost()
   self.reset_permissions()

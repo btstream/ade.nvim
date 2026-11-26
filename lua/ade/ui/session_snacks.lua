@@ -46,18 +46,11 @@ function M.available()
   return load_snacks() ~= nil
 end
 
----Format an ISO timestamp as "YYYY-MM-DD HH:MM".
+---Format an ISO timestamp as a local "YYYY-MM-DD HH:MM".
 ---@param value any
 ---@return string
 local function short_time(value)
-  if type(value) ~= "string" or value == "" then
-    return ""
-  end
-  local date, time = value:match("^(%d%d%d%d%-%d%d%-%d%d)T(%d%d:%d%d)")
-  if date and time then
-    return date .. " " .. time
-  end
-  return value:sub(1, 16)
+  return require("ade.ui.time").short(value)
 end
 
 ---A session's display label: its title, or the id when no title exists yet.
