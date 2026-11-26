@@ -79,10 +79,10 @@ function M.build(ctx, opts, action)
   local notify = ctx.notify
 
   -- A session manager switch carries its one-shot load in the setup action.
-  -- Write it before anything can fail: every reconfiguration that does not name
-  -- an intent (an agent switch, a plain setup, a second manager action) clears
-  -- it, so a stale intent can never reach an unrelated connection.
-  S.conn.pending_load = type(action) == "table" and action.pending_load or nil
+  -- Clear the previous intent first: every reconfiguration that does not name
+  -- one (an agent switch, a plain setup, a second manager action) or that fails
+  -- before it is built must leave nothing behind for a later connection.
+  S.conn.pending_load = nil
 
   -- Provenance comes from the raw input, before `merge` erases which fields the
   -- user actually wrote. Without it a preset command is indistinguishable from
@@ -112,6 +112,9 @@ function M.build(ctx, opts, action)
   if S.view.input then
     pcall(S.view.input.save_draft, S.view.input)
   end
+  -- Validation and the queue guard passed: this build really happens, so the
+  -- action's intent (if any) describes the connection it will start.
+  S.conn.pending_load = type(action) == "table" and action.pending_load or nil
   ctx.invalidate_operations()
   S.config = merged
 
