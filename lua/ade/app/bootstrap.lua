@@ -83,6 +83,7 @@ function M.build(ctx, opts, action)
   -- one (an agent switch, a plain setup, a second manager action) or that fails
   -- before it is built must leave nothing behind for a later connection.
   S.conn.pending_load = nil
+  S.conn.pending_load_started = nil
 
   -- Provenance comes from the raw input, before `merge` erases which fields the
   -- user actually wrote. Without it a preset command is indistinguishable from
@@ -835,7 +836,20 @@ function M.build(ctx, opts, action)
         if S.sess.service then
           -- `kind = "restore"` keeps the normal failed-load behaviour: a
           -- failure reports and starts a fresh session in the new folder.
-          S.sess.service:load(pending_load.id, { kind = "restore", cwd = pending_load.cwd })
+          --
+          -- The auth retry queued for this connection must not re-enter
+          -- on_ready while this load is in flight: mark the connection busy
+          -- until the load settles (success or failure).
+          S.conn.pending_load_started = true
+          local function settled()
+            S.conn.pending_load_started = nil
+          end
+          S.sess.service:load(pending_load.id, {
+            kind = "restore",
+            cwd = pending_load.cwd,
+            on_restored = settled,
+            on_failed = settled,
+          })
         else
           ctx.new_session()
         end
@@ -881,14 +895,21 @@ function M.build(ctx, opts, action)
           retry = function()
             local state = S.conn
             local client = state.client
-            -- A terminal login restarts the agent; by the time this retry runs
-            -- `on_ready` already handled the restarted client (or is handling
-            -- it right now, in the auth_after_ready drain). Calling connect()
-            -- again would enter on_ready twice for the same ready connection
-            -- and start an empty session beside the pending load. Only a
-            -- connection that is not up needs a real connect.
+            local service = S.sess and S.sess.service
+            -- A first-time terminal login reaches this retry with a ready
+            -- client but no session: `on_ready` deliberately declines to
+            -- restore or create while auth_after_ready is non-empty, so the
+            -- retry's connect() is what runs that path again. Skip it only
+            -- when on_ready already started something for this connection: a
+            -- session, a create, a replay, or the pending load.
             if state.phase == "ready" and client and client:is_ready() then
-              return
+              local busy = state.pending_load_started == true
+                or state.creating_session == true
+                or (service and service:is_replaying())
+                or S.sess.current ~= nil
+              if busy then
+                return
+              end
             end
             ctx.connect()
           end,

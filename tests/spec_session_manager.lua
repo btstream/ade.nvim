@@ -1437,6 +1437,50 @@ return function(t)
       end, 3000, "the manager to close")
     end)
 
+    t.it("a first-time terminal login creates one session on normal startup", function()
+      local dir = tmpdir("login-start")
+      local service, service_dir = start_service("login-start", {
+        -- The very first initialize asks for a login; the restart succeeds.
+        canned_init_auth_error = 1,
+        canned_auth_methods = { { id = "terminal", name = "Terminal", type = "terminal" } },
+      })
+      local saved_cwd = vim.fn.getcwd()
+      vim.cmd("cd " .. vim.fn.fnameescape(dir))
+      t.cleanup(function()
+        pcall(vim.cmd, "cd " .. vim.fn.fnameescape(saved_cwd))
+      end)
+
+      -- Patch before setup: Auth captures open_terminal when it is built and
+      -- this path does not rebuild it later.
+      local AuthModule = require("ade.app.auth")
+      local original_open = AuthModule.open_terminal
+      local logins = 0
+      AuthModule.open_terminal = function(_, opts)
+        logins = logins + 1
+        vim.defer_fn(function()
+          pcall(opts.on_exit, 0)
+        end, 10)
+        return true
+      end
+      t.cleanup(function()
+        AuthModule.open_terminal = original_open
+      end)
+
+      setup_service(t, service_dir)
+      t.cleanup(function()
+        pcall(controller.hide)
+      end)
+
+      controller.open()
+      local S = controller.state()
+      wait(function()
+        return S.conn.phase == "ready" and S.sess.current ~= nil
+      end, 30000, "the session after the first-time login")
+      t.eq(1, logins, "the login ran once")
+      t.eq(1, service.session_new_calls, "exactly one session must be created or restored")
+      t.eq("sess_mock", S.sess.current.id)
+    end)
+
     t.it("an auth retry loads the pending session exactly once", function()
       local dir_a, dir_b = tmpdir("autha"), tmpdir("authb")
       local service, service_dir = start_service("auth-load", {
