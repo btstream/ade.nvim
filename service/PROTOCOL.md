@@ -189,6 +189,7 @@ unsupported shape, agent line too long).
 | -32800 | request cancelled (section 16.3) |
 | -32050 | invalid policy rule set (section 17) |
 | -32060 to -32066 | teams, sections 18.10 and 18.16 |
+| -32070 to -32072 | session catalog, section 21.6 |
 | -32601, -32700, -32600, -32602 | standard JSON-RPC errors |
 
 ## 5. Relay rules (per instance)
@@ -2122,3 +2123,145 @@ When the same call also turned the session's switch off (`session.teams
   close itself still succeeds and answers `{}`.
 - **`team_stop` of one worker** (20.6) does not close the team and sends no
   such notice; the team's leader only hears the usual "worker stopped" notice.
+
+## 21. Session catalog across agents (feature `"sessions"`, api_version 8)
+
+The front end shows one list of the sessions of **every configured agent**,
+not only the agent the panel is connected to. Listing needs an agent process
+(ACP `session/list`), and the service has no agent configuration of its own,
+so the front end sends each agent's launch, and the service lists, caches and
+returns the results. Loading a session is unchanged (`agent.attach` +
+`session/load` through the tunnel); this section only covers listing.
+
+`hello.features` contains `"sessions"` whenever the service implements this
+section, with or without the event log. Without the event log nothing is
+persisted: `sessions.cached` answers an empty catalog and `sessions.refresh`
+still lists live.
+
+### 21.1 Entry shape
+
+```
+entry = {
+  agent:     string,   // the agent id of the launch it was listed with
+  sessionId: string,
+  cwd:       string,   // as reported by the agent, untouched
+  title:     string?,  // ACP SessionInfo.title, omitted when absent/empty
+  updatedAt: string?,  // ACP SessionInfo.updatedAt, untouched (ISO 8601)
+  _meta:     object?,  // ACP SessionInfo._meta, untouched when present
+}
+agent_state = {
+  listed_at: integer?, // unix ms of the last successful listing, absent if never
+  error:     {code: integer, message: string}?, // last refresh failure, cleared on success
+}
+```
+
+An agent's `SessionInfo` without a string `sessionId` or without a string
+`cwd` is dropped (it could not be loaded: `session/load` needs the cwd).
+
+### 21.2 `sessions.cached`
+
+`-> {}` `<- {sessions: entry[], agents: {<agent>: agent_state}}`
+
+Answered immediately from the store, no agent is contacted. `sessions` is in
+no particular order (the front end sorts). An empty store answers
+`{sessions: [], agents: {}}` (`agents` must encode as a JSON object).
+
+### 21.3 `sessions.refresh`
+
+```
+-> {agents: [{
+      agent:   string,
+      command: string,
+      args:    string[],
+      cwd:     string,              // absolute; working dir for a temporary process
+      env:     object<string,string>?,  // same meaning as agent.attach
+      launch:  object?,             // same meaning as agent.attach (16.4)
+    }],
+    timeout_ms: integer?}           // per agent, default 30000, clamped to [1000, 120000]
+<- {agents: {<agent>: {ok: true, count: integer} | {ok: false, error: {code, message}}}}
+```
+
+`agents` may be empty (answer `{agents: {}}`). Duplicate `agent` ids in one call
+are `-32602`. For every listed agent, independently and concurrently:
+
+1. **Reuse.** If a running, non-stopping instance has the same `agent`,
+   `command` and `args` (any `cwd`, any capabilities) and already holds a cached
+   `initialize` result, the service sends its own `session/list` requests on
+   that instance. Their responses go to the service only, never to a front end
+   (same mechanism as team service requests). No `initialize` is sent.
+2. **Temporary instance.** Otherwise the service spawns an **unlisted**
+   instance (like a team worker: never returned by `agent.attach` identity
+   lookup, never in `agent.list`, no event-log recording needed) with the
+   given `command`, `args`, `cwd`, `env`, `launch`, and sends
+   `initialize {protocolVersion: 1, clientCapabilities: {fs: {readTextFile: false,
+   writeTextFile: false}, terminal: false}}`. Every agent-to-client request
+   from a temporary instance is answered immediately with `-32601` (it never
+   reaches a front end and never counts as `pending_requests`). Notifications
+   from it are dropped. When the listing of that agent ends (success, error or
+   timeout) the instance is stopped (graceful sequence of 3.4).
+3. **Capability.** If the `initialize` result (fresh or cached) does not have
+   `agentCapabilities.sessionCapabilities.list` (any non-null value), the agent
+   fails with `-32070`. A failed `initialize` fails with the agent's error.
+4. **Paging.** `session/list` is sent **without** `cwd` (all directories), then
+   again with `cursor = nextCursor` while the response carries a non-empty
+   string `nextCursor` that was not seen before in this listing, at most 100
+   pages. An error response fails the agent with that error's `code` and
+   `message` (e.g. an auth error stays visible to the person).
+5. **Timeout.** If the agent has not finished within `timeout_ms` (from the
+   start of its step 1/2), it fails with `-32071`; late responses are ignored.
+   An agent process that exits first fails with `-32072`. A spawn failure is
+   `-32022` with the OS error.
+6. **Result.** On success the cache rows of that `agent` are **replaced** by the
+   listed entries (deduplicated by `sessionId`, last page wins), and
+   `agent_state = {listed_at: now}`. On failure the cached rows are kept and
+   `agent_state.error` is set (`listed_at` unchanged).
+
+As soon as one agent finishes, the requesting connection receives
+
+`<- sessions.updated {agent, sessions: entry[]}` on success, or
+`<- sessions.updated {agent, error: {code, message}}` on failure,
+
+and when every agent of the call has finished, the reply above. Only the
+requesting connection gets these notifications.
+
+**Joining.** If a refresh of the same `agent` id is already running (from any
+connection), the new call does not start a second one for it: it waits for the
+running one and receives the same `sessions.updated` and per-agent result.
+
+**Idle.** A running refresh counts as busy for idle exit (section 8). If the
+requesting connection closes, the refresh still finishes (and updates the
+cache); its notifications and reply are dropped.
+
+### 21.4 Keeping the cache current
+
+Section 11 tracking also updates the catalog, without a refresh:
+
+- a successful `session/delete` response (any instance, any origin) removes the
+  row `(instance agent, sessionId)`;
+- nothing else (new sessions and title changes show up on the next refresh).
+
+### 21.5 Storage
+
+Store schema version 5 adds
+
+```
+session_catalog (agent TEXT, session_id TEXT, json TEXT /* the entry */,
+                 PRIMARY KEY (agent, session_id))
+session_catalog_agents (agent TEXT PRIMARY KEY, json TEXT /* agent_state */)
+```
+
+Both survive service restarts (they are not cleared with the event log).
+Version 4 stores upgrade in place.
+
+### 21.6 Error codes
+
+| Code | Meaning |
+|---|---|
+| -32070 | the agent does not support `session/list` |
+| -32071 | listing timed out |
+| -32072 | the agent process exited during the listing |
+
+### 21.7 Versions
+
+`api_version` becomes `8` (front end `lua/ade/service/version.lua` and
+`service/src/lib.rs` together) and the service version `0.9.0`.
