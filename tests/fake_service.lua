@@ -51,6 +51,9 @@ Server.__index = Server
 ---  run_error?: table, uninstall_error?: table, canned_agent?: boolean,
 ---  agent_capabilities?: table, canned_capabilities?: table,
 ---  canned_resume?: boolean, canned_load_error?: table,
+---  session_catalog?: table[], session_agent_states?: table,
+---  session_refresh?: table, session_refresh_delay_ms?: integer,
+---  session_refresh_error?: table, session_refresh_hold?: boolean,
 ---  session_reload_unsupported?: boolean|table<string, boolean>,
 ---  team_answer_error?: table,
 ---  session_teams_default?: boolean, session_injected_default?: boolean}|nil
@@ -205,6 +208,21 @@ function M.new(opts)
     canned_resume = opts.canned_resume == true,
     -- A canned `session/load` that fails with this JSON-RPC error.
     canned_load_error = opts.canned_load_error,
+    -- PROTOCOL.md 21: the cached catalog and the scripted result of a refresh.
+    -- `session_refresh[agent] = {ok = true, sessions = {...}}` or
+    -- `{ok = false, error = {code, message}}`; without an entry the catalog rows
+    -- of that agent are listed as they are.
+    session_catalog = vim.deepcopy(opts.session_catalog or {}),
+    session_agent_states = vim.deepcopy(opts.session_agent_states or {}),
+    session_refresh = opts.session_refresh,
+    session_refresh_delay_ms = opts.session_refresh_delay_ms or 5,
+    session_refresh_error = opts.session_refresh_error,
+    -- Hold the refresh until `finish_session_refresh()`: lets a test observe
+    -- the cached rows while an agent is still refreshing.
+    session_refresh_hold = opts.session_refresh_hold == true,
+    session_refreshes = {},
+    held_session_refreshes = {},
+    session_updates = {},
     clients = {},
     instances = {},
     -- Instances whose stop was requested but whose exit has not been announced
@@ -1162,6 +1180,40 @@ function Server:dispatch(message, client)
     return self:install_uninstall(params, client, ident)
   end
 
+  if method == "sessions.cached" then
+    local states = self.session_agent_states or {}
+    if next(states) == nil then
+      -- PROTOCOL.md 21.2: an empty `agents` must encode as a JSON object.
+      states = vim.empty_dict()
+    end
+    return {
+      jsonrpc = "2.0",
+      id = ident,
+      result = { sessions = vim.deepcopy(self.session_catalog), agents = vim.deepcopy(states) },
+    }
+  end
+  if method == "sessions.refresh" then
+    self.session_refreshes[#self.session_refreshes + 1] = vim.deepcopy(params)
+    if self.session_refresh_error then
+      return error_reply(
+        ident,
+        self.session_refresh_error.code,
+        self.session_refresh_error.message,
+        self.session_refresh_error.data
+      )
+    end
+    local agents = type(params.agents) == "table" and params.agents or {}
+    if self.session_refresh_hold then
+      self.held_session_refreshes[#self.held_session_refreshes + 1] = {
+        client = client,
+        ident = ident,
+        agents = vim.deepcopy(agents),
+      }
+      return nil
+    end
+    self:begin_session_refresh(client, ident, agents)
+    return nil
+  end
   if method == "agent.attach" then
     -- Spawning the fake agent runs `jobstart`, which is forbidden in libuv's
     -- fast event context where socket reads arrive. Defer the whole attach one
@@ -1222,6 +1274,129 @@ function Server:dispatch(message, client)
     return nil
   end
   return error_reply(ident, -32601, "Method not found: " .. tostring(method))
+end
+
+---The result one agent would report from a refresh (PROTOCOL.md 21.3).
+---
+---A scripted `session_refresh[agent]` wins; otherwise the cached rows of that
+---agent are listed unchanged, which is the happy path tests usually want.
+---@param agent string
+---@return table outcome `{ok, sessions}` or `{ok=false, error}`
+function Server:session_outcome(agent)
+  local scripted = type(self.session_refresh) == "table" and self.session_refresh[agent] or nil
+  if scripted then
+    if scripted.ok == false then
+      return {
+        ok = false,
+        error = vim.deepcopy(scripted.error or { code = -32070, message = "session/list is not supported" }),
+      }
+    end
+    return { ok = true, sessions = vim.deepcopy(scripted.sessions or {}) }
+  end
+  local sessions = {}
+  for _, row in ipairs(self.session_catalog or {}) do
+    if row.agent == agent then
+      sessions[#sessions + 1] = vim.deepcopy(row)
+    end
+  end
+  return { ok = true, sessions = sessions }
+end
+
+---Store one agent's refresh result the way PROTOCOL.md 21.3 step 6 says.
+---@param agent string
+---@param outcome table
+function Server:apply_session_outcome(agent, outcome)
+  if outcome.ok then
+    local kept = {}
+    for _, row in ipairs(self.session_catalog or {}) do
+      if row.agent ~= agent then
+        kept[#kept + 1] = row
+      end
+    end
+    for _, row in ipairs(outcome.sessions or {}) do
+      kept[#kept + 1] = row
+    end
+    self.session_catalog = kept
+    self.session_agent_states[agent] = { listed_at = math.floor(vim.uv.gettimeofday() * 1000) }
+  else
+    self.session_agent_states[agent] =
+      vim.tbl_extend("force", self.session_agent_states[agent] or {}, { error = outcome.error })
+  end
+end
+
+---Run one `sessions.refresh`: per-agent `sessions.updated`, then the reply.
+---@param client table
+---@param ident any
+---@param agents table[]
+function Server:begin_session_refresh(client, ident, agents)
+  local reply = {}
+  local pending = #agents
+
+  local function finish()
+    local result = { agents = reply }
+    if next(reply) == nil then
+      result.agents = vim.empty_dict()
+    end
+    self:send(client, { jsonrpc = "2.0", id = ident, result = result })
+  end
+
+  local function agent_done(agent, outcome)
+    self:apply_session_outcome(agent, outcome)
+    local payload
+    if outcome.ok then
+      payload = { agent = agent, sessions = vim.deepcopy(outcome.sessions or {}) }
+      reply[agent] = { ok = true, count = #(outcome.sessions or {}) }
+    else
+      payload = { agent = agent, error = outcome.error }
+      reply[agent] = { ok = false, error = outcome.error }
+    end
+    self.session_updates[#self.session_updates + 1] = vim.deepcopy(payload)
+    self:emit(client, "sessions.updated", payload)
+    pending = pending - 1
+    if pending == 0 then
+      finish()
+    end
+  end
+
+  if pending == 0 then
+    finish()
+    return
+  end
+  for _, entry in ipairs(agents) do
+    local agent = entry.agent
+    local outcome = self:session_outcome(agent)
+    local delay = self.session_refresh_delay_ms or 0
+    if delay > 0 then
+      vim.defer_fn(function()
+        agent_done(agent, outcome)
+      end, delay)
+    else
+      vim.schedule(function()
+        agent_done(agent, outcome)
+      end)
+    end
+  end
+end
+
+---Release a refresh held by `session_refresh_hold`.
+---@return boolean released
+function Server:finish_session_refresh()
+  local item = table.remove(self.held_session_refreshes, 1)
+  if not item then
+    return false
+  end
+  self:begin_session_refresh(item.client, item.ident, item.agents)
+  return true
+end
+
+---Announce a `sessions.updated` for one agent, the way the service does.
+---@param agent string
+---@param payload table
+function Server:emit_sessions_updated(agent, payload)
+  payload = vim.deepcopy(payload or {})
+  payload.agent = agent
+  self.session_updates[#self.session_updates + 1] = vim.deepcopy(payload)
+  self:broadcast("sessions.updated", payload)
 end
 
 ---@param params table
