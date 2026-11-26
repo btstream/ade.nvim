@@ -770,6 +770,10 @@ impl Hub {
             let install_event = install_events.recv();
             #[cfg(not(unix))]
             let install_event = std::future::pending::<Option<()>>();
+            // The catalog has its own timer: team expiries are checked hourly,
+            // a listing timeout may be a second. Re-armed on every iteration,
+            // so starting or finishing a listing moves the wake-up.
+            let catalog_timer = tokio::time::sleep_until(self.catalog.next_deadline());
             tokio::select! {
                 command = self.commands.recv() => {
                     let Some(command) = command else { return };
@@ -799,6 +803,9 @@ impl Hub {
                 }
                 _ = expiry.tick() => {
                     self.expire_teams();
+                    self.update_busy();
+                }
+                _ = catalog_timer => {
                     self.expire_catalog();
                     self.update_busy();
                 }
@@ -3594,5 +3601,74 @@ mod tests {
         assert_eq!(summary["stopping"], false);
         assert_eq!(summary["sessions"], 0);
         assert_eq!(summary["log_bytes"], 0);
+    }
+
+    #[test]
+    fn a_temporary_instances_request_never_enters_the_pending_set() {
+        let (command_sender, commands) = mpsc::channel(1);
+        let (events, _events_receiver) = mpsc::unbounded_channel();
+        let mut hub = Hub::new(
+            commands,
+            command_sender,
+            events,
+            Arc::new(Notify::new()),
+            StopTimeouts::default(),
+        );
+        hub.instances.insert(
+            "i1".to_string(),
+            Instance {
+                id: "i1".to_string(),
+                key: InstanceKey {
+                    agent: "cat".to_string(),
+                    command: "catalog-agent".to_string(),
+                    args: Vec::new(),
+                    cwd: "/tmp/p".to_string(),
+                    capabilities: json!({}),
+                },
+                pid: 42,
+                started_at: 1,
+                control: ProcControl::dummy(42),
+                exited: Exited::new(),
+                // A temporary catalog instance is spawned with logging off.
+                relay: Relay::with_log(json!({}), false),
+                log_key: "catalog:i1".to_string(),
+                attached: Vec::new(),
+                stopping: false,
+                #[cfg(unix)]
+                _lease: None,
+                env: None,
+                temporary: true,
+                #[cfg(unix)]
+                launch: None,
+            },
+        );
+
+        hub.agent_line(
+            "i1",
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "fs/read_text_file",
+                "params": { "path": "/tmp/x" },
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            hub.instances["i1"].relay.pending_requests(),
+            0,
+            "a temporary instance's request is answered, not queued"
+        );
+
+        // Its notifications never reach the relay either (the log is off).
+        hub.agent_line(
+            "i1",
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": { "sessionId": "s1", "update": {} },
+            })
+            .to_string(),
+        );
+        assert_eq!(hub.instances["i1"].relay.pending_requests(), 0);
     }
 }

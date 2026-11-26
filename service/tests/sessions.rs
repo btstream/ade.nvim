@@ -176,12 +176,16 @@ fn tunnel_call(client: &mut Client, instance: &str, id: i64, method: &str, param
 }
 
 fn attach(client: &mut Client, work: &Path, env: Value) -> String {
+    attach_agent(client, work, env, "cat")
+}
+
+fn attach_agent(client: &mut Client, work: &Path, env: Value, agent: &str) -> String {
     let attached = client.request(
         5,
         "agent.attach",
         json!({
             "key": {
-                "agent": "cat",
+                "agent": agent,
                 "command": "python3",
                 "args": [agent_script()],
                 "cwd": work.to_string_lossy(),
@@ -316,13 +320,11 @@ fn a_failed_initialize_fails_the_agent_with_its_error() {
 }
 
 #[test]
-fn a_listing_timeout_fails_the_agent() {
-    let mut server = Server::with_env(
-        "catalog-timeout",
-        &[],
-        &[("NVIM_ADE_SERVER_TEAM_EXPIRY_TICK_MS", "25")],
-    );
-    let env = server.env(json!({"CATALOG_AGENT_LIST_DELAY": "1.5"}));
+fn a_listing_timeout_fires_without_the_team_tick() {
+    // No NVIM_ADE_SERVER_TEAM_EXPIRY_TICK_MS: the catalog has its own timer, so
+    // a 30 s "hang" must not stretch timeout_ms to the team tick's hour.
+    let mut server = Server::new("catalog-timeout");
+    let env = server.env(json!({"CATALOG_AGENT_LIST_DELAY": "30"}));
     let cwd = server.work.clone();
     let started = Instant::now();
     let response = server.refresh(2, vec![server.launch("cat", &cwd, env)], Some(1000));
@@ -331,16 +333,33 @@ fn a_listing_timeout_fails_the_agent() {
     assert_eq!(result["error"]["code"], -32071, "{response}");
     assert!(
         started.elapsed() < Duration::from_secs(5),
-        "the timeout tick must fire well before the 1.5 s late answer"
+        "the catalog timer must fire near timeout_ms, not the hourly team tick"
     );
 
     let updates = server.updated();
     assert_eq!(updates.len(), 1);
     assert_eq!(updates[0]["error"]["code"], -32071);
 
-    // The late response is ignored and the temporary process stops.
+    // The temporary process is stopped even though it ignores its closed stdin:
+    // the graceful stop escalates to SIGTERM.
+    server.wait_log("terminated", 1);
+    let cached = server.cached(3);
+    assert_eq!(cached["agents"]["cat"]["error"]["code"], -32071);
+}
+
+#[test]
+fn a_late_list_answer_does_not_win() {
+    let mut server = Server::new("catalog-late-answer");
+    // The answer arrives 0.5 s after the 1 s deadline.
+    let env = server.env(json!({"CATALOG_AGENT_LIST_DELAY": "1.5"}));
+    let cwd = server.work.clone();
+    let response = server.refresh(2, vec![server.launch("cat", &cwd, env)], Some(1000));
+    let result = &response["result"]["agents"]["cat"];
+    assert_eq!(result["ok"], false, "{response}");
+    assert_eq!(result["error"]["code"], -32071, "{response}");
     server.wait_log("exit", 1);
     let cached = server.cached(3);
+    assert_eq!(cached["sessions"].as_array().map(Vec::len), Some(0));
     assert_eq!(cached["agents"]["cat"]["error"]["code"], -32071);
 }
 
@@ -405,6 +424,146 @@ fn an_initialized_instance_is_reused_without_a_second_initialize() {
     assert_eq!(instances.len(), 1, "{instances:?}");
     assert_eq!(instances[0]["instance"], instance);
     assert_eq!(instances[0]["stopping"], false);
+}
+
+#[test]
+fn an_unlisted_initialized_instance_is_reused() {
+    // A team worker is spawned unlisted (via `spawn_worker`); the catalog must
+    // still find it by agent/command/args (PROTOCOL 21.3 step 1).
+    let mut server = Server::new("catalog-reuse-worker");
+    let env = server.env(json!({}));
+    // A different agent id keeps the leader out of the match.
+    let leader = attach_agent(&mut server.client, &server.work, env.clone(), "leader");
+    let config = json!({
+        "max_workers": 3,
+        "templates": {
+            "dev": {
+                "key": {
+                    "agent": "cat",
+                    "command": "python3",
+                    "args": [agent_script()],
+                },
+                "env": env,
+                "role": "list the sessions",
+            }
+        },
+        "workflows": {
+            "one": { "summary": "one worker", "team": [{ "name": "w1", "template": "dev" }] }
+        },
+        "default_workflow": "one",
+    });
+    let configured = server.client.request(
+        6,
+        "team.configure",
+        json!({ "cwd": server.work.to_string_lossy(), "config": config }),
+    );
+    assert!(configured["result"].is_object(), "configure: {configured}");
+    // Configure first, so session/new injects the team server and binds the
+    // session token that team.start needs.
+    let session = tunnel_call(
+        &mut server.client,
+        &leader,
+        11,
+        "session/new",
+        json!({ "cwd": server.work.to_string_lossy(), "mcpServers": [] }),
+    );
+    let session_id = session["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session/new: {session}"))
+        .to_string();
+    let started = server.client.request(
+        7,
+        "team.start",
+        json!({
+            "instance": leader,
+            "sessionId": session_id,
+            "workflow": "one",
+        }),
+    );
+    assert!(started["result"].is_object(), "team.start: {started}");
+    // The leader and the worker each initialize and open a session.
+    server.wait_log("initialize", 2);
+    server.wait_log("session/new", 2);
+    let worker = wait_for(
+        || {
+            server
+                .list()
+                .into_iter()
+                .find(|entry| entry["participant"] == "w1")
+        },
+        "the team worker instance",
+    );
+    let worker_pid = worker["pid"].clone();
+    let initializations = server.log_count("initialize");
+    assert!(initializations >= 2, "{initializations}");
+
+    let other = server.work.join("elsewhere");
+    std::fs::create_dir_all(&other).expect("other cwd");
+    let response = server.refresh(2, vec![server.launch("cat", &other, env)], None);
+    let result = &response["result"]["agents"]["cat"];
+    assert_eq!(result["ok"], true, "{response}");
+    assert_eq!(result["count"], 1, "{response}");
+
+    // No third process and no second initialize: the list went to the worker.
+    assert_eq!(
+        server.log_count("initialize"),
+        initializations,
+        "the worker's cached initialize must be reused: {:?}",
+        server.log_events()
+    );
+    let lists: Vec<Value> = server
+        .log_events()
+        .into_iter()
+        .filter(|value| value["event"] == "list")
+        .collect();
+    assert_eq!(lists.len(), 1, "{lists:?}");
+    assert_eq!(lists[0]["pid"], worker_pid, "the worker listed: {lists:?}");
+    // The worker is still running and not stopping.
+    let listed = server
+        .list()
+        .into_iter()
+        .find(|entry| entry["participant"] == "w1")
+        .expect("worker still listed");
+    assert_eq!(listed["stopping"], false);
+}
+
+#[test]
+fn repeated_timeouts_on_a_reused_instance_ignore_late_answers() {
+    let mut server = Server::new("catalog-reuse-timeout");
+    let env = server.env(json!({"CATALOG_AGENT_LIST_DELAY": "1.5"}));
+    let instance = attach(&mut server.client, &server.work, env.clone());
+    let cwd = server.work.clone();
+
+    for id in [2, 3] {
+        let response = server.refresh(
+            id,
+            vec![server.launch("cat", &cwd, env.clone())],
+            Some(1000),
+        );
+        let result = &response["result"]["agents"]["cat"];
+        assert_eq!(result["ok"], false, "{response}");
+        assert_eq!(result["error"]["code"], -32071, "{response}");
+    }
+
+    // The two late answers arrive while this listing runs; they must not touch
+    // the newer request.
+    let response = server.refresh(4, vec![server.launch("cat", &cwd, env)], Some(5000));
+    let result = &response["result"]["agents"]["cat"];
+    assert_eq!(result["ok"], true, "{response}");
+    assert_eq!(result["count"], 1, "{response}");
+    let cached = server.cached(5);
+    assert_eq!(
+        cached["sessions"].as_array().map(Vec::len),
+        Some(1),
+        "{cached}"
+    );
+    assert!(cached["agents"]["cat"].get("error").is_none(), "{cached}");
+
+    // A reused instance is never stopped by a timeout.
+    let listed = server.list();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["instance"], instance);
+    assert_eq!(listed[0]["stopping"], false);
 }
 
 #[test]

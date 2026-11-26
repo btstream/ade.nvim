@@ -22,6 +22,7 @@ Environment knobs:
 
 import json
 import os
+import signal
 import sys
 import time
 
@@ -45,8 +46,21 @@ REQUESTED = [False]
 def log(event):
     if not LOG:
         return
+    event = dict(event)
+    event["pid"] = os.getpid()
     with open(LOG, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(event) + "\n")
+
+
+def on_term(signum, frame):
+    # The service's graceful stop eventually SIGTERMs a process that ignores
+    # its closed stdin; record it so a test can see the temporary instance was
+    # really stopped.
+    log({"event": "terminated"})
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGTERM, on_term)
 
 
 def send(message):

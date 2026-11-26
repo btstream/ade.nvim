@@ -11,10 +11,11 @@
 //! contract says: a second refresh of the same agent waits for the first one.
 
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use crate::protocol::{
     failure, success, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND, SESSIONS_LIST_EXITED,
@@ -65,6 +66,17 @@ impl Catalog {
     /// while idle (PROTOCOL.md 21.3 "Idle").
     pub(crate) fn busy(&self) -> bool {
         !self.agents.is_empty()
+    }
+
+    /// When the hub must wake to expire the next listing. With no listing a
+    /// far-away instant is fine: starting one re-arms the hub's timer on the
+    /// next loop iteration.
+    pub(crate) fn next_deadline(&self) -> Instant {
+        self.agents
+            .values()
+            .map(|running| running.deadline)
+            .min()
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600))
     }
 }
 
@@ -316,12 +328,14 @@ impl Hub {
         }
     }
 
-    /// A live, non-stopping listed instance with the same agent, command and
-    /// args that already finished `initialize` (PROTOCOL.md 21.3 step 1).
+    /// A live, non-stopping instance with the same agent, command and args
+    /// that already finished `initialize` (PROTOCOL.md 21.3 step 1). Any
+    /// instance counts, not only the listed ones: a team worker is initialized
+    /// just the same and must not force a second process.
     fn reusable_instance(&self, request: &AgentRequest) -> Option<String> {
-        self.by_identity.values().find_map(|id| {
-            let instance = self.instances.get(id)?;
+        self.instances.values().find_map(|instance| {
             (!instance.stopping
+                && instance.exited.get().is_none()
                 && !instance.temporary
                 && instance.key.agent == request.key.agent
                 && instance.key.command == request.key.command
@@ -365,6 +379,8 @@ impl Hub {
         };
         let (agent_id, frame) = handle.relay.service_request("initialize", params);
         if !handle.control.send_frame(frame) {
+            // The request never reached the agent: its mapping must not stay.
+            handle.relay.forget_service_request(agent_id);
             return false;
         }
         self.catalog.driver.insert(
@@ -394,6 +410,7 @@ impl Hub {
         };
         let (agent_id, frame) = handle.relay.service_request("session/list", params);
         if !handle.control.send_frame(frame) {
+            handle.relay.forget_service_request(agent_id);
             return false;
         }
         self.catalog.driver.insert(
@@ -439,6 +456,10 @@ impl Hub {
             // Late response of a listing that already failed or timed out.
             return;
         }
+        if self.catalog_deadline_passed(agent) {
+            self.fail_catalog_agent(agent, SESSIONS_LIST_TIMEOUT, "the session list timed out");
+            return;
+        }
         if let Some(error) = message.get("error") {
             let (code, message) = agent_error(error);
             self.fail_catalog_agent(agent, code, &message);
@@ -468,6 +489,12 @@ impl Hub {
             .get(agent)
             .is_some_and(|running| running.instance == instance)
         {
+            return;
+        }
+        // A response that arrives after the deadline is too late even when the
+        // hub's timer has not fired yet (PROTOCOL.md 21.3 step 5).
+        if self.catalog_deadline_passed(agent) {
+            self.fail_catalog_agent(agent, SESSIONS_LIST_TIMEOUT, "the session list timed out");
             return;
         }
         if let Some(error) = message.get("error") {
@@ -580,6 +607,14 @@ impl Hub {
         }
     }
 
+    /// Whether the running listing of `agent` is already past its deadline.
+    fn catalog_deadline_passed(&self, agent: &str) -> bool {
+        self.catalog
+            .agents
+            .get(agent)
+            .is_some_and(|running| Instant::now() >= running.deadline)
+    }
+
     /// Remove a running listing and its driver entries.
     fn take_catalog_agent(&mut self, agent: &str) -> Option<RunningAgent> {
         let running = self.catalog.agents.remove(agent)?;
@@ -587,10 +622,29 @@ impl Hub {
         Some(running)
     }
 
+    /// Drop the catalog's unanswered requests of one agent and forget their
+    /// relay mappings, so a late response cannot leak or be mistaken for a
+    /// newer listing.
     fn catalog_drop_driver(&mut self, instance: &str, agent: &str) {
-        self.catalog
+        let dropped: Vec<u64> = self
+            .catalog
             .driver
-            .retain(|(owner, _), call| !(owner == instance && call.agent() == agent));
+            .iter()
+            .filter(|((owner, _), call)| owner == instance && call.agent() == agent)
+            .map(|((_, agent_id), _)| *agent_id)
+            .collect();
+        for agent_id in dropped {
+            self.catalog
+                .driver
+                .remove(&(instance.to_string(), agent_id));
+            self.forget_catalog_request(instance, agent_id);
+        }
+    }
+
+    fn forget_catalog_request(&mut self, instance: &str, agent_id: u64) {
+        if let Some(handle) = self.instances.get_mut(instance) {
+            handle.relay.forget_service_request(agent_id);
+        }
     }
 
     /// Tell every waiting call (one notification per connection).
@@ -650,9 +704,19 @@ impl Hub {
     /// An instance exited: a listing on it fails with -32072
     /// (PROTOCOL.md 21.3 step 5).
     pub(crate) fn catalog_instance_exited(&mut self, instance: &str) {
-        self.catalog
+        let dropped: Vec<u64> = self
+            .catalog
             .driver
-            .retain(|(owner, _), _| owner != instance);
+            .iter()
+            .filter(|((owner, _), _)| owner == instance)
+            .map(|((_, agent_id), _)| *agent_id)
+            .collect();
+        for agent_id in dropped {
+            self.catalog
+                .driver
+                .remove(&(instance.to_string(), agent_id));
+            self.forget_catalog_request(instance, agent_id);
+        }
         let agents: Vec<String> = self
             .catalog
             .agents
