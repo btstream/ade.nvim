@@ -44,6 +44,30 @@ local SessionManager = require("ade.app.session_manager")
 
 local M = {}
 
+---Whether a one-shot session manager load still describes this connection.
+---
+---The intent names the agent and the directory it was written for. A
+---reconfiguration clears it explicitly, but the editor's cwd can also change
+---between `setup` and the ready callback; loading through a connection that is
+---not in that folder would target the wrong agent process.
+---@param pending any
+---@param client table|nil
+---@param agent string|nil
+---@return boolean
+local function pending_load_applies(pending, client, agent)
+  if type(pending) ~= "table" or type(pending.id) ~= "string" then
+    return false
+  end
+  if agent ~= pending.agent then
+    return false
+  end
+  local cwd = client and client.cwd
+  if type(cwd) ~= "string" or type(pending.cwd) ~= "string" then
+    return false
+  end
+  return vim.fs.normalize(cwd) == vim.fs.normalize(pending.cwd)
+end
+
 ---Reconfigure everything: state, services, views and keymaps.
 ---
 ---@param ctx table controller helpers and entry points
@@ -53,6 +77,12 @@ function M.build(ctx, opts, action)
   local S = ctx.state
   local cfg = ctx.cfg
   local notify = ctx.notify
+
+  -- A session manager switch carries its one-shot load in the setup action.
+  -- Write it before anything can fail: every reconfiguration that does not name
+  -- an intent (an agent switch, a plain setup, a second manager action) clears
+  -- it, so a stale intent can never reach an unrelated connection.
+  S.conn.pending_load = type(action) == "table" and action.pending_load or nil
 
   -- Provenance comes from the raw input, before `merge` erases which fields the
   -- user actually wrote. Without it a preset command is indistinguishable from
@@ -787,6 +817,11 @@ function M.build(ctx, opts, action)
       local skip_restore = S.conn.skip_auto_restore
       S.conn.skip_auto_restore = nil
       local client, current = S.conn.client, S.sess.current
+      if pending_load and not pending_load_applies(pending_load, client, S.config and S.config.agent) then
+        -- This is not the connection the intent was written for: drop it and
+        -- behave like any other ready connection (restore or start fresh).
+        pending_load = nil
+      end
       reload_id = reload_id or (current and current.needs_load and current.id)
       if pending_load then
         -- `session/load` must use the directory the agent reported, and the
@@ -836,8 +871,13 @@ function M.build(ctx, opts, action)
           end,
         })
       then
+        -- The login retries this same connection; the pending load still
+        -- describes it.
         return
       end
+      -- This connection will not come up. A later, unrelated connection (another
+      -- agent, another folder) must never load the abandoned session.
+      S.conn.pending_load = nil
       local message = type(err) == "table" and (err.message or vim.inspect(err)) or tostring(err)
       -- The common first-run failure: the preset command is not on PATH and
       -- the adapter has not been installed by the manager either.
@@ -934,7 +974,12 @@ function M.build(ctx, opts, action)
 
   -- Cross-agent session manager (`:Ade sessions all`), docs/session-manager.md.
   -- It uses the shared service connection, not the panel's client, so it works
-  -- before the panel has ever connected.
+  -- before the panel has ever connected. A replaced manager must drop its
+  -- `sessions.updated` listener and its in-flight requests.
+  local previous_session_manager = S.view.session_manager
+  if previous_session_manager and type(previous_session_manager.dispose) == "function" then
+    pcall(previous_session_manager.dispose, previous_session_manager)
+  end
   S.view.session_manager = SessionManager.new({
     state = function()
       return S

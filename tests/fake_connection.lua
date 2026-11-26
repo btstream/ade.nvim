@@ -51,11 +51,48 @@ function M.new(opts)
   end
 
   ---Matches `Connection:subscribe(channel_id, method, fn)`.
-  function self:subscribe(_channel_id, method, fn)
-    self.subscriptions[method] = fn
+  ---
+  ---Listeners are keyed by channel like the real shared connection: several
+  ---objects (the panel, the session manager) can listen to the same method, and
+  ---tests need to see one go away without disturbing the others.
+  function self:subscribe(channel_id, method, fn)
+    self.subscriptions[method] = self.subscriptions[method] or {}
+    self.subscriptions[method][channel_id] = fn
   end
 
-  function self:unsubscribe_all() end
+  ---Matches `Connection:unsubscribe(channel_id, method)`.
+  function self:unsubscribe(channel_id, method)
+    local list = self.subscriptions[method]
+    if list then
+      list[channel_id] = nil
+    end
+  end
+
+  function self:unsubscribe_all(channel_id)
+    for _, list in pairs(self.subscriptions) do
+      list[channel_id] = nil
+    end
+  end
+
+  ---Number of live listeners for one notification, for lifecycle assertions.
+  ---@param method string
+  ---@return integer
+  function self:subscriber_count(method)
+    local count = 0
+    for _ in pairs(self.subscriptions[method] or {}) do
+      count = count + 1
+    end
+    return count
+  end
+
+  ---Deliver one notification to every listener, the way `dispatch` does.
+  ---@param method string
+  ---@param payload any
+  function self:emit(method, payload)
+    for _, fn in pairs(self.subscriptions[method] or {}) do
+      fn(payload)
+    end
+  end
 
   function self:notify_service()
     return true
@@ -116,10 +153,7 @@ function M.new(opts)
   ---Simulate a dropped connection: every subscriber is told, once.
   function self:drop(reason)
     self.closed = true
-    local fn = self.subscriptions["__disconnected"]
-    if fn then
-      fn({ reason = reason or "socket closed" })
-    end
+    self:emit("__disconnected", { reason = reason or "socket closed" })
   end
 
   return self

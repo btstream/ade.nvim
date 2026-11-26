@@ -448,6 +448,9 @@ end
 ---@param opts {on_created: (fun(session: table)|nil)|nil, on_failed: (fun(err: string)|nil)|nil}|nil
 function M.new_session(opts)
   if S.sess.service then
+    -- A new session is the user's explicit choice: an interrupted session
+    -- manager switch must not load its session on the connection this creates.
+    S.conn.pending_load = nil
     S.sess.service:create(function()
       S.conn.skip_auto_restore = true
       M.connect()
