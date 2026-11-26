@@ -162,6 +162,14 @@ function M.new(opts)
     session_reload_unsupported = opts.session_reload_unsupported,
     session_teams_hold = opts.session_teams_hold,
     session_teams_hold_answers = opts.session_teams_hold_answers,
+    -- A query (`session.teams` without `enabled`) reports `pending: true`
+    -- while nothing is injected, as PROTOCOL.md 20.5 says. Off by default so
+    -- existing cases keep their "no handshake is coming" reading.
+    session_teams_query_pending = opts.session_teams_query_pending == true,
+    -- Refuse an `enabled: false` write (a switch the service will not flip).
+    session_teams_off_error = opts.session_teams_off_error,
+    -- Delay that refusal so a test can let the in-flight load settle first.
+    session_teams_off_delay = opts.session_teams_off_delay,
     -- A canned `session/new` that fails with auth_required and offers these
     -- login methods: the front end's auth flow (picker → cancel) runs for real.
     canned_auth_methods = opts.canned_auth_methods,
@@ -472,7 +480,14 @@ function Server:dispatch(message, client)
       return {
         jsonrpc = "2.0",
         id = ident,
-        result = { enabled = switch.enabled, injected = switch.injected, leader = leader or nil },
+        result = {
+          enabled = switch.enabled,
+          injected = switch.injected,
+          leader = leader or nil,
+          -- PROTOCOL.md 20.5: a read-only query gains `pending: true` while
+          -- the service still waits for the token's MCP process.
+          pending = (self.session_teams_query_pending and not switch.injected) or nil,
+        },
       }
     end
     if params.enabled == false then
@@ -483,6 +498,19 @@ function Server:dispatch(message, client)
           "this session leads a team",
           { reason = "leads_team", team = vim.deepcopy(leader) }
         )
+      end
+      if not leader and self.session_teams_off_error then
+        local reply = error_reply(ident, -32061, "cannot turn teams off", { reason = "off_refused" })
+        if self.session_teams_off_delay then
+          -- A slow refusal: the in-flight load may settle before the person's
+          -- off is answered, which is exactly when a pre-emptive supersede
+          -- would misreport the enable.
+          vim.defer_fn(function()
+            self:send(client, reply)
+          end, self.session_teams_off_delay)
+          return nil
+        end
+        return reply
       end
       if leader then
         leader.state = "closed"
@@ -1365,11 +1393,21 @@ function Server:on_tunnel_send(params, client)
       end
       local result = message.method and replies[message.method]
       if message.method == "session/load" and self.canned_load_error and message.id ~= nil then
-        self:deliver(instance, {
-          jsonrpc = "2.0",
-          id = message.id,
-          error = vim.deepcopy(self.canned_load_error),
-        })
+        local function fail()
+          self:deliver(instance, {
+            jsonrpc = "2.0",
+            id = message.id,
+            error = vim.deepcopy(self.canned_load_error),
+          })
+        end
+        if self.canned_load_delay_ms then
+          -- A slow replay that then fails: with `consume_forward_mark` above it
+          -- lets a test see the handshake notification land *before* the load's
+          -- own failure, and prove nothing was reported in between.
+          vim.defer_fn(fail, self.canned_load_delay_ms)
+        else
+          fail()
+        end
         return
       end
       if message.method == "session/load" and self.canned_load_delay_ms and message.id ~= nil then

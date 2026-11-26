@@ -827,6 +827,16 @@ return function(t)
   ---------------------------------------------------------------------------
 
   t.describe("teams v3.1 reload settlement", function()
+    local function sent(service, method)
+      local out = {}
+      for _, entry in ipairs(service.sent) do
+        if type(entry.message) == "table" and entry.message.method == method then
+          out[#out + 1] = entry.message
+        end
+      end
+      return out
+    end
+
     local function start_canned(t, tag, opts)
       return start_service(
         t,
@@ -849,17 +859,23 @@ return function(t)
       local done, ok, value
       team():enable_session(inst, "sess_mock", function(result, reason)
         done, ok, value = true, result, reason
-      end, { wait_ms = 600 })
+      end, { wait_ms = 8000 })
       wait(function()
         return done
-      end, 10000, "the enable to settle")
+      end, 4000, "the enable to settle")
       t.eq(false, ok, "a load alone is not an injected session")
       t.match("did not inject", tostring(type(value) == "table" and value.message or value))
       t.falsy(joined(notices):find("teams are on for this chat", 1, true))
     end)
 
-    t.it("waits for `session.teams_changed` and succeeds once it injects", function()
-      local service, dir = start_canned(t, "reload-late")
+    t.it("a handshake before the load reply cannot settle the enable", function()
+      -- PROTOCOL.md 20.5: the one-shot mark is consumed when the load frame is
+      -- *written*, so the service may publish `injected: true` while the load's
+      -- own reply is still in flight. That notification is no proof of success.
+      local service, dir = start_canned(t, "reload-early-fail", {
+        canned_load_delay_ms = 500,
+        canned_load_error = { code = -32602, message = "session cwd mismatch" },
+      })
       setup(t, dir)
       controller.connect()
       wait_ready()
@@ -870,10 +886,47 @@ return function(t)
       team():enable_session(inst, "sess_mock", function(result, reason)
         done, ok, value = true, result, reason
       end, { wait_ms = 8000 })
+      wait(function()
+        return #sent(service, "session/load") > 0
+      end, 5000, "the load frame")
+      -- The handshake landed before the (delayed) load reply.
+      wait(function()
+        local cached = team():session_teams(inst, "sess_mock")
+        return cached ~= nil and cached.injected == true
+      end, 3000, "the early handshake")
+      vim.wait(150)
+      t.falsy(done, "an injected notification before the load cannot report success")
+      wait(function()
+        return done
+      end, 4000, "the load failure to settle the enable")
+      t.eq(false, ok, "the failed load settles it as a failure")
+      t.match("cannot reload", tostring(type(value) == "table" and value.message or value))
+    end)
+
+    t.it("waits for `session.teams_changed` and succeeds once it injects", function()
+      -- After a successful load the service may still be waiting for the MCP
+      -- process: the query says `pending: true`, so the enable waits for the
+      -- notification instead of settling.
+      local service, dir = start_canned(t, "reload-late", { session_teams_query_pending = true })
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      local inst = own_instance()
+      service.session_switches[tostring(inst) .. "\0sess_mock"] = { enabled = true, injected = false }
+      state().view.team.session_states[tostring(inst) .. "\0sess_mock"] = nil
+      local done, ok, value
+      team():enable_session(inst, "sess_mock", function(result, reason)
+        done, ok, value = true, result, reason
+      end, { wait_ms = 8000 })
+      wait(function()
+        return #sent(service, "session/load") > 0
+      end, 5000, "the load frame")
       -- The load succeeds; the MCP handshake arrives afterwards.
       wait(function()
-        return team():session_teams(inst, "sess_mock") ~= nil
-      end, 5000, "the load")
+        local cached = team():session_teams(inst, "sess_mock")
+        return cached ~= nil and cached.injected == false
+      end, 5000, "the load reply")
+      t.falsy(done, "nothing settles while the service waits for the MCP process")
       vim.defer_fn(function()
         local key = tostring(inst) .. "\0sess_mock"
         service.session_switches[key] = { enabled = true, injected = true }
@@ -884,6 +937,58 @@ return function(t)
       end, 10000, "the enable to settle on the injection")
       t.eq(true, ok, "the late injection settles it as success")
       t.eq(true, type(value) == "table" and value.injected == true)
+    end)
+
+    t.it("a handshake before a successful load reply still settles on the load", function()
+      local service, dir = start_canned(t, "reload-early-ok", {
+        canned_load_delay_ms = 500,
+        session_teams_query_pending = true,
+      })
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      local inst = own_instance()
+      service.session_switches[tostring(inst) .. "\0sess_mock"] = { enabled = true, injected = false }
+      state().view.team.session_states[tostring(inst) .. "\0sess_mock"] = nil
+      local done, ok, value
+      team():enable_session(inst, "sess_mock", function(result, reason)
+        done, ok, value = true, result, reason
+      end, { wait_ms = 8000 })
+      wait(function()
+        return #sent(service, "session/load") > 0
+      end, 5000, "the load frame")
+      wait(function()
+        local cached = team():session_teams(inst, "sess_mock")
+        return cached ~= nil and cached.injected == true
+      end, 3000, "the early handshake")
+      vim.wait(150)
+      t.falsy(done, "the handshake alone is not the load's success")
+      wait(function()
+        return done
+      end, 4000, "the successful load to settle the enable")
+      t.eq(true, ok, "the load succeeded and the switch is injected")
+      t.eq(true, type(value) == "table" and value.injected == true)
+    end)
+
+    t.it("`pending: false` fails at once instead of waiting out the hold", function()
+      local service, dir = start_canned(t, "reload-not-pending", { session_load_never_injects = true })
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      local inst = own_instance()
+      service.session_switches[tostring(inst) .. "\0sess_mock"] = { enabled = true, injected = false }
+      state().view.team.session_states[tostring(inst) .. "\0sess_mock"] = nil
+      local done, ok
+      team():enable_session(inst, "sess_mock", function(result)
+        done, ok = true, result
+      end, { wait_ms = 8000 })
+      local started = vim.uv.now()
+      wait(function()
+        return done
+      end, 4000, "the enable to settle")
+      local elapsed = vim.uv.now() - started
+      t.eq(false, ok, "no tools means no success")
+      t.truthy(elapsed < 5000, "`pending: false` must not wait the whole ten seconds")
     end)
 
     t.it("a successful off during a slow load wins over the enable", function()
@@ -899,15 +1004,59 @@ return function(t)
         done, ok, value = true, result, reason
       end, { wait_ms = 5000 })
       wait(function()
-        return #(service.sent or {}) > 0
-      end, 3000, "the reload")
+        return #sent(service, "session/load") > 0
+      end, 3000, "the load frame")
       -- The person turns the switch off while the load is still replaying.
-      team():set_session_teams(inst, "sess_mock", false, false, function() end)
+      local off_done, off_ok
+      team():set_session_teams(inst, "sess_mock", false, false, function(result)
+        off_done, off_ok = true, result
+      end)
+      wait(function()
+        return off_done
+      end, 3000, "the off reply")
+      t.eq(true, off_ok, "the off succeeded")
       wait(function()
         return done
       end, 12000, "the enable to settle after the off")
       t.eq(false, ok, "the late load must not report success")
       t.match("turned off", tostring(type(value) == "table" and value.message or value))
+    end)
+
+    t.it("a refused off leaves the enable to report its own outcome", function()
+      local service, dir = start_canned(t, "reload-off-refused", {
+        canned_load_delay_ms = 400,
+        -- The refusal reaches the front end only after the load has settled:
+        -- a pre-emptive supersede at write time would then misreport a success
+        -- as "turned off".
+        session_teams_off_error = true,
+        session_teams_off_delay = 1200,
+      })
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      local inst = own_instance()
+      service.session_switches[tostring(inst) .. "\0sess_mock"] = { enabled = true, injected = false }
+      state().view.team.session_states[tostring(inst) .. "\0sess_mock"] = nil
+      local done, ok, value
+      team():enable_session(inst, "sess_mock", function(result, reason)
+        done, ok, value = true, result, reason
+      end, { wait_ms = 8000 })
+      wait(function()
+        return #sent(service, "session/load") > 0
+      end, 3000, "the load frame")
+      local off_done, off_ok
+      team():set_session_teams(inst, "sess_mock", false, false, function(result)
+        off_done, off_ok = true, result
+      end)
+      wait(function()
+        return off_done
+      end, 5000, "the refused off reply")
+      t.eq(false, off_ok, "the service refused the off")
+      wait(function()
+        return done
+      end, 12000, "the enable to settle on its own load")
+      t.eq(true, ok, "a refused off must not be read as a supersede")
+      t.eq(true, type(value) == "table" and value.injected == true)
     end)
   end)
 

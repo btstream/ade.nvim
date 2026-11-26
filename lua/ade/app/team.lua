@@ -768,6 +768,9 @@ function Team:apply_session_teams(instance, session_id, value, seq, opts)
   local state = {
     enabled = value.enabled == true,
     injected = value.injected == true,
+    -- Present on a query result (PROTOCOL.md 20.5): the service still waits
+    -- for the agent's MCP process. A notification carries no flag.
+    pending = value.pending == true,
     leader = type(value.leader) == "table" and value.leader or nil,
     seq = seq,
   }
@@ -974,12 +977,13 @@ function Team:set_session_teams(instance, session_id, enabled, close, cb)
   if enabled == false then
     -- The person explicitly turned the tools off while an enable→reload is in
     -- flight. Do not cancel the enable (its load is still running and the
-    -- session must settle), but mark it: the late load must not report success
-    -- and a start flow must not continue. A failed off restore the enable.
-    Enable.supersede(self, instance, session_id, "off")
+    -- session must settle), but once the off really succeeded mark it: the late
+    -- load must not report success and a start flow must not continue. Until the
+    -- reply arrives the enable still owns its own outcome — a refused off
+    -- changes nothing.
     _write_session_teams(self, instance, session_id, enabled, close, function(ok, value)
-      if not ok then
-        Enable.resume(self, instance, session_id)
+      if ok then
+        Enable.supersede(self, instance, session_id, "off")
       end
       cb(ok, value)
     end)

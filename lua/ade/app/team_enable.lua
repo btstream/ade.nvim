@@ -263,23 +263,29 @@ function M.run(team, instance, session_id, cb, opts)
   ---Finish an enable whose write asked for a reload.
   ---
   ---The load only restarts the transcript: the agent's MCP process may connect
-  ---after it (or never). The listener is registered **before** the load starts,
+  ---after it (or never). Two facts must both hold before this reports success:
+  ---the ACP load really succeeded, and the newest switch state says `enabled`
+  ---and `injected`. The listener is registered **before** the load starts,
   ---because the service may publish `session.teams_changed` before the load
-  ---reply reaches this callback.
+  ---reply reaches this callback — but such an early notification is only
+  ---recorded, never settlement, since the load may still fail or be cancelled.
   local latest = nil
+  ---The newest state the cache accepted for this pair.
   local function state_now()
-    return latest or (team.session_teams and team:session_teams(instance, session_id)) or nil
+    local cached = team.session_teams and team:session_teams(instance, session_id) or nil
+    return cached or latest
   end
   local function terminal(state)
     return state and (state.injected == true or state.enabled == false)
   end
+  local load_done = false
   local settle_reload
   local function on_state(state)
     if not state then
       return
     end
     latest = state
-    if settle_reload and terminal(state) then
+    if load_done and terminal(state) then
       settle_reload(state)
     end
   end
@@ -287,16 +293,24 @@ function M.run(team, instance, session_id, cb, opts)
   if type(team.watch_session_state) == "function" then
     unsubscribe = team:watch_session_state(instance, session_id, on_state)
   end
+  local timer
+  local released = false
   local function release_wait()
+    released = true
+    if timer then
+      pcall(function()
+        timer:stop()
+        timer:close()
+      end)
+      timer = nil
+    end
     if unsubscribe then
       unsubscribe()
       unsubscribe = nil
     end
-    if entry.stop then
-      pcall(entry.stop)
-      entry.stop = nil
-    end
   end
+  -- Settling or cancelling the entry from outside must also drop the listener.
+  entry.stop = release_wait
   settle_reload = function(state)
     if state_of(team)[key] ~= entry then
       return
@@ -321,6 +335,8 @@ function M.run(team, instance, session_id, cb, opts)
       release_wait()
       return
     end
+    -- From here on the load is known good: an early notification may settle.
+    load_done = true
     if entry.superseded then
       release_wait()
       settle(false, M.error({}, "wrote_off"))
@@ -331,54 +347,58 @@ function M.run(team, instance, session_id, cb, opts)
       settle_reload(now)
       return
     end
+    if type(team.query_session_teams) ~= "function" then
+      -- No way to ask: do not claim the tools are there.
+      settle_reload(now or { enabled = true, injected = false })
+      return
+    end
     -- Ask the service for the real switch once; the cache may still hold the
     -- pre-load answer if the notification raced the reply.
-    if type(team.query_session_teams) == "function" then
-      team:query_session_teams(instance, session_id, nil, function(ok, value)
-        if ok and type(value) == "table" then
-          latest = {
-            enabled = value.enabled == true,
-            injected = value.injected == true,
-            pending = value.pending == true,
-          }
-          if terminal(latest) then
-            settle_reload(latest)
-            return
-          end
-        end
-        if entry.stop then
-          return
-        end
-        -- Not injected yet: wait for the notification, bounded like the
-        -- service's own hold (ten seconds), then tell the truth.
-        local timer
-        entry.stop = function()
-          if timer then
-            pcall(function()
-              timer:stop()
-              timer:close()
-            end)
-            timer = nil
-          end
-        end
+    team:query_session_teams(instance, session_id, nil, function(ok, value)
+      if state_of(team)[key] ~= entry then
+        return
+      end
+      if not ok or type(value) ~= "table" then
+        -- Reading the switch is not proof the tools arrived: say so at once.
+        release_wait()
+        settle(false, {
+          message = "cannot read the session's team tools: "
+            .. tostring(type(value) == "table" and (value.message or value.code) or value),
+          stage = "reload",
+        })
+        return
+      end
+      -- Decide from the state the cache accepted: a newer notification must
+      -- win over this reply, which only tells us whether the service is still
+      -- waiting for the agent's MCP process (`pending`).
+      local accepted = state_now()
+      if accepted and terminal(accepted) then
+        settle_reload(accepted)
+        return
+      end
+      if value.pending == true then
+        -- The service still waits for the agent's MCP process: wait for
+        -- `session.teams_changed`, bounded like the service's own hold.
         timer = vim.defer_fn(function()
           timer = nil
-          if state_of(team)[key] ~= entry then
+          if released or state_of(team)[key] ~= entry then
             return
           end
           settle_reload(state_now() or { enabled = true, injected = false })
         end, opts.wait_ms or 10000)
-      end, { source = "session" })
-      return
-    end
-    -- No way to ask: do not claim the tools are there.
-    settle_reload(now or { enabled = true, injected = false })
+        return
+      end
+      -- `pending: false` with nothing injected: no handshake is coming.
+      release_wait()
+      settle(false, M.error(accepted or value, "uninjected"))
+    end, { source = "session" })
   end
   local function on_answer(ok, value)
     if state_of(team)[key] ~= entry then
       return
     end
     if not ok then
+      release_wait()
       settle(false, value)
       return
     end
@@ -387,7 +407,12 @@ function M.run(team, instance, session_id, cb, opts)
       -- A failed load leaves the session as it was: report it, never "teams are
       -- on". A successful one still has to prove the tools were injected.
       team:reload_session(instance, session_id, function(reloaded, err)
+        if state_of(team)[key] ~= entry then
+          release_wait()
+          return
+        end
         if not reloaded then
+          release_wait()
           settle(false, {
             message = "cannot reload the session's team tools: " .. tostring(err and (err.message or err) or "?"),
             stage = "reload",
@@ -399,9 +424,11 @@ function M.run(team, instance, session_id, cb, opts)
       return
     end
     if outcome == "on" then
+      release_wait()
       settle(true, value)
       return
     end
+    release_wait()
     settle(false, M.error(value, outcome))
   end
   -- The raw write. `set_session_teams` is a plain enable here (no `close`), so
