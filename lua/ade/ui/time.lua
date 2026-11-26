@@ -7,17 +7,42 @@
 -- returns nil for anything else, so callers can fall back to the raw text.
 local M = {}
 
----The local zone's UTC offset in seconds at `epoch`.
----@param epoch integer
+local DAYS_IN_MONTH = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
+
+---@param year integer
+---@return boolean
+local function is_leap_year(year)
+  return year % 4 == 0 and (year % 100 ~= 0 or year % 400 == 0)
+end
+
+---@param year integer
+---@param month integer
 ---@return integer
-local function local_offset(epoch)
-  local text = os.date("%z", epoch)
-  local sign, hours, minutes = text:match("^([+-])(%d%d)(%d%d)$")
-  if not sign then
-    return 0
+local function days_in_month(year, month)
+  if month == 2 and is_leap_year(year) then
+    return 29
   end
-  local offset = tonumber(hours) * 3600 + tonumber(minutes) * 60
-  return sign == "-" and -offset or offset
+  return DAYS_IN_MONTH[month]
+end
+
+---Days since 1970-01-01 for a proleptic Gregorian date.
+---
+---Howard Hinnant's `days_from_civil`: pure arithmetic, so it cannot be shifted
+---by the machine's zone or by a DST transition. Applying it to the timestamp's
+---own fields (and subtracting the input's offset) is what keeps a UTC value
+---stable across a DST boundary — `os.time` on UTC fields plus an offset
+---correction double-counts the local shift.
+---@param year integer
+---@param month integer
+---@param day integer
+---@return integer
+local function days_from_civil(year, month, day)
+  local y = month <= 2 and year - 1 or year
+  local era = math.floor(y / 400)
+  local yoe = y - era * 400
+  local doy = math.floor((153 * (month + (month > 2 and -3 or 9)) + 2) / 5) + day - 1
+  local doe = yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy
+  return era * 146097 + doe - 719468
 end
 
 ---Parse an ISO 8601 timestamp into a unix time.
@@ -58,7 +83,11 @@ function M.parse(value)
     if not sign then
       return nil
     end
-    zone = tonumber(zone_hours) * 3600 + tonumber(zone_minutes) * 60
+    zone_hours, zone_minutes = tonumber(zone_hours), tonumber(zone_minutes)
+    if zone_hours > 23 or zone_minutes > 59 then
+      return nil
+    end
+    zone = zone_hours * 3600 + zone_minutes * 60
     if sign == "-" then
       zone = -zone
     end
@@ -66,23 +95,27 @@ function M.parse(value)
 
   year, month, day = tonumber(year), tonumber(month), tonumber(day)
   hour, minute = tonumber(hour), tonumber(minute)
-  if month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 60 then
+  if month < 1 or month > 12 then
+    return nil
+  end
+  if day < 1 or day > days_in_month(year, month) then
+    return nil
+  end
+  if hour > 23 or minute > 59 or second > 59 then
     return nil
   end
 
-  -- `os.time` interprets the table as local wall time, so its result is the
-  -- epoch of those fields in *this* zone. Shifting by the difference between
-  -- the timestamp's zone and the local one yields the real instant.
-  local wall = os.time({ year = year, month = month, day = day, hour = hour, min = minute, sec = second })
-  if not wall then
-    return nil
-  end
   if zone == "local" then
-    return wall
+    -- No zone means local wall time: the C library applies this machine's
+    -- offset (and DST) to the broken-down table, which is exactly right here.
+    return os.time({ year = year, month = month, day = day, hour = hour, min = minute, sec = second })
   end
-  local epoch = wall + local_offset(wall) - zone
-  -- One refinement for a DST boundary crossed between the two readings.
-  return wall + local_offset(epoch) - zone
+
+  -- Zoned input: build the UTC instant arithmetically, then subtract the
+  -- zone's offset. No local time is involved, so a DST boundary on this
+  -- machine cannot move the result.
+  local days = days_from_civil(year, month, day)
+  return days * 86400 + hour * 3600 + minute * 60 + second - zone
 end
 
 ---Format a timestamp as a local "YYYY-MM-DD HH:MM".
