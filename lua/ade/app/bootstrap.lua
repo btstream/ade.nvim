@@ -866,12 +866,22 @@ function M.build(ctx, opts, action)
       ctx.flush_auth_retry()
     end,
     on_start_failed = function(err)
+      -- The intent, if any, belongs to the connection that just failed. A
+      -- login may retry it; a cancelled or failed login must not leave it for a
+      -- later, unrelated connection.
+      local intent = S.conn.pending_load
+      local function clear_intent()
+        if intent ~= nil and S.conn.pending_load == intent then
+          S.conn.pending_load = nil
+        end
+      end
       if
         S.view.auth
         and S.view.auth:require(err, {
           retry = function()
             ctx.connect()
           end,
+          on_failed = clear_intent,
         })
       then
         -- The login retries this same connection; the pending load still
@@ -880,7 +890,7 @@ function M.build(ctx, opts, action)
       end
       -- This connection will not come up. A later, unrelated connection (another
       -- agent, another folder) must never load the abandoned session.
-      S.conn.pending_load = nil
+      clear_intent()
       local message = type(err) == "table" and (err.message or vim.inspect(err)) or tostring(err)
       -- The common first-run failure: the preset command is not on PATH and
       -- the adapter has not been installed by the manager either.
