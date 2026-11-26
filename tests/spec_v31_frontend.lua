@@ -228,7 +228,11 @@ return function(t)
 
     t.it("a remote close of a watched worker returns to L, never closes A", function()
       wise(t)
+      -- The canned agent advertises `session/close`, so "A was not closed" is a
+      -- real statement: the idle close is available and `no_close` suppressed
+      -- it (see "teams v3.1 close capability" for the positive control).
       local service, dir = start_service(t, "close-remote-leader", {
+        canned_capabilities = { loadSession = true, sessionCapabilities = { close = {} } },
         team_watch = {
           instance = "inst-w",
           sessionId = "sess-w",
@@ -238,6 +242,7 @@ return function(t)
       setup(t, dir)
       controller.connect()
       wait_ready()
+      t.eq(true, state().conn.client:has_session_capability("close"), "the agent offers `session/close`")
       -- A is the ordinary chat on screen; L is a different chat of the same
       -- project and leads the team. The worker was opened from A, so the
       -- generic "restore the previous chat" path would go back to A.
@@ -811,6 +816,101 @@ return function(t)
       t.eq(side_width, vim.api.nvim_win_get_width(side), "the ordinary sidebar keeps its width")
       t.eq(true, vim.wo[side].winfixwidth, "and its fixed-width option")
       UI:close()
+    end)
+  end)
+
+  ---------------------------------------------------------------------------
+  -- A.1 The close capability: the guard above is only meaningful with it
+  ---------------------------------------------------------------------------
+
+  t.describe("teams v3.1 close capability", function()
+    local State = require("ade.session.state")
+
+    ---The same canned agent as the close cases: it really offers
+    ---`session/close`, so a missing close is a decision, not a limitation.
+    local function start_closeable(t, tag, opts)
+      return start_service(
+        t,
+        tag,
+        vim.tbl_extend("force", {
+          canned_capabilities = { loadSession = true, sessionCapabilities = { close = {} } },
+        }, opts or {})
+      )
+    end
+
+    local function sent_frames(service, method)
+      local out = {}
+      for _, entry in ipairs(service.sent) do
+        if type(entry.message) == "table" and entry.message.method == method then
+          out[#out + 1] = entry.message
+        end
+      end
+      return out
+    end
+
+    ---A second ordinary chat of the same project, loaded and idle.
+    local function add_chat(id, dir, instance)
+      local session = State.new(id, dir)
+      session.agent_name = "opencode"
+      session.instance = instance or own_instance()
+      session.needs_load = false
+      session.status = "idle"
+      session.blocks = {}
+      state().sess.all[id] = session
+      return session
+    end
+
+    t.it("a manual session switch does idle-close the chat it leaves", function()
+      local service, dir = start_closeable(t, "close-cap-manual")
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      t.eq(true, state().conn.client:has_session_capability("close"), "the agent offers `session/close`")
+      -- A is the chat on screen and, importantly, leads no team: nothing but
+      -- the ordinary switch can keep it from being idle-closed.
+      local a = state().sess.current
+      t.eq("sess_mock", a.id)
+      a.status = "idle"
+      t.eq(nil, team():team_for_cwd(dir), "no team protects A in this control")
+      local inst = own_instance()
+      service:track_session(inst, { sessionId = "sess_mock", cwd = dir })
+      local b = add_chat("sess_b", dir, inst)
+      service:track_session(inst, { sessionId = "sess_b", cwd = dir })
+      local before = #sent_frames(service, "session/close")
+      -- `:Ade sessions` <CR> / the tree's <CR>: load the chosen session. This
+      -- is the ordinary switch path, not the team-closed one, so it carries no
+      -- `no_close`.
+      controller.load_session("sess_b")
+      wait(function()
+        return #sent_frames(service, "session/close") > before
+      end, 15000, "the idle close of the chat the switch left")
+      t.eq("sess_mock", sent_frames(service, "session/close")[before + 1].params.sessionId)
+      -- The replay commits a fresh projection of the same id, so compare ids.
+      t.eq(b.id, state().sess.current and state().sess.current.id, "the chosen chat is on screen")
+    end)
+
+    t.it("an agent without the capability never receives `session/close`", function()
+      -- The negative half: the same switch on an agent that does not advertise
+      -- `close` sends nothing, which is why the earlier cases needed the
+      -- capability before they could prove anything about `no_close`.
+      local service, dir = start_service(t, "close-cap-none")
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      t.eq(false, state().conn.client:has_session_capability("close"), "the agent does not offer `session/close`")
+      local a = state().sess.current
+      a.status = "idle"
+      local inst = own_instance()
+      service:track_session(inst, { sessionId = "sess_mock", cwd = dir })
+      add_chat("sess_b", dir, inst)
+      service:track_session(inst, { sessionId = "sess_b", cwd = dir })
+      local before = #sent_frames(service, "session/close")
+      controller.load_session("sess_b")
+      wait(function()
+        return state().sess.current and state().sess.current.id == "sess_b"
+      end, 15000, "the switch without a close capability")
+      vim.wait(200)
+      t.eq(before, #sent_frames(service, "session/close"), "no close is sent without the capability")
     end)
   end)
 
