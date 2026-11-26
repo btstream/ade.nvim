@@ -340,6 +340,102 @@ return function(t)
       end, 5000, "the panes to go away")
     end)
 
+    t.it("falls back when the service's leader instance is missing", function()
+      wise(t)
+      local service, dir = start_service(t, "close-leader-no-instance", {
+        team_watch = { instance = "inst-w", sessionId = "sess-w" },
+      })
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      local a = state().sess.current
+      a.status = "idle"
+      -- A local chat carries the leader's id; the service omitted `instance`,
+      -- so a bare-id match is a guess and must not be trusted.
+      add_chat("sess_leader", dir, own_instance())
+      -- `vim.NIL` makes the encoded row carry an explicit `null` instance, so a
+      -- deep-extend cannot fall back to the default pair.
+      seed_team(service, dir, { leader = { instance = vim.NIL, sessionId = "sess_leader" } })
+      local UI = ui()
+      t.eq(true, controller.open_team("all"))
+      local watched
+      team():watch("t1", "w1", true, function(ok)
+        watched = ok
+      end)
+      wait(function()
+        return watched
+      end, 10000, "the watch")
+      UI:watch(team().watching.session, "t1/w1")
+      wait(function()
+        return UI.router.target ~= nil
+      end, 5000, "the worker transcript")
+      local closes_before = #sent_frames(service, "session/close")
+      service:team_changed({
+        id = "t1",
+        cwd = dir,
+        state = "closed",
+        leader = { sessionId = "sess_leader" },
+        participants = {},
+        inbox = {},
+        limits = {},
+      })
+      wait(function()
+        return UI.router.target == nil
+      end, 5000, "the chat to leave the worker")
+      t.eq(a, state().sess.current, "an unknown leader instance restores the previous chat")
+      t.eq(closes_before, #sent_frames(service, "session/close"), "A was not closed")
+      wait(function()
+        return not UI.layout:is_open()
+      end, 5000, "the panes to go away")
+    end)
+
+    t.it("falls back when the local session's instance is unknown", function()
+      wise(t)
+      local service, dir = start_service(t, "close-local-no-instance", {
+        team_watch = { instance = "inst-w", sessionId = "sess-w" },
+      })
+      setup(t, dir)
+      controller.connect()
+      wait_ready()
+      local a = state().sess.current
+      a.status = "idle"
+      local inst = own_instance()
+      local l = add_chat("sess_leader", dir, inst)
+      l.instance = nil
+      seed_team(service, dir, { leader = { instance = inst, sessionId = "sess_leader" } })
+      local UI = ui()
+      t.eq(true, controller.open_team("all"))
+      local watched
+      team():watch("t1", "w1", true, function(ok)
+        watched = ok
+      end)
+      wait(function()
+        return watched
+      end, 10000, "the watch")
+      UI:watch(team().watching.session, "t1/w1")
+      wait(function()
+        return UI.router.target ~= nil
+      end, 5000, "the worker transcript")
+      local closes_before = #sent_frames(service, "session/close")
+      service:team_changed({
+        id = "t1",
+        cwd = dir,
+        state = "closed",
+        leader = { instance = inst, sessionId = "sess_leader" },
+        participants = {},
+        inbox = {},
+        limits = {},
+      })
+      wait(function()
+        return UI.router.target == nil
+      end, 5000, "the chat to leave the worker")
+      t.eq(a, state().sess.current, "the previous chat comes back, not the same-id session")
+      t.eq(closes_before, #sent_frames(service, "session/close"), "A was not closed")
+      wait(function()
+        return not UI.layout:is_open()
+      end, 5000, "the panes to go away")
+    end)
+
     t.it("the tree's `x` closes the team and its panes", function()
       wise(t)
       local service, dir = start_service(t, "close-tree-x", {

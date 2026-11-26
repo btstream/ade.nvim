@@ -1033,22 +1033,24 @@ end
 ---The leader session of a team that is already out of the caches.
 ---
 ---Only an exact `(instance, sessionId)` match is trusted: a bare id may name a
----different conversation, and the same cwd routinely has several chats.
+---different conversation, and the same cwd routinely has several chats. A
+---missing instance on either side is not evidence of a match, so it falls back
+---to restoring the previous chat.
 ---@param entry table the closed team's last known row
 ---@return table|nil session
 ---@return boolean trusted
 function Dashboard:closed_leader_session(entry)
   local leader = type(entry.leader) == "table" and entry.leader or nil
   local session_id = leader and type(leader.sessionId) == "string" and leader.sessionId or nil
-  if not session_id then
+  local instance = leader and type(leader.instance) == "string" and leader.instance ~= "" and leader.instance or nil
+  if not session_id or not instance then
     return nil, false
   end
-  local instance = type(leader.instance) == "string" and leader.instance or nil
   local function matches(session)
     if type(session) ~= "table" or session.id ~= session_id then
       return false
     end
-    return instance == nil or session.instance == nil or session.instance == instance
+    return type(session.instance) == "string" and session.instance ~= "" and session.instance == instance
   end
   local current = self.current_session and self.current_session() or nil
   if matches(current) then
