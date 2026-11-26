@@ -1638,6 +1638,69 @@ return function(t)
       end
       t.eq(0, loads, "a failed login must not load the session")
     end)
+
+    t.it("manual :Ade login on a ready client with no session creates one", function()
+      local dir = tmpdir("manual-login")
+      local service, service_dir = start_service("manual-login", {
+        -- Two non-terminal methods, so both the initial failure and the manual
+        -- login raise the method picker.
+        canned_auth_methods = {
+          { id = "first", name = "First method" },
+          { id = "second", name = "Second method" },
+        },
+        session_new_auth_error = true,
+      })
+      local saved_cwd = vim.fn.getcwd()
+      vim.cmd("cd " .. vim.fn.fnameescape(dir))
+      t.cleanup(function()
+        pcall(vim.cmd, "cd " .. vim.fn.fnameescape(saved_cwd))
+      end)
+      setup_service(t, service_dir, { ui = { picker = "internal" } })
+      t.cleanup(function()
+        pcall(controller.hide)
+      end)
+
+      local function picker_window()
+        for _, win in ipairs(vim.api.nvim_list_wins()) do
+          if vim.b[vim.api.nvim_win_get_buf(win)].ade_picker == true then
+            return win
+          end
+        end
+      end
+
+      controller.open()
+      local first_picker
+      wait(function()
+        first_picker = picker_window()
+        return first_picker ~= nil
+      end, 20000, "the initial login picker")
+      vim.api.nvim_set_current_win(first_picker)
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+      local S = controller.state()
+      wait(function()
+        return S.conn.phase == "ready" and S.sess.current == nil and picker_window() == nil
+      end, 10000, "a ready client with no session after the cancel")
+
+      -- The person logs in for real; the next session/new succeeds.
+      service.session_new_auth_error = false
+      controller.login()
+      local second_picker
+      wait(function()
+        second_picker = picker_window()
+        return second_picker ~= nil
+      end, 10000, "the manual login picker")
+      vim.api.nvim_set_current_win(second_picker)
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+
+      -- The retry must re-run on_ready on the ready client and create a
+      -- session instead of leaving `current` nil forever.
+      wait(function()
+        local state = controller.state()
+        return state.sess.current ~= nil
+      end, 20000, "the session after the manual login")
+      t.eq("sess_mock", S.sess.current.id)
+      t.eq(2, service.session_new_calls, "one failed creation and one after the manual login")
+    end)
   end)
 
   t.describe("session manager entry points", function()

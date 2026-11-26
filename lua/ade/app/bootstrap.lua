@@ -879,6 +879,17 @@ function M.build(ctx, opts, action)
         S.view.auth
         and S.view.auth:require(err, {
           retry = function()
+            local state = S.conn
+            local client = state.client
+            -- A terminal login restarts the agent; by the time this retry runs
+            -- `on_ready` already handled the restarted client (or is handling
+            -- it right now, in the auth_after_ready drain). Calling connect()
+            -- again would enter on_ready twice for the same ready connection
+            -- and start an empty session beside the pending load. Only a
+            -- connection that is not up needs a real connect.
+            if state.phase == "ready" and client and client:is_ready() then
+              return
+            end
             ctx.connect()
           end,
           on_failed = clear_intent,

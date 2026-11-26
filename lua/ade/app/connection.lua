@@ -245,14 +245,6 @@ function Connection:connect()
   if S.conn.phase == "starting" then
     return
   end
-  -- An auth retry can call `connect()` after the restarted client is already
-  -- ready and `on_ready` has run. Re-entering `on_ready` would consume a
-  -- session manager's pending load twice (or start an empty session while the
-  -- load it just started is still in flight), so a ready connection has
-  -- nothing left to do here.
-  if S.conn.phase == "ready" and S.conn.client and S.conn.client:is_ready() then
-    return
-  end
   -- A stopped client carries old event bindings and an old RPC generation.
   -- Reopening after a crash uses a fresh client just like explicit reconnect.
   if S.conn.client and not S.conn.client:is_ready() then

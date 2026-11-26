@@ -1551,6 +1551,8 @@ function Server:on_tunnel_send(params, client)
         ["session/prompt"] = { stopReason = "end_turn" },
         ["session/close"] = {},
         ["session/delete"] = {},
+        -- A non-terminal login method (`:Ade login`).
+        authenticate = {},
       }
       if not self.canned_resume then
         replies["session/resume"] = nil
