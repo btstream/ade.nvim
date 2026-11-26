@@ -29,8 +29,10 @@ use crate::relay::{
 use crate::runtime::{self, Exited, ProcControl, RuntimeEvent, SpawnSpec, StopTimeouts};
 use crate::store::EventKind;
 
+mod catalog;
 mod teams;
 
+use catalog::{Catalog, CatalogResult};
 use teams::{PendingWorktree, ServiceCall, TeamResult};
 
 /// How long a suspended team is kept (18.15); tests shorten it.
@@ -461,6 +463,9 @@ struct Instance {
     /// The environment and managed release it was launched with, for the
     /// built-in worker template (20.4).
     env: Option<Vec<(String, String)>>,
+    /// A temporary instance the session catalog spawned (PROTOCOL.md 21.3):
+    /// never listed, and its agent-to-client requests are answered -32601.
+    temporary: bool,
     #[cfg(unix)]
     launch: Option<install::Launch>,
 }
@@ -570,6 +575,11 @@ pub struct Hub {
     /// A closed team's one notice to its leader session, waiting for that
     /// session's running prompt to end (20.9). Keyed by (instance, session).
     closing_notices: HashMap<(String, String), Vec<(u64, Value)>>,
+    /// Session catalog refreshes and their service-originated requests
+    /// (PROTOCOL.md 21).
+    catalog: Catalog,
+    /// Finished catalog reads from the blocking pool.
+    catalog_results: mpsc::UnboundedReceiver<CatalogResult>,
 }
 
 impl Hub {
@@ -583,6 +593,7 @@ impl Hub {
         let (runtime_sender, runtime_events) = mpsc::unbounded_channel::<RuntimeEvent>();
         let (load_sender, load_results) = mpsc::unbounded_channel::<LoadResult>();
         let (team_sender, team_results) = mpsc::unbounded_channel::<TeamResult>();
+        let (catalog, catalog_results) = Catalog::new();
         #[cfg(unix)]
         let (install_event_sender, install_events) = mpsc::unbounded_channel::<InstallEvent>();
         Self {
@@ -640,6 +651,8 @@ impl Hub {
             pending_enables: HashMap::new(),
             next_pending_enable: 0,
             closing_notices: HashMap::new(),
+            catalog,
+            catalog_results,
         }
     }
 
@@ -779,8 +792,14 @@ impl Hub {
                     self.finish_team_result(result);
                     self.update_busy();
                 }
+                result = self.catalog_results.recv() => {
+                    let Some(result) = result else { return };
+                    self.finish_catalog_result(result);
+                    self.update_busy();
+                }
                 _ = expiry.tick() => {
                     self.expire_teams();
+                    self.expire_catalog();
                     self.update_busy();
                 }
                 _ = board_tick.tick() => {
@@ -891,6 +910,7 @@ impl Hub {
             Command::Disconnected { conn } => {
                 self.conns.remove(&conn);
                 self.drop_pending_enables_of(conn);
+                self.catalog_connection_closed(conn);
                 if let Some(token) = self.conn_tokens.get(&conn).cloned() {
                     if let Some(identity) = self.teams.session_identity(&token) {
                         let before = self.session_states(std::slice::from_ref(&identity));
@@ -1111,6 +1131,13 @@ impl Hub {
             return;
         }
 
+        if method.starts_with("sessions.") {
+            if is_request {
+                self.handle_catalog_method(conn, &method, &params, &id);
+            }
+            return;
+        }
+
         if method.starts_with("team.") || method == "session.teams" {
             if !self.event_log {
                 // Teams are advertised only together with "log"; without it
@@ -1157,6 +1184,7 @@ impl Hub {
                     let instances: Vec<Value> = self
                         .instances
                         .iter()
+                        .filter(|(_, instance)| !instance.temporary)
                         .map(|(id, instance)| {
                             let mut summary =
                                 instance_summary(instance, self.log_bytes(&instance.log_key));
@@ -1661,6 +1689,7 @@ impl Hub {
     ) -> Result<String, String> {
         self.spawn_inner(
             Some(identity),
+            false,
             key,
             env,
             #[cfg(unix)]
@@ -1679,6 +1708,25 @@ impl Hub {
     ) -> Result<String, String> {
         self.spawn_inner(
             None,
+            false,
+            key,
+            env,
+            #[cfg(unix)]
+            launch,
+        )
+    }
+
+    /// Spawn an unlisted temporary instance for one `sessions.refresh`
+    /// (PROTOCOL.md 21.3): no identity, no logging, never in `agent.list`.
+    fn spawn_catalog(
+        &mut self,
+        key: InstanceKey,
+        env: Option<Vec<(String, String)>>,
+        #[cfg(unix)] launch: Option<install::Launch>,
+    ) -> Result<String, String> {
+        self.spawn_inner(
+            None,
+            true,
             key,
             env,
             #[cfg(unix)]
@@ -1689,6 +1737,7 @@ impl Hub {
     fn spawn_inner(
         &mut self,
         listed_identity: Option<String>,
+        temporary: bool,
         key: InstanceKey,
         env: Option<Vec<(String, String)>>,
         #[cfg(unix)] launch: Option<install::Launch>,
@@ -1770,7 +1819,11 @@ impl Hub {
                 identity.clone()
             }
             None => {
-                let key = format!("team:{instance_id}");
+                let key = if temporary {
+                    format!("catalog:{instance_id}")
+                } else {
+                    format!("team:{instance_id}")
+                };
                 self.recorder.forget_instance(&key);
                 key
             }
@@ -1784,13 +1837,16 @@ impl Hub {
                 started_at: now_ms(),
                 control: started.control,
                 exited,
-                relay: Relay::with_log(key.capabilities.clone(), self.event_log),
+                // A temporary catalog instance never records events
+                // (PROTOCOL.md 21.3).
+                relay: Relay::with_log(key.capabilities.clone(), self.event_log && !temporary),
                 log_key,
                 attached: Vec::new(),
                 stopping: false,
                 #[cfg(unix)]
                 _lease: lease,
                 env,
+                temporary,
                 #[cfg(unix)]
                 launch,
             },
@@ -2540,6 +2596,20 @@ impl Hub {
             );
             return;
         }
+        // A temporary catalog instance has no front end: every agent-to-client
+        // request is answered -32601 and never enters the pending set, and its
+        // notifications are dropped (PROTOCOL.md 21.3 step 2).
+        if self
+            .instances
+            .get(instance_id)
+            .is_some_and(|instance| instance.temporary)
+            && value.get("method").is_some()
+        {
+            if let Some(id) = value.get("id").cloned() {
+                self.worker_error_response(instance_id, &id);
+            }
+            return;
+        }
         // Permission policy first (PROTOCOL.md 17.2): a decided request is
         // answered here, never added to the pending set and never relayed.
         let is_permission = value.get("method").and_then(Value::as_str)
@@ -2611,6 +2681,17 @@ impl Hub {
         let had_prompt_finished = outcome.prompt_finished.is_some();
         let events = outcome.events.clone();
         self.record_events(instance_id, events);
+        // A successful `session/delete` removes the catalog row for the
+        // instance's agent (PROTOCOL.md 21.4).
+        if let Some(session) = outcome.deleted_session.clone() {
+            if let Some(agent) = self
+                .instances
+                .get(instance_id)
+                .map(|instance| instance.key.agent.clone())
+            {
+                self.delete_catalog_session(&agent, &session);
+            }
+        }
 
         // Retractions come first: a front end must close the question before
         // the agent sees the answer (PROTOCOL.md 14).
@@ -2703,7 +2784,9 @@ impl Hub {
                 seq,
                 message,
             }) => {
-                self.handle_service_response(instance_id, agent_id, seq, &message);
+                if !self.handle_catalog_service_response(instance_id, agent_id, &message) {
+                    self.handle_service_response(instance_id, agent_id, seq, &message);
+                }
             }
             Some(AgentAction::Drop) | None => {
                 // The requester left, but the agent still answered a forwarded
@@ -2791,6 +2874,7 @@ impl Hub {
         let before = self.session_states(&exiting_sessions);
         self.fail_held_prompts(instance_id);
         self.cleanup_instance_pending(instance_id);
+        self.catalog_instance_exited(instance_id);
         let Some(instance) = self.instances.remove(instance_id) else {
             return;
         };
@@ -2860,6 +2944,7 @@ impl Hub {
 
     fn update_busy(&mut self) {
         let busy = self.teams.has_active()
+            || self.catalog.busy()
             || self.instances.values().any(|instance| {
                 instance.relay.turns_running() > 0 || instance.relay.pending_requests() > 0
             })
@@ -3480,6 +3565,7 @@ mod tests {
             #[cfg(unix)]
             _lease: None,
             env: None,
+            temporary: false,
             #[cfg(unix)]
             launch: None,
         };

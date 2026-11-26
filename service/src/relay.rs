@@ -487,6 +487,9 @@ pub struct AgentOutcome {
     pub delivered: Vec<Delivery>,
     /// A front end closed or deleted this session successfully.
     pub closed_session: Option<String>,
+    /// The same, but only for a successful `session/delete`: the catalog row
+    /// must go (PROTOCOL.md 21.4). `session/close` leaves it in place.
+    pub deleted_session: Option<String>,
     /// The front-end request this frame answers (20.2 token binding).
     pub frontend_request: Option<FrontendRequest>,
 }
@@ -1378,9 +1381,16 @@ impl Relay {
         // Session bookkeeping for the methods that change the session table
         // (PROTOCOL.md 11).
         let closed_session = self.track_session_response(&outgoing, object);
+        // A successful delete is also a catalog change (PROTOCOL.md 21.4);
+        // `session/close` is not.
+        let deleted_session = match outgoing.method.as_str() {
+            "session/delete" if object.get("result").is_some() => outgoing.session_id.clone(),
+            _ => None,
+        };
 
         let mut outcome = AgentOutcome {
             closed_session,
+            deleted_session,
             frontend_request: frontend
                 .as_ref()
                 .map(|(conn, frontend_id)| FrontendRequest {
