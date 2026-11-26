@@ -284,10 +284,20 @@ return function(t)
       end, 5000, "the board pane")
       t.truthy(pane_win(UI, "members"), "the board does not close members")
       t.eq("ade_team_board", vim.bo[pane_buf(UI, "board")].filetype)
+      -- A narrow board shows the columns that fit and pages the rest with
+      -- `zh`/`zl`, so the first column comes up straight away and `T1` (in the
+      -- second column) needs one page to the right.
       wait(function()
-        local text = pane_text(UI, "board")
-        return text:find("T1", 1, true) ~= nil and text:find("待开发", 1, true) ~= nil
-      end, 5000, "the board rows")
+        return pane_text(UI, "board"):find("待开发", 1, true) ~= nil
+      end, 5000, "the board's first column")
+      local visible = require("ade.ui.team.board").visible_columns(vim.api.nvim_win_get_width(pane_win(UI, "board")), 2)
+      if visible < 2 then
+        vim.api.nvim_set_current_win(pane_win(UI, "board"))
+        UI:handle_key("zl")
+      end
+      wait(function()
+        return pane_text(UI, "board"):find("T1", 1, true) ~= nil
+      end, 5000, "the board's T1 card")
       -- Focusing the same pane again must not duplicate it.
       vim.cmd("Ade team board")
       local wins = {}
