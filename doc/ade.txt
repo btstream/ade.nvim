@@ -26,6 +26,7 @@ ade.nvim 是一个 Neovim 原生的 Agent Client Protocol 客户端。
     new          新建会话
     stop         中止当前回合
     sessions     打开会话浏览器（<CR> 切换，<C-d> 删除，输入即过滤）
+    sessions all 跨 Agent 会话管理器：所有已配置 Agent、所有目录的会话
     delete       同 sessions，在浏览器内用 <C-d> 删除
     model        切换模型
     mode         切换模式
@@ -555,6 +556,39 @@ q 关闭，gg/G 跳到首项/末项；需要搜索保留字母 j/k/q 时用大�
 
 删除非当前会话不影响当前对话；删除当前会话会自动新建一个。Agent 未声明
 sessionCapabilities.delete 时给出提示，不弹出无法兑现的确认框。
+
+跨 Agent 会话管理器                                   *ade-session-manager*
+
+:Ade sessions all（Lua：require("ade").session_manager()）在一个窗口里列出所有
+已配置 Agent 的会话，跨项目目录。它先显示服务缓存（sessions.cached），再让各
+Agent 在后台刷新（sessions.refresh），先完成的 Agent 先替换自己的行
+（sessions.updated）。顶部状态行逐个 Agent 显示：
+
+    ✓ 个数      已列出的会话数
+    ⟳           正在刷新
+    ✗ 错误      刷新失败，该 Agent 的缓存行仍然可见
+    – 原因      未安装或命令不可用，不参与刷新
+
+行按 updatedAt 倒序；缺少 updatedAt 的排在最后，再按 Agent、标题排序。当前面板
+正在显示的会话（同一 Agent、同一 id）行首带箭头。目录已不存在的行变暗并显示
+(missing)，<CR> 只提示不加载。
+
+    <CR>        打开选中的会话
+    <C-r>       再次刷新
+    <Tab>       切换 Agent 过滤（全部 → 各 Agent → 全部）
+    <C-d>       无（此窗口不删除会话）
+    输入        fuzzy 过滤 Agent、目录和标题
+    <BS>/<C-u>  删除一个字符 / 清空过滤
+    <Esc>/q     关闭
+
+该窗口需要服务后端且 hello.features 含 "sessions"（服务 0.9.0、api_version 8）。
+否则提示一次，并退回当前 Agent 的 :Ade sessions 浏览器。
+
+打开一行时：目录已不存在则只提示；cwd 被配置固定且与会话目录不同则拒绝；当前
+Agent 与连接目录都匹配时直接加载；否则先 :cd 到会话目录，再像 :Ade agent 那样
+切换 Agent，并留下一次性待加载会话——新连接就绪后直接加载它，不会先建空会话。
+若当前有排队消息或运行中的回合，会先确认“丢弃 N 条排队消息、打断 M 个回合”，
+可取消。服务中的团队状态不受影响。
 
 ==============================================================================
 16. 行为细节                                                *ade-behavior*
