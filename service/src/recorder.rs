@@ -131,6 +131,26 @@ enum Job {
         instance_key: String,
         session_id: String,
     },
+    /// Replace one agent's catalog rows and its state (PROTOCOL.md 21.5).
+    CatalogReplace {
+        agent: String,
+        entries: Vec<(String, String)>,
+        state_json: String,
+        bytes: usize,
+    },
+    /// Record a failed refresh for one agent (21.3).
+    CatalogError {
+        agent: String,
+        code: i64,
+        message: String,
+        bytes: usize,
+    },
+    /// Remove one catalog row (21.4).
+    CatalogDelete {
+        agent: String,
+        session_id: String,
+        bytes: usize,
+    },
     /// Complete the receiver once every earlier job is written.
     Barrier(oneshot::Sender<()>),
 }
@@ -566,6 +586,79 @@ impl Recorder {
         }
     }
 
+    // -- session catalog (PROTOCOL.md 21.5) --------------------------------
+
+    /// Queue a full replacement of one agent's catalog rows, ordered with the
+    /// writes around it. Never blocks; the writer owns the store.
+    pub fn replace_catalog(&self, agent: &str, entries: Vec<(String, String)>, state_json: String) {
+        if !self.enabled {
+            return;
+        }
+        let bytes = agent.len()
+            + state_json.len()
+            + entries
+                .iter()
+                .map(|(session_id, json)| session_id.len() + json.len())
+                .sum::<usize>();
+        self.inner.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if !self.send(Job::CatalogReplace {
+            agent: agent.to_string(),
+            entries,
+            state_json,
+            bytes,
+        }) {
+            self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Queue a failed-refresh state for one agent (its rows are kept).
+    pub fn set_catalog_error(&self, agent: &str, code: i64, message: &str) {
+        if !self.enabled {
+            return;
+        }
+        let bytes = agent.len() + message.len();
+        self.inner.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if !self.send(Job::CatalogError {
+            agent: agent.to_string(),
+            code,
+            message: message.to_string(),
+            bytes,
+        }) {
+            self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Queue the removal of one catalog row (a successful `session/delete`).
+    pub fn delete_catalog_session(&self, agent: &str, session_id: &str) {
+        if !self.enabled {
+            return;
+        }
+        let bytes = agent.len() + session_id.len();
+        self.inner.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if !self.send(Job::CatalogDelete {
+            agent: agent.to_string(),
+            session_id: session_id.to_string(),
+            bytes,
+        }) {
+            self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Flush, then read the whole catalog (entries and agent states).
+    ///
+    /// Reading touches SQLite, so it runs on the blocking pool. With the event
+    /// log disabled there is no catalog: `sessions.cached` answers empty.
+    pub async fn load_catalog(&self) -> Result<crate::store::StoredCatalog> {
+        if !self.enabled {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        self.flush().await;
+        let store = Arc::clone(&self.inner.store);
+        tokio::task::spawn_blocking(move || store.load_session_catalog())
+            .await
+            .context("reading the session catalog")?
+    }
+
     /// Number of team snapshot transactions actually written (a test sees
     /// whether a batch coalesced several saves for one team).
     pub fn team_write_count(&self) -> usize {
@@ -843,6 +936,29 @@ impl Writer {
                         self.write(&mut batch);
                         self.mark_session_incomplete_now(&instance_key, &session_id);
                     }
+                    Job::CatalogReplace {
+                        agent,
+                        entries,
+                        state_json,
+                        bytes,
+                    } => {
+                        self.replace_catalog(&agent, &entries, &state_json, bytes);
+                    }
+                    Job::CatalogError {
+                        agent,
+                        code,
+                        message,
+                        bytes,
+                    } => {
+                        self.set_catalog_error(&agent, code, &message, bytes);
+                    }
+                    Job::CatalogDelete {
+                        agent,
+                        session_id,
+                        bytes,
+                    } => {
+                        self.delete_catalog_session(&agent, &session_id, bytes);
+                    }
                     Job::TeamSave {
                         id,
                         state_json,
@@ -936,6 +1052,29 @@ impl Writer {
                 } => {
                     self.write(&mut batch);
                     self.mark_session_incomplete_now(&instance_key, &session_id);
+                }
+                Job::CatalogReplace {
+                    agent,
+                    entries,
+                    state_json,
+                    bytes,
+                } => {
+                    self.replace_catalog(&agent, &entries, &state_json, bytes);
+                }
+                Job::CatalogError {
+                    agent,
+                    code,
+                    message,
+                    bytes,
+                } => {
+                    self.set_catalog_error(&agent, code, &message, bytes);
+                }
+                Job::CatalogDelete {
+                    agent,
+                    session_id,
+                    bytes,
+                } => {
+                    self.delete_catalog_session(&agent, &session_id, bytes);
                 }
                 Job::TeamSave {
                     id,
@@ -1255,6 +1394,36 @@ impl Writer {
             }
         }
         self.flush_team_saves();
+    }
+
+    fn replace_catalog(
+        &mut self,
+        agent: &str,
+        entries: &[(String, String)],
+        state_json: &str,
+        bytes: usize,
+    ) {
+        self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        if let Err(error) = self
+            .store
+            .replace_session_catalog(agent, entries, state_json)
+        {
+            crate::svc_log!("nvim_ade_server: cannot save the session catalog: {error:#}");
+        }
+    }
+
+    fn set_catalog_error(&mut self, agent: &str, code: i64, message: &str, bytes: usize) {
+        self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        if let Err(error) = self.store.set_session_catalog_error(agent, code, message) {
+            crate::svc_log!("nvim_ade_server: cannot save the catalog error: {error:#}");
+        }
+    }
+
+    fn delete_catalog_session(&mut self, agent: &str, session_id: &str, bytes: usize) {
+        self.inner.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        if let Err(error) = self.store.delete_session_catalog_row(agent, session_id) {
+            crate::svc_log!("nvim_ade_server: cannot delete a catalog row: {error:#}");
+        }
     }
 
     fn save_board(

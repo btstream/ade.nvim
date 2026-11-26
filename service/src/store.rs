@@ -71,10 +71,16 @@ use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBeha
 /// - 1: the S4a event log.
 /// - 2: the team tables (18.15).
 /// - 3: boards, card history and named workflows (19.11).
-pub const SCHEMA_VERSION: i64 = 4;
+/// - 4: per-session team switches (20.5).
+/// - 5: the session catalog (21.5).
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// How long a writer waits for another process holding the database lock.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Every stored catalog entry and agent state, each as `(key, json)` text
+/// (PROTOCOL.md 21.5). The caller decodes the JSON.
+pub type StoredCatalog = (Vec<(String, String)>, Vec<(String, String)>);
 
 /// What a stored event is.
 ///
@@ -940,6 +946,109 @@ impl Store {
         Ok(())
     }
 
+    /// Replace every catalog row of one agent and record its state
+    /// (PROTOCOL.md 21.3 and 21.5): the listed entries win, an old row that is
+    /// no longer listed disappears.
+    pub fn replace_session_catalog(
+        &self,
+        agent: &str,
+        entries: &[(String, String)],
+        state_json: &str,
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("starting the session catalog replacement")?;
+        tx.execute(
+            "DELETE FROM session_catalog WHERE agent = ?1",
+            params![agent],
+        )
+        .context("clearing the agent's catalog rows")?;
+        {
+            let mut insert = tx
+                .prepare_cached(
+                    "INSERT INTO session_catalog (agent, session_id, json) VALUES (?1, ?2, ?3)",
+                )
+                .context("preparing a catalog row insert")?;
+            for (session_id, json) in entries {
+                insert
+                    .execute(params![agent, session_id, json])
+                    .context("inserting a catalog row")?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO session_catalog_agents (agent, json) VALUES (?1, ?2)
+             ON CONFLICT(agent) DO UPDATE SET json = excluded.json",
+            params![agent, state_json],
+        )
+        .context("saving the catalog agent state")?;
+        tx.commit()
+            .context("committing the session catalog replacement")?;
+        Ok(())
+    }
+
+    /// Record a failed refresh for one agent, keeping its rows and
+    /// `listed_at` (PROTOCOL.md 21.3 step 6).
+    pub fn set_session_catalog_error(&self, agent: &str, code: i64, message: &str) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("starting the catalog error update")?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT json FROM session_catalog_agents WHERE agent = ?1",
+                params![agent],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("reading the catalog agent state")?;
+        let mut state = existing
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        state["error"] = serde_json::json!({ "code": code, "message": message });
+        tx.execute(
+            "INSERT INTO session_catalog_agents (agent, json) VALUES (?1, ?2)
+             ON CONFLICT(agent) DO UPDATE SET json = excluded.json",
+            params![agent, state.to_string()],
+        )
+        .context("saving the catalog agent error")?;
+        tx.commit().context("committing the catalog error update")?;
+        Ok(())
+    }
+
+    /// Remove one catalog row (a successful `session/delete`, PROTOCOL.md
+    /// 21.4).
+    pub fn delete_session_catalog_row(&self, agent: &str, session_id: &str) -> Result<()> {
+        self.lock()?
+            .prepare_cached("DELETE FROM session_catalog WHERE agent = ?1 AND session_id = ?2")?
+            .execute(params![agent, session_id])
+            .context("deleting a catalog row")?;
+        Ok(())
+    }
+
+    /// Every catalog entry and agent state, as stored JSON text: `(entries,
+    /// agent states)`. The caller decodes them; an unreadable row is dropped
+    /// there, never guessed.
+    pub fn load_session_catalog(&self) -> Result<StoredCatalog> {
+        let conn = self.lock()?;
+        let entries = conn
+            .prepare("SELECT agent, json FROM session_catalog")?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("loading the session catalog")?;
+        let agents = conn
+            .prepare("SELECT agent, json FROM session_catalog_agents")?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("loading the catalog agent states")?;
+        Ok((entries, agents))
+    }
+
     pub fn clear_events_for_restart(&self) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn
@@ -973,8 +1082,8 @@ impl Store {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .context("reading the event store schema version")
             .map_err(Failure::classify)?;
-        // Version 1 is the S4a event log; version 2 adds the team tables. Both
-        // migrate in place, and existing events are kept.
+        // Versions 1 through 4 all migrate in place, and existing events are
+        // kept.
         if version != 0 && !(1..=SCHEMA_VERSION).contains(&version) {
             return Err(Failure::corrupt(format!(
                 "event store schema version {version} is not supported (expected {SCHEMA_VERSION})"
@@ -1249,6 +1358,16 @@ fn create_schema(conn: &Connection) -> Result<()> {
              session_id TEXT    NOT NULL,
              enabled    INTEGER NOT NULL,
              PRIMARY KEY (agent, session_id)
+         );
+         CREATE TABLE IF NOT EXISTS session_catalog (
+             agent      TEXT NOT NULL,
+             session_id TEXT NOT NULL,
+             json       TEXT NOT NULL,
+             PRIMARY KEY (agent, session_id)
+         );
+         CREATE TABLE IF NOT EXISTS session_catalog_agents (
+             agent TEXT PRIMARY KEY,
+             json  TEXT NOT NULL
          );",
     )
     .context("creating tables")
