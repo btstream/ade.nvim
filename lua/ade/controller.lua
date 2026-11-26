@@ -470,6 +470,16 @@ function M.pick_session()
   end
 end
 
+---Open the cross-agent session manager (`:Ade sessions all`).
+---
+---Works before the panel has connected: it uses the shared service connection,
+---and falls back to `pick_session()` on a direct backend or an old service.
+function M.session_manager()
+  if S.view.session_manager then
+    S.view.session_manager:open()
+  end
+end
+
 ---Open the session browser ready to delete (same dialog, <C-d> is the action).
 function M.delete_session_flow()
   M.pick_session()

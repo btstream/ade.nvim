@@ -218,6 +218,12 @@ function M.pick_session()
   ensure().pick_session()
 end
 
+---Open the session manager: every configured agent's stored sessions, across
+---directories (`:Ade sessions all`).
+function M.session_manager()
+  ensure().session_manager()
+end
+
 ---Delete a stored session (asks for confirmation first).
 function M.delete_session()
   ensure().delete_session_flow()
