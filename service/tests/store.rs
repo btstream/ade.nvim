@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use nvim_ade_server::store::{EventKind, NewEvent, Query, Store};
+use nvim_ade_server::store::{EventKind, NewEvent, Query, Store, SCHEMA_VERSION};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1196,7 +1196,7 @@ fn a_version_one_log_migrates_without_losing_events() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 4);
+    assert_eq!(version, SCHEMA_VERSION);
     let tables: i64 = conn
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type = 'table'
@@ -1256,7 +1256,7 @@ fn a_version_two_log_with_data_keeps_events_and_teams_when_upgraded() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 4);
+    assert_eq!(version, SCHEMA_VERSION);
     let tables: i64 = conn
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type = 'table'
@@ -1311,4 +1311,114 @@ fn workflows_are_stored_per_scope_and_project_and_survive_reopening() {
     let rows = store.load_workflows().expect("load");
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|(scope, _, _, _)| scope == "project"));
+}
+
+#[test]
+fn a_version_four_log_adds_the_session_catalog_when_upgraded() {
+    let dir = TempDir::new("migrate-v4");
+    let path = dir.db();
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    {
+        let store = Store::open(&path).expect("open");
+        store
+            .append(event("old-instance", Some("old-session"), "kept"))
+            .expect("append");
+        store
+            .save_team("t7", r#"{"id":"t7","cwd":"/p"}"#, 7, 3)
+            .expect("save team");
+    }
+    // Turn the file into the v4 schema: no catalog tables.
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw");
+        conn.execute_batch(
+            "DROP TABLE session_catalog; DROP TABLE session_catalog_agents;
+             PRAGMA user_version = 4;",
+        )
+        .expect("downgrade");
+    }
+
+    let store = Store::open(&path).expect("migrate");
+    let events = store.read(&Query::new("old-instance")).expect("read");
+    assert_eq!(events.len(), 1, "the event log survives the upgrade");
+    assert_eq!(store.load_teams().expect("teams").len(), 1);
+    let conn = rusqlite::Connection::open(&path).expect("open raw");
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("version");
+    assert_eq!(version, SCHEMA_VERSION);
+    let tables: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table'
+             AND name IN ('session_catalog', 'session_catalog_agents')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("tables");
+    assert_eq!(tables, 2);
+    drop(conn);
+
+    store
+        .replace_session_catalog(
+            "claude",
+            &[(
+                "s1".to_string(),
+                r#"{"agent":"claude","sessionId":"s1","cwd":"/p"}"#.to_string(),
+            )],
+            r#"{"listed_at":7}"#,
+        )
+        .expect("save catalog");
+    drop(store);
+
+    let store = Store::open(&path).expect("reopen");
+    let (entries, agents) = store.load_session_catalog().expect("load catalog");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, "claude");
+    assert_eq!(
+        agents,
+        vec![("claude".to_string(), r#"{"listed_at":7}"#.to_string())]
+    );
+}
+
+#[test]
+fn the_session_catalog_is_not_cleared_with_the_event_log() {
+    let dir = TempDir::new("catalog-kept");
+    let path = dir.db();
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    let store = Store::open(&path).expect("open");
+    store
+        .replace_session_catalog(
+            "opencode",
+            &[
+                (
+                    "a".to_string(),
+                    r#"{"agent":"opencode","sessionId":"a","cwd":"/p"}"#.to_string(),
+                ),
+                (
+                    "b".to_string(),
+                    r#"{"agent":"opencode","sessionId":"b","cwd":"/q"}"#.to_string(),
+                ),
+            ],
+            r#"{"listed_at":11}"#,
+        )
+        .expect("save catalog");
+    // A failed refresh keeps the rows and keeps `listed_at`.
+    store
+        .set_session_catalog_error("opencode", -32071, "the session list timed out")
+        .expect("error state");
+
+    store.clear_events_for_restart().expect("restart");
+
+    let (entries, agents) = store.load_session_catalog().expect("load catalog");
+    assert_eq!(entries.len(), 2, "the catalog survives a restart");
+    let state: serde_json::Value = serde_json::from_str(&agents[0].1).expect("state json");
+    assert_eq!(state["listed_at"], 11);
+    assert_eq!(state["error"]["code"], -32071);
+
+    store
+        .delete_session_catalog_row("opencode", "a")
+        .expect("delete row");
+    let (entries, _) = store.load_session_catalog().expect("load catalog");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, "opencode");
+    assert!(entries[0].1.contains("\"sessionId\":\"b\""));
 }

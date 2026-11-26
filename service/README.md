@@ -5,7 +5,7 @@ Neovim, one process per user, and holds ACP agent processes so they outlive the
 front end. It relays raw ACP JSON-RPC between an agent and whichever front end
 is attached; it is not an ACP client itself.
 
-The protocol (api_version 7) is specified in [`PROTOCOL.md`](PROTOCOL.md). That
+The protocol (api_version 8) is specified in [`PROTOCOL.md`](PROTOCOL.md). That
 document is the contract: socket and token paths are in "Where things live"
 below, everything else is there.
 
@@ -14,7 +14,7 @@ below, everything else is there.
 | Command | What it does |
 |---|---|
 | `nvim_ade_server serve [--socket <path>] [--idle-timeout <secs>] [--print-paths] [--event-log on\|off] [--event-log-max-mb <n>]` | Run the service. `--idle-timeout` overrides `NVIM_ADE_SERVER_IDLE_TIMEOUT_SECS` (default 1800); `--print-paths` prints the resolved paths and exits without binding. `--event-log` (default `on`) and `--event-log-max-mb` (default 256, 16–4096) are the event log flags of PROTOCOL.md section 15. |
-| `nvim_ade_server version` | Print `{"version":"0.8.1","api_version":7}` on one line. |
+| `nvim_ade_server version` | Print `{"version":"0.9.0","api_version":8}` on one line. |
 | `nvim_ade_server mcp` | MCP over stdio for a team participant. Reads `ADE_TEAM_TOKEN` from the environment (never from argv) and connects to the service socket; it never prints the token. |
 
 `serve` prints exactly one line on stdout:
@@ -138,11 +138,12 @@ is kept for `agent.exited`.
 [`PROTOCOL.md`](PROTOCOL.md) is normative; this is a short orientation.
 
 JSON-RPC 2.0, one UTF-8 JSON object per line, terminated by `\n`, max 64 MiB.
-The current `api_version` is **7** and `hello` reports `features: ["tunnel",
-"install", "policy", "log", "teams"]` on unix (`"install"` is absent on Windows;
-with `--event-log off` `"log"` and `"teams"` are absent too, because teams need
-the event log). A participant connection (`hello.participant_token`) gets an
-empty `features` list and may call only `bus.*`.
+The current `api_version` is **8** and `hello` reports `features: ["tunnel",
+"install", "policy", "log", "teams", "sessions"]` on unix (`"install"` is
+absent on Windows; with `--event-log off` `"log"` and `"teams"` are absent too,
+because teams need the event log; `"sessions"` stays). A participant connection
+(`hello.participant_token`) gets an empty `features` list and may call only
+`bus.*`.
 
 | Method | Direction | Purpose |
 |---|---|---|
@@ -151,6 +152,8 @@ empty `features` list and may call only `bus.*`.
 | `install.resolve / run / uninstall` | front end → service | managed npm installs, unix only (PROTOCOL.md 16) |
 | `policy.set / clear / list` | front end → service | permission rule sets (PROTOCOL.md 17) |
 | `policy.applied` (notification) | service → attached front ends | a request the policy answered itself |
+| `sessions.cached / refresh` | front end → service | the cross-agent session catalog (PROTOCOL.md 21) |
+| `sessions.updated` (notification) | service → the requesting connection | one agent's catalog result |
 | `team.configure / list / set_leader / stop_worker / session.teams / send / read / answer / answer_group / watch / unwatch / reset_limits / close` | front end → service | teams and the bus (PROTOCOL.md 18, 19) |
 | `team.start / workflows / workflow_delete / board / card_history` | front end → service | workflows and the board (PROTOCOL.md 19) |
 | `bus.spawn / send / ask_human / status / read` | participant (MCP) → service | tools for a team agent (PROTOCOL.md 18.6) |
@@ -324,17 +327,28 @@ after 7 days. Participant tokens are at least 128 random bits and kept only as
 hashes; neither tokens nor template environments are written to the event log,
 `team.list` or stderr.
 
-## Team storage (schema v3)
+## Team storage (schema v5)
 
 The event log database (`nvim_ade_server.events.sqlite3`, 0600) uses
-`PRAGMA user_version = 3`. Version 1 was the event log, version 2 added the
-team tables; both migrate **in place** and keep their data. Version 3 adds:
+`PRAGMA user_version = 5`. Version 1 was the event log, version 2 added the
+team tables, version 3 the boards/workflows and version 4 the per-session team
+switches; all migrate **in place** and keep their data. Version 3 adds:
 
 | Table | Contents |
 |---|---|
 | `boards (team_id PRIMARY KEY, rev, json)` | the team's board as last persisted: workflow name and text, columns and every card (title, column, owner, stage, body up to 8 KiB, fields). A board serialises to at most 256 KiB. |
 | `card_history (team_id, card_id, rev, json, ts_ms, PRIMARY KEY (team_id, card_id, rev))` | the previously persisted version of every card a write changed; each card keeps its 20 newest versions. |
 | `workflows (scope, project, name, json, updated_ms, PRIMARY KEY (scope, project, name))` | named workflows saved by the leader; `scope` is `project` (with the project key in `project`) or `user` (`project` is `""`). The JSON holds the summary, the flow **text** and the team composition. |
+
+Version 5 adds the session catalog (PROTOCOL.md 21.5):
+
+| Table | Contents |
+|---|---|
+| `session_catalog (agent, session_id, json, PRIMARY KEY (agent, session_id))` | one listed session per row, as an entry of PROTOCOL.md 21.1. Replaced per agent on a successful refresh. |
+| `session_catalog_agents (agent PRIMARY KEY, json)` | `listed_at` / last `error` of one agent. |
+
+The catalog is **not** cleared with the event log: both tables survive a
+service restart.
 
 Retention and deletion:
 

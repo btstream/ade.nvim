@@ -487,6 +487,9 @@ pub struct AgentOutcome {
     pub delivered: Vec<Delivery>,
     /// A front end closed or deleted this session successfully.
     pub closed_session: Option<String>,
+    /// The same, but only for a successful `session/delete`: the catalog row
+    /// must go (PROTOCOL.md 21.4). `session/close` leaves it in place.
+    pub deleted_session: Option<String>,
     /// The front-end request this frame answers (20.2 token binding).
     pub frontend_request: Option<FrontendRequest>,
 }
@@ -598,6 +601,13 @@ impl Relay {
     /// The `initialize` result the agent returned, once it succeeded.
     pub fn initialize_result(&self) -> Option<&Value> {
         self.initialize.as_ref().map(|(_, result)| result)
+    }
+
+    /// Forget a service request that will never be answered (a timed-out
+    /// catalog listing). A late response for it is then an unknown id and is
+    /// dropped like any other unmapped response.
+    pub fn forget_service_request(&mut self, agent_id: u64) {
+        self.outgoing.remove(&agent_id);
     }
 
     /// Sessions known to live in the instance, newest activity first
@@ -1378,9 +1388,16 @@ impl Relay {
         // Session bookkeeping for the methods that change the session table
         // (PROTOCOL.md 11).
         let closed_session = self.track_session_response(&outgoing, object);
+        // A successful delete is also a catalog change (PROTOCOL.md 21.4);
+        // `session/close` is not.
+        let deleted_session = match outgoing.method.as_str() {
+            "session/delete" if object.get("result").is_some() => outgoing.session_id.clone(),
+            _ => None,
+        };
 
         let mut outcome = AgentOutcome {
             closed_session,
+            deleted_session,
             frontend_request: frontend
                 .as_ref()
                 .map(|(conn, frontend_id)| FrontendRequest {
@@ -2766,5 +2783,21 @@ mod tests {
             "error": {"code": -32800, "message": "request cancelled"},
         });
         assert_eq!(relay.frontend_message(B, &late), FrontendAction::Drop);
+    }
+
+    #[test]
+    fn a_forgotten_service_request_does_not_leak_and_its_late_answer_is_ignored() {
+        let mut relay = Relay::new(json!({}));
+        let (agent_id, _frame) = relay.service_request("session/list", json!({}));
+        assert_eq!(relay.outgoing.len(), 1, "the request is tracked");
+
+        relay.forget_service_request(agent_id);
+        assert!(relay.outgoing.is_empty(), "nothing is left behind");
+
+        // The agent answered anyway: the unmapped id is dropped safely.
+        let late = json!({"jsonrpc": "2.0", "id": agent_id, "result": {"sessions": []}});
+        let outcome = relay.agent_message_full(&late, &[]);
+        assert_eq!(outcome.action, Some(AgentAction::Invalid));
+        assert_eq!(relay.pending_requests(), 0);
     }
 }

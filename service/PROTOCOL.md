@@ -1,4 +1,4 @@
-# nvim_ade_server protocol (api_version 6, service 0.7.1)
+# nvim_ade_server protocol (api_version 8, service 0.9.0)
 
 This is the contract between the Neovim front end (`lua/ade/service/`) and the
 service (`service/src/`). Both sides implement it as written; a deviation is a
@@ -39,8 +39,8 @@ they do not change what is written here.
 `-> {token, client, client_version, api_version}`
 `<- {server_version, api_version, features}`
 
-`api_version` is `6`. `features` contains `"tunnel"`, `"policy"` (section 17),
-`"teams"` (section 18),
+`api_version` is `8`. `features` contains `"tunnel"`, `"policy"` (section 17),
+`"teams"` (section 18), `"sessions"` (section 21),
 `"install"` on unix (section 16), and `"log"` when the event log is enabled (section 10). Errors are unchanged:
 `-32001` bad token (connection closed), `-32002` incompatible api_version with
 `data = {server_api_version}`, `-32003` hello required.
