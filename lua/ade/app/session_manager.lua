@@ -89,6 +89,9 @@ function M.new(deps)
     -- Every `refresh` owns a sequence: a late reply must not settle the header
     -- of a newer refresh.
     refresh_seq = 0,
+    -- Set while an `open` waits for the service handshake; released with it.
+    hello_connection = nil,
+    disposed = false,
   }, Manager)
 end
 
@@ -240,6 +243,13 @@ function Manager:release()
   if connection then
     ServiceSessions.unsubscribe(connection, self.channel)
   end
+  -- An `open` waiting for the handshake must not fire after the window closed
+  -- or the manager was replaced.
+  local hello = self.hello_connection
+  self.hello_connection = nil
+  if hello and type(hello.on_hello) == "function" then
+    pcall(hello.on_hello, hello, self.channel, nil)
+  end
 end
 
 ---The window closed on its own (q, <Esc>, or losing focus).
@@ -254,6 +264,7 @@ end
 
 ---Forget this manager: used when a reconfiguration replaces it.
 function Manager:dispose()
+  self.disposed = true
   self:close_window()
 end
 
@@ -263,6 +274,9 @@ end
 ---backend or an old service the existing `:Ade sessions` picker is the honest
 ---answer.
 function Manager:open()
+  if self.disposed then
+    return
+  end
   local cfg = self:config()
   if type(cfg) ~= "table" then
     return
@@ -288,9 +302,19 @@ function Manager:open()
   if not settled then
     -- The handshake is still running (a version restart). Open when it lands
     -- instead of blocking the editor; if it never does, nothing is shown.
+    local round = self.round
+    self.hello_connection = connection
     connection:on_hello(self.channel, function()
       connection:on_hello(self.channel, nil)
+      if self.hello_connection == connection then
+        self.hello_connection = nil
+      end
       vim.schedule(function()
+        -- A close, a load, or a replacement may have happened while the
+        -- handshake was in flight; only the round that asked may open.
+        if self.disposed or round ~= self.round then
+          return
+        end
         self:open()
       end)
     end)
@@ -319,8 +343,9 @@ function Manager:start(connection, cfg)
     self.configured[id] = true
   end
   self.entries, self.agent_states, self.refreshing, self.status = {}, {}, {}, nil
-  -- Agents whose fresh rows already arrived. The cache reply can be overtaken
-  -- by a fast refresh; its stale rows must not overwrite the fresh ones.
+  -- Agents that received a successful update in this window round. A late
+  -- `sessions.cached` reply may fill agents with no such rows, but must never
+  -- replace rows a refresh already delivered (even if a later refresh failed).
   self.updated_agents = {}
 
   ServiceSessions.subscribe(connection, self.channel, function(payload)
@@ -432,9 +457,9 @@ function Manager:on_updated(payload)
   self.refreshing[agent] = nil
   local state = self.agent_states[agent] or {}
   if payload.error then
-    -- A failed refresh keeps the cached rows visible and must not count as
-    -- fresh rows: a late `sessions.cached` reply still has to fill them in.
-    self.updated_agents[agent] = nil
+    -- A failed refresh keeps whatever rows this window already has: the latest
+    -- successful update, or — when this agent never succeeded — a cached
+    -- snapshot the (possibly still pending) cache reply will fill in.
     state.error = payload.error
     self.agent_states[agent] = state
     self:refresh_view()

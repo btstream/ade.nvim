@@ -42,8 +42,15 @@ return function(t)
       listeners = {},
       features = opts.features or { sessions = true },
       ensure_ok = opts.ensure_ok ~= false,
+      ensure_pending = opts.ensure_pending == true,
+      hellos = {},
     }
     function connection:ensure(cb)
+      if self.ensure_pending then
+        -- Simulates a handshake that is still running (a version restart).
+        self.ensure_cb = cb
+        return
+      end
       cb(self.ensure_ok, self.ensure_ok and nil or "the service is unavailable")
     end
     function connection:has_feature(name)
@@ -69,7 +76,20 @@ return function(t)
       return count
     end
     function connection:on_hello(channel, fn)
-      self.hello = { channel = channel, fn = fn }
+      self.hellos[channel] = fn
+    end
+    function connection:hello_count()
+      local count = 0
+      for _ in pairs(self.hellos) do
+        count = count + 1
+      end
+      return count
+    end
+    function connection:hello(channel)
+      local fn = channel and self.hellos[channel] or next(self.hellos)
+      if fn then
+        fn()
+      end
     end
     function connection:request(method, params, cb)
       self.requests[#self.requests + 1] = { method = method, params = params, cb = cb }
@@ -389,6 +409,56 @@ return function(t)
       t.truthy(ctx.ui.view.refreshing.alpha, "the older reply must not clear the newer refresh")
       second_reply.cb(true, { agents = { alpha = { ok = true } } })
       t.eq(nil, ctx.ui.view.refreshing.alpha)
+    end)
+
+    t.it("keeps the latest successful rows when a later refresh fails", function()
+      local dir = tmpdir("multiround")
+      local instance, ctx = manager({
+        cfg = config({ alpha = { command = "alpha-acp" } }),
+        cwd = dir,
+      })
+      instance:open()
+      local initial_cached = ctx.connection.requests[1]
+      t.eq("sessions.cached", initial_cached.method)
+      ctx.connection:updated({
+        agent = "alpha",
+        sessions = { { agent = "alpha", sessionId = "fresh", cwd = dir, title = "Fresh row" } },
+      })
+      instance:refresh()
+      ctx.connection:updated({ agent = "alpha", error = { code = -32071, message = "listing timed out" } })
+      -- The initial cache request answers very late with the old snapshot.
+      initial_cached.cb(true, {
+        sessions = { { agent = "alpha", sessionId = "old", cwd = dir, title = "Old row" } },
+        agents = { alpha = { listed_at = 1 } },
+      })
+      t.eq(1, #ctx.ui.view.entries)
+      t.eq("Fresh row", ctx.ui.view.entries[1].title, "a failure must keep the latest successful rows")
+      t.eq("listing timed out", ctx.ui.view.agent_state.alpha.error.message)
+    end)
+
+    t.it("a disposed manager never opens from a late handshake", function()
+      local connection = fake_connection({ ensure_pending = true })
+      local instance, ctx = manager({
+        cfg = config({ alpha = { command = "alpha-acp" } }),
+        connection = connection,
+      })
+      instance:open()
+      t.eq(1, connection:hello_count(), "the wait registers one hello listener")
+      t.eq(0, #ctx.handles)
+      -- Capture the callback before dispose removes it: a dispatch already in
+      -- flight must still not open a window from a disposed manager.
+      local pending
+      for _, fn in pairs(connection.hellos) do
+        pending = fn
+      end
+      t.eq("function", type(pending))
+      instance:dispose()
+      t.eq(0, connection:hello_count(), "dispose removes the hello listener")
+      pending()
+      vim.wait(60)
+      t.eq(0, #ctx.handles, "the scheduled open must be dropped with the manager")
+      instance:open()
+      t.eq(0, #ctx.handles, "a disposed manager cannot be reopened")
     end)
 
     t.it("keeps cached rows and shows the error when an agent fails", function()
@@ -882,7 +952,75 @@ return function(t)
       local utc = assert(time.parse("2026-11-26T15:48:00Z"))
       t.eq(os.date("%Y-%m-%d %H:%M", utc), time.short("2026-11-26T15:48:00Z"))
       t.eq("not a time", time.short("not a time"))
+      t.eq("2026-02-31T00:00", time.short("2026-02-31T00:00:00Z"), "invalid input falls back to the raw text")
       t.eq("", time.short(nil))
+    end)
+
+    t.it("rejects calendar-invalid dates, times and offsets", function()
+      t.eq(nil, time.parse("2026-02-31T00:00:00Z"), "February has 28 days in 2026")
+      t.truthy(time.parse("2024-02-29T00:00:00Z"), "2024 is a leap year")
+      t.eq(nil, time.parse("2026-02-29T00:00:00Z"), "2026 is not a leap year")
+      t.eq(nil, time.parse("2026-04-31T00:00:00Z"))
+      t.eq(nil, time.parse("2026-01-01T24:00:00Z"))
+      t.eq(nil, time.parse("2026-01-01T00:60:00Z"))
+      t.eq(nil, time.parse("2026-01-01T00:00:60Z"))
+      t.eq(nil, time.parse("2026-01-01T00:00:00+99:99"))
+      t.eq(nil, time.parse("2026-01-01T00:00:00+24:00"))
+    end)
+  end)
+
+  t.describe("session timestamps under other zones", function()
+    ---Run one expression in a child Neovim with TZ set.
+    ---
+    ---Changing TZ inside a running process needs `tzset` and is not portable, so
+    ---the DST cases get their own process.
+    ---@param tz string
+    ---@param script string
+    ---@return string
+    local function in_zone(tz, script)
+      local result = vim
+        .system({
+          vim.v.progpath,
+          "--headless",
+          "-u",
+          "NONE",
+          "--cmd",
+          "set runtimepath+=" .. root,
+          "-c",
+          "lua " .. script,
+          "-c",
+          "qa!",
+        }, { env = { TZ = tz }, text = true })
+        :wait()
+      return (result.stdout or ""):gsub("%s+$", "")
+    end
+
+    local function unix_only()
+      return vim.fn.has("unix") == 1
+    end
+
+    t.it("keeps a UTC instant across the New York DST transitions", function()
+      if not unix_only() then
+        io.write("SKIP: TZ child test needs unix\n")
+        return
+      end
+      t.eq(
+        "2026-03-08 01:30",
+        in_zone("America/New_York", 'print(require("ade.ui.time").short("2026-03-08T06:30:00Z"))')
+      )
+      t.eq(
+        "2026-11-01 01:30",
+        in_zone("America/New_York", 'print(require("ade.ui.time").short("2026-11-01T06:30:00Z"))')
+      )
+    end)
+
+    t.it("converts a +08:00 timestamp to the local zone of the process", function()
+      if not unix_only() then
+        io.write("SKIP: TZ child test needs unix\n")
+        return
+      end
+      t.eq("2026-11-26 07:48", in_zone("UTC", 'print(require("ade.ui.time").short("2026-11-26T15:48:00+08:00"))'))
+      t.eq("2026-11-26 23:48", in_zone("Asia/Shanghai", 'print(require("ade.ui.time").short("2026-11-26T15:48:00Z"))'))
     end)
   end)
 
@@ -1297,6 +1435,415 @@ return function(t)
       wait(function()
         return manager_window() == nil
       end, 3000, "the manager to close")
+    end)
+
+    t.it("a first-time terminal login creates one session on normal startup", function()
+      local dir = tmpdir("login-start")
+      local service, service_dir = start_service("login-start", {
+        -- The very first initialize asks for a login; the restart succeeds.
+        canned_init_auth_error = 1,
+        canned_auth_methods = { { id = "terminal", name = "Terminal", type = "terminal" } },
+      })
+      local saved_cwd = vim.fn.getcwd()
+      vim.cmd("cd " .. vim.fn.fnameescape(dir))
+      t.cleanup(function()
+        pcall(vim.cmd, "cd " .. vim.fn.fnameescape(saved_cwd))
+      end)
+
+      -- Patch before setup: Auth captures open_terminal when it is built and
+      -- this path does not rebuild it later.
+      local AuthModule = require("ade.app.auth")
+      local original_open = AuthModule.open_terminal
+      local logins = 0
+      AuthModule.open_terminal = function(_, opts)
+        logins = logins + 1
+        vim.defer_fn(function()
+          pcall(opts.on_exit, 0)
+        end, 10)
+        return true
+      end
+      t.cleanup(function()
+        AuthModule.open_terminal = original_open
+      end)
+
+      setup_service(t, service_dir)
+      t.cleanup(function()
+        pcall(controller.hide)
+      end)
+
+      controller.open()
+      local S = controller.state()
+      wait(function()
+        return S.conn.phase == "ready" and S.sess.current ~= nil
+      end, 30000, "the session after the first-time login")
+      t.eq(1, logins, "the login ran once")
+      t.eq(1, service.session_new_calls, "exactly one session must be created or restored")
+      t.eq("sess_mock", S.sess.current.id)
+    end)
+
+    t.it("an auth retry loads the pending session exactly once", function()
+      local dir_a, dir_b = tmpdir("autha"), tmpdir("authb")
+      local service, service_dir = start_service("auth-load", {
+        canned_init_auth_error = 1,
+        canned_auth_methods = { { id = "terminal", name = "Terminal", type = "terminal" } },
+        session_catalog = {
+          {
+            agent = "opencode",
+            sessionId = "sess_chosen",
+            cwd = dir_b,
+            title = "Chosen session",
+            updatedAt = "2026-11-26T08:00:00Z",
+          },
+        },
+      })
+      local saved_cwd = vim.fn.getcwd()
+      vim.cmd("cd " .. vim.fn.fnameescape(dir_a))
+      t.cleanup(function()
+        pcall(vim.cmd, "cd " .. vim.fn.fnameescape(saved_cwd))
+      end)
+      setup_service(t, service_dir)
+      t.cleanup(close_manager_windows)
+      t.cleanup(function()
+        pcall(controller.hide)
+      end)
+
+      local S = controller.state()
+      -- The real Auth flow, but an instant, successful terminal login. Patch
+      -- the module: the session manager's switch rebuilds the Auth object, so
+      -- patching the current instance would be lost.
+      local AuthModule = require("ade.app.auth")
+      local original_open = AuthModule.open_terminal
+      local logins = 0
+      AuthModule.open_terminal = function(_, opts)
+        logins = logins + 1
+        vim.defer_fn(function()
+          pcall(opts.on_exit, 0)
+        end, 10)
+        return true
+      end
+      t.cleanup(function()
+        AuthModule.open_terminal = original_open
+      end)
+
+      ade.session_manager()
+      local win, buf
+      wait(function()
+        win, buf = manager_window()
+        return win ~= nil and has_line(lines_of(buf), "Chosen session")
+      end, 8000, "the cached row")
+      local row = line_index(lines_of(buf), "Chosen session")
+      vim.api.nvim_win_set_cursor(win, { row, 0 })
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+
+      wait(function()
+        return S.conn.phase == "ready" and S.sess.current and S.sess.current.id == "sess_chosen"
+      end, 30000, "the chosen session after the login")
+      t.eq(1, logins, "the login ran once")
+      t.eq(0, service.session_new_calls, "the auth retry must not create an empty session")
+      local loads = 0
+      for _, frame in ipairs(service.sent) do
+        local message = frame.message
+        if
+          type(message) == "table"
+          and message.method == "session/load"
+          and type(message.params) == "table"
+          and message.params.sessionId == "sess_chosen"
+        then
+          loads = loads + 1
+        end
+      end
+      t.eq(1, loads, "the chosen session must be loaded exactly once")
+    end)
+
+    t.it("cancelling the login after a failed start drops the pending load", function()
+      local dir_a, dir_b = tmpdir("authca"), tmpdir("authcb")
+      local service, service_dir = start_service("auth-cancel", {
+        canned_init_auth_error = 1,
+        canned_auth_methods = {
+          { id = "one", name = "First method", type = "terminal" },
+          { id = "two", name = "Second method", type = "terminal" },
+        },
+        session_catalog = {
+          {
+            agent = "opencode",
+            sessionId = "sess_cancelled",
+            cwd = dir_b,
+            title = "Cancelled session",
+            updatedAt = "2026-11-26T08:00:00Z",
+          },
+        },
+      })
+      local saved_cwd = vim.fn.getcwd()
+      vim.cmd("cd " .. vim.fn.fnameescape(dir_a))
+      t.cleanup(function()
+        pcall(vim.cmd, "cd " .. vim.fn.fnameescape(saved_cwd))
+      end)
+      setup_service(t, service_dir, { ui = { picker = "internal" } })
+      t.cleanup(close_manager_windows)
+      t.cleanup(function()
+        pcall(controller.hide)
+      end)
+
+      ade.session_manager()
+      local win, buf
+      wait(function()
+        win, buf = manager_window()
+        return win ~= nil and has_line(lines_of(buf), "Cancelled session")
+      end, 8000, "the cached row")
+      local row = line_index(lines_of(buf), "Cancelled session")
+      vim.api.nvim_win_set_cursor(win, { row, 0 })
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+
+      local picker_win
+      wait(function()
+        for _, candidate in ipairs(vim.api.nvim_list_wins()) do
+          if vim.b[vim.api.nvim_win_get_buf(candidate)].ade_picker == true then
+            picker_win = candidate
+            return true
+          end
+        end
+      end, 10000, "the login method picker")
+      vim.api.nvim_set_current_win(picker_win)
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+      local S = controller.state()
+      wait(function()
+        return S.conn.pending_load == nil
+      end, 5000, "the cancelled login to drop the pending load")
+      local loads = 0
+      for _, frame in ipairs(service.sent) do
+        local message = frame.message
+        if type(message) == "table" and message.method == "session/load" then
+          loads = loads + 1
+        end
+      end
+      t.eq(0, loads, "a cancelled login must not load the session")
+    end)
+
+    t.it("a login terminal that fails drops the pending load", function()
+      local dir_a, dir_b = tmpdir("authfa"), tmpdir("authfb")
+      local service, service_dir = start_service("auth-failed", {
+        canned_init_auth_error = 1,
+        canned_auth_methods = { { id = "terminal", name = "Terminal", type = "terminal" } },
+        session_catalog = {
+          {
+            agent = "opencode",
+            sessionId = "sess_refused",
+            cwd = dir_b,
+            title = "Refused session",
+            updatedAt = "2026-11-26T08:00:00Z",
+          },
+        },
+      })
+      local saved_cwd = vim.fn.getcwd()
+      vim.cmd("cd " .. vim.fn.fnameescape(dir_a))
+      t.cleanup(function()
+        pcall(vim.cmd, "cd " .. vim.fn.fnameescape(saved_cwd))
+      end)
+      setup_service(t, service_dir)
+      t.cleanup(close_manager_windows)
+      t.cleanup(function()
+        pcall(controller.hide)
+      end)
+
+      local S = controller.state()
+      local AuthModule = require("ade.app.auth")
+      local original_open = AuthModule.open_terminal
+      local logins = 0
+      AuthModule.open_terminal = function(_, opts)
+        logins = logins + 1
+        vim.defer_fn(function()
+          pcall(opts.on_exit, 1)
+        end, 10)
+        return true
+      end
+      t.cleanup(function()
+        AuthModule.open_terminal = original_open
+      end)
+
+      ade.session_manager()
+      local win, buf
+      wait(function()
+        win, buf = manager_window()
+        return win ~= nil and has_line(lines_of(buf), "Refused session")
+      end, 8000, "the cached row")
+      local row = line_index(lines_of(buf), "Refused session")
+      vim.api.nvim_win_set_cursor(win, { row, 0 })
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+
+      wait(function()
+        return logins == 1 and S.conn.pending_load == nil
+      end, 15000, "the failed login to drop the pending load")
+      local loads = 0
+      for _, frame in ipairs(service.sent) do
+        local message = frame.message
+        if type(message) == "table" and message.method == "session/load" then
+          loads = loads + 1
+        end
+      end
+      t.eq(0, loads, "a failed login must not load the session")
+    end)
+
+    t.it("a cancelled pending-load login cannot block a later first-time login", function()
+      local dir_a, dir_b = tmpdir("stalela"), tmpdir("stalelb")
+      local service, service_dir = start_service("stale-login", {
+        -- The connection starts fine; the chosen session's load asks for a
+        -- login, which the person cancels. That must not leave state behind
+        -- that suppresses an unrelated later first-time login.
+        canned_auth_methods = { { id = "terminal", name = "Terminal", type = "terminal" } },
+        canned_load_error = {
+          code = -32000,
+          message = "Authentication required",
+          data = {
+            authMethods = {
+              { id = "one", name = "First method" },
+              { id = "two", name = "Second method" },
+            },
+          },
+        },
+        session_catalog = {
+          {
+            agent = "opencode",
+            sessionId = "sess_stale",
+            cwd = dir_b,
+            title = "Stale session",
+            updatedAt = "2026-11-26T08:00:00Z",
+          },
+        },
+      })
+      local saved_cwd = vim.fn.getcwd()
+      vim.cmd("cd " .. vim.fn.fnameescape(dir_a))
+      t.cleanup(function()
+        pcall(vim.cmd, "cd " .. vim.fn.fnameescape(saved_cwd))
+      end)
+      setup_service(t, service_dir, { ui = { picker = "internal" } })
+      t.cleanup(close_manager_windows)
+      t.cleanup(function()
+        pcall(controller.hide)
+      end)
+
+      local S = controller.state()
+      local AuthModule = require("ade.app.auth")
+      local original_open = AuthModule.open_terminal
+      local logins = 0
+      AuthModule.open_terminal = function(_, opts)
+        logins = logins + 1
+        vim.defer_fn(function()
+          pcall(opts.on_exit, 0)
+        end, 10)
+        return true
+      end
+      t.cleanup(function()
+        AuthModule.open_terminal = original_open
+      end)
+
+      local function picker_window()
+        for _, win in ipairs(vim.api.nvim_list_wins()) do
+          if vim.b[vim.api.nvim_win_get_buf(win)].ade_picker == true then
+            return win
+          end
+        end
+      end
+
+      ade.session_manager()
+      local win, buf
+      wait(function()
+        win, buf = manager_window()
+        return win ~= nil and has_line(lines_of(buf), "Stale session")
+      end, 8000, "the cached row")
+      local row = line_index(lines_of(buf), "Stale session")
+      vim.api.nvim_win_set_cursor(win, { row, 0 })
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+
+      local picker_win
+      wait(function()
+        picker_win = picker_window()
+        return picker_win ~= nil
+      end, 15000, "the session/load login picker")
+      vim.api.nvim_set_current_win(picker_win)
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+      wait(function()
+        return picker_window() == nil and S.conn.phase == "ready" and S.sess.current == nil
+      end, 10000, "the cancelled load login")
+
+      -- Drop the connection, then make the next startup a first-time terminal
+      -- login. Nothing from the cancelled load may suppress its retry.
+      controller.disconnect()
+      wait(function()
+        return S.conn.phase == "stopped"
+      end, 5000, "the disconnect")
+      service.canned_load_error = nil
+      service.canned_init_auth_error = 1
+
+      controller.open()
+      wait(function()
+        return S.conn.phase == "ready" and S.sess.current ~= nil
+      end, 30000, "the session after the next first-time login")
+      t.eq(1, logins, "the terminal login ran once")
+      t.eq(1, service.session_new_calls, "exactly one session must be created")
+      t.eq("sess_mock", S.sess.current.id)
+    end)
+
+    t.it("manual :Ade login on a ready client with no session creates one", function()
+      local dir = tmpdir("manual-login")
+      local service, service_dir = start_service("manual-login", {
+        -- Two non-terminal methods, so both the initial failure and the manual
+        -- login raise the method picker.
+        canned_auth_methods = {
+          { id = "first", name = "First method" },
+          { id = "second", name = "Second method" },
+        },
+        session_new_auth_error = true,
+      })
+      local saved_cwd = vim.fn.getcwd()
+      vim.cmd("cd " .. vim.fn.fnameescape(dir))
+      t.cleanup(function()
+        pcall(vim.cmd, "cd " .. vim.fn.fnameescape(saved_cwd))
+      end)
+      setup_service(t, service_dir, { ui = { picker = "internal" } })
+      t.cleanup(function()
+        pcall(controller.hide)
+      end)
+
+      local function picker_window()
+        for _, win in ipairs(vim.api.nvim_list_wins()) do
+          if vim.b[vim.api.nvim_win_get_buf(win)].ade_picker == true then
+            return win
+          end
+        end
+      end
+
+      controller.open()
+      local first_picker
+      wait(function()
+        first_picker = picker_window()
+        return first_picker ~= nil
+      end, 20000, "the initial login picker")
+      vim.api.nvim_set_current_win(first_picker)
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+      local S = controller.state()
+      wait(function()
+        return S.conn.phase == "ready" and S.sess.current == nil and picker_window() == nil
+      end, 10000, "a ready client with no session after the cancel")
+
+      -- The person logs in for real; the next session/new succeeds.
+      service.session_new_auth_error = false
+      controller.login()
+      local second_picker
+      wait(function()
+        second_picker = picker_window()
+        return second_picker ~= nil
+      end, 10000, "the manual login picker")
+      vim.api.nvim_set_current_win(second_picker)
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+
+      -- The retry must re-run on_ready on the ready client and create a
+      -- session instead of leaving `current` nil forever.
+      wait(function()
+        local state = controller.state()
+        return state.sess.current ~= nil
+      end, 20000, "the session after the manual login")
+      t.eq("sess_mock", S.sess.current.id)
+      t.eq(2, service.session_new_calls, "one failed creation and one after the manual login")
     end)
   end)
 

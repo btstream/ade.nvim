@@ -834,7 +834,10 @@ function M.build(ctx, opts, action)
         end
         if S.sess.service then
           -- `kind = "restore"` keeps the normal failed-load behaviour: a
-          -- failure reports and starts a fresh session in the new folder.
+          -- failure reports and starts a fresh session in the new folder. The
+          -- load sets the replay (or create) state synchronously, which is what
+          -- tells an auth retry queued for this connection not to re-enter
+          -- on_ready while it runs.
           S.sess.service:load(pending_load.id, { kind = "restore", cwd = pending_load.cwd })
         else
           ctx.new_session()
@@ -866,12 +869,39 @@ function M.build(ctx, opts, action)
       ctx.flush_auth_retry()
     end,
     on_start_failed = function(err)
+      -- The intent, if any, belongs to the connection that just failed. A
+      -- login may retry it; a cancelled or failed login must not leave it for a
+      -- later, unrelated connection.
+      local intent = S.conn.pending_load
+      local function clear_intent()
+        if intent ~= nil and S.conn.pending_load == intent then
+          S.conn.pending_load = nil
+        end
+      end
       if
         S.view.auth
         and S.view.auth:require(err, {
           retry = function()
+            local state = S.conn
+            local client = state.client
+            local service = S.sess and S.sess.service
+            -- A first-time terminal login reaches this retry with a ready
+            -- client but no session: `on_ready` deliberately declines to
+            -- restore or create while auth_after_ready is non-empty, so the
+            -- retry's connect() is what runs that path again. Skip it only
+            -- when on_ready already started something for this connection: a
+            -- session, a create, or a replay (the pending load included).
+            if state.phase == "ready" and client and client:is_ready() then
+              local busy = state.creating_session == true
+                or (service and service:is_replaying())
+                or S.sess.current ~= nil
+              if busy then
+                return
+              end
+            end
             ctx.connect()
           end,
+          on_failed = clear_intent,
         })
       then
         -- The login retries this same connection; the pending load still
@@ -880,7 +910,7 @@ function M.build(ctx, opts, action)
       end
       -- This connection will not come up. A later, unrelated connection (another
       -- agent, another folder) must never load the abandoned session.
-      S.conn.pending_load = nil
+      clear_intent()
       local message = type(err) == "table" and (err.message or vim.inspect(err)) or tostring(err)
       -- The common first-run failure: the preset command is not on PATH and
       -- the adapter has not been installed by the manager either.
