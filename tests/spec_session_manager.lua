@@ -50,12 +50,23 @@ return function(t)
       return self.features[name] == true
     end
     function connection:subscribe(channel, method, fn)
-      self.listeners[method] = fn
+      self.listeners[method] = self.listeners[method] or {}
+      self.listeners[method][channel] = fn
       self.channel = channel
     end
     function connection:unsubscribe(channel, method)
-      self.listeners[method] = nil
+      local list = self.listeners[method]
+      if list then
+        list[channel] = nil
+      end
       self.unsubscribed = { channel = channel, method = method }
+    end
+    function connection:subscriber_count(method)
+      local count = 0
+      for _ in pairs(self.listeners[method] or {}) do
+        count = count + 1
+      end
+      return count
     end
     function connection:on_hello(channel, fn)
       self.hello = { channel = channel, fn = fn }
@@ -75,8 +86,7 @@ return function(t)
       return false
     end
     function connection:updated(payload)
-      local fn = self.listeners["sessions.updated"]
-      if fn then
+      for _, fn in pairs(self.listeners["sessions.updated"] or {}) do
         fn(payload)
       end
     end
@@ -98,7 +108,14 @@ return function(t)
           self.busy = value == true
         end
         function handle:close()
+          if self.closed then
+            return
+          end
           self.closed = true
+          -- Mirror the real window: the owner hears about a close exactly once.
+          if type(self.view.on_close) == "function" then
+            pcall(self.view.on_close)
+          end
         end
         function handle:is_open()
           return self.closed ~= true
@@ -279,6 +296,101 @@ return function(t)
       t.eq("Fresh one", ctx.ui.view.entries[1].title, "the stale cache must not win")
     end)
 
+    t.it("keeps an error that arrives before the cache reply", function()
+      local dir = tmpdir("errcache")
+      local instance, ctx = manager({
+        cfg = config({ alpha = { command = "alpha-acp" }, beta = { command = "beta-acp" } }),
+        cwd = dir,
+      })
+      instance:open()
+      ctx.connection:updated({ agent = "beta", error = { code = -32070, message = "auth required" } })
+      ctx.connection:reply("sessions.cached", true, {
+        sessions = {
+          { agent = "alpha", sessionId = "a1", cwd = dir, title = "Alpha cached" },
+          { agent = "beta", sessionId = "b1", cwd = dir, title = "Beta cached" },
+        },
+        agents = { alpha = { listed_at = 11 }, beta = { listed_at = 12 } },
+      })
+      local titles = {}
+      for _, entry in ipairs(ctx.ui.view.entries) do
+        titles[entry.title] = true
+      end
+      t.truthy(titles["Beta cached"], "a failed agent still gets its cached rows")
+      t.truthy(titles["Alpha cached"])
+      t.eq("auth required", ctx.ui.view.agent_state.beta.error.message, "the failure must survive the cache merge")
+      t.eq(12, ctx.ui.view.agent_state.beta.listed_at)
+      t.eq(11, ctx.ui.view.agent_state.alpha.listed_at)
+    end)
+
+    t.it("fills cached rows when the refresh reply lands first", function()
+      local dir = tmpdir("replycache")
+      local instance, ctx = manager({
+        cfg = config({ alpha = { command = "alpha-acp" } }),
+        cwd = dir,
+      })
+      instance:open()
+      ctx.connection:reply("sessions.refresh", true, { agents = { alpha = { ok = true, count = 1 } } })
+      t.eq(0, #ctx.ui.view.entries)
+      t.eq(nil, ctx.ui.view.refreshing.alpha)
+      ctx.connection:reply("sessions.cached", true, {
+        sessions = { { agent = "alpha", sessionId = "a1", cwd = dir, title = "Cached later" } },
+        agents = { alpha = { listed_at = 5 } },
+      })
+      t.eq(1, #ctx.ui.view.entries)
+      t.eq("Cached later", ctx.ui.view.entries[1].title)
+      t.eq(5, ctx.ui.view.agent_state.alpha.listed_at)
+    end)
+
+    t.it("unsubscribes on close and drops callbacks from an earlier opening", function()
+      local dir = tmpdir("lifecycle")
+      local instance, ctx = manager({
+        cfg = config({ alpha = { command = "alpha-acp" } }),
+        cwd = dir,
+      })
+      t.eq(0, ctx.connection:subscriber_count("sessions.updated"))
+      instance:open()
+      t.eq(1, ctx.connection:subscriber_count("sessions.updated"))
+      local first_cached = ctx.connection.requests[#ctx.connection.requests - 1]
+      local first_refresh = ctx.connection.requests[#ctx.connection.requests]
+      ctx.ui:close()
+      t.eq(0, ctx.connection:subscriber_count("sessions.updated"), "closing the window must drop the listener")
+
+      instance:open()
+      t.eq(1, ctx.connection:subscriber_count("sessions.updated"))
+      local second_cached = ctx.connection.requests[#ctx.connection.requests - 1]
+      -- Replies from the closed round must not touch the new window.
+      first_cached.cb(true, {
+        sessions = { { agent = "alpha", sessionId = "stale", cwd = dir, title = "Stale round" } },
+      })
+      t.eq(0, #ctx.ui.view.entries)
+      first_refresh.cb(true, { agents = { alpha = { ok = true, count = 1 } } })
+      t.truthy(ctx.ui.view.refreshing.alpha, "a stale refresh reply must not settle the new round")
+      second_cached.cb(true, {
+        sessions = { { agent = "alpha", sessionId = "fresh", cwd = dir, title = "Fresh round" } },
+      })
+      t.eq(1, #ctx.ui.view.entries)
+      t.eq("Fresh round", ctx.ui.view.entries[1].title)
+      instance:close_window()
+      t.eq(0, ctx.connection:subscriber_count("sessions.updated"))
+    end)
+
+    t.it("drops a refresh reply from an older <C-r>", function()
+      local dir = tmpdir("refreshseq")
+      local instance, ctx = manager({
+        cfg = config({ alpha = { command = "alpha-acp" } }),
+        cwd = dir,
+      })
+      instance:open()
+      local first_reply = ctx.connection.requests[#ctx.connection.requests]
+      instance:refresh()
+      local second_reply = ctx.connection.requests[#ctx.connection.requests]
+      t.truthy(first_reply ~= second_reply)
+      first_reply.cb(true, { agents = { alpha = { ok = true } } })
+      t.truthy(ctx.ui.view.refreshing.alpha, "the older reply must not clear the newer refresh")
+      second_reply.cb(true, { agents = { alpha = { ok = true } } })
+      t.eq(nil, ctx.ui.view.refreshing.alpha)
+    end)
+
     t.it("keeps cached rows and shows the error when an agent fails", function()
       local dir = tmpdir("failed")
       local instance, ctx = manager({
@@ -411,8 +523,11 @@ return function(t)
       t.eq(true, ctx.calls.setups[1].action.discard_queued)
       t.eq(1, ctx.calls.opened)
       t.eq(to, vim.fn.getcwd(), "the editor must move to the session's folder")
-      t.eq("sess2", ctx.state.conn.pending_load.id)
-      t.eq(to, ctx.state.conn.pending_load.cwd)
+      -- The intent travels in the setup action, scoped to the target connection.
+      local intent = ctx.calls.setups[1].action.pending_load
+      t.eq("beta", intent.agent)
+      t.eq("sess2", intent.id)
+      t.eq(to, intent.cwd)
       t.truthy(ctx.ui.closed)
       t.eq(0, #ctx.calls.loads, "the new connection must load it, not the old one")
     end)
@@ -451,6 +566,34 @@ return function(t)
       t.eq(from, vim.fn.getcwd(), "Cancel must not move the editor")
     end)
 
+    t.it("clears the busy wait when the confirmation is dismissed", function()
+      local from, to = tmpdir("disfrom"), tmpdir("disto")
+      vim.cmd("cd " .. vim.fn.fnameescape(from))
+      t.cleanup(function()
+        pcall(vim.cmd, "cd " .. vim.fn.fnameescape(original_cwd))
+      end)
+      local instance, ctx = manager({
+        cfg = config({ alpha = { command = "alpha-acp" }, beta = { command = "beta-acp" } }),
+        client = { cwd = from },
+        phase = "ready",
+        cwd = from,
+        preopen = true,
+        flow = {
+          pending_work = function()
+            return 0, 1
+          end,
+        },
+      })
+      instance:load({ agent = "beta", sessionId = "sess5", cwd = to })
+      t.eq(true, ctx.ui.busy)
+      local question = ctx.calls.presenter[1]
+      t.eq("function", type(question.on_cancel))
+      question.on_cancel()
+      t.eq(false, ctx.ui.busy, "a dismissed confirmation must clear the wait")
+      t.eq(0, #ctx.calls.setups)
+      t.eq(from, vim.fn.getcwd())
+    end)
+
     t.it("switches after the confirmation is accepted", function()
       local from, to = tmpdir("okfrom"), tmpdir("okto")
       vim.cmd("cd " .. vim.fn.fnameescape(from))
@@ -474,7 +617,7 @@ return function(t)
       t.eq(1, #ctx.calls.setups)
       t.eq(true, ctx.calls.setups[1].action.discard_queued)
       t.eq(to, vim.fn.getcwd())
-      t.eq("sess4", ctx.state.conn.pending_load.id)
+      t.eq("sess4", ctx.calls.setups[1].action.pending_load.id)
     end)
 
     t.it("refuses a pinned cwd and a missing directory", function()
@@ -576,7 +719,10 @@ return function(t)
       t.truthy(line_index(lines, "Fix the toolbar badge") < line_index(lines, "Session manager design"))
       t.truthy(line_index(lines, "Session manager design") < line_index(lines, "Migrate auth"))
       t.truthy(line_index(lines, "Migrate auth") < line_index(lines, "Undated session"))
-      t.match("2026%-11%-25 18:02", lines[3])
+      -- Local time, computed rather than hardcoded: the machine's zone is
+      -- whatever the person running the suite uses.
+      local expected_time = require("ade.ui.time").short("2026-11-25T18:02:00Z")
+      t.truthy(lines[3]:find(expected_time, 1, true), "the row must show " .. expected_time)
       t.match("%(missing%)", table.concat(lines, "\n"))
       t.truthy(
         vim.startswith(lines[3], require("ade.ui.icons").get(true).arrow_right .. " "),
@@ -656,6 +802,87 @@ return function(t)
       handle:close()
       t.eq(false, handle:is_open())
       handle:update(state())
+    end)
+
+    t.it("shows timestamps in local time, not in the agent's UTC", function()
+      local dir = tmpdir("uia5")
+      dir_b = tmpdir("uib5")
+      dir_missing = tmpdir("uimissing5")
+      vim.fn.delete(dir_missing, "rf")
+      local time = require("ade.ui.time")
+      local epoch = assert(time.parse("2026-11-26T15:48:00Z"))
+      local expected = os.date("%Y-%m-%d %H:%M", epoch)
+      local handle = open_window(state({
+        entries = {
+          {
+            agent = "alpha",
+            sessionId = "t1",
+            cwd = dir,
+            title = "Timed session",
+            updatedAt = "2026-11-26T15:48:00Z",
+          },
+        },
+        current_agent = nil,
+        current_id = nil,
+      }))
+      t.truthy(has_line(handle:lines(), expected), "the row must show " .. expected)
+      -- The parse is zone-aware even when this machine runs in UTC.
+      t.eq("2026-11-26 07:48", os.date("!%Y-%m-%d %H:%M", assert(time.parse("2026-11-26T15:48:00+08:00"))))
+    end)
+
+    t.it("gives the title most of an 80-column row", function()
+      local dir = tmpdir("uinarrow")
+      local deep = dir .. "/very/deep/project/folder"
+      vim.fn.mkdir(deep, "p")
+      vim.o.columns = 80
+      local view = state({
+        entries = {
+          {
+            agent = "alpha",
+            sessionId = "a1",
+            cwd = deep,
+            title = "Session catalog view",
+            updatedAt = "2026-11-26T08:00:00Z",
+          },
+        },
+        agent_state = {},
+        refreshing = {},
+        current_agent = nil,
+        current_id = nil,
+      })
+      local handle = ui.open(view)
+      t.cleanup(function()
+        pcall(handle.close, handle)
+      end)
+      local row = handle:lines()[3]
+      -- The old 34% cwd column left about 13 title characters here; the title
+      -- now keeps the remaining width.
+      t.match("Session catalog v", row)
+      t.truthy(row:find("project/folder", 1, true), "the cwd suffix stays readable")
+      t.falsy(row:find(deep, 1, true), "the cwd is truncated")
+    end)
+  end)
+
+  t.describe("session timestamps", function()
+    local time = require("ade.ui.time")
+
+    t.it("parses ISO 8601 with Z, offsets and fractions", function()
+      t.eq("2026-11-26 15:48", os.date("!%Y-%m-%d %H:%M", assert(time.parse("2026-11-26T15:48:00Z"))))
+      t.eq("2026-11-26 07:48", os.date("!%Y-%m-%d %H:%M", assert(time.parse("2026-11-26T15:48:00+08:00"))))
+      t.eq("2026-11-26 16:48", os.date("!%Y-%m-%d %H:%M", assert(time.parse("2026-11-26T15:48:00-0100"))))
+      t.eq("2026-11-26 15:48", os.date("!%Y-%m-%d %H:%M", assert(time.parse("2026-11-26T15:48:33.899Z"))))
+      t.eq("2026-11-26 15:48", os.date("!%Y-%m-%d %H:%M", assert(time.parse("2026-11-26 15:48Z"))))
+      t.eq(nil, time.parse("yesterday"))
+      t.eq(nil, time.parse("2026-13-01T00:00:00Z"))
+    end)
+
+    t.it("keeps a zone-less timestamp local and falls back to raw text", function()
+      local epoch = assert(time.parse("2026-11-26T15:48:00"))
+      t.eq("2026-11-26 15:48", os.date("%Y-%m-%d %H:%M", epoch))
+      local utc = assert(time.parse("2026-11-26T15:48:00Z"))
+      t.eq(os.date("%Y-%m-%d %H:%M", utc), time.short("2026-11-26T15:48:00Z"))
+      t.eq("not a time", time.short("not a time"))
+      t.eq("", time.short(nil))
     end)
   end)
 
@@ -887,6 +1114,189 @@ return function(t)
       end, 20000, "the requested session to load")
       t.eq(dir_b, vim.fn.getcwd())
       t.eq(nil, manager_window())
+    end)
+
+    t.it("drops the one-shot load when the target agent fails to start", function()
+      local dir_a, dir_b = tmpdir("faila"), tmpdir("failb")
+      local service, service_dir = start_service("failed-start", {
+        session_catalog = {
+          {
+            agent = "beta",
+            sessionId = "sess_stale",
+            cwd = dir_b,
+            title = "Stale session",
+            updatedAt = "2026-11-26T08:00:00Z",
+          },
+        },
+        -- Attaching beta fails with -32022 (the launch is broken); every other
+        -- agent works. This is the non-auth start failure the leak was about.
+        spawn_agent = function(instance)
+          if type(instance.key) == "table" and instance.key.agent == "beta" then
+            return false
+          end
+        end,
+      })
+      local saved_cwd = vim.fn.getcwd()
+      vim.cmd("cd " .. vim.fn.fnameescape(dir_a))
+      t.cleanup(function()
+        pcall(vim.cmd, "cd " .. vim.fn.fnameescape(saved_cwd))
+      end)
+      setup_service(t, service_dir, {
+        agents = {
+          beta = { command = "/bin/false" },
+        },
+      })
+      t.cleanup(close_manager_windows)
+      t.cleanup(function()
+        pcall(controller.hide)
+      end)
+
+      ade.session_manager()
+      local win, buf
+      wait(function()
+        win, buf = manager_window()
+        return win ~= nil and has_line(lines_of(buf), "Stale session")
+      end, 8000, "the cached row")
+      local row = line_index(lines_of(buf), "Stale session")
+      vim.api.nvim_win_set_cursor(win, { row, 0 })
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+
+      local S = controller.state()
+      wait(function()
+        return S.conn.phase == "disconnected"
+      end, 20000, "the failed start")
+      t.eq(nil, S.conn.pending_load, "a failed start must drop the one-shot load")
+
+      -- An ordinary agent switch afterwards must behave normally, not load the
+      -- abandoned session through the new connection.
+      controller.pick_agent("opencode")
+      wait(function()
+        local state = controller.state()
+        return state.conn.phase == "ready" and state.sess.current ~= nil
+      end, 25000, "the next agent")
+      t.truthy(S.sess.current.id ~= "sess_stale", "the abandoned session must not load")
+      t.eq("sess_mock", S.sess.current.id, "the ordinary path starts fresh")
+      for _, frame in ipairs(service.sent) do
+        local message = frame.message
+        if type(message) == "table" and message.method == "session/load" then
+          t.truthy(message.params.sessionId ~= "sess_stale", "the abandoned session was loaded")
+        end
+      end
+    end)
+
+    t.it("a reconfiguration closes the manager and drops its listener", function()
+      local service, service_dir = start_service("dispose", {})
+      setup_service(t, service_dir, {
+        agents = { alpha = { command = "python3", args = { root .. "tests/mock_agent.py" } } },
+      })
+      t.cleanup(close_manager_windows)
+
+      ade.session_manager()
+      wait(function()
+        return manager_window() ~= nil
+      end, 8000, "the manager window")
+      local S = controller.state()
+      local old_manager = S.view.session_manager
+      local connection = ServiceConnection.shared()
+      local unsubscribed = 0
+      local original_unsubscribe = connection.unsubscribe
+      connection.unsubscribe = function(self, ...)
+        unsubscribed = unsubscribed + 1
+        return original_unsubscribe(self, ...)
+      end
+      t.cleanup(function()
+        connection.unsubscribe = original_unsubscribe
+        pcall(controller.hide)
+      end)
+
+      controller.pick_agent("alpha")
+      t.truthy(S.view.session_manager ~= old_manager, "a reconfiguration must build a fresh manager")
+      t.eq(nil, manager_window(), "the replaced manager's window must close")
+      t.truthy(unsubscribed >= 1, "the replaced manager must unsubscribe its listener")
+    end)
+
+    t.it("cancelling the switch in the real picker clears the wait", function()
+      local dir_a, dir_b = tmpdir("reala"), tmpdir("realb")
+      local service, service_dir = start_service("real-picker", {
+        session_catalog = {
+          {
+            agent = "opencode",
+            sessionId = "sess_other",
+            cwd = dir_b,
+            title = "Other folder session",
+            updatedAt = "2026-11-26T08:00:00Z",
+          },
+        },
+      })
+      local saved_cwd = vim.fn.getcwd()
+      vim.cmd("cd " .. vim.fn.fnameescape(dir_a))
+      t.cleanup(function()
+        pcall(vim.cmd, "cd " .. vim.fn.fnameescape(saved_cwd))
+      end)
+      setup_service(t, service_dir, { ui = { picker = "internal" } })
+      controller.open()
+      wait(function()
+        local state = controller.state()
+        return state.conn.phase == "ready" and state.sess.current ~= nil
+      end, 25000, "the panel to be ready")
+      t.cleanup(function()
+        pcall(controller.hide)
+      end)
+      local S = controller.state()
+      S.sess.current.status = "running"
+
+      local function picker_window()
+        for _, win in ipairs(vim.api.nvim_list_wins()) do
+          local picker_buf = vim.api.nvim_win_get_buf(win)
+          if vim.b[picker_buf].ade_picker == true then
+            return win
+          end
+        end
+      end
+
+      ade.session_manager()
+      local win, buf
+      wait(function()
+        win, buf = manager_window()
+        return win ~= nil and has_line(lines_of(buf), "Other folder session")
+      end, 8000, "the cached row")
+      t.cleanup(close_manager_windows)
+      local row = line_index(lines_of(buf), "Other folder session")
+      vim.api.nvim_win_set_cursor(win, { row, 0 })
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+      local picker_win
+      wait(function()
+        picker_win = picker_window()
+        return picker_win ~= nil
+      end, 5000, "the real confirmation picker")
+      vim.api.nvim_set_current_win(picker_win)
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+      wait(function()
+        return picker_window() == nil
+      end, 3000, "the picker to close")
+      t.eq(dir_a, vim.fn.getcwd(), "dismissing the picker must not switch folders")
+      t.truthy(manager_window(), "the manager stays open")
+
+      -- Not stuck busy: the same row can ask again.
+      win = manager_window()
+      vim.api.nvim_set_current_win(win)
+      vim.api.nvim_win_set_cursor(win, { row, 0 })
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+      wait(function()
+        return picker_window() ~= nil
+      end, 3000, "a second confirmation")
+      t.eq(S.conn.phase, "ready", "no switch happened")
+      -- Leave cleanly.
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+      wait(function()
+        return picker_window() == nil
+      end, 3000, "the second picker to close")
+      win = manager_window()
+      vim.api.nvim_set_current_win(win)
+      vim.api.nvim_feedkeys("q", "x", false)
+      wait(function()
+        return manager_window() == nil
+      end, 3000, "the manager to close")
     end)
   end)
 
