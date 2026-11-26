@@ -135,9 +135,6 @@ function M.new()
   -- One-shot session manager request `{id, cwd}`: consumed by `on_ready` so a
   -- switch loads that session instead of restoring or creating one.
   conn.pending_load = nil
-  -- Set while that one-shot load is in flight, so an auth retry queued for the
-  -- same connection does not re-enter `on_ready`.
-  conn.pending_load_started = nil
   sess.all = {}
   sess.titles = {}
   sess.cwds = {}

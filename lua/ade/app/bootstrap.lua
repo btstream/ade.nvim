@@ -83,7 +83,6 @@ function M.build(ctx, opts, action)
   -- one (an agent switch, a plain setup, a second manager action) or that fails
   -- before it is built must leave nothing behind for a later connection.
   S.conn.pending_load = nil
-  S.conn.pending_load_started = nil
 
   -- Provenance comes from the raw input, before `merge` erases which fields the
   -- user actually wrote. Without it a preset command is indistinguishable from
@@ -835,21 +834,11 @@ function M.build(ctx, opts, action)
         end
         if S.sess.service then
           -- `kind = "restore"` keeps the normal failed-load behaviour: a
-          -- failure reports and starts a fresh session in the new folder.
-          --
-          -- The auth retry queued for this connection must not re-enter
-          -- on_ready while this load is in flight: mark the connection busy
-          -- until the load settles (success or failure).
-          S.conn.pending_load_started = true
-          local function settled()
-            S.conn.pending_load_started = nil
-          end
-          S.sess.service:load(pending_load.id, {
-            kind = "restore",
-            cwd = pending_load.cwd,
-            on_restored = settled,
-            on_failed = settled,
-          })
+          -- failure reports and starts a fresh session in the new folder. The
+          -- load sets the replay (or create) state synchronously, which is what
+          -- tells an auth retry queued for this connection not to re-enter
+          -- on_ready while it runs.
+          S.sess.service:load(pending_load.id, { kind = "restore", cwd = pending_load.cwd })
         else
           ctx.new_session()
         end
@@ -901,10 +890,9 @@ function M.build(ctx, opts, action)
             -- restore or create while auth_after_ready is non-empty, so the
             -- retry's connect() is what runs that path again. Skip it only
             -- when on_ready already started something for this connection: a
-            -- session, a create, a replay, or the pending load.
+            -- session, a create, or a replay (the pending load included).
             if state.phase == "ready" and client and client:is_ready() then
-              local busy = state.pending_load_started == true
-                or state.creating_session == true
+              local busy = state.creating_session == true
                 or (service and service:is_replaying())
                 or S.sess.current ~= nil
               if busy then

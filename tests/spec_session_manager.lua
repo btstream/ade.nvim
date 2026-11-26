@@ -1683,6 +1683,106 @@ return function(t)
       t.eq(0, loads, "a failed login must not load the session")
     end)
 
+    t.it("a cancelled pending-load login cannot block a later first-time login", function()
+      local dir_a, dir_b = tmpdir("stalela"), tmpdir("stalelb")
+      local service, service_dir = start_service("stale-login", {
+        -- The connection starts fine; the chosen session's load asks for a
+        -- login, which the person cancels. That must not leave state behind
+        -- that suppresses an unrelated later first-time login.
+        canned_auth_methods = { { id = "terminal", name = "Terminal", type = "terminal" } },
+        canned_load_error = {
+          code = -32000,
+          message = "Authentication required",
+          data = {
+            authMethods = {
+              { id = "one", name = "First method" },
+              { id = "two", name = "Second method" },
+            },
+          },
+        },
+        session_catalog = {
+          {
+            agent = "opencode",
+            sessionId = "sess_stale",
+            cwd = dir_b,
+            title = "Stale session",
+            updatedAt = "2026-11-26T08:00:00Z",
+          },
+        },
+      })
+      local saved_cwd = vim.fn.getcwd()
+      vim.cmd("cd " .. vim.fn.fnameescape(dir_a))
+      t.cleanup(function()
+        pcall(vim.cmd, "cd " .. vim.fn.fnameescape(saved_cwd))
+      end)
+      setup_service(t, service_dir, { ui = { picker = "internal" } })
+      t.cleanup(close_manager_windows)
+      t.cleanup(function()
+        pcall(controller.hide)
+      end)
+
+      local S = controller.state()
+      local AuthModule = require("ade.app.auth")
+      local original_open = AuthModule.open_terminal
+      local logins = 0
+      AuthModule.open_terminal = function(_, opts)
+        logins = logins + 1
+        vim.defer_fn(function()
+          pcall(opts.on_exit, 0)
+        end, 10)
+        return true
+      end
+      t.cleanup(function()
+        AuthModule.open_terminal = original_open
+      end)
+
+      local function picker_window()
+        for _, win in ipairs(vim.api.nvim_list_wins()) do
+          if vim.b[vim.api.nvim_win_get_buf(win)].ade_picker == true then
+            return win
+          end
+        end
+      end
+
+      ade.session_manager()
+      local win, buf
+      wait(function()
+        win, buf = manager_window()
+        return win ~= nil and has_line(lines_of(buf), "Stale session")
+      end, 8000, "the cached row")
+      local row = line_index(lines_of(buf), "Stale session")
+      vim.api.nvim_win_set_cursor(win, { row, 0 })
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>", true, false, true), "x", false)
+
+      local picker_win
+      wait(function()
+        picker_win = picker_window()
+        return picker_win ~= nil
+      end, 15000, "the session/load login picker")
+      vim.api.nvim_set_current_win(picker_win)
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+      wait(function()
+        return picker_window() == nil and S.conn.phase == "ready" and S.sess.current == nil
+      end, 10000, "the cancelled load login")
+
+      -- Drop the connection, then make the next startup a first-time terminal
+      -- login. Nothing from the cancelled load may suppress its retry.
+      controller.disconnect()
+      wait(function()
+        return S.conn.phase == "stopped"
+      end, 5000, "the disconnect")
+      service.canned_load_error = nil
+      service.canned_init_auth_error = 1
+
+      controller.open()
+      wait(function()
+        return S.conn.phase == "ready" and S.sess.current ~= nil
+      end, 30000, "the session after the next first-time login")
+      t.eq(1, logins, "the terminal login ran once")
+      t.eq(1, service.session_new_calls, "exactly one session must be created")
+      t.eq("sess_mock", S.sess.current.id)
+    end)
+
     t.it("manual :Ade login on a ready client with no session creates one", function()
       local dir = tmpdir("manual-login")
       local service, service_dir = start_service("manual-login", {
