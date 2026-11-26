@@ -51,6 +51,7 @@ Server.__index = Server
 ---  run_error?: table, uninstall_error?: table, canned_agent?: boolean,
 ---  agent_capabilities?: table, canned_capabilities?: table,
 ---  canned_resume?: boolean, canned_load_error?: table,
+---  canned_init_auth_error?: integer,
 ---  session_catalog?: table[], session_agent_states?: table,
 ---  session_refresh?: table, session_refresh_delay_ms?: integer,
 ---  session_refresh_error?: table, session_refresh_hold?: boolean,
@@ -183,6 +184,9 @@ function M.new(opts)
     -- creation must succeed, or the panel never gets going.
     session_new_auth_after = opts.session_new_auth_after or 0,
     session_new_calls = 0,
+    -- Fail this many `initialize` replies with auth_required. The real Auth
+    -- flow then logs in, restarts the agent and retries the same connection.
+    canned_init_auth_error = opts.canned_init_auth_error or 0,
     -- A canned `session/load` that takes this long (a slow agent replay).
     canned_load_delay_ms = opts.canned_load_delay_ms,
     -- A forwarded load that answers but never injects the tools: the MCP
@@ -1553,6 +1557,21 @@ function Server:on_tunnel_send(params, client)
       end
       if message.method == "session/new" and message.id ~= nil then
         self.session_new_calls = self.session_new_calls + 1
+      end
+      if message.method == "initialize" and self.canned_init_auth_error > 0 and message.id ~= nil then
+        -- The first start after a session manager switch is "not logged in":
+        -- the real Auth flow then runs a login and restarts the agent.
+        self.canned_init_auth_error = self.canned_init_auth_error - 1
+        self:deliver(instance, {
+          jsonrpc = "2.0",
+          id = message.id,
+          error = {
+            code = -32000,
+            message = "Authentication required",
+            data = { authMethods = vim.deepcopy(self.canned_auth_methods or {}) },
+          },
+        })
+        return
       end
       if
         self.session_new_auth_error
