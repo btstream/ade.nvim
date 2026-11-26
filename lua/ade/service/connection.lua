@@ -52,6 +52,8 @@ local NAMES = {
   "team.board_changed",
   -- PROTOCOL.md 20.5: a session's team switch or leadership changed.
   "session.teams_changed",
+  -- PROTOCOL.md 21.3: one agent of a `sessions.refresh` finished.
+  "sessions.updated",
 }
 
 ---@param opts {paths?: table, timeout?: integer, resolve_binary?: fun(): table|nil,string|nil,

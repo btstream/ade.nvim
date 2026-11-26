@@ -40,6 +40,7 @@ local Adoption = require("ade.app.adoption")
 local Restore = require("ade.app.restore")
 local Reconnector = require("ade.app.reconnector")
 local ConnectionFlow = require("ade.app.connection_flow")
+local SessionManager = require("ade.app.session_manager")
 
 local M = {}
 
@@ -778,11 +779,29 @@ function M.build(ctx, opts, action)
         pcall(S.conn.policy.reconcile, S.conn.policy, true)
       end
       local reload_id = S.conn.service:take_pending_reload()
+      -- A session manager row was chosen: load that exact session in its own
+      -- directory instead of auto-restoring another one or creating an empty
+      -- session. The request is one-shot, so a later reconnect behaves normally.
+      local pending_load = S.conn.pending_load
+      S.conn.pending_load = nil
       local skip_restore = S.conn.skip_auto_restore
       S.conn.skip_auto_restore = nil
       local client, current = S.conn.client, S.sess.current
       reload_id = reload_id or (current and current.needs_load and current.id)
-      if reload_id then
+      if pending_load then
+        -- `session/load` must use the directory the agent reported, and the
+        -- catalog was rebuilt by the switch, so seed it before loading.
+        if S.sess.catalog then
+          S.sess.catalog:cwds()[pending_load.id] = pending_load.cwd
+        end
+        if S.sess.service then
+          -- `kind = "restore"` keeps the normal failed-load behaviour: a
+          -- failure reports and starts a fresh session in the new folder.
+          S.sess.service:load(pending_load.id, { kind = "restore", cwd = pending_load.cwd })
+        else
+          ctx.new_session()
+        end
+      elseif reload_id then
         local session = S.sess.all[reload_id] or (current and current.id == reload_id and current)
         if not (client and client.created == true and session and S.conn.restore:after_restart(session)) then
           ctx.reload_session(reload_id)
@@ -911,6 +930,22 @@ function M.build(ctx, opts, action)
     on_use = function(id)
       ctx.pick_agent(id)
     end,
+  })
+
+  -- Cross-agent session manager (`:Ade sessions all`), docs/session-manager.md.
+  -- It uses the shared service connection, not the panel's client, so it works
+  -- before the panel has ever connected.
+  S.view.session_manager = SessionManager.new({
+    state = function()
+      return S
+    end,
+    config = cfg,
+    notify = notify,
+    setup = ctx.setup,
+    open = ctx.open,
+    pick_session = ctx.pick_session,
+    resolve_cwd = ctx.resolve_cwd,
+    presenter = manager_presenter,
   })
 
   S.view.attachments = Attachments.new({

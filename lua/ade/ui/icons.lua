@@ -9,6 +9,8 @@ local M = {}
 local glyphs = {
   agent_error = "✗",
   agent_installed = "✓",
+  agent_refreshing = "⟳",
+  agent_unavailable = "–",
   agent_system = "●",
   agent_missing = "○",
   agent_update = "→",
@@ -131,6 +133,11 @@ function M.nerd()
     status_idle = "󰝦", -- circle-outline
     status_waiting = "󰀪", -- alert
     status_cancelling = "󰅖", -- close
+    -- Session manager header: the extra states it shows per agent.
+    agent_installed = "✓",
+    agent_error = "✗",
+    agent_refreshing = "⟳", -- refresh
+    agent_unavailable = "–", -- en dash
   }
 end
 
@@ -184,6 +191,10 @@ function M.ascii()
     status_idle = "o",
     status_waiting = "!",
     status_cancelling = "x",
+    agent_installed = "v",
+    agent_error = "x",
+    agent_refreshing = "~",
+    agent_unavailable = "-",
   }
 end
 

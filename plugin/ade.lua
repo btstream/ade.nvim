@@ -102,6 +102,8 @@ local function complete(arglead, cmdline)
       table.sort(candidates)
     elseif sub == "service" then
       candidates = SERVICE_SUBCOMMANDS
+    elseif sub == "sessions" then
+      candidates = { "all" }
     elseif sub == "team" then
       local trailing = cmdline:match("%s$") ~= nil
       local typing_sub = (#words == 3 and not trailing) or (#words == 2 and trailing)
@@ -171,7 +173,13 @@ local function setup()
       elseif sub == "stop" or sub == "cancel" then
         ade.cancel()
       elseif sub == "sessions" then
-        ade.pick_session()
+        -- `:Ade sessions all` is the cross-agent manager; no argument keeps the
+        -- existing current-agent browser.
+        if rest == "all" then
+          ade.session_manager()
+        else
+          ade.pick_session()
+        end
       elseif sub == "delete" then
         ade.delete_session()
       elseif sub == "reconnect" then

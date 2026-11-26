@@ -132,6 +132,9 @@ function M.new()
   conn.pending_auth_retries = nil
   conn.auth_after_ready = nil
   conn.auth_retry_timer = nil
+  -- One-shot session manager request `{id, cwd}`: consumed by `on_ready` so a
+  -- switch loads that session instead of restoring or creating one.
+  conn.pending_load = nil
   sess.all = {}
   sess.titles = {}
   sess.cwds = {}
