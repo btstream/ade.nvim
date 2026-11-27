@@ -121,16 +121,20 @@ function M.extend(edgy_opts, view_opts)
     position = view_opts.position
   end
   edgy_opts[position] = edgy_opts[position] or {}
+  local target = edgy_opts[position]
   local views = M.views(view_opts)
   -- Registered means present on any side: a user who put ade_team_tree on
   -- `left` must not get a second tree on `right`.
   local present = registered(edgy_opts)
   if not present["ade_chat"] then
-    table.insert(edgy_opts[position], 1, views.chat)
+    table.insert(target, 1, views.chat)
     present["ade_chat"] = true
   end
   if not present["ade_input"] then
-    table.insert(edgy_opts[position], 2, views.input)
+    -- Never insert past the end: when ade_chat lives on another side the
+    -- target list can be empty, and `insert(list, 2, ...)` would create a
+    -- sparse table whose array part `ipairs` never sees.
+    table.insert(target, math.min(2, #target + 1), views.input)
     present["ade_input"] = true
   end
   local team = view_opts and view_opts.team
@@ -139,8 +143,14 @@ function M.extend(edgy_opts, view_opts)
     for _, view in ipairs(M.TEAM_VIEWS) do
       local side = sides[view.name] or position
       if views[view.name] and side ~= false and not present[view.ft] then
-        edgy_opts[side] = edgy_opts[side] or {}
-        table.insert(edgy_opts[side], views[view.name])
+        local list = edgy_opts[side]
+        if type(list) ~= "table" then
+          list = {}
+          edgy_opts[side] = list
+        end
+        -- Append only: always #list + 1, so the array part stays contiguous
+        -- even when the side was created empty.
+        table.insert(list, views[view.name])
         present[view.ft] = true
       end
     end

@@ -139,6 +139,60 @@ return function(t)
       t.falsy(has(opts.right, "ade_team_tree"))
     end)
 
+    t.it("keeps a contiguous array when the chat view is on another side", function()
+      local function count_ipairs(list)
+        local found = 0
+        for _ in ipairs(list) do
+          found = found + 1
+        end
+        return found
+      end
+      local function fts(list)
+        local out = {}
+        for _, view in ipairs(list) do
+          if type(view) == "table" and view.ft then
+            out[view.ft] = true
+          end
+        end
+        return out
+      end
+
+      -- team = false: only the composer belongs to the target side.
+      local opts = { left = { { ft = "ade_chat" } }, right = {} }
+      edgy_views.extend(opts, { team = false })
+      t.eq(count_ipairs(opts.right), #opts.right, "right must stay a proper array")
+      t.eq(1, #opts.right)
+      t.truthy(fts(opts.right).ade_input, "the composer is registered")
+      t.eq(nil, opts.right[2], "no hole at index 2")
+      t.falsy(fts(opts.right).ade_chat, "the chat stays where the user put it")
+
+      -- team on: the team views join the target side after the composer.
+      opts = { left = { { ft = "ade_chat" } }, right = {} }
+      edgy_views.extend(opts)
+      t.eq(count_ipairs(opts.right), #opts.right, "right must stay a proper array")
+      local right = fts(opts.right)
+      for _, ft in ipairs({ "ade_input", "ade_team_tree", "ade_team_members", "ade_team_board" }) do
+        t.truthy(right[ft], ft .. " is not reachable through ipairs")
+      end
+      t.falsy(right.ade_chat, "ade_chat must not be registered twice")
+    end)
+
+    t.it("keeps a contiguous array when every team view goes to another side", function()
+      local opts = {
+        left = { { ft = "ade_chat" }, { ft = "ade_team_tree" } },
+        right = {},
+        top = {},
+      }
+      edgy_views.extend(opts, { team = { tree = "left", members = "left", board = "top" } })
+      local counted = 0
+      for _ in ipairs(opts.right) do
+        counted = counted + 1
+      end
+      t.eq(#opts.right, counted, "right must stay a proper array")
+      t.eq(1, #opts.right, "only the composer was left for this side")
+      t.eq("ade_input", opts.right[1].ft)
+    end)
+
     if not has_edgy then
       t.it("has_view reports false without edgy", function()
         t.falsy(edgy_views.has_view("ade_chat"))
