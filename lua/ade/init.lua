@@ -4,17 +4,60 @@ local controller = require("ade.controller")
 local M = {}
 
 local configured = false
+-- A setup that arrived while text was locked, waiting to be applied.
+local pending = nil
 
----Configure ade.nvim. Safe to call multiple times.
----@param opts table|nil
----@param action {discard_queued?: boolean}|nil explicit consent to drop unsent messages
-function M.setup(opts, action)
-  controller.setup(opts, action)
+---Whether buffer text may not be changed right now (E565).
+---
+---lazy.nvim loads a plugin from its `keys` handler inside an `<expr>` mapping,
+---so `setup()` can run under textlock, where creating the panel buffers fails
+---halfway. Neovim has no query for textlock, so probe it on a scratch buffer.
+---@return boolean
+local function textlocked()
+  local ok, buf = pcall(vim.api.nvim_create_buf, false, true)
+  if not ok then
+    return true
+  end
+  local locked = not pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, { "" })
+  if not pcall(vim.api.nvim_buf_delete, buf, { force = true }) then
+    vim.schedule(function()
+      pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    end)
+  end
+  return locked
+end
+
+local function apply_pending()
+  local request = pending
+  pending = nil
+  controller.setup(request.opts, request.action)
   configured = true
 end
 
+---Configure ade.nvim. Safe to call multiple times.
+---
+---Under textlock the configuration is kept and applied as soon as the lock is
+---gone (or by the first API call, whichever comes first), never replaced by
+---the defaults.
+---@param opts table|nil
+---@param action {discard_queued?: boolean}|nil explicit consent to drop unsent messages
+function M.setup(opts, action)
+  pending = { opts = opts, action = action }
+  if textlocked() then
+    vim.schedule(function()
+      if pending then
+        apply_pending()
+      end
+    end)
+    return
+  end
+  apply_pending()
+end
+
 local function ensure()
-  if not configured then
+  if pending then
+    apply_pending()
+  elseif not configured then
     M.setup({})
   end
   return controller
