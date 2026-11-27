@@ -177,6 +177,11 @@ impl TestServer {
         self.dir.path()
     }
 
+    /// A handle to the same temporary directory, for a restart in place.
+    pub fn temp_dir(&self) -> TempDir {
+        self.dir.clone()
+    }
+
     pub fn socket(&self) -> &Path {
         &self.socket
     }
