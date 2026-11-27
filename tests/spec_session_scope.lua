@@ -22,30 +22,39 @@ return function(t)
     return S
   end
 
-  ---Replace the picker backends with recorders.
-  local function capture_pickers()
+  ---Replace the browser backend with a recorder.
+  local function capture_browsers()
+    local presenter = require("ade.app.presenter")
     local calls = {}
-    local snacks = require("ade.ui.session_snacks")
-    local internal = require("ade.ui.session_picker")
-    local orig_snacks = snacks.open
-    local orig_internal = internal.open
-    snacks.open = function(opts)
-      calls[#calls + 1] = { backend = "snacks", opts = opts }
-      return true
-    end
-    internal.open = function(opts)
-      calls[#calls + 1] = { backend = "internal", opts = opts }
+    local original = presenter.open_session_browser
+    presenter.open_session_browser = function(state, backend)
+      local handle = {
+        state = state,
+        backend = backend,
+        update = function(self, next_state)
+          if next_state then
+            self.state = next_state
+            calls[#calls].state = next_state
+          end
+        end,
+        close = function() end,
+        is_open = function()
+          return true
+        end,
+        set_busy = function() end,
+      }
+      calls[#calls + 1] = handle
+      return handle
     end
     return calls, function()
-      snacks.open = orig_snacks
-      internal.open = orig_internal
+      presenter.open_session_browser = original
     end
   end
 
   t.describe("session listing scope", function()
     t.it("uses the editor cwd for the query", function()
       local S = setup()
-      local captured, restore = capture_pickers()
+      local captured, restore = capture_browsers()
 
       controller.pick_session()
       vim.wait(6000, function()
@@ -53,11 +62,11 @@ return function(t)
       end, 20)
       restore()
 
-      t.truthy(captured[1], "no picker was shown")
+      t.truthy(captured[1], "no browser was shown")
       -- The mock agent only returns sessions whose cwd matches, so seeing the
       -- session created for this directory proves the cwd was passed through.
       local ids = {}
-      for _, session in ipairs(captured[1].opts.sessions) do
+      for _, session in ipairs(captured[1].state.entries) do
         ids[session.sessionId] = true
       end
       t.truthy(ids[S.sess.current.id], "the active session is missing from the list")
@@ -75,7 +84,7 @@ return function(t)
       -- unscoped query with every session it knows.
       vim.env.ACP_EMPTY_SCOPE_DIR = root
       local S = setup(root)
-      local captured, restore = capture_pickers()
+      local captured, restore = capture_browsers()
 
       controller.pick_session()
       vim.wait(6000, function()
@@ -83,21 +92,21 @@ return function(t)
       end, 20)
       restore()
 
-      t.truthy(captured[1], "no picker was shown")
+      t.truthy(captured[1], "no browser was shown")
       local ids = {}
-      for _, session in ipairs(captured[1].opts.sessions) do
+      for _, session in ipairs(captured[1].state.entries) do
         ids[session.sessionId] = true
       end
       -- The unscoped fallback brings in sessions from other directories.
       t.truthy(ids["sess_elsewhere"], "the unscoped fallback was not used")
-      t.truthy(#captured[1].opts.sessions > 1, "expected more than one session")
+      t.truthy(#captured[1].state.entries > 1, "expected more than one session")
       vim.env.ACP_EMPTY_SCOPE_DIR = nil
       controller.hide()
     end)
 
     t.it("reports an empty result only when the agent has nothing at all", function()
       local S = setup()
-      local captured, restore = capture_pickers()
+      local captured, restore = capture_browsers()
       local original = S.conn.client.list_sessions
       S.conn.client.list_sessions = function(_, cwd)
         return true, { sessions = {} }
@@ -111,7 +120,7 @@ return function(t)
       restore()
       S.conn.client.list_sessions = original
 
-      t.eq(0, #captured, "a picker should not open for an empty list")
+      t.eq(0, #captured, "a browser should not open for an empty list")
       controller.hide()
     end)
 

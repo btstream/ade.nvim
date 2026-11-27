@@ -175,45 +175,80 @@ return function(t)
   end)
 
   t.describe("session browser highlights", function()
-    local session_picker = require("ade.ui.session_picker")
+    local internal = require("ade.ui.session_browser.internal")
+
+    ---A browser state with the two rows the highlight cases need.
+    local function browser_state(over)
+      return vim.tbl_extend("force", {
+        scopes = { "here", "agent", "all" },
+        scope = "here",
+        entries = {
+          {
+            agent = "opencode",
+            sessionId = "aaa",
+            title = "First",
+            cwd = "/tmp/project",
+            updatedAt = "2026-11-07T10:49:33.899Z",
+            source = "live",
+          },
+          { agent = "opencode", sessionId = "bbb", title = "Second", cwd = "/tmp/project", source = "live" },
+        },
+        agents = { "opencode" },
+        agent_state = {},
+        refreshing = {},
+        unavailable = {},
+        current_agent = "opencode",
+        current_id = "aaa",
+        use_icons = true,
+        can_delete = function()
+          return true
+        end,
+        on_open = function() end,
+        on_delete = function(_, done)
+          done(true)
+        end,
+        on_refresh = function() end,
+        on_cycle_scope = function() end,
+        on_close = function() end,
+        is_dir = function()
+          return true
+        end,
+      }, over or {})
+    end
+
+    ---Keymap callbacks by lhs.
+    local function maps_of(buf)
+      local maps = {}
+      for _, map in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+        maps[map.lhs] = map
+      end
+      return maps
+    end
 
     t.it("colours the current marker, separator, metadata and footer", function()
-      local browser = session_picker.open({
-        sessions = {
-          { sessionId = "aaa", title = "First", updatedAt = "2026-11-07T10:49:33.899Z" },
-          { sessionId = "bbb", title = "Second" },
-        },
-        current_id = "aaa",
-      })
-      local buf = browser.buf
-      local groups = marks(buf, "ade_sessions")
+      local browser = internal.open(browser_state())
+      local groups = marks(browser.buf, "ade_session_browser")
 
       t.truthy(groups.AdePickerItem, "rows have no item group")
-      t.eq({ 1 }, groups.AdePickerSelection, "only the cursor row should be selected")
-      -- The arrow and the "✓ current" suffix both use the group.
-      t.truthy(vim.tbl_contains(groups.AdePickerCurrent, 1), "the current session arrow lost its group")
-      t.falsy(vim.tbl_contains(groups.AdePickerCurrent, 2), "a plain row was marked as current")
-      t.eq({ 1 }, groups.AdePickerCurrentItem, "the current session title lost its emphasis")
+      -- Rows start below the scope line, the agent status and the rule.
+      t.eq({ 4 }, groups.AdePickerSelection, "only the cursor row should be selected")
+      t.truthy(vim.tbl_contains(groups.AdePickerCurrent, 4), "the current session arrow lost its group")
+      t.falsy(vim.tbl_contains(groups.AdePickerCurrent, 5), "a plain row was marked as current")
+      t.eq({ 4 }, groups.AdePickerCurrentItem, "the current session title lost its emphasis")
       t.truthy(groups.AdePickerMeta, "the timestamp has no group")
-      t.truthy(groups.AdePickerSeparator, "the rule above the footer has no group")
+      t.truthy(groups.AdePickerSeparator, "the rules have no group")
       t.truthy(groups.AdePickerFooter, "the footer hint has no group")
 
-      -- Rows are items, the rule and footer are not.
-      t.falsy(vim.tbl_contains(groups.AdePickerItem, 3), "the separator must not be painted as a row")
+      -- Rows are items, the rules and footer are not.
+      t.falsy(vim.tbl_contains(groups.AdePickerItem, 3), "the header rule must not be painted as a row")
       pcall(vim.api.nvim_win_close, browser.win, true)
     end)
 
     t.it("colours the typed query with the prompt group", function()
-      local browser = session_picker.open({
-        sessions = { { sessionId = "aaa", title = "First" }, { sessionId = "bbb", title = "Second" } },
-      })
+      local browser = internal.open(browser_state())
       -- Drive the filter mapping the way a keystroke would.
-      local maps = {}
-      for _, map in ipairs(vim.api.nvim_buf_get_keymap(browser.buf, "n")) do
-        maps[map.lhs] = map
-      end
-      maps.F.callback()
-      local groups = marks(browser.buf, "ade_sessions")
+      maps_of(browser.buf).F.callback()
+      local groups = marks(browser.buf, "ade_session_browser")
       t.truthy(groups.AdePickerPrompt, "the live query has no group")
       -- "First" matched F: the match is marked inside the title, after the marker.
       t.truthy(groups.AdePickerMatch, "the filter match has no group")
@@ -221,15 +256,9 @@ return function(t)
     end)
 
     t.it("marks the empty state", function()
-      local browser = session_picker.open({
-        sessions = { { sessionId = "aaa", title = "First" } },
-      })
-      local maps = {}
-      for _, map in ipairs(vim.api.nvim_buf_get_keymap(browser.buf, "n")) do
-        maps[map.lhs] = map
-      end
-      maps.Z.callback()
-      local groups = marks(browser.buf, "ade_sessions")
+      local browser = internal.open(browser_state())
+      maps_of(browser.buf).Z.callback()
+      local groups = marks(browser.buf, "ade_session_browser")
       t.truthy(groups.AdePickerEmpty, "the empty state has no group")
       pcall(vim.api.nvim_win_close, browser.win, true)
     end)

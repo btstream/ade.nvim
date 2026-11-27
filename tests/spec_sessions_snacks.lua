@@ -1,7 +1,7 @@
 return function(t)
   local ade = require("ade")
   local controller = require("ade.controller")
-  local session_snacks = require("ade.ui.session_snacks")
+  local session_snacks = require("ade.ui.session_browser.snacks")
 
   local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
 
@@ -86,7 +86,7 @@ return function(t)
       local S = setup()
       local picker = open_browser(S)
       t.truthy(picker, "snacks picker was not used")
-      t.eq(" Sessions ", picker.opts.title)
+      t.eq(" Sessions · current folder ", picker.opts.title)
       picker:close()
       controller.hide()
     end)
@@ -290,4 +290,82 @@ return function(t)
       controller.hide()
     end)
   end)
+
+  if has_snacks then
+    t.describe("session browser snacks scopes", function()
+      t.it("shows agent and cwd, cycles scope and filters agents", function()
+        local scope_cycles, refreshes = 0, 0
+        local handle
+        local view
+        view = {
+          scopes = { "here", "agent", "all" },
+          scope = "here",
+          entries = {
+            { agent = "alpha", sessionId = "a1", cwd = "/tmp/a", title = "Alpha row", source = "live" },
+            { agent = "beta", sessionId = "b1", cwd = "/tmp/b", title = "Beta row", source = "catalog" },
+          },
+          agents = { "alpha", "beta" },
+          agent_state = {},
+          refreshing = {},
+          unavailable = {},
+          current_agent = "alpha",
+          current_id = "a1",
+          use_icons = true,
+          can_delete = function()
+            return true
+          end,
+          on_open = function() end,
+          on_delete = function(_, done)
+            done(true)
+          end,
+          on_refresh = function()
+            refreshes = refreshes + 1
+          end,
+          on_cycle_scope = function()
+            scope_cycles = scope_cycles + 1
+            view.scope = "all"
+            handle:update(view)
+          end,
+          on_close = function() end,
+          is_dir = function()
+            return true
+          end,
+        }
+        handle = session_snacks.open(view)
+        t.truthy(handle, "snacks is available in this branch")
+        local picker = handle.picker
+        t.eq(" Sessions · current folder ", picker.opts.title)
+
+        -- The finder carries the row, its agent and its cwd for filtering.
+        local items = picker:items()
+        t.eq(2, #items)
+        t.truthy(items[1].text:find("alpha", 1, true))
+        t.truthy(items[1].text:find("/tmp/a", 1, true))
+        local row = picker.opts.format(items[1], picker)
+        local chunks = {}
+        for _, chunk in ipairs(row) do
+          chunks[#chunks + 1] = tostring(chunk[1])
+        end
+        t.truthy(table.concat(chunks, " "):find("alpha", 1, true), "the agent column is missing")
+        t.truthy(table.concat(chunks, " "):find("/tmp/a", 1, true), "the cwd column is missing")
+
+        picker:action("ade_scope", picker:current())
+        t.eq(1, scope_cycles)
+        t.eq(" Sessions · all agents ", picker.opts.title, "the title follows the scope")
+
+        picker:action("ade_agent", picker:current())
+        t.eq("alpha", handle:agent_filter())
+        local ids = {}
+        for _, item in ipairs(picker:items()) do
+          ids[item.session.sessionId] = true
+        end
+        t.truthy(ids["a1"])
+        t.falsy(ids["b1"], "the agent filter must hide the other agent")
+
+        picker:action("ade_refresh")
+        t.eq(1, refreshes)
+        handle:close()
+      end)
+    end)
+  end
 end
