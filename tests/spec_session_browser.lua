@@ -85,8 +85,14 @@ return function(t)
       return count
     end
     function connection:hello(channel)
-      local fn = channel and self.hellos[channel] or next(self.hellos)
-      if fn then
+      local fn
+      if channel then
+        fn = self.hellos[channel]
+      else
+        local _, value = next(self.hellos)
+        fn = value
+      end
+      if type(fn) == "function" then
         fn()
       end
     end
@@ -362,10 +368,14 @@ return function(t)
         cwd = dir,
       })
       instance:open("all")
+      local initial_cached = ctx.connection.requests[1]
       ctx.connection:reply("sessions.refresh", true, { agents = { alpha = { ok = true, count = 1 } } })
       t.eq(0, #ctx.ui.view.entries)
       t.eq(nil, ctx.ui.view.refreshing.alpha)
-      ctx.connection:reply("sessions.cached", true, {
+      -- The refresh also re-reads the cache for can_delete; answer that one
+      -- first, then the original cache request with the old rows.
+      ctx.connection:reply("sessions.cached", true, { sessions = {}, agents = {} })
+      initial_cached.cb(true, {
         sessions = { { agent = "alpha", sessionId = "a1", cwd = dir, title = "Cached later" } },
         agents = { alpha = { listed_at = 5 } },
       })
@@ -495,6 +505,45 @@ return function(t)
       t.eq(nil, ctx.ui.view.refreshing.beta)
     end)
 
+    t.it("re-reads can_delete from the cache after a refresh", function()
+      local dir = tmpdir("can-refresh")
+      local instance, ctx = manager({
+        cfg = config({ alpha = { command = "alpha-acp" } }),
+        cwd = dir,
+      })
+      instance:open("all")
+      ctx.connection:reply("sessions.cached", true, {
+        sessions = {},
+        agents = { alpha = { listed_at = 1, can_delete = false } },
+      })
+      t.eq(false, instance:can_delete({ agent = "alpha", sessionId = "x" }))
+
+      -- The refresh reply itself has no can_delete (real wire); the browser
+      -- must re-read the cache to learn the new capability.
+      ctx.connection:reply("sessions.refresh", true, { agents = { alpha = { ok = true, count = 0 } } })
+      local recheck
+      for _, request in ipairs(ctx.connection.requests) do
+        if request.method == "sessions.cached" and not request.replied then
+          recheck = request
+        end
+      end
+      t.truthy(recheck, "a successful refresh must re-read the cache")
+      ctx.connection:reply("sessions.cached", true, {
+        sessions = {},
+        agents = { alpha = { listed_at = 2, can_delete = true } },
+      })
+      t.eq(true, instance:can_delete({ agent = "alpha", sessionId = "x" }))
+
+      -- And the reverse: a capability removed by the next refresh.
+      instance:refresh()
+      ctx.connection:reply("sessions.refresh", true, { agents = { alpha = { ok = true, count = 0 } } })
+      ctx.connection:reply("sessions.cached", true, {
+        sessions = {},
+        agents = { alpha = { listed_at = 3, can_delete = false } },
+      })
+      t.eq(false, instance:can_delete({ agent = "alpha", sessionId = "x" }))
+    end)
+
     t.it("sends each available launch and marks missing ones unavailable", function()
       local dir = tmpdir("params")
       local instance, ctx = manager({
@@ -582,6 +631,52 @@ return function(t)
       t.truthy(ctx.ui, "the catalog must open without a panel")
       t.eq("agent", ctx.ui.view.scope)
       t.eq({ "agent", "all" }, ctx.ui.view.scopes)
+      -- The scope that is shown, not the requested one, decides whether the
+      -- catalog starts: here was skipped, so agent must really be loaded.
+      t.eq(2, #ctx.connection.requests)
+      t.eq("sessions.cached", ctx.connection.requests[1].method)
+      t.eq("sessions.refresh", ctx.connection.requests[2].method)
+      local params = ctx.connection.requests[2].params.agents
+      t.eq(1, #params)
+      t.eq("alpha", params[1].agent)
+      t.eq(1, ctx.connection:subscriber_count("sessions.updated"))
+      ctx.connection:updated({
+        agent = "alpha",
+        sessions = { { agent = "alpha", sessionId = "a1", cwd = dir, title = "Agent row" } },
+      })
+      t.eq(1, #ctx.ui.view.entries)
+      t.eq("Agent row", ctx.ui.view.entries[1].title)
+    end)
+
+    t.it("starts the catalog after an asynchronous hello", function()
+      local dir = tmpdir("async-hello")
+      local connection = fake_connection({ ensure_pending = true })
+      local instance, ctx = manager({
+        cfg = config({ alpha = { command = "alpha-acp" } }),
+        connection = connection,
+        cwd = dir,
+      })
+      instance:open("all")
+      t.eq(nil, ctx.ui, "the window waits for the handshake")
+      t.eq(0, #connection.requests)
+
+      -- The handshake completes; the deferred open must now start the catalog.
+      connection.ensure_pending = false
+      connection.ensure_cb(true)
+      connection:hello()
+      vim.wait(80)
+
+      t.truthy(ctx.ui, "the window must open when the service is ready")
+      t.eq("all", ctx.ui.view.scope)
+      t.eq(2, #connection.requests)
+      t.eq("sessions.cached", connection.requests[1].method)
+      t.eq("sessions.refresh", connection.requests[2].method)
+      t.eq(1, connection:subscriber_count("sessions.updated"))
+      connection:updated({
+        agent = "alpha",
+        sessions = { { agent = "alpha", sessionId = "a2", cwd = dir, title = "After hello" } },
+      })
+      t.eq(1, #ctx.ui.view.entries)
     end)
 
     t.it("cycles here, agent and all with their sources", function()
@@ -607,6 +702,11 @@ return function(t)
       -- the current agent's rows.
       instance:cycle_scope()
       t.eq("agent", ctx.ui.view.scope)
+      -- Tab into a catalog scope starts the source once (cached + refresh).
+      t.eq(2, #ctx.connection.requests)
+      t.eq("sessions.cached", ctx.connection.requests[1].method)
+      t.eq("sessions.refresh", ctx.connection.requests[2].method)
+      t.eq(1, ctx.connection:subscriber_count("sessions.updated"))
       ctx.connection:updated({
         agent = "alpha",
         sessions = { { agent = "alpha", sessionId = "a1", cwd = dir, title = "Alpha row" } },
@@ -624,6 +724,7 @@ return function(t)
 
       instance:cycle_scope()
       t.eq("all", ctx.ui.view.scope)
+      t.eq(2, #ctx.connection.requests, "cycling must not start a second round")
       titles = {}
       for _, entry in ipairs(ctx.ui.view.entries) do
         titles[entry.title] = true
@@ -1600,6 +1701,177 @@ return function(t)
       wait(function()
         return line_index(lines_of(buf), "Panel old session") == nil
       end, 5000, "the row to disappear")
+    end)
+
+    local function snacks_browser()
+      local ok, sp = pcall(require, "snacks.picker")
+      if not ok then
+        return nil
+      end
+      for _, candidate in ipairs(sp.get()) do
+        if type(candidate.title) == "string" and candidate.title:find("Sessions", 1, true) then
+          return candidate
+        end
+      end
+    end
+
+    local function close_snacks(t)
+      t.cleanup(function()
+        local ok, sp = pcall(require, "snacks.picker")
+        if ok then
+          for _, candidate in ipairs(sp.get()) do
+            pcall(function()
+              candidate:close()
+            end)
+          end
+        end
+        -- Let snacks tear its layout down before the harness resets the
+        -- options; closing during a VimResized callback is its known race.
+        vim.wait(100)
+      end)
+    end
+
+    local function row_of(picker, id)
+      for _, item in ipairs(picker:items()) do
+        if item.session.sessionId == id then
+          return item
+        end
+      end
+    end
+
+    t.it("keeps the snacks browser open when the row's directory is gone", function()
+      if not require("ade.ui.session_browser.snacks").available() then
+        io.write("SKIP: snacks.nvim is not installed\n")
+        return
+      end
+      local dir_a, missing = tmpdir("snacka"), tmpdir("snackm")
+      vim.fn.delete(missing, "rf")
+      local service, service_dir = start_service("snacks-missing", {
+        session_catalog = {
+          {
+            agent = "opencode",
+            sessionId = "sess_gone",
+            cwd = missing,
+            title = "Gone session",
+            updatedAt = "2026-11-26T08:00:00Z",
+          },
+        },
+      })
+      local saved_cwd = vim.fn.getcwd()
+      vim.cmd("cd " .. vim.fn.fnameescape(dir_a))
+      t.cleanup(function()
+        pcall(vim.cmd, "cd " .. vim.fn.fnameescape(saved_cwd))
+      end)
+      setup_service(t, service_dir, { ui = { session_picker = "snacks" } })
+      close_snacks(t)
+      ade.session_manager()
+      local picker
+      wait(function()
+        picker = snacks_browser()
+        return picker ~= nil and row_of(picker, "sess_gone") ~= nil
+      end, 10000, "the snacks browser")
+      picker:action("ade_open", row_of(picker, "sess_gone"))
+      vim.wait(600)
+      t.falsy(picker.closed, "a missing directory must keep the browser open")
+      t.truthy(snacks_browser(), "the picker is still the session browser")
+    end)
+
+    t.it("keeps the snacks browser open on a pinned cwd refusal", function()
+      if not require("ade.ui.session_browser.snacks").available() then
+        io.write("SKIP: snacks.nvim is not installed\n")
+        return
+      end
+      local dir_a, dir_b = tmpdir("snackpina"), tmpdir("snackpinb")
+      local service, service_dir = start_service("snacks-pinned", {
+        session_catalog = {
+          {
+            agent = "opencode",
+            sessionId = "sess_other",
+            cwd = dir_b,
+            title = "Other folder",
+            updatedAt = "2026-11-26T08:00:00Z",
+          },
+        },
+      })
+      local saved_cwd = vim.fn.getcwd()
+      vim.cmd("cd " .. vim.fn.fnameescape(dir_a))
+      t.cleanup(function()
+        pcall(vim.cmd, "cd " .. vim.fn.fnameescape(saved_cwd))
+      end)
+      setup_service(t, service_dir, { cwd = dir_a, ui = { session_picker = "snacks" } })
+      close_snacks(t)
+      ade.session_manager()
+      local picker
+      wait(function()
+        picker = snacks_browser()
+        return picker ~= nil and row_of(picker, "sess_other") ~= nil
+      end, 10000, "the snacks browser")
+      picker:action("ade_open", row_of(picker, "sess_other"))
+      vim.wait(600)
+      t.falsy(picker.closed, "a pinned cwd must keep the browser open")
+      t.eq(dir_a, vim.fn.getcwd())
+    end)
+
+    t.it("keeps the snacks browser open when the switch is cancelled", function()
+      if not require("ade.ui.session_browser.snacks").available() then
+        io.write("SKIP: snacks.nvim is not installed\n")
+        return
+      end
+      local dir_a, dir_b = tmpdir("snackcancela"), tmpdir("snackcancelb")
+      local service, service_dir = start_service("snacks-cancel", {
+        session_catalog = {
+          {
+            agent = "opencode",
+            sessionId = "sess_other",
+            cwd = dir_b,
+            title = "Other folder",
+            updatedAt = "2026-11-26T08:00:00Z",
+          },
+        },
+      })
+      local saved_cwd = vim.fn.getcwd()
+      vim.cmd("cd " .. vim.fn.fnameescape(dir_a))
+      t.cleanup(function()
+        pcall(vim.cmd, "cd " .. vim.fn.fnameescape(saved_cwd))
+      end)
+      setup_service(t, service_dir, {
+        ui = { session_picker = "snacks", picker = "internal" },
+      })
+      close_snacks(t)
+      controller.open()
+      wait(function()
+        local state = controller.state()
+        return state.conn.phase == "ready" and state.sess.current ~= nil
+      end, 25000, "the panel to be ready")
+      t.cleanup(function()
+        pcall(controller.hide)
+      end)
+      local S = controller.state()
+      S.sess.current.status = "running"
+
+      ade.session_manager()
+      local picker
+      wait(function()
+        picker = snacks_browser()
+        return picker ~= nil and row_of(picker, "sess_other") ~= nil
+      end, 10000, "the snacks browser")
+      picker:action("ade_open", row_of(picker, "sess_other"))
+
+      local confirm
+      wait(function()
+        for _, win in ipairs(vim.api.nvim_list_wins()) do
+          if vim.b[vim.api.nvim_win_get_buf(win)].ade_picker == true then
+            confirm = win
+            return true
+          end
+        end
+        return false
+      end, 5000, "the switch confirmation")
+      vim.api.nvim_set_current_win(confirm)
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
+      vim.wait(600)
+      t.falsy(picker.closed, "Cancel must keep the snacks browser open")
+      t.eq(dir_a, vim.fn.getcwd(), "Cancel must not switch folders")
     end)
 
     t.it("asks before interrupting pending work and Cancel keeps everything", function()

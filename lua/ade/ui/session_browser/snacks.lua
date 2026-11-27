@@ -41,12 +41,25 @@ function M.available()
   return load_snacks() ~= nil
 end
 
----The picker title for one scope.
----@param scope string|nil
+---The picker title: scope plus the shared per-agent status.
+---
+---snacks has no footer or status area, so the agent states (unavailable,
+---refreshing, list errors) and a refresh failure live in the title and are
+---redrawn by `handle:update`.
+---@param state table
+---@param icons table
 ---@return string
-local function title_for(scope)
-  local label = model.scope_titles[scope or "here"] or tostring(scope)
-  return " Sessions · " .. label .. " "
+local function title_for(state, icons)
+  local label = model.scope_titles[state.scope or "here"] or tostring(state.scope)
+  local parts = { "Sessions · " .. label }
+  local header = model.agent_header_text(state, icons, 80)
+  if type(header) == "string" and header ~= "" then
+    parts[#parts + 1] = model.truncate(header, 80)
+  end
+  if type(state.status) == "string" and state.status ~= "" then
+    parts[#parts + 1] = model.truncate(state.status, 60)
+  end
+  return " " .. table.concat(parts, " · ") .. " "
 end
 
 ---Preview text shown to the right of the list.
@@ -86,6 +99,9 @@ function M.open(view)
   local state = view
   -- The agent filter is a view concern; it only applies to the `all` scope.
   local agent_filter = nil
+  -- While a modal picker owns focus (the delete or switch confirmation), the
+  -- picker must stay open instead of snacks' auto_close closing it.
+  local busy = false
 
   local function finder()
     local items = {}
@@ -107,7 +123,7 @@ function M.open(view)
 
   local picker
   picker = Snacks.picker({
-    title = title_for(state.scope),
+    title = title_for(state, icon_set),
     layout = { preset = "select" },
     preview = "preview",
     show_empty = true,
@@ -139,11 +155,12 @@ function M.open(view)
     finder = finder,
     actions = {
       ---Open the selected session.
-      ade_open = function(p, item)
-        if not item then
+      ade_open = function(_, item)
+        if busy or not item then
           return
         end
-        p:close()
+        -- The app closes the window when a load really starts: a missing
+        -- directory, a pinned cwd or a cancelled agent switch keeps it open.
         vim.schedule(function()
           state.on_open(item.session)
         end)
@@ -151,7 +168,7 @@ function M.open(view)
 
       ---Delete the selected session, keeping the picker open.
       ade_delete = function(p, item)
-        if not item then
+        if busy or not item then
           return
         end
         local entry = item.session
@@ -159,11 +176,20 @@ function M.open(view)
           vim.notify("ade.nvim: this agent cannot delete sessions", vim.log.levels.WARN)
           return
         end
+        if picker.opts then
+          picker.opts.auto_close = false
+        end
+        local function restore()
+          if picker.opts then
+            picker.opts.auto_close = true
+          end
+        end
         vim.ui.select({ "Delete", "Cancel" }, {
           prompt = string.format('Delete "%s"?', model.label_of(entry)),
           kind = "ade_confirm_delete",
         }, function(choice)
           vim.schedule(function()
+            restore()
             if choice ~= "Delete" or p.closed then
               return
             end
@@ -182,6 +208,9 @@ function M.open(view)
 
       ---Cycle the scope (here -> agent -> all -> here).
       ade_scope = function(p)
+        if busy then
+          return
+        end
         if type(state.on_cycle_scope) == "function" then
           state.on_cycle_scope()
         end
@@ -192,7 +221,7 @@ function M.open(view)
 
       ---Cycle the agent filter of the `all` scope.
       ade_agent = function(p)
-        if state.scope ~= "all" then
+        if busy or state.scope ~= "all" then
           return
         end
         local agents = state.agents or {}
@@ -214,6 +243,9 @@ function M.open(view)
 
       ---Refresh the current scope.
       ade_refresh = function()
+        if busy then
+          return
+        end
         if type(state.on_refresh) == "function" then
           state.on_refresh()
         end
@@ -250,6 +282,13 @@ function M.open(view)
   end
 
   local handle = {}
+  ---Keep the picker open while a modal confirmation owns focus.
+  function handle:set_busy(value)
+    busy = value == true
+    if picker.opts then
+      picker.opts.auto_close = not busy
+    end
+  end
   function handle:update(next_state)
     if next_state then
       state = next_state
@@ -257,7 +296,7 @@ function M.open(view)
     if picker.closed then
       return
     end
-    local title = title_for(state.scope)
+    local title = title_for(state, icon_set)
     if picker.title ~= title then
       picker.title = title
       if picker.opts then

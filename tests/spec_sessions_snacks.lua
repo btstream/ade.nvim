@@ -86,7 +86,7 @@ return function(t)
       local S = setup()
       local picker = open_browser(S)
       t.truthy(picker, "snacks picker was not used")
-      t.eq(" Sessions · current folder ", picker.opts.title)
+      t.truthy(picker.opts.title:find("Sessions · current folder", 1, true), picker.opts.title)
       picker:close()
       controller.hide()
     end)
@@ -334,7 +334,7 @@ return function(t)
         handle = session_snacks.open(view)
         t.truthy(handle, "snacks is available in this branch")
         local picker = handle.picker
-        t.eq(" Sessions · current folder ", picker.opts.title)
+        t.truthy(picker.opts.title:find("Sessions · current folder", 1, true), picker.opts.title)
 
         -- The finder carries the row, its agent and its cwd for filtering.
         local items = picker:items()
@@ -351,7 +351,7 @@ return function(t)
 
         picker:action("ade_scope", picker:current())
         t.eq(1, scope_cycles)
-        t.eq(" Sessions · all agents ", picker.opts.title, "the title follows the scope")
+        t.truthy(picker.opts.title:find("Sessions · all agents", 1, true), "the title follows the scope")
 
         picker:action("ade_agent", picker:current())
         t.eq("alpha", handle:agent_filter())
@@ -364,6 +364,54 @@ return function(t)
 
         picker:action("ade_refresh")
         t.eq(1, refreshes)
+        handle:close()
+      end)
+
+      t.it("shows agent states, refreshing and failures in the title", function()
+        local view = {
+          scopes = { "agent", "all" },
+          scope = "all",
+          entries = {},
+          agents = { "alpha", "beta", "delta", "gamma" },
+          agent_state = { beta = { error = { code = -32070, message = "auth required" } } },
+          refreshing = { gamma = true },
+          unavailable = { delta = "not installed" },
+          current_agent = "opencode",
+          current_id = nil,
+          use_icons = true,
+          status = "refresh failed: timeout",
+          can_delete = function()
+            return true
+          end,
+          on_open = function() end,
+          on_delete = function(_, done)
+            done(true)
+          end,
+          on_refresh = function() end,
+          on_cycle_scope = function() end,
+          on_close = function() end,
+          is_dir = function()
+            return true
+          end,
+        }
+        local handle = session_snacks.open(view)
+        t.truthy(handle)
+        local title = handle.picker.opts.title
+        t.truthy(title:find("alpha", 1, true), title)
+        t.truthy(title:find("auth required", 1, true), title)
+        t.truthy(title:find("not installed", 1, true), title)
+        t.truthy(title:find("⟳", 1, true), title)
+        t.truthy(title:find("refresh failed: timeout", 1, true), title)
+
+        -- The update redraws the title: a recovered agent and a finished
+        -- refresh disappear from it.
+        view.agent_state = {}
+        view.refreshing = {}
+        view.status = nil
+        handle:update(view)
+        title = handle.picker.opts.title
+        t.falsy(title:find("auth required", 1, true), title)
+        t.falsy(title:find("refresh failed", 1, true), title)
         handle:close()
       end)
     end)
