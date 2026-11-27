@@ -148,6 +148,7 @@ def handle(message):
                 sys.exit(0)
             if DELETE_DELAY:
                 time.sleep(DELETE_DELAY)
+            log({"event": "delete_answered", "params": message.get("params")})
             if DELETE_ERROR:
                 code, text = DELETE_ERROR.split(":", 1)
                 error(ident, int(code), text)
