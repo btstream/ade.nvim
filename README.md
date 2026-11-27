@@ -103,8 +103,8 @@ require("ade").setup({})
 | `:Ade open` / `:Ade hide` | 显式打开 / 隐藏 |
 | `:Ade new` | 新建会话 |
 | `:Ade stop` | 中止当前回合 |
-| `:Ade sessions` | 打开会话浏览器：`<CR>` 切换、`<C-d>` 删除、输入即过滤 |
-| `:Ade sessions all` | 跨 Agent 会话管理器：列出所有已配置 Agent、所有目录的会话，打开时同步切换目录与 Agent |
+| `:Ade sessions` | 打开会话浏览器（从当前 Agent/目录开始；`<Tab>` 切换作用域，`<C-d>` 删除） |
+| `:Ade sessions all` | 同一个浏览器，从“所有已配置 Agent、所有目录”的作用域开始 |
 | `:Ade delete` | 打开同一个会话浏览器，用 `<C-d>` 删除选中会话 |
 | `:Ade model` / `:Ade mode` | 切换模型 / 模式 |
 | `:Ade reconnect` | Agent 崩溃后重连并恢复当前会话 |
@@ -1646,48 +1646,32 @@ session id 做缓存，因此切换后标题立即更新。
 
 ### 会话浏览器
 
-`:Ade sessions` 默认使用 **snacks.nvim 的 picker**：自带 fuzzy 搜索、实时预览，
-并沿用你已有的 snacks 主题。未安装 snacks 时自动回退到内置窗口，不会报错。
+`:Ade sessions` 和 `:Ade sessions all` 共用同一个窗口（默认 **snacks.nvim 的
+picker**，未安装时回退到内置窗口）。窗口有三个**作用域**，用 `<Tab>` 循环：
+
+| 作用域 | 行 | 来源 |
+|---|---|---|
+| `here` | 当前 Agent、当前目录 | 面板连接上的实时 `session/list`（direct 后端也可用） |
+| `agent` | 当前 Agent、所有目录 | 服务会话目录，按 Agent 过滤 |
+| `all` | 所有已配置 Agent | 服务会话目录（先缓存，再后台刷新） |
+
+`:Ade sessions` 从 `here` 打开，`:Ade sessions all` 从 `all` 打开。没有服务
+（direct 后端、旧服务或没有 `"sessions"` feature）时只有 `here`，按 `<Tab>` 会提示
+一次原因；面板没有连接时跳过 `here`。在 `all` 中按 `<S-Tab>` 循环 Agent 过滤。
 
 | 按键 | 说明 |
 |---|---|
-| `<CR>` | 切换到选中会话 |
+| `<CR>` | 打开选中会话 |
 | `<C-d>` | 删除选中会话（二次确认） |
-| 输入 | fuzzy 过滤（fzf 语法） |
+| `<C-r>` | 刷新当前作用域 |
+| `<Tab>` | 切换作用域（here → agent → all） |
+| `<S-Tab>` | 在 `all` 中循环 Agent 过滤 |
+| 输入 | fuzzy 过滤 Agent、目录和标题 |
 | `<Esc>` / `q` | 关闭 |
 
-列表右侧显示更新时间，当前会话行首有箭头标记；右侧预览区显示完整会话 ID、
-目录与创建/更新时间。删除后列表原地刷新，可连续删除。
-
-想强制使用内置窗口：
-
-```lua
-require("ade").setup({ ui = { session_picker = "internal" } })
-```
-
-内置窗口（回退时）支持 `j`/`k` 移动与 `<BS>`/`<C-u>` 编辑过滤。
-`q` 关闭、`gg`/`G` 跳转；这些按键对应的字母可用大写 `Q`/`J`/`K` 输入过滤，
-`g` 用于过滤（`gg` 仍可跳到首项）。
-
-- 删除非当前会话：当前对话不受影响。
-- 删除当前会话：确认后自动新建一个会话。
-- Agent 未声明 `sessionCapabilities.delete` 时给出提示，不弹出无法兑现的确认框。
-
-### 跨 Agent 会话管理器（`:Ade sessions all`）
-
-`:Ade sessions all`（Lua：`require("ade").session_manager()`）把**所有已配置 Agent**
-的会话放在一个窗口里，跨项目目录显示。窗口顶部的状态行逐个 Agent 显示
-`✓ 个数`（已列出）、`⟳`（正在刷新）、`✗ 错误`（刷新失败，缓存行仍可见）或
-`– 原因`（未安装/命令不可用）。行按更新时间倒序，缺少更新时间的排在最后；当前面板
-正在显示的会话带箭头标记；目录已不存在的行变暗并显示 `(missing)`，`<CR>` 只会提示。
-
-打开窗口先显示服务缓存（`sessions.cached`），随后各 Agent 在后台刷新
-（`sessions.refresh`），先完成的 Agent 先替换自己的行（`sessions.updated`）。
-`<C-r>` 可再次刷新；`<Tab>` 在“全部 → 各 Agent → 全部”之间循环过滤；输入即 fuzzy
-过滤 Agent、目录和标题；`q`/`<Esc>`/`<C-c>` 关闭。
-
-该窗口需要 ade 服务后端且 `hello.features` 包含 `"sessions"`（服务 0.9.0、
-api_version 8）。否则会提示一次，并退回当前 Agent 的 `:Ade sessions` 浏览器。
+行按更新时间倒序，缺少更新时间的排在最后；当前会话行首有箭头标记；目录已不存在的
+行变暗并显示 `(missing)`，`<CR>` 只会提示。右侧预览区显示完整 Agent、会话 ID、目录与
+时间。删除后列表原地去掉该行，可连续删除。
 
 打开一行时：
 
@@ -1698,8 +1682,28 @@ api_version 8）。否则会提示一次，并退回当前 Agent 的 `:Ade sessi
    一次性的“待加载会话”，新连接就绪后直接加载它，不会先建一个空会话。若当前有排队
    消息或运行中的回合，会先确认“将丢弃 N 条排队消息、打断 M 个回合”，可取消。
 
-切换 Agent 会丢弃旧连接的排队消息并打断运行中的回合，所以确认框是有意为之；
-团队状态由服务持有，切 Agent 不会停止团队。
+删除规则：
+
+- 面板当前 Agent 的会话走面板连接（`session/delete`），删除当前会话后自动新建一个；
+  当前对话不受影响。Agent 未声明 `sessionCapabilities.delete` 时给出提示，不弹出
+  无法兑现的确认框。
+- 其他 Agent 的会话由服务删除（`hello.features` 需要 `"sessions.delete"`，服务 0.10.0、
+  api_version 9），删除后同时清理 `last_sessions` 记录。服务版本过旧会提示升级；
+  会话仍被运行中的 Agent 持有时显示“the session is open in a running agent
+  instance”，不支持删除时显示“this agent cannot delete sessions”。
+
+想强制使用内置窗口（两个命令都生效）：
+
+```lua
+require("ade").setup({ ui = { session_picker = "internal" } })
+```
+
+内置窗口支持 `j`/`k` 移动与 `<BS>`/`<C-u>` 编辑过滤。`q` 关闭、`gg`/`G` 跳转；
+这些按键对应的字母可用大写 `Q`/`J`/`K` 输入过滤，`g` 用于过滤（`gg` 仍可跳到首项）。
+仓库缓存与服务状态的理解：`here` 是实时请求；`agent`/`all` 打开时先显示服务缓存
+（`sessions.cached`），随后各 Agent 后台刷新（`sessions.refresh`），先完成的 Agent
+先替换自己的行（`sessions.updated`）。切换 Agent 会丢弃旧连接的排队消息并打断运行中的
+回合，所以确认框是有意为之；团队状态由服务持有，切 Agent 不会停止团队。
 
 ### 窗口保护
 

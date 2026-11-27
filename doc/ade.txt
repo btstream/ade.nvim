@@ -25,8 +25,8 @@ ade.nvim 是一个 Neovim 原生的 Agent Client Protocol 客户端。
     hide         隐藏面板，不中断会话
     new          新建会话
     stop         中止当前回合
-    sessions     打开会话浏览器（<CR> 切换，<C-d> 删除，输入即过滤）
-    sessions all 跨 Agent 会话管理器：所有已配置 Agent、所有目录的会话
+    sessions     打开会话浏览器（从当前 Agent/目录开始）
+    sessions all 同一个浏览器，从所有已配置 Agent、所有目录的作用域开始
     delete       同 sessions，在浏览器内用 <C-d> 删除
     model        切换模型
     mode         切换模式
@@ -557,12 +557,32 @@ q 关闭，gg/G 跳到首项/末项；需要搜索保留字母 j/k/q 时用大�
 删除非当前会话不影响当前对话；删除当前会话会自动新建一个。Agent 未声明
 sessionCapabilities.delete 时给出提示，不弹出无法兑现的确认框。
 
-跨 Agent 会话管理器                                   *ade-session-manager*
+会话浏览器的三个作用域                               *ade-session-manager*
 
-:Ade sessions all（Lua：require("ade").session_manager()）在一个窗口里列出所有
-已配置 Agent 的会话，跨项目目录。它先显示服务缓存（sessions.cached），再让各
-Agent 在后台刷新（sessions.refresh），先完成的 Agent 先替换自己的行
-（sessions.updated）。顶部状态行逐个 Agent 显示：
+:Ade sessions 和 :Ade sessions all 共用一个窗口（后端见 ui.session_picker，默认
+snacks，不可用时回退内置窗口）。窗口顶部是作用域行，<Tab> 在三个作用域间循环：
+
+    here    当前 Agent、当前目录；面板连接上的实时 session/list
+    agent   当前 Agent、所有目录；服务会话目录，按当前 Agent 过滤
+    all     所有已配置 Agent；服务会话目录（先缓存，再后台刷新）
+
+:Ade sessions 从 here 打开，:Ade sessions all 从 all 打开（Lua：
+require("ade").session_manager()）。没有服务（direct 后端、旧服务、没有
+"sessions" feature）时只有 here，<Tab> 提示一次原因；面板没有连接时跳过 here。
+在 all 中按 <S-Tab> 循环 Agent 过滤。
+
+    <CR>        打开选中的会话
+    <C-d>       删除选中的会话（二次确认）
+    <C-r>       刷新当前作用域
+    <Tab>       切换作用域（here → agent → all）
+    <S-Tab>     在 all 中循环 Agent 过滤
+    输入        fuzzy 过滤 Agent、目录和标题
+    <BS>/<C-u>  删除一个字符 / 清空过滤
+    <Esc>/q     关闭
+
+agent/all 作用域先显示服务缓存（sessions.cached），再让各 Agent 在后台刷新
+（sessions.refresh），先完成的 Agent 先替换自己的行（sessions.updated）。顶部
+状态行逐个 Agent 显示：
 
     ✓ 个数      已列出的会话数
     ⟳           正在刷新
@@ -573,16 +593,11 @@ Agent 在后台刷新（sessions.refresh），先完成的 Agent 先替换自己
 正在显示的会话（同一 Agent、同一 id）行首带箭头。目录已不存在的行变暗并显示
 (missing)，<CR> 只提示不加载。
 
-    <CR>        打开选中的会话
-    <C-r>       再次刷新
-    <Tab>       切换 Agent 过滤（全部 → 各 Agent → 全部）
-    <C-d>       无（此窗口不删除会话）
-    输入        fuzzy 过滤 Agent、目录和标题
-    <BS>/<C-u>  删除一个字符 / 清空过滤
-    <Esc>/q     关闭
-
-该窗口需要服务后端且 hello.features 含 "sessions"（服务 0.9.0、api_version 8）。
-否则提示一次，并退回当前 Agent 的 :Ade sessions 浏览器。
+删除：面板当前 Agent 的会话走面板连接（session/delete），删除当前会话后自动新建
+一个；其他 Agent 的会话由服务删除（hello.features 含 "sessions.delete"，服务
+0.10.0、api_version 9），同时清理 last_sessions 记录。服务过旧会提示升级；仍被
+运行中 Agent 持有的会话显示 "the session is open in a running agent instance"，
+Agent 不支持删除时显示 "this agent cannot delete sessions"。
 
 打开一行时：目录已不存在则只提示；cwd 被配置固定且与会话目录不同则拒绝；当前
 Agent 与连接目录都匹配时直接加载；否则先 :cd 到会话目录，再像 :Ade agent 那样
