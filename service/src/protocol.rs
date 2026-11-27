@@ -34,21 +34,40 @@ pub const SESSIONS_LIST_UNSUPPORTED: i64 = -32070;
 pub const SESSIONS_LIST_TIMEOUT: i64 = -32071;
 /// The agent process exited during the listing (PROTOCOL.md 21.6).
 pub const SESSIONS_LIST_EXITED: i64 = -32072;
+/// The agent does not support `session/delete` (PROTOCOL.md 21.8).
+pub const SESSIONS_DELETE_UNSUPPORTED: i64 = -32073;
+/// The session is in use by a running instance (PROTOCOL.md 21.8).
+pub const SESSIONS_DELETE_IN_USE: i64 = -32074;
 
 /// Maximum length of one line in either direction (PROTOCOL.md section 2).
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Features advertised by `hello` with the event log disabled.
 #[cfg(unix)]
-pub const FEATURES: &[&str] = &["tunnel", "install", "policy", "sessions"];
+pub const FEATURES: &[&str] = &["tunnel", "install", "policy", "sessions", "sessions.delete"];
 #[cfg(not(unix))]
-pub const FEATURES: &[&str] = &["tunnel", "policy", "sessions"];
+pub const FEATURES: &[&str] = &["tunnel", "policy", "sessions", "sessions.delete"];
 /// Features advertised by `hello` with the event log enabled (PROTOCOL.md 3.1
 /// and 10). `"sessions"` is present in both cases (PROTOCOL.md 21).
 #[cfg(unix)]
-pub const FEATURES_WITH_LOG: &[&str] = &["tunnel", "install", "policy", "log", "teams", "sessions"];
+pub const FEATURES_WITH_LOG: &[&str] = &[
+    "tunnel",
+    "install",
+    "policy",
+    "log",
+    "teams",
+    "sessions",
+    "sessions.delete",
+];
 #[cfg(not(unix))]
-pub const FEATURES_WITH_LOG: &[&str] = &["tunnel", "policy", "log", "teams", "sessions"];
+pub const FEATURES_WITH_LOG: &[&str] = &[
+    "tunnel",
+    "policy",
+    "log",
+    "teams",
+    "sessions",
+    "sessions.delete",
+];
 
 /// The `features` list for one service configuration.
 pub fn features(log_enabled: bool) -> &'static [&'static str] {
