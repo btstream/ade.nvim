@@ -111,7 +111,7 @@ function M.open(view)
     if state.scope ~= "all" then
       agent_filter = nil
     end
-    visible = model.visible(state.entries, query, agent_filter)
+    visible = model.visible(state.entries, query, agent_filter, state.scope)
   end
 
   ---@param entry table

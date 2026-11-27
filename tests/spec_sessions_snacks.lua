@@ -336,11 +336,12 @@ return function(t)
         local picker = handle.picker
         t.truthy(picker.opts.title:find("Sessions · current folder", 1, true), picker.opts.title)
 
-        -- The finder carries the row, its agent and its cwd for filtering.
+        -- In `here` the finder text is the title plus the id, like the old
+        -- session picker: the shared cwd must not make every row match.
         local items = picker:items()
         t.eq(2, #items)
-        t.truthy(items[1].text:find("alpha", 1, true))
-        t.truthy(items[1].text:find("/tmp/a", 1, true))
+        t.truthy(items[1].text:find("Alpha row", 1, true), items[1].text)
+        t.falsy(items[1].text:find("/tmp/a", 1, true), items[1].text)
         local row = picker.opts.format(items[1], picker)
         local chunks = {}
         for _, chunk in ipairs(row) do
@@ -352,6 +353,16 @@ return function(t)
         picker:action("ade_scope", picker:current())
         t.eq(1, scope_cycles)
         t.truthy(picker.opts.title:find("Sessions · all agents", 1, true), "the title follows the scope")
+
+        -- In `all` the agent and the directory are part of the match text.
+        local all_text = {}
+        for _, item in ipairs(picker:items()) do
+          all_text[item.session.sessionId] = item.text
+        end
+        t.truthy(all_text["a1"]:find("alpha", 1, true), all_text["a1"])
+        t.truthy(all_text["a1"]:find("/tmp/a", 1, true), all_text["a1"])
+        t.truthy(all_text["b1"]:find("beta", 1, true), all_text["b1"])
+        t.truthy(all_text["b1"]:find("/tmp/b", 1, true), all_text["b1"])
 
         picker:action("ade_agent", picker:current())
         t.eq("alpha", handle:agent_filter())
