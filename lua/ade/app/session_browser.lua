@@ -283,12 +283,14 @@ function Browser:wait_for_catalog(connection)
       end
       self.catalog_state = nil
       if self:prepare_catalog(false) == true then
-        if self.scope == "agent" or self.scope == "all" then
+        -- A deferred open (`:Ade sessions all` waiting for the service) can
+        -- now proceed; `open` starts the catalog for the effective scope. An
+        -- already open window only needs the catalog if it is showing one.
+        if not (self.ui and self.ui:is_open()) then
+          self:open(self.pending_scope or "here")
+        elseif self.scope == "agent" or self.scope == "all" then
           self:start_catalog(self.connection)
         end
-        -- A deferred open (`:Ade sessions all` waiting for the service) can
-        -- now proceed; an already open window just needs its scope line.
-        self:open(self.pending_scope or "here")
         self:refresh_view()
       end
     end)
@@ -468,7 +470,39 @@ function Browser:on_refresh_reply(ok, value)
       self.agent_states[agent] = state
     end
   end
+  -- `sessions.updated` and the refresh reply do not carry `can_delete` on the
+  -- wire; a capability change is only visible in the refreshed cache entry.
+  self:refresh_capabilities()
   self:refresh_view()
+end
+
+---Re-read the cached agent states and merge only `can_delete`.
+---
+---The restart of the catalog during a refresh can change an agent's delete
+---capability (a managed update, a different adapter); the cached state is the
+---only place the service records it. Rows are untouched, so this cannot
+---resurrect a stale snapshot.
+function Browser:refresh_capabilities()
+  local connection = self.connection
+  if not connection then
+    return
+  end
+  local round = self.round
+  local seq = self.refresh_seq
+  ServiceSessions.cached(connection, function(ok, value)
+    if not ok or round ~= self.round or seq ~= self.refresh_seq or not self.connection then
+      return
+    end
+    local states = type(value) == "table" and value.agents or {}
+    for agent, cached_state in pairs(states) do
+      if self.configured[agent] and type(cached_state) == "table" then
+        local state = self.agent_states[agent] or {}
+        state.can_delete = cached_state.can_delete
+        self.agent_states[agent] = state
+      end
+    end
+    self:refresh_view()
+  end)
 end
 
 ---------------------------------------------------------------------------
@@ -703,9 +737,12 @@ function Browser:open(requested)
   -- The availability check decides whether the scope line offers `agent` and
   -- `all`; the catalog's cached read and refresh start only when one is shown.
   if self.catalog_state == nil and catalog_capable then
-    if self:prepare_catalog(requested ~= "here") == nil then
-      if requested ~= "here" or not panel then
-        -- The requested scope (or the only remaining one) needs the catalog.
+    if self:prepare_catalog(false) == nil then
+      -- The handshake is still running. When the effective scope needs the
+      -- catalog (the requested one, or every scope because `here` is missing),
+      -- wait for the hello and reopen; otherwise `here` can open now.
+      local needs_catalog = requested ~= "here" or not panel
+      if needs_catalog then
         return
       end
     end
@@ -736,6 +773,11 @@ function Browser:open(requested)
       self:open_window()
     end)
     return
+  end
+  -- The effective scope is `agent`/`all` (here was skipped or the request fell
+  -- back to the agent). Start the catalog exactly once for this round.
+  if self.catalog_state == true then
+    self:start_catalog(self.connection)
   end
   self:open_window()
 end
