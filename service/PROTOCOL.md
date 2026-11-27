@@ -189,7 +189,7 @@ unsupported shape, agent line too long).
 | -32800 | request cancelled (section 16.3) |
 | -32050 | invalid policy rule set (section 17) |
 | -32060 to -32066 | teams, sections 18.10 and 18.16 |
-| -32070 to -32072 | session catalog, section 21.6 |
+| -32070 to -32074 | session catalog, section 21.6 |
 | -32601, -32700, -32600, -32602 | standard JSON-RPC errors |
 
 ## 5. Relay rules (per instance)
@@ -2152,6 +2152,8 @@ entry = {
 agent_state = {
   listed_at: integer?, // unix ms of the last successful listing, absent if never
   error:     {code: integer, message: string}?, // last refresh failure, cleared on success
+  can_delete: boolean?, // api_version 9: whether the last successful listing's
+                        // initialize result has sessionCapabilities.delete
 }
 ```
 
@@ -2212,8 +2214,9 @@ are `-32602`. For every listed agent, independently and concurrently:
    An agent process that exits first fails with `-32072`. A spawn failure is
    `-32022` with the OS error.
 6. **Result.** On success the cache rows of that `agent` are **replaced** by the
-   listed entries (deduplicated by `sessionId`, last page wins), and
-   `agent_state = {listed_at: now}`. On failure the cached rows are kept and
+   listed entries (deduplicated by `sessionId`, last page wins, minus the ids
+   deleted by `sessions.delete` while this listing ran, see 21.8), and
+   `agent_state = {listed_at: now, can_delete}` (api_version 9). On failure the cached rows are kept and
    `agent_state.error` is set (`listed_at` unchanged).
 
 As soon as one agent finishes, the requesting connection receives
@@ -2259,9 +2262,65 @@ Version 4 stores upgrade in place.
 |---|---|
 | -32070 | the agent does not support `session/list` |
 | -32071 | listing timed out |
-| -32072 | the agent process exited during the listing |
+| -32072 | the agent process exited during the listing (or the delete, 21.8) |
+| -32073 | the agent does not support `session/delete` (21.8) |
+| -32074 | the session is in use by a running instance (21.8) |
 
 ### 21.7 Versions
 
 `api_version` becomes `8` (front end `lua/ade/service/version.lua` and
 `service/src/lib.rs` together) and the service version `0.9.0`.
+
+### 21.8 `sessions.delete` (feature `"sessions.delete"`, api_version 9)
+
+Deletes one stored session of any configured agent, including agents no front
+end is connected to. The front end deletes the session of its **own** panel
+connection through the tunnel as before (`session/delete`, tracked by 21.4);
+this method is for every other case.
+
+```
+-> {agent: {agent, command, args, cwd, env?, launch?},  // same item as 21.3 `agents[]`
+    sessionId: string,
+    timeout_ms: integer?}                               // default 30000, clamped to [1000, 120000]
+<- {}
+```
+
+Invalid params (missing fields, wrong types) are `-32602`. Then, in order:
+
+1. **In use.** If any running, non-stopping instance (listed or unlisted, any
+   connection) whose `agent` id equals `agent.agent` tracks `sessionId`
+   (section 11), fail with `-32074`. Nothing is sent to an agent.
+2. **Reuse / temporary instance.** Exactly as 21.3 steps 1 and 2 (same reuse
+   rule, same unlisted temporary instance, same `initialize`, same `-32601`
+   answer to agent-to-client requests, notifications dropped).
+3. **Capability.** If the `initialize` result does not have
+   `agentCapabilities.sessionCapabilities.delete` (any non-null value), fail
+   with `-32073`.
+4. **Delete.** Send a service-originated `session/delete {sessionId}`. Its
+   response goes to the service only. An error response fails with that
+   error's `code` and `message`.
+5. **Timeout / exit / spawn.** As 21.3 step 5: `-32071` when not finished
+   within `timeout_ms` from the start of step 2 (late responses ignored),
+   `-32072` when the agent process exits first, `-32022` for a spawn failure.
+6. **Result.** On success the catalog row `(agent, sessionId)` is removed
+   (explicitly, regardless of relay tracking) and the reply is `{}`. A
+   temporary instance is stopped when the call ends (success, error or
+   timeout; graceful sequence of 3.4). No `sessions.updated` is sent.
+7. **Joining.** A delete of the same `(agent, sessionId)` while one is running
+   (from any connection) does not send a second `session/delete`; it waits and
+   receives the same reply or error.
+8. **Racing a refresh.** If a `sessions.refresh` of the same `agent` is running
+   when a delete succeeds, that `sessionId` is dropped from the refresh's result
+   (21.3 step 6) and from its `sessions.updated` notification, so the deleted row
+   cannot come back from a listing that started before the delete.
+
+A delete may share a temporary instance with a running refresh of the same
+agent only if the implementation can do so without changing either's
+observable behaviour; otherwise it spawns its own. A running delete counts as
+busy for idle exit (section 8). If the requesting connection closes, the delete
+still finishes (and updates the catalog); its reply is dropped.
+
+`hello.features` contains `"sessions.delete"` (with or without the event log;
+without it there is no catalog row to remove). `api_version` becomes `9`
+(`lua/ade/service/version.lua` and `service/src/lib.rs` together) and the
+service version `0.10.0`.
