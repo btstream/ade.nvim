@@ -630,6 +630,12 @@ impl Relay {
         summaries
     }
 
+    /// Whether the relay tracks `session_id` as live in this instance
+    /// (PROTOCOL.md 11). `sessions.delete` uses it for the in-use check.
+    pub fn tracks_session(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id)
+    }
+
     /// Number of tracked sessions, for `agent.list`.
     pub fn session_count(&self) -> usize {
         self.sessions.len()
