@@ -108,6 +108,14 @@ impl Server {
         self.client.request(id, "sessions.refresh", params)
     }
 
+    fn delete(&mut self, id: i64, agent: Value, session: &str, timeout: Option<u64>) -> Value {
+        let mut params = json!({ "agent": agent, "sessionId": session });
+        if let Some(timeout) = timeout {
+            params["timeout_ms"] = json!(timeout);
+        }
+        self.client.request(id, "sessions.delete", params)
+    }
+
     fn cached(&mut self, id: i64) -> Value {
         let response = self.client.request(id, "sessions.cached", json!({}));
         response.get("result").cloned().unwrap_or(Value::Null)
@@ -263,6 +271,7 @@ fn refresh_lists_pages_and_caches_them() {
         "{cached}"
     );
     assert!(cached["agents"]["cat"]["listed_at"].is_u64(), "{cached}");
+    assert_eq!(cached["agents"]["cat"]["can_delete"], true, "{cached}");
     assert!(cached["agents"]["cat"].get("error").is_none(), "{cached}");
 
     // Paged without cwd first, then with the previous page's cursor.
@@ -424,6 +433,11 @@ fn an_initialized_instance_is_reused_without_a_second_initialize() {
     assert_eq!(instances.len(), 1, "{instances:?}");
     assert_eq!(instances[0]["instance"], instance);
     assert_eq!(instances[0]["stopping"], false);
+    let cached = server.cached(3);
+    assert_eq!(
+        cached["agents"]["cat"]["can_delete"], true,
+        "can_delete comes from the reused initialize: {cached}"
+    );
 }
 
 #[test]
@@ -705,12 +719,14 @@ fn without_the_event_log_refresh_still_lists_but_caches_nothing() {
     let hello = server
         .client
         .hello(&server.server.token(), nvim_ade_server::API_VERSION);
-    assert!(
-        hello["result"]["features"]
-            .as_array()
-            .is_some_and(|features| features.iter().any(|feature| feature == "sessions")),
-        "the sessions feature does not need the log: {hello}"
-    );
+    for feature in ["sessions", "sessions.delete"] {
+        assert!(
+            hello["result"]["features"]
+                .as_array()
+                .is_some_and(|features| features.iter().any(|value| value == feature)),
+            "the {feature} feature does not need the log: {hello}"
+        );
+    }
     let env = server.env(json!({}));
     let cwd = server.work.clone();
     let response = server.refresh(2, vec![server.launch("cat", &cwd, env)], None);
@@ -741,6 +757,381 @@ fn duplicate_agent_ids_are_invalid_params() {
     let launch = server.launch("cat", &cwd, env);
     let response = server.refresh(2, vec![launch.clone(), launch], None);
     assert_eq!(response["error"]["code"], -32602, "{response}");
+    assert!(
+        server.log_events().is_empty(),
+        "nothing is spawned for an invalid call"
+    );
+}
+
+#[test]
+fn sessions_delete_reuses_an_initialized_instance_and_removes_the_row() {
+    let mut server = Server::new("catalog-delete-reuse");
+    let env = server.env(json!({}));
+    let cwd = server.work.clone();
+    let response = server.refresh(2, vec![server.launch("cat", &cwd, env.clone())], None);
+    assert_eq!(
+        response["result"]["agents"]["cat"]["ok"], true,
+        "{response}"
+    );
+    let cached = server.cached(3);
+    assert_eq!(cached["agents"]["cat"]["can_delete"], true, "{cached}");
+    assert_eq!(
+        cached["sessions"].as_array().map(Vec::len),
+        Some(1),
+        "{cached}"
+    );
+    server.wait_log("exit", 1);
+
+    // The listed instance is reused: no second process, no second initialize.
+    let instance = attach(&mut server.client, &server.work, env.clone());
+    let initializations = server.log_count("initialize");
+    let deleted = server.delete(4, server.launch("cat", &cwd, env), "s1", None);
+    assert_eq!(deleted["result"], json!({}), "{deleted}");
+    assert_eq!(
+        server.log_count("initialize"),
+        initializations,
+        "the delete must reuse the initialized instance"
+    );
+    assert_eq!(server.log_count("session/delete"), 1);
+
+    let cached = server.cached(5);
+    assert_eq!(
+        cached["sessions"].as_array().map(Vec::len),
+        Some(0),
+        "{cached}"
+    );
+    let listed = server.list();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["instance"], instance);
+    assert_eq!(listed[0]["stopping"], false);
+}
+
+#[test]
+fn sessions_delete_spawns_and_stops_a_temporary_instance() {
+    let mut server = Server::new("catalog-delete-temp");
+    let env = server.env(json!({}));
+    let cwd = server.work.clone();
+    server.refresh(2, vec![server.launch("cat", &cwd, env.clone())], None);
+    server.wait_log("exit", 1);
+
+    let before = server.log_count("initialize");
+    let response = server.delete(3, server.launch("cat", &cwd, env), "s1", None);
+    assert_eq!(response["result"], json!({}), "{response}");
+    assert_eq!(
+        server.log_count("initialize"),
+        before + 1,
+        "the delete spawns its own temporary instance"
+    );
+    assert_eq!(server.log_count("session/delete"), 1);
+    let cached = server.cached(4);
+    assert_eq!(
+        cached["sessions"].as_array().map(Vec::len),
+        Some(0),
+        "{cached}"
+    );
+    // The refresh's and the delete's temporary processes both stopped.
+    server.wait_log("exit", 2);
+}
+
+#[test]
+fn sessions_delete_without_the_capability_is_rejected() {
+    let mut server = Server::new("catalog-delete-capability");
+    let env = server.env(json!({"CATALOG_AGENT_NO_DELETE": "1"}));
+    let cwd = server.work.clone();
+    let response = server.refresh(2, vec![server.launch("cat", &cwd, env.clone())], None);
+    assert_eq!(
+        response["result"]["agents"]["cat"]["ok"], true,
+        "{response}"
+    );
+    let cached = server.cached(3);
+    assert_eq!(cached["agents"]["cat"]["can_delete"], false, "{cached}");
+
+    // Temporary path: the fresh initialize says no delete.
+    let response = server.delete(4, server.launch("cat", &cwd, env.clone()), "s1", None);
+    assert_eq!(response["error"]["code"], -32073, "{response}");
+    assert_eq!(server.log_count("session/delete"), 0);
+    server.wait_log("exit", 2);
+
+    // Reuse path: the cached initialize also lacks delete.
+    let instance = attach(&mut server.client, &server.work, env.clone());
+    let initializations = server.log_count("initialize");
+    let response = server.delete(5, server.launch("cat", &cwd, env), "s1", None);
+    assert_eq!(response["error"]["code"], -32073, "{response}");
+    assert_eq!(server.log_count("initialize"), initializations);
+    assert_eq!(server.log_count("session/delete"), 0);
+    let listed = server.list();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["instance"], instance);
+    assert_eq!(listed[0]["stopping"], false);
+}
+
+#[test]
+fn sessions_delete_refuses_a_session_in_use() {
+    let mut server = Server::new("catalog-delete-in-use");
+    let env = server.env(json!({}));
+    let cwd = server.work.clone();
+    server.refresh(2, vec![server.launch("cat", &cwd, env.clone())], None);
+    server.wait_log("exit", 1);
+
+    let instance = attach(&mut server.client, &server.work, env.clone());
+    let loaded = tunnel_call(
+        &mut server.client,
+        &instance,
+        20,
+        "session/load",
+        json!({
+            "sessionId": "s1",
+            "cwd": server.work.to_string_lossy(),
+            "mcpServers": [],
+        }),
+    );
+    assert!(loaded.get("result").is_some(), "{loaded}");
+
+    let deletes = server.log_count("session/delete");
+    let response = server.delete(3, server.launch("cat", &cwd, env), "s1", None);
+    assert_eq!(response["error"]["code"], -32074, "{response}");
+    assert_eq!(response["error"]["message"], "session is in use");
+    assert_eq!(
+        server.log_count("session/delete"),
+        deletes,
+        "nothing must reach an agent"
+    );
+    let cached = server.cached(4);
+    assert_eq!(
+        cached["sessions"].as_array().map(Vec::len),
+        Some(1),
+        "an in-use session keeps its row: {cached}"
+    );
+}
+
+#[test]
+fn sessions_delete_passes_an_agent_error_through() {
+    let mut server = Server::new("catalog-delete-error");
+    let cwd = server.work.clone();
+    let list_env = server.env(json!({}));
+    server.refresh(2, vec![server.launch("cat", &cwd, list_env)], None);
+
+    let env = server.env(json!({"CATALOG_AGENT_DELETE_ERROR": "409:cannot delete"}));
+    let response = server.delete(3, server.launch("cat", &cwd, env), "s1", None);
+    assert_eq!(response["error"]["code"], 409, "{response}");
+    assert_eq!(response["error"]["message"], "cannot delete");
+    let cached = server.cached(4);
+    assert_eq!(
+        cached["sessions"].as_array().map(Vec::len),
+        Some(1),
+        "a failed delete keeps the row: {cached}"
+    );
+}
+
+#[test]
+fn sessions_delete_timeout_stops_the_temporary_instance() {
+    let mut server = Server::new("catalog-delete-timeout");
+    let env = server.env(json!({}));
+    let cwd = server.work.clone();
+    server.refresh(2, vec![server.launch("cat", &cwd, env.clone())], None);
+    server.wait_log("exit", 1);
+
+    let slow = server.env(json!({"CATALOG_AGENT_DELETE_DELAY": "30"}));
+    let started = Instant::now();
+    let response = server.delete(3, server.launch("cat", &cwd, slow), "s1", Some(1000));
+    assert_eq!(response["error"]["code"], -32071, "{response}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the catalog timer must fire near timeout_ms"
+    );
+    server.wait_log("terminated", 1);
+    let cached = server.cached(4);
+    assert_eq!(
+        cached["sessions"].as_array().map(Vec::len),
+        Some(1),
+        "a timed-out delete keeps the row: {cached}"
+    );
+}
+
+#[test]
+fn sessions_delete_reports_an_agent_exit() {
+    let mut server = Server::new("catalog-delete-exit");
+    let env = server.env(json!({"CATALOG_AGENT_EXIT_ON_DELETE": "1"}));
+    let cwd = server.work.clone();
+    let response = server.delete(2, server.launch("cat", &cwd, env), "s1", None);
+    assert_eq!(response["error"]["code"], -32072, "{response}");
+}
+
+#[test]
+fn sessions_delete_joins_a_running_delete() {
+    let mut first = Server::new("catalog-delete-join");
+    let env = first.env(json!({"CATALOG_AGENT_DELETE_DELAY": "0.5"}));
+    let cwd = first.work.clone();
+    first.refresh(2, vec![first.launch("cat", &cwd, env.clone())], None);
+    first.wait_log("exit", 1);
+
+    let mut second = first.server.connect();
+    let hello = second.hello(&first.server.token(), nvim_ade_server::API_VERSION);
+    assert!(hello["result"].is_object(), "hello: {hello}");
+
+    let params = json!({
+        "agent": first.launch("cat", &cwd, env),
+        "sessionId": "s1",
+        "timeout_ms": 5000,
+    });
+    first.client.send(&json!({
+        "jsonrpc": "2.0", "id": 20, "method": "sessions.delete", "params": params.clone(),
+    }));
+    second.send(&json!({
+        "jsonrpc": "2.0", "id": 21, "method": "sessions.delete", "params": params,
+    }));
+    let first_reply = wait_for(|| first.client.take_response(20), "the first delete reply");
+    let joined_reply = wait_for(|| second.take_response(21), "the joined delete reply");
+    assert_eq!(first_reply["result"], json!({}), "{first_reply}");
+    assert_eq!(joined_reply["result"], json!({}), "{joined_reply}");
+    assert_eq!(
+        first.log_count("session/delete"),
+        1,
+        "joining must not send a second session/delete"
+    );
+    first.wait_log("exit", 2);
+}
+
+#[test]
+fn a_delete_during_a_refresh_removes_the_row_from_the_result() {
+    let mut server = Server::new("catalog-delete-race");
+    let cwd = server.work.clone();
+    let refresh_env = server.env(json!({"CATALOG_AGENT_LIST_DELAY": "1.2"}));
+    let refresh = json!({
+        "agents": [server.launch("cat", &cwd, refresh_env)],
+        "timeout_ms": 5000,
+    });
+    server.client.send(&json!({
+        "jsonrpc": "2.0", "id": 20, "method": "sessions.refresh", "params": refresh,
+    }));
+    // The refresh's list request is sleeping in the agent now.
+    server.wait_log("list", 1);
+
+    let delete_env = server.env(json!({}));
+    let response = server.delete(21, server.launch("cat", &cwd, delete_env), "s1", Some(5000));
+    assert_eq!(response["result"], json!({}), "{response}");
+
+    let notification = server.client.next_notification(WAIT);
+    assert_eq!(notification["method"], "sessions.updated");
+    assert_eq!(notification["params"]["agent"], "cat");
+    assert_eq!(
+        notification["params"]["sessions"],
+        json!([]),
+        "the deleted row must not come back: {notification}"
+    );
+    let reply = wait_for(|| server.client.take_response(20), "the refresh reply");
+    assert_eq!(reply["result"]["agents"]["cat"]["ok"], true, "{reply}");
+    assert_eq!(reply["result"]["agents"]["cat"]["count"], 0, "{reply}");
+    let cached = server.cached(22);
+    assert_eq!(
+        cached["sessions"].as_array().map(Vec::len),
+        Some(0),
+        "{cached}"
+    );
+}
+
+#[test]
+fn a_delete_finishes_after_its_connection_closes() {
+    let mut server = Server::new("catalog-delete-closed");
+    let env = server.env(json!({}));
+    let cwd = server.work.clone();
+    server.refresh(2, vec![server.launch("cat", &cwd, env.clone())], None);
+    server.wait_log("exit", 1);
+
+    let slow = server.env(json!({"CATALOG_AGENT_DELETE_DELAY": "0.8"}));
+    let params = json!({
+        "agent": server.launch("cat", &cwd, slow),
+        "sessionId": "s1",
+        "timeout_ms": 5000,
+    });
+    server.client.send(&json!({
+        "jsonrpc": "2.0", "id": 20, "method": "sessions.delete", "params": params,
+    }));
+    server.client.disconnect();
+
+    let mut observer = server.server.connect();
+    let hello = observer.hello(&server.server.token(), nvim_ade_server::API_VERSION);
+    assert!(hello["result"].is_object(), "hello: {hello}");
+    let cached = wait_for(
+        || {
+            let cached = observer.request(3, "sessions.cached", json!({}));
+            let result = cached.get("result")?.clone();
+            (result["sessions"].as_array().map(Vec::len) == Some(0)).then_some(result)
+        },
+        "the row removed after the connection closed",
+    );
+    assert_eq!(cached["agents"]["cat"]["can_delete"], true, "{cached}");
+}
+
+#[test]
+fn idle_exit_waits_for_a_running_delete() {
+    let mut server = Server::with_env("catalog-delete-idle", &["--idle-timeout", "0.5"], &[]);
+    let env = server.env(json!({}));
+    let cwd = server.work.clone();
+    server.refresh(2, vec![server.launch("cat", &cwd, env.clone())], None);
+    server.wait_log("exit", 1);
+
+    let slow = server.env(json!({"CATALOG_AGENT_DELETE_DELAY": "1.5"}));
+    let params = json!({
+        "agent": server.launch("cat", &cwd, slow),
+        "sessionId": "s1",
+        "timeout_ms": 5000,
+    });
+    let started = Instant::now();
+    server.client.send(&json!({
+        "jsonrpc": "2.0", "id": 20, "method": "sessions.delete", "params": params,
+    }));
+    server.client.disconnect();
+    let code = server.server.wait_for_exit(Duration::from_secs(15));
+    assert!(
+        code.is_some(),
+        "the service must idle-exit after the delete; stderr:\n{}",
+        server.server.stderr()
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(1500),
+        "idle exit must wait for the running delete (took {:?})",
+        started.elapsed()
+    );
+
+    let dir = server.server.temp_dir();
+    let restarted = TestServer::start_in_dir(dir, "catalog-delete-idle-restart", &[], &[]);
+    let mut client = restarted.connect();
+    let hello = client.hello(&restarted.token(), nvim_ade_server::API_VERSION);
+    assert!(hello["result"].is_object(), "hello: {hello}");
+    let cached = client.request(2, "sessions.cached", json!({}));
+    assert_eq!(
+        cached["result"]["sessions"].as_array().map(Vec::len),
+        Some(0),
+        "the delete finished before the idle exit: {cached}"
+    );
+}
+
+#[test]
+fn sessions_delete_rejects_invalid_params() {
+    let mut server = Server::new("catalog-delete-invalid");
+    let launch = server.launch("cat", &server.work, server.env(json!({})));
+    let cases = [
+        json!({}),
+        json!({ "agent": launch }),
+        json!({ "agent": launch, "sessionId": "" }),
+        json!({ "agent": launch, "sessionId": 7 }),
+        // A relative cwd is not a launch the service may spawn.
+        json!({
+            "agent": {
+                "agent": "cat", "command": "python3", "args": [agent_script()],
+                "cwd": "relative",
+            },
+            "sessionId": "s1",
+        }),
+        json!({ "agent": launch, "sessionId": "s1", "timeout_ms": -1 }),
+    ];
+    for (index, params) in cases.iter().enumerate() {
+        let response = server
+            .client
+            .request(100 + index as i64, "sessions.delete", params.clone());
+        assert_eq!(response["error"]["code"], -32602, "{params}: {response}");
+    }
     assert!(
         server.log_events().is_empty(),
         "nothing is spawned for an invalid call"

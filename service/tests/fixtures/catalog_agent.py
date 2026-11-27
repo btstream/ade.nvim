@@ -18,6 +18,10 @@ Environment knobs:
   CATALOG_AGENT_EXIT_ON_LIST   exit the process when `session/list` arrives
   CATALOG_AGENT_CLIENT_REQUEST send an `fs/read_text_file` request before the
                                first `session/list` answer
+  CATALOG_AGENT_NO_DELETE      omit `sessionCapabilities.delete` (null)
+  CATALOG_AGENT_DELETE_DELAY   seconds to sleep before answering `session/delete`
+  CATALOG_AGENT_DELETE_ERROR   "code:message" error for every `session/delete`
+  CATALOG_AGENT_EXIT_ON_DELETE exit the process when `session/delete` arrives
 """
 
 import json
@@ -36,8 +40,12 @@ PAGES = json.loads(
 LIST_DELAY = float(os.environ.get("CATALOG_AGENT_LIST_DELAY", "0"))
 LIST_ERROR = os.environ.get("CATALOG_AGENT_LIST_ERROR")
 NO_LIST = os.environ.get("CATALOG_AGENT_NO_LIST")
+NO_DELETE = os.environ.get("CATALOG_AGENT_NO_DELETE")
 INIT_FAIL = os.environ.get("CATALOG_AGENT_INIT_FAIL")
 EXIT_ON_LIST = os.environ.get("CATALOG_AGENT_EXIT_ON_LIST")
+EXIT_ON_DELETE = os.environ.get("CATALOG_AGENT_EXIT_ON_DELETE")
+DELETE_DELAY = float(os.environ.get("CATALOG_AGENT_DELETE_DELAY", "0"))
+DELETE_ERROR = os.environ.get("CATALOG_AGENT_DELETE_ERROR")
 CLIENT_REQUEST = os.environ.get("CATALOG_AGENT_CLIENT_REQUEST")
 PAGE = [0]
 REQUESTED = [False]
@@ -90,9 +98,10 @@ def handle(message):
             error(ident, 500, "initialize refused")
             return
         capabilities = {"loadSession": True}
-        capabilities["sessionCapabilities"] = (
-            {"list": None} if NO_LIST else {"list": {}}
-        )
+        capabilities["sessionCapabilities"] = {
+            "list": None if NO_LIST else {},
+            "delete": None if NO_DELETE else {},
+        }
         result(ident, {"protocolVersion": 1, "agentCapabilities": capabilities})
         return
 
@@ -126,12 +135,24 @@ def handle(message):
         result(ident, body)
         return
 
-    if method in ("session/new", "session/close", "session/delete"):
-        log({"event": method})
+    if method in ("session/new", "session/close", "session/delete") or method in (
+        "session/load",
+        "session/resume",
+    ):
+        log({"event": method, "params": message.get("params")})
         if method == "session/new":
             result(ident, {"sessionId": "agent-session"})
-        else:
-            result(ident, {})
+            return
+        if method == "session/delete":
+            if EXIT_ON_DELETE:
+                sys.exit(0)
+            if DELETE_DELAY:
+                time.sleep(DELETE_DELAY)
+            if DELETE_ERROR:
+                code, text = DELETE_ERROR.split(":", 1)
+                error(ident, int(code), text)
+                return
+        result(ident, {})
         return
 
     if ident is not None:
