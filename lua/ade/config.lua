@@ -141,11 +141,33 @@ M.defaults = {
     spawn_confirm = { auto = {} },
     limits = { max_turns_per_task = 30, max_turns_total = 200 },
     templates = {}, -- resolved to the inherited `worker` template when empty
-    -- Team panel layout (W0f): below this width the panel uses a float.
+    -- Deprecated team pane keys (W0f). `wide` and `members_width` are carried
+    -- over to `teams.layout` during normalisation when the new keys are not
+    -- set; see `M.team_aliases`.
     dashboard = {
       wide = 160,
       members_width = 32,
       keys = { interrupt = "<M-CR>" },
+    },
+    -- Team pane placement. The defaults reproduce the previous hard-coded
+    -- behaviour: all panes split to the right, tree/members 32 columns, the
+    -- board takes the free space, and below `float_below` columns every pane
+    -- is a float.
+    layout = {
+      -- inherit: follow `layout.backend` (native | external)
+      backend = "inherit", -- inherit | native | external
+      -- native only: below this editor width every pane is a float
+      float_below = 160,
+      -- native only: same-side panes share one column/row. Off keeps the old
+      -- layout: every pane opens its own column (left/right) or row
+      -- (top/bottom), and an unsized pane takes the free space.
+      stack = false,
+      panes = {
+        tree = { position = "right", size = 32 },
+        members = { position = "right", size = 32 },
+        -- No size: the board takes the free space.
+        board = { position = "right" },
+      },
     },
   },
 
@@ -864,7 +886,66 @@ local function validate_icons(overrides)
   end
 end
 
-function M.validate(cfg)
+---Read a value from the user's raw table, before defaults were merged.
+---@param raw any
+---@param path string[]
+---@return any
+local function raw_get(raw, path)
+  local node = raw
+  for _, key in ipairs(path) do
+    if type(node) ~= "table" then
+      return nil
+    end
+    node = node[key]
+  end
+  return node
+end
+
+---Carry the deprecated `teams.dashboard` keys over to `teams.layout`.
+---
+---Defaults are deep-merged, so a new key that still holds its default is
+---indistinguishable from one the user set. `raw` is the user's table before
+---merging, which tells the two apart; a value set at the new key always wins.
+---
+---Without `raw` nothing is carried over: guessing from the merged table could
+---overwrite a new key the caller already set to its default.
+---@param cfg table merged configuration
+---@param raw table|nil user configuration
+function M.team_aliases(cfg, raw)
+  if type(raw) ~= "table" then
+    return
+  end
+  local teams = cfg.teams
+  if type(teams) ~= "table" then
+    return
+  end
+  local layout, dashboard = teams.layout, teams.dashboard
+  if type(layout) ~= "table" or type(dashboard) ~= "table" then
+    return
+  end
+  if dashboard.wide ~= nil and raw_get(raw, { "teams", "layout", "float_below" }) == nil then
+    layout.float_below = dashboard.wide
+  end
+  if dashboard.members_width == nil then
+    return
+  end
+  local panes = layout.panes
+  if type(panes) ~= "table" then
+    return
+  end
+  for _, name in ipairs({ "tree", "members" }) do
+    local pane = panes[name]
+    if type(pane) == "table" and raw_get(raw, { "teams", "layout", "panes", name, "size" }) == nil then
+      pane.size = dashboard.members_width
+    end
+  end
+end
+
+---Validate and normalize a merged configuration table.
+---@param cfg table
+---@param raw table|nil the user's configuration before defaults were merged
+function M.validate(cfg, raw)
+  M.team_aliases(cfg, raw)
   M.normalize_keymaps(cfg)
   check_enum(cfg.backend, { "direct", "service", "auto" }, "backend")
   local service = cfg.service
@@ -1658,6 +1739,33 @@ function M.validate(cfg)
     fail("teams.dashboard.members_width must be an integer between 16 and 120")
   end
 
+  local team_layout = teams.layout
+  if type(team_layout) ~= "table" then
+    fail("teams.layout must be a table")
+  end
+  check_enum(team_layout.backend, { "inherit", "native", "external" }, "teams.layout.backend")
+  check_number(team_layout.float_below, 40, 10000, "teams.layout.float_below")
+  if team_layout.float_below % 1 ~= 0 then
+    fail("teams.layout.float_below must be an integer")
+  end
+  if type(team_layout.stack) ~= "boolean" then
+    fail("teams.layout.stack must be a boolean, got %s", type(team_layout.stack))
+  end
+  if type(team_layout.panes) ~= "table" then
+    fail("teams.layout.panes must be a table")
+  end
+  for _, name in ipairs({ "tree", "members", "board" }) do
+    local pane = team_layout.panes[name]
+    local at = "teams.layout.panes." .. name
+    if type(pane) ~= "table" then
+      fail("%s must be a table", at)
+    end
+    check_enum(pane.position, { "left", "right", "top", "bottom", "float" }, at .. ".position")
+    if pane.size ~= nil then
+      check_number(pane.size, 0.05, 1000, at .. ".size")
+    end
+  end
+
   local limits = teams.limits
   if type(limits) ~= "table" then
     fail("teams.limits must be a table")
@@ -1875,6 +1983,20 @@ function M.normalize_keymaps(cfg)
       end
     end
   end
+end
+
+---Resolve the team pane backend: `teams.layout.backend = "inherit"` follows
+---`layout.backend`.
+---@param cfg table
+---@return "native"|"external"
+function M.team_backend(cfg)
+  local layout = type(cfg) == "table" and cfg.teams and cfg.teams.layout or nil
+  local backend = type(layout) == "table" and layout.backend or "inherit"
+  if backend ~= "native" and backend ~= "external" then
+    local main = type(cfg) == "table" and cfg.layout or nil
+    backend = type(main) == "table" and main.backend or "native"
+  end
+  return backend == "external" and "external" or "native"
 end
 
 ---Resolve the panel width in columns for a total `total` width.

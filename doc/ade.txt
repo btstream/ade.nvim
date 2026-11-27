@@ -360,6 +360,17 @@ ade.nvim 创建两个普通视图：
     ade_chat    对话记录（只读）
     ade_input   输入区（可编辑）
 
+团队面板同样是普通视图：ade_team_tree / ade_team_members / ade_team_board。
+extend() 默认把它们注册到聊天面板的同一侧；也可以逐个指定位置，或整体关闭：
+
+    require("ade.integrations.edgy").extend(opts, {
+      team = { tree = "left", members = "left", board = "bottom" },
+    })
+    -- team = false: 团队面板不交给 edgy，保持普通窗口
+
+external 模式下第一次打开团队面板时会检查这些 filetype 是否注册，缺失时只警告
+一次。团队面板的 size 由 edgy 决定，ade.nvim 不会套用 teams.layout.panes.*.size。
+
 由 edgy 决定它们的位置和尺寸。ade.nvim 不会持续调整窗口大小，也不会在窗口
 被关闭后强行重开。
 
@@ -1334,7 +1345,17 @@ leader 保存流程时，只有你在对话里明确提到 leader 的 agent、�
           role = "按 leader 分配的卡片审查代码。", -- 可选
         },
       },
-      dashboard = { wide = 160 },  -- 面板宽度阈值（40..10000）
+      dashboard = { wide = 160 },  -- 已废弃：改用 teams.layout.float_below
+      layout = {
+        backend = "inherit",       -- inherit = 跟随 layout.backend
+        float_below = 160,         -- 仅 native：窄于此列数时改用浮窗
+        stack = false,             -- 仅 native：同侧面板是否共用一列/一行
+        panes = {
+          tree    = { position = "right", size = 32 },
+          members = { position = "right", size = 32 },
+          board   = { position = "right" }, -- 不写 size：占满剩余空间
+        },
+      },
     }
 
 注意：旧的 teams.definitions 和 teams.workflow 已删除，配置里出现时 setup
@@ -1456,8 +1477,17 @@ teams.templates = { worker = { agent = "inherit", worktree = true } }。
 
 面板 ~
                                                              *ade-teams-panel*
-会话树、成员面板和看板都在当前 tabpage 内独立打开、聚焦和关闭。宽屏（列数 >=
-teams.dashboard.wide，默认 160）使用分栏；窄屏只显示请求的浮窗。q 关闭
+会话树、成员面板和看板都在当前 tabpage 内独立打开、聚焦和关闭。位置和大小由
+teams.layout.panes.<tree|members|board> 决定：position 取 left / right / top /
+bottom / float，size 为左右面板的列数或上下面板的行数，0 < size <= 1 表示占
+编辑器比例，省略 size 则占满剩余空间。teams.layout.stack = false（默认）时
+每个面板各自占一列（左右）或一行（上下）；设为 true 时同侧面板共用一列/一行，
+按 tree、members、board 的顺序排列，与打开顺序无关。teams.layout.backend = "inherit"
+（默认）跟随 layout.backend：native 模式下列数少于 teams.layout.float_below
+（默认 160）时只显示请求的浮窗；external 模式（edgy 等）只创建普通分栏，
+位置和尺寸交给布局管理器。旧键 teams.dashboard.wide 等价于
+teams.layout.float_below，teams.dashboard.members_width 等价于 tree/members
+的 size（新键优先）。q 关闭
 所在面板，不关闭另一个面板、聊天窗口或团队。
 
 树      按项目分组，每个会话一行；leader 标 [leader] 并强调，开关关掉的会话
@@ -1472,9 +1502,9 @@ teams.dashboard.wide，默认 160）使用分栏；窄屏只显示请求的浮�
         中 / ○ 空闲 / ? 等你回答 / ⏸ 暂停 / ✕ 退出）和已持续时间、任务
         与未读消息（✉ N）。宽度不够时先缩短模型，再缩短 agent；放不下的
         模型会换到第二行。第二行还显示 ↳ 最近动态，第三行显示 worktree 分
-        支。成员栏宽度由 teams.dashboard.members_width 决定（默认 32，
-        16..120），winfixwidth + nowrap；手动拖动后本次打开期间保持，下次
-        打开恢复配置值。
+        支。成员栏宽度由 teams.layout.panes.members.size 决定（默认 32，
+        16..120；旧键 teams.dashboard.members_width 仍可用），winfixwidth +
+        nowrap；手动拖动后本次打开期间保持，下次打开恢复配置值。
 看板    列之间是粗竖线（┃），列标题带数量和底色；卡片是圆角框，负责人用
         角色色画边框，光标所在卡片高亮。列宽只由窗口宽度决定，不随标题长
         度跳动；列太多时横向滚动（zh / zl），标题行固定。已归档的卡片按阶

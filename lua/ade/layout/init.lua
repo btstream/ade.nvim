@@ -3,6 +3,16 @@ local log = require("ade.log")
 
 local M = {}
 
+-- Filetypes ade owns. The team panes count as panel buffers: their windows are
+-- locked and splitting away from them must not produce an editable duplicate.
+local PANEL_FILETYPES = {
+  ade_chat = true,
+  ade_input = true,
+  ade_team_tree = true,
+  ade_team_members = true,
+  ade_team_board = true,
+}
+
 local state = {
   backend = "native",
   position = "right",
@@ -20,6 +30,13 @@ function M.setup(config)
   M.install_lock_guard()
 end
 
+---Whether `ft` is one of ade's own buffer types.
+---@param ft string
+---@return boolean
+function M.is_panel_filetype(ft)
+  return PANEL_FILETYPES[ft] == true
+end
+
 ---Whether a buffer belongs to the ADE panel.
 ---@param buf integer
 ---@return boolean
@@ -27,8 +44,19 @@ function M.is_panel_buffer(buf)
   if not buf or not vim.api.nvim_buf_is_valid(buf) then
     return false
   end
-  local ft = vim.bo[buf].filetype
-  return ft == "ade_chat" or ft == "ade_input"
+  return M.is_panel_filetype(vim.bo[buf].filetype)
+end
+
+---Register a panel-owned window (the chat/composer pair or a team pane) so the
+---lock guard treats it as managed instead of replacing its buffer with a
+---scratch one.
+---@param win integer
+---@param name string
+function M.track_window(win, name)
+  if not win or not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+  state.views[name] = win
 end
 
 ---Guard against the ways a locked ADE window could still be repurposed.
@@ -68,9 +96,8 @@ function M.install_lock_guard()
       -- locked and unusable duplicate. Hand it a fresh scratch buffer instead
       -- so splitting away from the panel behaves like a normal split.
       local is_managed = false
-      for _, view in ipairs({ "chat", "input" }) do
-        local current = state.views and state.views[view]
-        if current and current == win then
+      for _, current in pairs(state.views or {}) do
+        if current == win then
           is_managed = true
         end
       end
@@ -336,8 +363,7 @@ function M.remember_focus()
     return
   end
   local buf = vim.api.nvim_win_get_buf(win)
-  local ft = vim.bo[buf].filetype
-  if ft == "ade_chat" or ft == "ade_input" then
+  if M.is_panel_filetype(vim.bo[buf].filetype) then
     return
   end
   state.saved_win = win

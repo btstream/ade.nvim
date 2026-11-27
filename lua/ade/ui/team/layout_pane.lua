@@ -1,9 +1,12 @@
--- The in-tab team panes: members and board open in the *current* tabpage.
+-- The in-tab team panes: tree, members and board open in the *current*
+-- tabpage.
 --
--- Both panes are independent: each command opens or focuses only its own
--- pane, closing one leaves the other (and the ordinary chat panel) alone.
--- Wide terminals get native splits; narrow ones get floats sized to the pane
--- that was actually requested, never a forced second tabpage.
+-- Placement comes from `teams.layout.panes`: left/right/top/bottom splits
+-- (pinned to their configured size) or `float`. With the external backend a
+-- layout manager owns the geometry, so the panes are only opened as plain
+-- splits; below `teams.layout.float_below` columns (native only) every pane is
+-- a float sized to the pane that was actually requested, never a forced second
+-- tabpage.
 local M = {}
 
 local Pane = {}
@@ -22,6 +25,41 @@ local FILETYPES = {
   members = "ade_team_members",
   board = "ade_team_board",
 }
+
+---Whether a position shares the editor's columns (left/right) instead of its
+---lines (top/bottom).
+---@param position string
+---@return boolean
+local function horizontal(position)
+  return position == "left" or position == "right"
+end
+
+---@param horizontal_axis boolean
+---@return "winfixwidth"|"winfixheight"
+local function pin_option(horizontal_axis)
+  return horizontal_axis and "winfixwidth" or "winfixheight"
+end
+
+---@param horizontal_axis boolean
+---@param win integer
+---@return integer
+local function win_size(horizontal_axis, win)
+  if horizontal_axis then
+    return vim.api.nvim_win_get_width(win)
+  end
+  return vim.api.nvim_win_get_height(win)
+end
+
+---@param horizontal_axis boolean
+---@param win integer
+---@param value integer
+local function set_win_size(horizontal_axis, win, value)
+  if horizontal_axis then
+    pcall(vim.api.nvim_win_set_width, win, value)
+  else
+    pcall(vim.api.nvim_win_set_height, win, value)
+  end
+end
 
 ---@param dashboard table
 ---@return table
@@ -51,10 +89,78 @@ function M.new(dashboard)
   return self
 end
 
+---The effective placement backend: `teams.layout.backend = "inherit"` follows
+---`layout.backend`.
+---@return "native"|"external"
+function Pane:backend()
+  return require("ade.config").team_backend(self.dashboard.config() or {})
+end
+
+---Where a pane asks to be placed.
+---@param name string
+---@return string
+function Pane:position(name)
+  local cfg = self.dashboard.config() or {}
+  local teams = cfg.teams or {}
+  local pane = ((teams.layout or {}).panes or {})[name]
+  local position = type(pane) == "table" and pane.position or nil
+  if position == "left" or position == "right" or position == "top" or position == "bottom" or position == "float" then
+    return position
+  end
+  return "right"
+end
+
+---The configured size of a pane on its axis, in cells; nil means "take the
+---free space".
+---
+---A number up to 1 is a fraction of the editor, as with `layout.width`.
+---@param name string
+---@param position string|nil
+---@return integer|nil
+function Pane:size(name, position)
+  position = position or self:position(name)
+  local cfg = self.dashboard.config() or {}
+  local teams = cfg.teams or {}
+  local pane = ((teams.layout or {}).panes or {})[name]
+  local size = type(pane) == "table" and tonumber(pane.size) or nil
+  if size == nil and (name == "tree" or name == "members") then
+    -- A configuration table that only carries the deprecated key. A
+    -- normalised configuration already has it under `teams.layout`.
+    local legacy = teams.dashboard
+    size = type(legacy) == "table" and tonumber(legacy.members_width) or nil
+  end
+  if size == nil then
+    return nil
+  end
+  local horizontal_axis = horizontal(position)
+  local total = horizontal_axis and vim.o.columns or (vim.o.lines - vim.o.cmdheight)
+  local cells = size <= 1 and math.floor(total * size + 0.5) or math.floor(size)
+  if horizontal_axis then
+    -- The configured clamp. Vim still keeps the focused window at least
+    -- 'winwidth' wide, so a pane asking for less opens that wide.
+    return math.max(16, math.min(120, cells))
+  end
+  -- Never take the whole height: the ordinary windows above/below need lines.
+  return math.max(3, math.min(math.max(3, total - 4), cells))
+end
+
+---Whether same-side panes share one column/row (`teams.layout.stack`).
+---@return boolean
+function Pane:stack()
+  local cfg = self.dashboard.config() or {}
+  local layout = ((cfg.teams or {}).layout or {})
+  return layout.stack == true
+end
+
 ---@return integer
 function Pane:wide()
   local cfg = self.dashboard.config() or {}
-  return tonumber(((cfg.teams or {}).dashboard or {}).wide) or 160
+  local teams = cfg.teams or {}
+  local value = tonumber((teams.layout or {}).float_below)
+  if not value then
+    value = tonumber((teams.dashboard or {}).wide)
+  end
+  return value or 160
 end
 
 ---@return integer
@@ -62,8 +168,7 @@ function Pane:members_width()
   if tonumber(self.adopted_width) then
     return self.adopted_width
   end
-  local cfg = self.dashboard.config() or {}
-  return math.max(16, math.min(120, tonumber(((cfg.teams or {}).dashboard or {}).members_width) or 32))
+  return self:size("members", "right") or 32
 end
 
 function Pane:is_open_pane(name)
@@ -168,150 +273,166 @@ end
 
 ---The window a new pane splits from.
 ---
----Always the widest ordinary window **of this tabpage**, never another pane and
----never a narrow leftover split: `:botright vsplit` from inside the members
----window puts the new pane *beside* it (squeezing members to its minimum and
----leaving the board a sliver), and splitting a thin stray window has the same
----effect. Another tab's widest window would put the new pane in the wrong tab.
+---Always the widest (left/right) or tallest (top/bottom) ordinary window **of
+---this tabpage**, never another pane and never a narrow leftover split:
+---`:botright vsplit` from inside the members window puts the new pane *beside*
+---it (squeezing members to its minimum and leaving the board a sliver), and
+---splitting a thin stray window has the same effect. Another tab's window would
+---put the new pane in the wrong tab.
+---@param position string|nil
 ---@return integer
-function Pane:split_base()
+function Pane:split_base(position)
+  local horizontal_axis = not position or horizontal(position)
+  local pin = pin_option(horizontal_axis)
   -- Prefer an unpinned window: a pinned one (ade's chat, a fixed sidebar)
-  -- keeps its width across the split, so it is a base only when nothing else is.
-  local widest, pinned
-  local width, pinned_width = 0, 0
+  -- keeps its size across the split, so it is a base only when nothing else is.
+  local largest, pinned
+  local size, pinned_size = 0, 0
   for _, win in ipairs(tab_windows()) do
     if self:name_of(win) == nil and vim.api.nvim_win_get_config(win).relative == "" then
-      local w = vim.api.nvim_win_get_width(win)
-      if vim.wo[win].winfixwidth then
-        if w > pinned_width then
-          pinned, pinned_width = win, w
+      local current = win_size(horizontal_axis, win)
+      if vim.wo[win][pin] then
+        if current > pinned_size then
+          pinned, pinned_size = win, current
         end
-      elseif w > width then
-        widest, width = win, w
+      elseif current > size then
+        largest, size = win, current
       end
     end
   end
-  return widest or pinned or vim.api.nvim_get_current_win()
+  return largest or pinned or vim.api.nvim_get_current_win()
 end
 
----Widths of the pinned (`winfixwidth`) ordinary windows of `tab`: ade's own
----chat/composer or a person's fixed sidebar. Team panes and floats are left out.
+---Pinned sizes of the ordinary (`winfixwidth`/`winfixheight`) windows of `tab`
+---on one axis: ade's own chat/composer or a person's fixed split. Team panes and
+---floats are left out.
 ---@param tab integer|nil default: the current tabpage
 ---@param except integer|nil a window to leave out (the one being split)
----@return { win: integer, width: integer }[]
-function Pane:pinned_widths(tab, except)
+---@param horizontal_axis boolean
+---@return { win: integer, size: integer }[]
+function Pane:pinned_sizes(tab, except, horizontal_axis)
   local ok, wins = pcall(vim.api.nvim_tabpage_list_wins, tab or vim.api.nvim_get_current_tabpage())
+  local pin = pin_option(horizontal_axis)
   local out = {}
   for _, win in ipairs(ok and wins or {}) do
     if
       win ~= except
       and self:name_of(win) == nil
       and vim.api.nvim_win_get_config(win).relative == ""
-      and vim.wo[win].winfixwidth
+      and vim.wo[win][pin]
     then
-      out[#out + 1] = { win = win, width = vim.api.nvim_win_get_width(win) }
+      out[#out + 1] = { win = win, size = win_size(horizontal_axis, win) }
     end
   end
   return out
 end
 
----Put pinned windows back at the widths `pinned_widths` saw. Opening or
----closing a team pane must not move them: Vim may hand a closed pane's columns
----to a pinned neighbour, or pull a wider pane's columns out of one.
----@param pinned { win: integer, width: integer }[]
-local function restore_pinned(pinned)
+---Widths of the pinned (`winfixwidth`) ordinary windows of `tab`.
+---@param tab integer|nil
+---@param except integer|nil
+---@return { win: integer, size: integer }[]
+function Pane:pinned_widths(tab, except)
+  return self:pinned_sizes(tab, except, true)
+end
+
+---Heights of the pinned (`winfixheight`) ordinary windows of `tab`.
+---@param tab integer|nil
+---@param except integer|nil
+---@return { win: integer, size: integer }[]
+function Pane:pinned_heights(tab, except)
+  return self:pinned_sizes(tab, except, false)
+end
+
+---Put pinned windows back at the sizes `pinned_sizes` saw. Opening or closing a
+---team pane must not move them: Vim may hand a closed pane's cells to a pinned
+---neighbour, or pull a larger pane's cells out of one.
+---@param pinned { win: integer, size: integer }[]
+---@param horizontal_axis boolean
+local function restore_pinned(pinned, horizontal_axis)
   for _, entry in ipairs(pinned) do
-    if vim.api.nvim_win_is_valid(entry.win) and vim.api.nvim_win_get_width(entry.win) ~= entry.width then
-      pcall(vim.api.nvim_win_set_width, entry.win, entry.width)
+    local valid = vim.api.nvim_win_is_valid(entry.win)
+    if valid and win_size(horizontal_axis, entry.win) ~= entry.size then
+      set_win_size(horizontal_axis, entry.win, entry.size)
     end
   end
 end
 
 ---Close a team pane window without moving the pinned windows of its tab.
+---
+---The external backend owns the geometry, so there it only closes the window.
 ---@param win integer
 local function close_keeping_pins(self, win)
+  if self:backend() == "external" then
+    pcall(vim.api.nvim_win_close, win, true)
+    return
+  end
   local ok, tab = pcall(vim.api.nvim_win_get_tabpage, win)
-  local pinned = ok and self:pinned_widths(tab) or {}
+  local widths = ok and self:pinned_widths(tab) or {}
+  local heights = ok and self:pinned_heights(tab) or {}
   pcall(vim.api.nvim_win_close, win, true)
-  restore_pinned(pinned)
+  restore_pinned(widths, true)
+  restore_pinned(heights, false)
 end
 
+---The open pane of the same side a new one is inserted next to, when
+---`teams.layout.stack` is on.
+---
+---Panes on one side share a column (left/right) or a row (top/bottom) and are
+---ordered by `PANES` (tree, members, board), whatever order they were opened
+---in. A new pane goes before its next open successor when there is one,
+---otherwise after its previous open predecessor.
 ---@param name string
----@return integer|nil win
-function Pane:create_split(name)
-  local previous = vim.api.nvim_get_current_win()
-  local base = self:split_base()
-  if base and base ~= previous and vim.api.nvim_win_is_valid(base) then
-    pcall(vim.api.nvim_set_current_win, base)
+---@param position string
+---@return { win: integer, before: boolean }|nil
+function Pane:side_neighbour(name, position)
+  if position == "float" then
+    return nil
   end
-  -- Open panes carry `winfixwidth`, and Vim honours it while dividing the
-  -- screen: the split would hand the new pane whatever columns are left over
-  -- instead of its configured width. Release the pins for this one split — but
-  -- only this tab's team panes, and remember each one's width to restore.
-  local fixed = {}
-  for _, win in ipairs(tab_windows()) do
-    if self:name_of(win) ~= nil and vim.wo[win].winfixwidth then
-      fixed[#fixed + 1] = { win = win, width = vim.api.nvim_win_get_width(win) }
-      pcall(function()
-        vim.wo[win].winfixwidth = false
-      end)
+  local tab = vim.api.nvim_get_current_tabpage()
+  local index = #PANES + 1
+  for position_index, candidate in ipairs(PANES) do
+    if candidate == name then
+      index = position_index
     end
   end
-  local function restore_fixed(skip, reset_width)
-    for _, entry in ipairs(fixed) do
-      local fixed_win = entry.win
-      if fixed_win ~= skip and vim.api.nvim_win_is_valid(fixed_win) then
-        if reset_width then
-          -- Its own width, not the configured one: the split may have run a
-          -- `WinResized` handler that adopted the squeezed width meanwhile.
-          pcall(vim.api.nvim_win_set_width, fixed_win, entry.width)
-        end
-        pcall(function()
-          vim.wo[fixed_win].winfixwidth = true
-        end)
-      end
+  ---@param candidate string
+  ---@return integer|nil
+  local function usable(candidate)
+    if candidate == name or not self:is_open_pane(candidate) then
+      return nil
     end
-  end
-  -- Every other pinned window of this tab (ade's own chat/composer, a
-  -- person's fixed sidebar) keeps its width: the team panes take what the
-  -- split and the free columns give them, never columns Vim would pull out of
-  -- a pinned window when a pane asks for more than is free. The window being
-  -- split is the exception: it is where the new pane's columns come from.
-  local pinned = self:pinned_widths(nil, vim.api.nvim_get_current_win())
-  local equalalways = vim.o.equalalways
-  vim.o.equalalways = false
-  local ok = pcall(vim.cmd, "botright vsplit")
-  if not ok then
-    -- No new pane: only the pin is ours to restore; no width was touched.
-    -- Restore it while 'equalalways' is still off, or re-pinning would make
-    -- Vim rebalance and move the very width we are preserving.
-    restore_fixed(nil, false)
-    vim.o.equalalways = equalalways
-    if previous and vim.api.nvim_win_is_valid(previous) then
-      pcall(vim.api.nvim_set_current_win, previous)
+    local win = self.windows[candidate]
+    local ok, win_tab = pcall(vim.api.nvim_win_get_tabpage, win)
+    if
+      ok
+      and win_tab == tab
+      and vim.api.nvim_win_get_config(win).relative == ""
+      and self:position(candidate) == position
+    then
+      return win
     end
     return nil
   end
-  local win = vim.api.nvim_get_current_win()
-  if name == "members" or name == "tree" then
-    -- The width setting only applies to this new team pane; a failed width call
-    -- must not skip the restore below, so both are guarded and nothing throws.
-    local width_ok, width = pcall(self.members_width, self)
-    if width_ok then
-      pcall(vim.api.nvim_win_set_width, win, width)
+  for successor = index + 1, #PANES do
+    local win = usable(PANES[successor])
+    if win then
+      return { win = win, before = true }
     end
-    pcall(function()
-      vim.wo[win].winfixwidth = true
-    end)
   end
-  -- Pin the older panes again at their own width: the split is free to shrink
-  -- a pane while its pin is released, so restoring the pin alone would keep the
-  -- shrunken pane. Then the new pane takes every column they do not use.
-  restore_fixed(win, true)
-  if name ~= "members" and name ~= "tree" then
-    -- Fill the columns the pinned panes leave free, but never shrink below the
-    -- width the split itself gave: the ordinary chat may carry `winfixwidth`,
-    -- so a smaller target could only squeeze this pane into a sliver.
+  for predecessor = index - 1, 1, -1 do
+    local win = usable(PANES[predecessor])
+    if win then
+      return { win = win, before = false }
+    end
+  end
+  return nil
+end
+
+---Widen/heighten a fresh pane into the space the pinned windows leave free.
+---@param win integer
+---@param horizontal_axis boolean
+function Pane:fill_free_space(win, horizontal_axis)
+  if horizontal_axis then
     local used = 0
     for _, other in ipairs(tab_windows()) do
       if other ~= win then
@@ -322,26 +443,198 @@ function Pane:create_split(name)
     if target > vim.api.nvim_win_get_width(win) then
       pcall(vim.api.nvim_win_set_width, win, target)
     end
+    return
   end
-  restore_pinned(pinned)
+  -- Only windows in the new pane's own column share its lines; side-by-side
+  -- windows keep their full height.
+  local column = vim.api.nvim_win_get_position(win)[2]
+  local used = 0
+  for _, other in ipairs(tab_windows()) do
+    if other ~= win and vim.api.nvim_win_get_position(other)[2] == column then
+      used = used + vim.api.nvim_win_get_height(other)
+    end
+  end
+  local target = math.max(3, vim.o.lines - vim.o.cmdheight - used)
+  if target > vim.api.nvim_win_get_height(win) then
+    pcall(vim.api.nvim_win_set_height, win, target)
+  end
+end
+
+---Open a pane as a plain split by position.
+---
+---This is what the external backend does: the layout manager owns the geometry,
+---so nothing is sized, pinned, adopted or restored (no width/height, no
+---`winfixwidth`, no pinned restore, no float fallback).
+---@param name string
+---@param position string
+---@return integer|nil win
+---@return integer|nil previous
+function Pane:create_plain_split(name, position)
+  local previous = vim.api.nvim_get_current_win()
+  local cmd
+  if position == "left" then
+    cmd = "topleft vsplit"
+  elseif position == "top" then
+    cmd = "topleft split"
+  elseif position == "bottom" then
+    cmd = "botright split"
+  else
+    cmd = "botright vsplit"
+  end
+  local ok = pcall(vim.cmd, cmd)
+  if not ok then
+    if previous and vim.api.nvim_win_is_valid(previous) then
+      pcall(vim.api.nvim_set_current_win, previous)
+    end
+    return nil
+  end
+  return vim.api.nvim_get_current_win(), previous
+end
+
+---@param name string
+---@param position string|nil
+---@return integer|nil win, integer|nil previous
+function Pane:create_split(name, position)
+  position = position or self:position(name)
+  if self:backend() == "external" then
+    return self:create_plain_split(name, position)
+  end
+  local horizontal_axis = horizontal(position)
+  local pin = pin_option(horizontal_axis)
+  local previous = vim.api.nvim_get_current_win()
+  -- With `teams.layout.stack` on, several panes on one side share a column/
+  -- row and are inserted in `PANES` order. Off (the default) every pane opens
+  -- its own column/row from the ordinary split base.
+  local neighbour = self:stack() and self:side_neighbour(name, position) or nil
+  local base = neighbour and neighbour.win or self:split_base(position)
+  if base and base ~= previous and vim.api.nvim_win_is_valid(base) then
+    pcall(vim.api.nvim_set_current_win, base)
+  end
+  -- Open panes carry the pin, and Vim honours it while dividing the screen:
+  -- the split would hand the new pane whatever is left over instead of its
+  -- configured size. Release the pins for this one split — but only this tab's
+  -- team panes, and remember each one's size to restore.
+  local fixed = {}
+  for _, win in ipairs(tab_windows()) do
+    if self:name_of(win) ~= nil and vim.wo[win][pin] then
+      fixed[#fixed + 1] = { win = win, size = win_size(horizontal_axis, win) }
+      pcall(function()
+        vim.wo[win][pin] = false
+      end)
+    end
+  end
+  local function restore_fixed(skip, reset_size)
+    for _, entry in ipairs(fixed) do
+      local fixed_win = entry.win
+      if fixed_win ~= skip and vim.api.nvim_win_is_valid(fixed_win) then
+        if reset_size then
+          -- Its own size, not the configured one: the split may have run a
+          -- `WinResized` handler that adopted the squeezed size meanwhile.
+          set_win_size(horizontal_axis, fixed_win, entry.size)
+        end
+        pcall(function()
+          vim.wo[fixed_win][pin] = true
+        end)
+      end
+    end
+  end
+  -- Every other pinned window of this tab (ade's own chat/composer, a
+  -- person's fixed split) keeps its size: the team panes take what the split
+  -- and the free cells give them, never cells Vim would pull out of a pinned
+  -- window when a pane asks for more than is free. The window being split is
+  -- the exception: it is where the new pane's cells come from.
+  local current = vim.api.nvim_get_current_win()
+  local pinned = self:pinned_sizes(nil, current, horizontal_axis)
+  local equalalways = vim.o.equalalways
+  vim.o.equalalways = false
+  local cmd
+  if neighbour then
+    -- Insert before the next open successor (above/left of it) or after the
+    -- previous open predecessor (below/right of it), so the visual order stays
+    -- tree, members, board.
+    local side = neighbour.before and "aboveleft " or "belowright "
+    cmd = side .. (horizontal_axis and "split" or "vsplit")
+  elseif position == "left" then
+    cmd = "topleft vsplit"
+  elseif position == "top" then
+    cmd = "topleft split"
+  elseif position == "bottom" then
+    cmd = "botright split"
+  else
+    cmd = "botright vsplit"
+  end
+  local ok = pcall(vim.cmd, cmd)
+  if not ok then
+    -- No new pane: only the pin is ours to restore; no size was touched.
+    -- Restore it while 'equalalways' is still off, or re-pinning would make
+    -- Vim rebalance and move the very size we are preserving.
+    restore_fixed(nil, false)
+    vim.o.equalalways = equalalways
+    if previous and vim.api.nvim_win_is_valid(previous) then
+      pcall(vim.api.nvim_set_current_win, previous)
+    end
+    return nil
+  end
+  local win = vim.api.nvim_get_current_win()
+  local size = self:size(name, position)
+  if size then
+    -- The new pane is current here; sizing it while pinned takes effect and
+    -- survives the 'equalalways' restore below. A failed size call must not
+    -- skip the restore, so both are guarded and nothing throws.
+    set_win_size(horizontal_axis, win, size)
+    pcall(function()
+      vim.wo[win][pin] = true
+    end)
+  end
+  -- Pin the older panes again at their own size: the split is free to shrink
+  -- a pane while its pin is released, so restoring the pin alone would keep the
+  -- shrunken pane. A stacked pane shares the split's axis with its neighbour,
+  -- so there is nothing to restore there.
+  restore_fixed(win, not neighbour)
+  if not neighbour and size == nil then
+    -- Fill the cells the pinned windows leave free, but never shrink below the
+    -- size the split itself gave: the ordinary chat may carry the pin, so a
+    -- smaller target could only squeeze this pane into a sliver.
+    self:fill_free_space(win, horizontal_axis)
+  end
+  restore_pinned(pinned, horizontal_axis)
   vim.o.equalalways = equalalways
   if not (previous and vim.api.nvim_win_is_valid(previous)) then
     previous = win
   end
+  if vim.api.nvim_win_is_valid(win) then
+    pcall(vim.api.nvim_set_current_win, win)
+  end
   return win, previous
+end
+
+---True when `win` is a real floating window (not a split).
+---@param win integer|nil
+---@return boolean
+local function is_float(win)
+  return win ~= nil and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_config(win).relative ~= ""
 end
 
 ---@param name string
 ---@return integer|nil win
 function Pane:create_float(name)
-  local names = self:open_names()
-  if not vim.tbl_contains(names, name) then
-    names[#names + 1] = name
+  -- Only real floats share the float geometry. A pane that is currently a
+  -- split must never be turned into a float (explicit position = "float" for
+  -- one pane must leave another split pane alone), so splits are not
+  -- repositioned and take no space in the stack.
+  local floating = {}
+  for _, candidate in ipairs(PANES) do
+    if is_float(self:win(candidate)) then
+      floating[#floating + 1] = candidate
+    end
+  end
+  if not vim.tbl_contains(floating, name) then
+    floating[#floating + 1] = name
   end
   -- Keep PANES order so adding a pane never reshuffles the other float.
   local ordered = {}
   for _, candidate in ipairs(PANES) do
-    if vim.tbl_contains(names, candidate) then
+    if vim.tbl_contains(floating, candidate) then
       ordered[#ordered + 1] = candidate
     end
   end
@@ -351,7 +644,7 @@ function Pane:create_float(name)
   for _, other in ipairs(ordered) do
     local win = self:win(other)
     local geo = geometry[other]
-    if win and geo then
+    if is_float(win) and geo then
       pcall(vim.api.nvim_win_set_config, win, {
         relative = "editor",
         width = geo.width,
@@ -411,10 +704,17 @@ function Pane:show(name)
     self:refresh()
     return true
   end
-  local split = vim.o.columns >= self:wide()
+  local position = self:position(name)
+  local external = self:backend() == "external"
   local win
-  if split then
-    win = self:create_split(name)
+  if position == "float" then
+    -- `position = "float"` always floats, whatever the backend or width.
+    win = self:create_float(name)
+  elseif external then
+    -- The layout manager decides; no float fallback for narrow editors.
+    win = self:create_split(name, position)
+  elseif vim.o.columns >= self:wide() then
+    win = self:create_split(name, position)
   else
     win = self:create_float(name)
   end
@@ -422,13 +722,25 @@ function Pane:show(name)
     self.dashboard:notify("无法打开团队面板窗口")
     return false
   end
+  local layout = require("ade.layout")
   self.windows[name] = win
+  -- Register before the buffer is set: the lock guard fires on WinNew, and a
+  -- pane window that inherits a locked team buffer must be recognised as ours.
+  layout.track_window(win, "team_" .. name)
   local buf = self:ensure_buffer(name)
-  require("ade.layout").set_window_buffer(win, buf)
+  layout.set_window_buffer(win, buf)
   self:apply_window_options(win, name)
+  layout.lock_window(win)
   self.dashboard:attach_keys(buf, name)
   self:install_events()
   self:refresh()
+  if external then
+    -- A layout manager in external mode needs a view for the pane fts too;
+    -- warn once when the user's configuration has none.
+    pcall(function()
+      require("ade.integrations.edgy").check_team_registered()
+    end)
+  end
   pcall(vim.api.nvim_set_current_win, win)
   return true
 end
@@ -437,16 +749,21 @@ end
 ---@param name string
 ---@return boolean closed
 function Pane:close_pane(name)
-  local win = self:win(name)
+  -- Read the recorded window, not `win()`: a pane closed from outside (edgy,
+  -- `:close`) is already invalid when the scheduled WinClosed handler runs, and
+  -- its buffer and layout registration still need cleaning up.
+  local win = self.windows[name]
   if not win then
     return false
   end
   self.windows[name] = nil
   local had_content = self.last_lines[name] ~= nil
   self.last_lines[name] = nil
+  self.floats[name] = nil
   if vim.api.nvim_win_is_valid(win) then
     close_keeping_pins(self, win)
   end
+  require("ade.layout").forget_window(win)
   if not self:is_open() then
     self:remove_events()
     local buf = self:buf(name)
@@ -469,6 +786,9 @@ function Pane:close()
     self.windows[name] = nil
     if win and vim.api.nvim_win_is_valid(win) then
       close_keeping_pins(self, win)
+    end
+    if win then
+      require("ade.layout").forget_window(win)
     end
   end
   self:remove_events()
@@ -504,7 +824,11 @@ function Pane:install_events()
         return
       end
       local win = self:win("members")
-      if win and vim.api.nvim_win_get_width(win) ~= self:members_width() then
+      local adopt = self:backend() ~= "external" and horizontal(self:position("members"))
+      if adopt and win and vim.api.nvim_win_get_width(win) ~= self:members_width() then
+        -- The person dragged the members pane: keep that width for this open.
+        -- External managers own the geometry, and a top/bottom or float pane
+        -- has no meaningful members *width*, so nothing is adopted there.
         self.adopted_width = vim.api.nvim_win_get_width(win)
       end
       vim.schedule(function()
@@ -574,9 +898,7 @@ end
 ---the old split. Only a loaded edgy is touched (never a lazy-load), and an
 ---update failure is not the panel's to report.
 function Pane:release_external()
-  local cfg = self.dashboard and self.dashboard.config and self.dashboard.config() or {}
-  local layout = type(cfg) == "table" and cfg.layout or nil
-  if type(layout) ~= "table" or layout.backend ~= "external" then
+  if self:backend() ~= "external" then
     return
   end
   if package.loaded["edgy.layout"] == nil and package.loaded["edgy"] == nil then

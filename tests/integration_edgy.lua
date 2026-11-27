@@ -270,6 +270,46 @@ check("team panes do not narrow ade's panel under edgy", function()
   end
 end)
 
+check("team views are registered with edgy and placed by it", function()
+  local layout = require("ade.ui.team.layout_pane")
+  local cfg = require("ade.config").effective()
+  local pane = layout.new({
+    config = function()
+      return cfg
+    end,
+    notify = function() end,
+    attach_keys = function() end,
+    render_pane = function()
+      return { "members" }, {}, {}, {}
+    end,
+  })
+  assert(pane:show("members"), "the members pane did not open")
+  local win = pane:win("members")
+  require("edgy.layout").update()
+  vim.wait(100)
+  assert(edgy.get_win(win) ~= nil, "the members pane is not managed by edgy")
+  assert(vim.api.nvim_win_get_config(win).relative == "", "edgy must lay the pane out as a split")
+  assert(vim.api.nvim_win_get_width(win) ~= 32, "the pane size must come from edgy, not ade")
+  pane:close()
+  require("edgy.layout").update()
+  vim.wait(100)
+end)
+
+check("the team registration check stays quiet when extend registered the views", function()
+  ade_edgy._team_checked = nil
+  local messages = {}
+  local original = vim.notify
+  vim.notify = function(msg, level)
+    if level == vim.log.levels.WARN then
+      messages[#messages + 1] = tostring(msg)
+    end
+  end
+  ade_edgy.check_team_registered()
+  vim.wait(200)
+  vim.notify = original
+  assert(#messages == 0, "unexpected warning: " .. table.concat(messages, " | "))
+end)
+
 ade.hide()
 
 if #failures > 0 then

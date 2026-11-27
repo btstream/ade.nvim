@@ -796,14 +796,26 @@ return function(t)
     ---Open members then the board, close them in `order`, and require the
     ---panel's width and pin to stay exactly as they were at every step; the
     ---document window must be back at its width once every team pane is gone.
+    ---
+    ---The external backend owns no geometry at all (A1): it must not "restore"
+    ---anything when a pane closes, so Vim's own redistribution of the closed
+    ---window's cells is outside ade's contract there. Only a real layout
+    ---manager puts the panel back, so the size checks apply to native mode.
     ---@return table widths seen while both panes were open
     local function run_layout(t, columns, side, order, backend)
       local pane, chat, doc = native_panel(t, columns, 0, backend, side)
       local label = ("%s panel, %d columns, %s"):format(side, columns, backend or "native")
+      local manages_geometry = backend ~= "external"
       local start_chat = vim.api.nvim_win_get_width(chat)
       local start_doc = vim.api.nvim_win_get_width(doc)
       local function same(what)
-        t.eq(start_chat, vim.api.nvim_win_get_width(chat), "the panel keeps its width " .. what .. " (" .. label .. ")")
+        if manages_geometry or what:find("opens", 1, true) then
+          t.eq(
+            start_chat,
+            vim.api.nvim_win_get_width(chat),
+            "the panel keeps its width " .. what .. " (" .. label .. ")"
+          )
+        end
         t.eq(true, vim.wo[chat].winfixwidth, "the panel keeps its pin " .. what .. " (" .. label .. ")")
       end
       pane.windows.members = pane:create_split("members")
@@ -817,7 +829,9 @@ return function(t)
       same("after " .. order[1] .. " closes")
       pane:close_pane(order[2])
       same("after " .. order[2] .. " closes")
-      t.eq(start_doc, vim.api.nvim_win_get_width(doc), "the document window is back at its width (" .. label .. ")")
+      if manages_geometry then
+        t.eq(start_doc, vim.api.nvim_win_get_width(doc), "the document window is back at its width (" .. label .. ")")
+      end
       return open
     end
 
@@ -869,7 +883,9 @@ return function(t)
       local real_cmd = vim.cmd
       vim.cmd = function(...)
         local arg = ...
-        if arg == "botright vsplit" then
+        -- The board stacks beside the open members pane, so the command is the
+        -- stacking split, not the fresh-column one.
+        if arg == "botright vsplit" or arg == "belowright split" then
           error("simulated split failure")
         end
         return real_cmd(...)

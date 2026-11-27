@@ -1,17 +1,26 @@
 -- edgy.nvim integration helpers.
 --
 -- ade.nvim exposes two ordinary views (`ade_chat` and `ade_input`) so that a
--- layout manager can own their position. This module builds the recommended
--- edgy view definitions without touching the user's configuration.
+-- layout manager can own their position. The team panes (`ade_team_tree`,
+-- `ade_team_members`, `ade_team_board`) are ordinary views too. This module
+-- builds the recommended edgy view definitions without touching the user's
+-- configuration.
 local M = {}
 
----@param opts {agent_title?: string, width?: number, input_height?: number, toolbar_winbar?: boolean, title_winbar?: boolean}|nil
----@return {chat: table, input: table}
+---Team pane filetypes and their titles, in dashboard order.
+M.TEAM_VIEWS = {
+  { name = "tree", ft = "ade_team_tree", title = "Team" },
+  { name = "members", ft = "ade_team_members", title = "Members" },
+  { name = "board", ft = "ade_team_board", title = "Board" },
+}
+
+---@param opts {agent_title?: string, width?: number, input_height?: number, toolbar_winbar?: boolean, title_winbar?: boolean, team?: boolean}|nil
+---@return table
 function M.views(opts)
   opts = opts or {}
   local toolbar_winbar = opts.toolbar_winbar ~= false
   local title_winbar = opts.title_winbar == true
-  return {
+  local views = {
     chat = {
       ft = "ade_chat",
       title = opts.agent_title or "Agent",
@@ -34,6 +43,55 @@ function M.views(opts)
       },
     },
   }
+  if opts.team ~= false then
+    local panes = require("ade.config").defaults.teams.layout.panes
+    for _, team in ipairs(M.TEAM_VIEWS) do
+      local pane = panes[team.name] or {}
+      views[team.name] = {
+        ft = team.ft,
+        title = team.title,
+        -- The board has no configured size: it takes what the edgebar gives it.
+        size = pane.size and { width = pane.size } or nil,
+        wo = {
+          -- ade owns the pane winbar (team, workers, turns).
+          winbar = false,
+          winfixwidth = pane.size ~= nil,
+        },
+      }
+    end
+  end
+  return views
+end
+
+---The filetypes registered on every side of an edgy config.
+---
+---edgy only reads the array parts of `left`/`right`/`top`/`bottom`. A view is
+---registered once no matter which side it sits on, so extending must never add
+---a second definition for an ft that already appears somewhere else.
+---@param edgy_opts table
+---@return table<string, boolean>
+local function registered(edgy_opts)
+  local present = {}
+  for _, side in ipairs({ "left", "right", "top", "bottom" }) do
+    local views = edgy_opts[side]
+    if type(views) == "table" then
+      for _, view in ipairs(views) do
+        if type(view) == "table" and view.ft then
+          present[view.ft] = true
+        elseif type(view) == "string" then
+          present[view] = true
+        end
+      end
+    end
+  end
+  return present
+end
+
+---Default positions of the team views: the same side as the chat panel.
+---@param position string
+---@return table<string, string>
+local function default_team_positions(position)
+  return { tree = position, members = position, board = position }
 end
 
 ---Append the ADE views to an edgy config in place.
@@ -42,6 +100,12 @@ end
 ---   opts = function(_, opts)
 ---     require("ade.integrations.edgy").extend(opts)
 ---   end
+---
+---`view_opts.team` moves the team views per pane:
+---
+---   extend(opts, { team = { tree = "left", members = "left", board = "bottom" } })
+---
+---`team = false` leaves them out; the default is the chat panel's position.
 ---@param edgy_opts table
 ---@param view_opts table|nil
 ---@return table
@@ -57,20 +121,39 @@ function M.extend(edgy_opts, view_opts)
     position = view_opts.position
   end
   edgy_opts[position] = edgy_opts[position] or {}
+  local target = edgy_opts[position]
   local views = M.views(view_opts)
-  local present = {}
-  for _, view in ipairs(edgy_opts[position]) do
-    if type(view) == "table" and view.ft then
-      present[view.ft] = true
-    elseif type(view) == "string" then
-      present[view] = true
-    end
-  end
+  -- Registered means present on any side: a user who put ade_team_tree on
+  -- `left` must not get a second tree on `right`.
+  local present = registered(edgy_opts)
   if not present["ade_chat"] then
-    table.insert(edgy_opts[position], 1, views.chat)
+    table.insert(target, 1, views.chat)
+    present["ade_chat"] = true
   end
   if not present["ade_input"] then
-    table.insert(edgy_opts[position], 2, views.input)
+    -- Never insert past the end: when ade_chat lives on another side the
+    -- target list can be empty, and `insert(list, 2, ...)` would create a
+    -- sparse table whose array part `ipairs` never sees.
+    table.insert(target, math.min(2, #target + 1), views.input)
+    present["ade_input"] = true
+  end
+  local team = view_opts and view_opts.team
+  if team ~= false then
+    local sides = type(team) == "table" and team or default_team_positions(position)
+    for _, view in ipairs(M.TEAM_VIEWS) do
+      local side = sides[view.name] or position
+      if views[view.name] and side ~= false and not present[view.ft] then
+        local list = edgy_opts[side]
+        if type(list) ~= "table" then
+          list = {}
+          edgy_opts[side] = list
+        end
+        -- Append only: always #list + 1, so the array part stays contiguous
+        -- even when the side was created empty.
+        table.insert(list, views[view.name])
+        present[view.ft] = true
+      end
+    end
   end
   return edgy_opts
 end
@@ -123,15 +206,33 @@ end
 ---Registers a single delayed check so the warning appears at most once per
 ---session, and only when the user actually opened the panel.
 function M.check_registered()
+  M.check_views({ "ade_chat", "ade_input" }, "chat", "_checked")
+end
+
+---Warn when edgy is the layout backend but the team pane views are not
+---registered. Called the first time a team pane opens in external mode.
+function M.check_team_registered()
+  local fts = {}
+  for _, view in ipairs(M.TEAM_VIEWS) do
+    fts[#fts + 1] = view.ft
+  end
+  M.check_views(fts, "team", "_team_checked")
+end
+
+---Shared once-only registration check.
+---@param fts string[]
+---@param what string what the views belong to (for the warning)
+---@param flag string module field guarding the once-only warning
+function M.check_views(fts, what, flag)
   if not M.available() then
     return
   end
-  if M._checked then
+  if M[flag] then
     return
   end
-  M._checked = true
+  M[flag] = true
   local missing = {}
-  for _, ft in ipairs({ "ade_chat", "ade_input" }) do
+  for _, ft in ipairs(fts) do
     if not M.has_view(ft) then
       missing[#missing + 1] = ft
     end
@@ -142,8 +243,9 @@ function M.check_registered()
   vim.schedule(function()
     vim.notify(
       string.format(
-        "ade.nvim: %s is not registered with edgy. Add the views as array "
+        "ade.nvim: %s %s view(s) are not registered with edgy. Add the views as array "
           .. "entries (not as named keys) or call require('ade.integrations.edgy').extend(opts).",
+        what,
         table.concat(missing, " and ")
       ),
       vim.log.levels.WARN
