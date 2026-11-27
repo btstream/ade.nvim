@@ -19,15 +19,22 @@ vim.opt.number = true
 vim.opt.laststatus = 3
 vim.opt.splitkeep = "screen"
 
+-- The chat pair goes to the right (the configured `layout.position`); the team
+-- panes go to the left edge and the board spans the bottom. Use `team = false`
+-- to leave the team panes as ordinary windows instead.
+local views = { right = {}, left = {}, bottom = {} }
+require("ade.integrations.edgy").extend(views, {
+  team = { tree = "left", members = "left", board = "bottom" },
+})
+
 require("edgy").setup({
-  right = (function()
-    local opts = { right = {} }
-    require("ade.integrations.edgy").extend(opts)
-    return opts.right
-  end)(),
+  right = views.right,
+  left = views.left,
+  bottom = views.bottom,
   options = {
     right = { size = 46 },
     left = { size = 30 },
+    bottom = { size = 12 },
   },
   animate = { enabled = true },
 })

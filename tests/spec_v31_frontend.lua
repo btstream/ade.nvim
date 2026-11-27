@@ -869,7 +869,9 @@ return function(t)
       local real_cmd = vim.cmd
       vim.cmd = function(...)
         local arg = ...
-        if arg == "botright vsplit" then
+        -- The board stacks beside the open members pane, so the command is the
+        -- stacking split, not the fresh-column one.
+        if arg == "botright vsplit" or arg == "belowright split" then
           error("simulated split failure")
         end
         return real_cmd(...)

@@ -354,7 +354,7 @@ return function(t)
       narrow(t)
       local service, dir = start_service(t, "narrow", { team_board = sample_board() })
       setup(t, "narrow", service, dir)
-      controller.state().config.teams.dashboard.wide = 300
+      controller.state().config.teams.layout.float_below = 300
       controller.connect()
       wait_ready()
       service:team_changed(base_team(dir))
@@ -1241,15 +1241,17 @@ return function(t)
       setup(t, "v2-style", service, dir)
       controller.connect()
       wait_ready()
-      local dashboard_width = controller.state().config.teams.dashboard.members_width
-      controller.state().config.teams.dashboard.members_width = 80
+      local dashboard_width = controller.state().config.teams.layout.panes.members.size
+      controller.state().config.teams.layout.panes.members.size = 80
+      controller.state().config.teams.layout.panes.tree.size = 80
       t.cleanup(function()
         -- The width is read from the live configuration every time a pane is
         -- created, so leaving it at 80 would size the panes of every later
         -- case in this file (and hide the board's second column).
         local cfg = controller.state().config
-        if cfg and cfg.teams and cfg.teams.dashboard then
-          cfg.teams.dashboard.members_width = dashboard_width
+        if cfg and cfg.teams and cfg.teams.layout then
+          cfg.teams.layout.panes.members.size = dashboard_width
+          cfg.teams.layout.panes.tree.size = dashboard_width
         end
       end)
       local entry = base_team(dir)

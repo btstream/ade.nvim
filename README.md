@@ -828,9 +828,22 @@ teams = {
     },
     pi = { agent = "pi" },
   },
-  dashboard = { wide = 160 },  -- 屏幕宽度 >= 160 列时在当前 Tab 分栏
+  dashboard = { wide = 160 },  -- 已废弃：改用 teams.layout.float_below
+  layout = {
+    backend = "inherit",         -- inherit = 跟随 layout.backend；native | external
+    float_below = 160,           -- 仅 native：屏幕窄于此列数时面板改用浮窗
+    panes = {
+      tree    = { position = "right", size = 32 },
+      members = { position = "right", size = 32 },
+      board   = { position = "right" }, -- 不写 size：占满剩余空间
+    },
+  },
 }
 ```
+
+旧的 `teams.dashboard.wide` / `teams.dashboard.members_width` 仍可用，分别等价于
+`teams.layout.float_below` 与 `tree`/`members` 的 `size`；只有新键未设置时才套用旧值
+（新键优先）。
 
 旧的 `teams.definitions` 和 `teams.workflow` 已删除：配置里出现时 setup 直接报错（错误
 里给出新写法），不做迁移。旧键 `teams.spawn_from_chat` 也删除了：全局开关是
@@ -894,13 +907,20 @@ load 打上一次性转发标记并注入工具），load 成功后才继续；�
 旧服务（api_version 5/6）上没有新接口：前端提示“服务版本过旧；空闲后会自动更新，或用
 `:Ade service stop` 手动重启”，不会反复重试看板。
 
-会话树、成员面板和看板都留在当前 Tab，各自打开和关闭。宽屏（`teams.dashboard.wide`，默认
-160）使用分栏；窄屏使用浮窗，只显示请求的面板。会话树按键：`<CR>` 打开会话（按正常
+会话树、成员面板和看板都留在当前 Tab，各自打开和关闭。位置和大小由
+`teams.layout.panes` 决定：`position` 取 `left` / `right` / `top` / `bottom` / `float`，
+`size` 为列数（左右）或行数（上下），`0 < size <= 1` 表示占编辑器比例，省略 `size`
+则占满剩余空间。同一侧打开多个面板时按 tree、members、board 的顺序堆叠（左右在下方，
+上下在右侧）。`teams.layout.backend = "inherit"`（默认）跟随 `layout.backend`：native
+模式下窄于 `teams.layout.float_below`（默认 160）列时改用浮窗，只显示请求的面板；
+external 模式（edgy 等）只创建普通分栏，尺寸和位置交给布局管理器，不套用 `size`。
+会话树按键：`<CR>` 打开会话（按正常
 `session/load` 路径加载；worker 行打开它的对话）、`t` 切换该会话的团队开关（未知时先
 查询）、`x` 停止 worker 或关闭团队（只有 leader 行关闭团队，均需确认）、
 `L` 把领导权交给光标会话、`S` 为光标会话选流程启动、`b` 打开光标行所属团队的看板。
 行属于另一个服务实例、或该实例未连接时，`t/L/S/x` 会提示并拒绝执行。成员栏宽度由
-`teams.dashboard.members_width`（默认 32，16..120）决定。成员面板按键作用于光标下的对象：
+`teams.layout.panes.members.size`（默认 32，16..120；旧键
+`teams.dashboard.members_width` 仍可用）决定。成员面板按键作用于光标下的对象：
 成员上 `<CR>` / `w` 在普通聊天面板查看或联系成员，卡片上 `<CR>` 打开详情浮窗，
 `m` 给成员发消息/就卡片给 leader 发消息，`H` 看卡片历史版本，`a` 回答成员提问，
 `!` 打开待处理的选择（提问、spawn、权限、回合上限），
@@ -1287,7 +1307,21 @@ require("ade").setup({
 })
 ```
 
-`extend()` 只是把下面两个 view 定义插入你的 `opts.right`，不会覆盖已有配置。
+`extend()` 只是把下面两个 view 定义插入你的 `opts.right`，不会覆盖已有配置。它同时
+注册团队面板的三个 view（`ade_team_tree` / `ade_team_members` / `ade_team_board`）：
+
+```lua
+-- 默认：团队面板和聊天面板放同一侧
+require("ade.integrations.edgy").extend(opts)
+
+-- 指定每个团队面板的位置；team = false 表示不交给 edgy。
+require("ade.integrations.edgy").extend(opts, {
+  team = { tree = "left", members = "left", board = "bottom" },
+})
+```
+
+可用位置为 `left` / `right` / `top` / `bottom`；`team = false` 时团队面板保持为普通
+窗口。external 模式下打开团队面板会检查这些 filetype 是否注册，缺失时只警告一次。
 
 > **注意**：两个视图必须作为**数组元素**写进列表，不能写成具名字段。
 > edgy 只遍历 `ipairs(views)`，`right = { { ft = "ade_chat" }, input = { ft = "ade_input" } }`
