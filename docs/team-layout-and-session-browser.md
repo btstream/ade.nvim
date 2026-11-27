@@ -33,6 +33,8 @@ teams = {
     backend = "inherit",          -- inherit | native | external
     -- native only: below this editor width every pane is a float
     float_below = 160,
+    -- native only: same-side panes share one column/row (A2); off = old layout
+    stack = false,
     panes = {
       tree    = { position = "right", size = 32 },
       members = { position = "right", size = 32 },
@@ -82,9 +84,14 @@ When the effective backend is `external`:
 - `split_base` / `create_split` take the pane's position. Left/right keep the
   current column logic (release pins of team panes, split, restore). Top/bottom
   do the same with heights (`winfixheight`, a `pinned_heights` twin).
-- Several panes on one side are stacked in `PANES` order (tree, members,
-  board): the second one splits the first (`belowright split` for left/right,
-  `belowright vsplit` for top/bottom) instead of the base window.
+- Stacking is **opt-in**: `teams.layout.stack = false` (default) keeps the old
+  behaviour, every pane opens its own column (left/right) or row (top/bottom)
+  and a pane without `size` fills the free space. With `stack = true`, panes
+  on the same side share one column/row in `PANES` order (tree, members,
+  board) whatever order they are opened in: a new pane is inserted before its
+  next open successor or after its previous open predecessor
+  (`aboveleft`/`belowright split` for left/right, `aboveleft`/`belowright
+  vsplit` for top/bottom).
 - `float_below` keeps its meaning; `position = "float"` always floats.
 - Board rendering already adapts to width; check `board.lua` column layout at
   bottom positions with small heights.
