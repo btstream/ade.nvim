@@ -48,18 +48,18 @@ M.form = {
 ---`backend` is the configured `ui.session_picker`: "snacks" tries snacks first
 ---and falls back to the built-in window, anything else uses the built-in window
 ---directly so an explicit choice is honoured even when snacks is installed.
----@param opts table session picker options
+---Returns the backend handle (`update`, `close`, `is_open`) or nil.
+---@param state table session browser state
 ---@param backend string|nil "snacks" | "internal"
----@return boolean opened
-function M.open_session_browser(opts, backend)
+---@return table|nil handle
+function M.open_session_browser(state, backend)
   if backend == "snacks" then
-    local snacks = require("ade.ui.session_snacks")
-    if snacks.open(opts) then
-      return true
+    local handle = require("ade.ui.session_browser.snacks").open(state)
+    if handle then
+      return handle
     end
   end
-  require("ade.ui.session_picker").open(opts)
-  return true
+  return require("ade.ui.session_browser.internal").open(state)
 end
 
 ---Icons for the given mode, e.g. `check_circle`.

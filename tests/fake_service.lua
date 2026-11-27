@@ -55,6 +55,9 @@ Server.__index = Server
 ---  session_catalog?: table[], session_agent_states?: table,
 ---  session_refresh?: table, session_refresh_delay_ms?: integer,
 ---  session_refresh_error?: table, session_refresh_hold?: boolean,
+---  session_delete_error?: table, session_delete_in_use?: boolean,
+---  session_delete_unsupported?: boolean, session_delete_delay_ms?: integer,
+---  session_delete_hold?: boolean, session_can_delete?: boolean,
 ---  session_reload_unsupported?: boolean|table<string, boolean>,
 ---  team_answer_error?: table,
 ---  session_teams_default?: boolean, session_injected_default?: boolean}|nil
@@ -227,6 +230,17 @@ function M.new(opts)
     session_refreshes = {},
     held_session_refreshes = {},
     session_updates = {},
+    -- PROTOCOL.md 21.8: delete success is the default; each error path has a
+    -- switch, and a held reply lets a test observe the in-flight state.
+    session_delete_error = opts.session_delete_error,
+    session_delete_in_use = opts.session_delete_in_use == true,
+    session_delete_unsupported = opts.session_delete_unsupported == true,
+    session_delete_delay_ms = opts.session_delete_delay_ms or 0,
+    session_delete_hold = opts.session_delete_hold == true,
+    session_deletes = {},
+    held_session_deletes = {},
+    -- `agent_state.can_delete` recorded by the next successful listing.
+    session_can_delete = opts.session_can_delete,
     clients = {},
     instances = {},
     -- Instances whose stop was requested but whose exit has not been announced
@@ -1218,6 +1232,51 @@ function Server:dispatch(message, client)
     self:begin_session_refresh(client, ident, agents)
     return nil
   end
+  if method == "sessions.delete" then
+    self.session_deletes[#self.session_deletes + 1] = vim.deepcopy(params)
+    local agent = type(params.agent) == "table" and params.agent.agent or nil
+    if
+      type(agent) ~= "string"
+      or type(params.sessionId) ~= "string"
+      or type(params.agent.command) ~= "string"
+      or type(params.agent.cwd) ~= "string"
+    then
+      return error_reply(ident, -32602, "invalid params")
+    end
+    if self.session_delete_error then
+      return error_reply(
+        ident,
+        self.session_delete_error.code,
+        self.session_delete_error.message,
+        self.session_delete_error.data
+      )
+    end
+    if self.session_delete_in_use then
+      return error_reply(ident, -32074, "session is in use")
+    end
+    if self.session_delete_unsupported then
+      return error_reply(ident, -32073, "session/delete is not supported")
+    end
+    local function finish()
+      self:apply_session_delete(agent, params.sessionId)
+      self:send(client, { jsonrpc = "2.0", id = ident, result = {} })
+    end
+    if self.session_delete_hold then
+      self.held_session_deletes[#self.held_session_deletes + 1] = {
+        client = client,
+        ident = ident,
+        agent = agent,
+        sessionId = params.sessionId,
+      }
+      return nil
+    end
+    if self.session_delete_delay_ms > 0 then
+      vim.defer_fn(finish, self.session_delete_delay_ms)
+    else
+      vim.schedule(finish)
+    end
+    return nil
+  end
   if method == "agent.attach" then
     -- Spawning the fake agent runs `jobstart`, which is forbidden in libuv's
     -- fast event context where socket reads arrive. Defer the whole attach one
@@ -1295,7 +1354,7 @@ function Server:session_outcome(agent)
         error = vim.deepcopy(scripted.error or { code = -32070, message = "session/list is not supported" }),
       }
     end
-    return { ok = true, sessions = vim.deepcopy(scripted.sessions or {}) }
+    return { ok = true, sessions = vim.deepcopy(scripted.sessions or {}), can_delete = scripted.can_delete }
   end
   local sessions = {}
   for _, row in ipairs(self.session_catalog or {}) do
@@ -1321,7 +1380,17 @@ function Server:apply_session_outcome(agent, outcome)
       kept[#kept + 1] = row
     end
     self.session_catalog = kept
-    self.session_agent_states[agent] = { listed_at = math.floor(vim.uv.gettimeofday() * 1000) }
+    local can_delete = outcome.can_delete
+    if can_delete == nil then
+      can_delete = self.session_can_delete
+    end
+    if can_delete == nil then
+      can_delete = true
+    end
+    self.session_agent_states[agent] = {
+      listed_at = math.floor(vim.uv.gettimeofday() * 1000),
+      can_delete = can_delete,
+    }
   else
     self.session_agent_states[agent] =
       vim.tbl_extend("force", self.session_agent_states[agent] or {}, { error = outcome.error })
@@ -1380,6 +1449,31 @@ function Server:begin_session_refresh(client, ident, agents)
       end)
     end
   end
+end
+
+---Remove one catalog row, as PROTOCOL.md 21.8 step 6 requires.
+---@param agent string
+---@param session_id string
+function Server:apply_session_delete(agent, session_id)
+  local kept = {}
+  for _, row in ipairs(self.session_catalog or {}) do
+    if not (row.agent == agent and row.sessionId == session_id) then
+      kept[#kept + 1] = row
+    end
+  end
+  self.session_catalog = kept
+end
+
+---Release a delete held by `session_delete_hold`.
+---@return boolean released
+function Server:finish_session_delete()
+  local item = table.remove(self.held_session_deletes, 1)
+  if not item then
+    return false
+  end
+  self:apply_session_delete(item.agent, item.sessionId)
+  self:send(item.client, { jsonrpc = "2.0", id = item.ident, result = {} })
+  return true
 end
 
 ---Release a refresh held by `session_refresh_hold`.

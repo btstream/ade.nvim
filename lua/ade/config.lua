@@ -275,7 +275,7 @@ M.defaults = {
     -- Backend for the :Ade sessions browser.
     -- "snacks" uses snacks.nvim when it is installed, and falls back to the
     -- built-in window automatically when it is not. "internal" always uses the
-    -- built-in window.
+    -- built-in window. Applies to both `:Ade sessions` and `:Ade sessions all`.
     ---@type "snacks"|"internal"
     session_picker = "snacks",
 

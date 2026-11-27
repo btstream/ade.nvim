@@ -152,8 +152,8 @@ return function(t)
   end
 
   t.describe("teams v3 front end", function()
-    t.it("negotiates api_version 8", function()
-      t.eq(8, Version.API_VERSION)
+    t.it("negotiates api_version 9", function()
+      t.eq(9, Version.API_VERSION)
     end)
 
     t.it("sends the configuration but injects no MCP server", function()

@@ -40,7 +40,7 @@ local Adoption = require("ade.app.adoption")
 local Restore = require("ade.app.restore")
 local Reconnector = require("ade.app.reconnector")
 local ConnectionFlow = require("ade.app.connection_flow")
-local SessionManager = require("ade.app.session_manager")
+local SessionBrowser = require("ade.app.session_browser")
 
 local M = {}
 
@@ -1005,15 +1005,15 @@ function M.build(ctx, opts, action)
     end,
   })
 
-  -- Cross-agent session manager (`:Ade sessions all`), docs/session-manager.md.
-  -- It uses the shared service connection, not the panel's client, so it works
-  -- before the panel has ever connected. A replaced manager must drop its
-  -- `sessions.updated` listener and its in-flight requests.
-  local previous_session_manager = S.view.session_manager
-  if previous_session_manager and type(previous_session_manager.dispose) == "function" then
-    pcall(previous_session_manager.dispose, previous_session_manager)
+  -- One session browser for `:Ade sessions` and `:Ade sessions all`
+  -- (docs/team-layout-and-session-browser.md, part C). The catalog scope uses
+  -- the shared service connection, not the panel's client. A replaced browser
+  -- must drop its `sessions.updated` listener and its in-flight requests.
+  local previous_session_browser = S.view.session_browser
+  if previous_session_browser and type(previous_session_browser.dispose) == "function" then
+    pcall(previous_session_browser.dispose, previous_session_browser)
   end
-  S.view.session_manager = SessionManager.new({
+  S.view.session_browser = SessionBrowser.new({
     state = function()
       return S
     end,
@@ -1021,9 +1021,12 @@ function M.build(ctx, opts, action)
     notify = notify,
     setup = ctx.setup,
     open = ctx.open,
-    pick_session = ctx.pick_session,
     resolve_cwd = ctx.resolve_cwd,
     presenter = manager_presenter,
+    catalog = S.sess.catalog,
+    generation = function()
+      return ctx.Operations.generation
+    end,
   })
 
   S.view.attachments = Attachments.new({

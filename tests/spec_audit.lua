@@ -3,10 +3,39 @@ return function(t)
   local config = require("ade.config")
 
   t.describe("audit regressions", function()
+    local function browser_state(over)
+      return vim.tbl_extend("force", {
+        scopes = { "here" },
+        scope = "here",
+        entries = {
+          { agent = "opencode", sessionId = "aaa", title = "First", cwd = "/tmp", source = "live" },
+          { agent = "opencode", sessionId = "bbb", title = "Old", cwd = "/tmp", source = "live" },
+        },
+        agents = { "opencode" },
+        agent_state = {},
+        refreshing = {},
+        unavailable = {},
+        current_agent = "opencode",
+        current_id = "aaa",
+        use_icons = true,
+        can_delete = function()
+          return over and over.can_delete == true or true
+        end,
+        on_open = function() end,
+        on_delete = function(_, done)
+          done(true)
+        end,
+        on_refresh = function() end,
+        on_cycle_scope = function() end,
+        on_close = function() end,
+        is_dir = function()
+          return true
+        end,
+      }, over or {})
+    end
+
     t.it("keeps internal session navigation ahead of text mappings", function()
-      local browser = require("ade.ui.session_picker").open({
-        sessions = { { sessionId = "aaa", title = "First" }, { sessionId = "bbb", title = "Old" } },
-      })
+      local browser = require("ade.ui.session_browser.internal").open(browser_state())
       local maps = {}
       for _, map in ipairs(vim.api.nvim_buf_get_keymap(browser.buf, "n")) do
         maps[map.lhs] = map
@@ -14,8 +43,10 @@ return function(t)
       t.eq("next", maps.j.desc)
       t.eq("previous", maps.k.desc)
       t.eq("close", maps.q.desc)
-      maps.O.callback()
-      local lines = table.concat(browser.symbols(), "\n")
+      -- "l" only occurs in the target title (the agent and cwd are part of the
+      -- fuzzy haystack now, so a letter like "o" matches every opencode row).
+      maps.L.callback()
+      local lines = table.concat(browser:lines(), "\n")
       t.truthy(lines:find("Old", 1, true))
       t.eq(nil, lines:find("First", 1, true))
       maps.q.callback()
@@ -37,10 +68,10 @@ return function(t)
       end
       local browser
       local ok, err = pcall(function()
-        browser = require("ade.ui.session_picker").open({
-          sessions = { { sessionId = "one", title = "First" } },
+        browser = require("ade.ui.session_browser.internal").open(browser_state({
+          entries = { { agent = "opencode", sessionId = "one", title = "First", cwd = "/tmp", source = "live" } },
           can_delete = true,
-        })
+        }))
         browser.delete_current()
         t.truthy(vim.api.nvim_win_is_valid(browser.win))
         vim.api.nvim_win_close(confirmation, true)

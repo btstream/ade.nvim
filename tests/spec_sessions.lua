@@ -160,16 +160,8 @@ return function(t)
       -- Every mock session reports `2026-01-01T00:00:00Z`; the browser must
       -- render the local clock, not the UTC text from the agent.
       local expected = require("ade.ui.time").short("2026-01-01T00:00:00Z")
-      local ns = vim.api.nvim_create_namespace("ade_sessions")
-      local found = false
-      for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(browser.buf, ns, 0, -1, { details = true })) do
-        for _, chunk in ipairs(mark[4].virt_text or {}) do
-          if tostring(chunk[1]):find(expected, 1, true) then
-            found = true
-          end
-        end
-      end
-      t.truthy(found, "the session time must be local: expected " .. expected)
+      local joined = table.concat(browser_lines(browser), "\n")
+      t.truthy(joined:find(expected, 1, true), "the session time must be local: expected " .. expected)
       pcall(vim.api.nvim_win_close, browser.win, true)
       controller.hide()
     end)
@@ -252,7 +244,7 @@ return function(t)
       end
       local browser = open_browser(S)
       t.truthy(browser)
-      vim.api.nvim_win_set_cursor(browser.win, { 1, 0 })
+      vim.api.nvim_win_set_cursor(browser.win, { 4, 0 })
 
       local prompted = false
       local original = vim.ui.select

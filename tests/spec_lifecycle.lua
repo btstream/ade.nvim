@@ -45,11 +45,23 @@ return function(t)
   end
 
   local function with_browser(s, client, fn)
-    local browser = require("ade.ui.session_picker")
-    local original, options = browser.open, nil
-    browser.open = function(opts)
-      options = opts
-      return {}
+    local presenter = require("ade.app.presenter")
+    local original = presenter.open_session_browser
+    local state
+    presenter.open_session_browser = function(view)
+      state = view
+      return {
+        update = function(_, next_state)
+          if next_state then
+            state = next_state
+          end
+        end,
+        close = function() end,
+        is_open = function()
+          return true
+        end,
+        set_busy = function() end,
+      }
     end
     s.config.ui.session_picker = "internal"
     client.has_session_capability = function()
@@ -66,9 +78,24 @@ return function(t)
     end
     local ok, err = pcall(function()
       controller.pick_session()
-      fn(options)
+      vim.wait(3000, function()
+        return state ~= nil
+      end, 20)
+      local browser = {
+        entries = state and state.entries or {},
+        on_delete = function(session_id, done)
+          local entry
+          for _, row in ipairs(state and state.entries or {}) do
+            if row.sessionId == session_id then
+              entry = row
+            end
+          end
+          state.on_delete(entry, done)
+        end,
+      }
+      fn(browser)
     end)
-    browser.open = original
+    presenter.open_session_browser = original
     if not ok then
       error(err)
     end
