@@ -636,6 +636,15 @@ impl Relay {
         self.sessions.contains_key(session_id)
     }
 
+    /// Forget a session after a service-originated delete succeeded
+    /// (PROTOCOL.md 21.8). The generic response bookkeeping is skipped for
+    /// those requests (a late answer must change nothing), so the catalog
+    /// handler does it on its valid-success branch.
+    pub fn forget_session(&mut self, session_id: &str) {
+        self.sessions.remove(session_id);
+        self.adopters.remove(session_id);
+    }
+
     /// Number of tracked sessions, for `agent.list`.
     pub fn session_count(&self) -> usize {
         self.sessions.len()
@@ -1392,12 +1401,23 @@ impl Relay {
         }
 
         // Session bookkeeping for the methods that change the session table
-        // (PROTOCOL.md 11).
-        let closed_session = self.track_session_response(&outgoing, object);
+        // (PROTOCOL.md 11). A service-originated `session/delete` belongs to
+        // the catalog (21.8): its handler checks the deadline *before* touching
+        // the catalog or section 11, so the generic side effects must not run
+        // here — a late answer would then mutate state after a -32071.
+        let service_delete =
+            matches!(&origin, Origin::Service) && outgoing.method == "session/delete";
+        let closed_session = if service_delete {
+            None
+        } else {
+            self.track_session_response(&outgoing, object)
+        };
         // A successful delete is also a catalog change (PROTOCOL.md 21.4);
         // `session/close` is not.
         let deleted_session = match outgoing.method.as_str() {
-            "session/delete" if object.get("result").is_some() => outgoing.session_id.clone(),
+            "session/delete" if !service_delete && object.get("result").is_some() => {
+                outgoing.session_id.clone()
+            }
             _ => None,
         };
 

@@ -846,6 +846,13 @@ impl Hub {
         if running.temporary {
             self.stop_catalog_instance(&running.instance);
         }
+        // The generic relay bookkeeping is skipped for service deletes (a late
+        // answer must change nothing), so do its section 11/team cleanup here
+        // on the valid-success branch only.
+        if let Some(handle) = self.instances.get_mut(&running.instance) {
+            handle.relay.forget_session(session);
+        }
+        self.leader_session_closed(&running.instance, session);
         // Explicit, regardless of the relay's section 11 tracking (21.8).
         self.recorder.delete_catalog_session(agent, session);
         // A refresh running now must not bring the row back (21.8 step 8).
@@ -1369,4 +1376,153 @@ fn agent_error(error: &Value) -> (i64, String) {
         .unwrap_or("the agent failed")
         .to_string();
     (code, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::{mpsc, watch, Notify};
+
+    use super::super::{Instance, Outbox};
+    use super::*;
+    use crate::recorder::Recorder;
+    use crate::relay::Relay;
+    use crate::runtime::{Exited, ProcControl, StopTimeouts};
+
+    fn test_instance(id: &str, agent: &str) -> Instance {
+        Instance {
+            id: id.to_string(),
+            key: InstanceKey {
+                agent: agent.to_string(),
+                command: "catalog-agent".to_string(),
+                args: Vec::new(),
+                cwd: "/tmp".to_string(),
+                capabilities: json!({}),
+            },
+            pid: 42,
+            started_at: 1,
+            control: ProcControl::dummy(42),
+            exited: Exited::new(),
+            relay: Relay::with_log(json!({}), true),
+            log_key: format!("catalog:{id}"),
+            attached: Vec::new(),
+            stopping: false,
+            #[cfg(unix)]
+            _lease: None,
+            env: None,
+            temporary: false,
+            #[cfg(unix)]
+            launch: None,
+        }
+    }
+
+    fn test_hub() -> Hub {
+        let (command_sender, commands) = mpsc::channel(1);
+        let (events, _events_receiver) = mpsc::unbounded_channel();
+        Hub::new(
+            commands,
+            command_sender,
+            events,
+            Arc::new(Notify::new()),
+            StopTimeouts::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_late_service_delete_response_changes_nothing() {
+        let recorder = Recorder::in_memory(1024 * 1024);
+        recorder.replace_catalog(
+            "cat",
+            vec![(
+                "s1".to_string(),
+                r#"{"agent":"cat","sessionId":"s1","cwd":"/tmp"}"#.to_string(),
+            )],
+            r#"{"listed_at":5,"can_delete":true}"#.to_string(),
+        );
+        recorder.flush().await;
+
+        let mut hub = test_hub();
+        hub.recorder = recorder.clone();
+
+        let mut instance = test_instance("i1", "cat");
+        let (agent_id, _frame) = instance
+            .relay
+            .service_request("session/delete", json!({ "sessionId": "s1" }));
+        hub.instances.insert("i1".to_string(), instance);
+
+        let (closer, _watch) = watch::channel(false);
+        let (outbox, mut replies) = Outbox::with_limit(closer, 64 * 1024, 7);
+        hub.conns.insert(7, outbox);
+
+        // The catalog timer has not fired yet, but the deadline is already
+        // past: the race where the agent's runtime event wins over the timer.
+        hub.catalog.deletes.insert(
+            ("cat".to_string(), "s1".to_string()),
+            RunningDelete {
+                waiters: vec![(7, json!(9))],
+                instance: "i1".to_string(),
+                temporary: false,
+                deadline: Instant::now() - Duration::from_secs(1),
+            },
+        );
+        hub.catalog.driver.insert(
+            ("i1".to_string(), agent_id),
+            CatalogCall::Delete {
+                agent: "cat".to_string(),
+                session: "s1".to_string(),
+            },
+        );
+
+        hub.agent_line(
+            "i1",
+            &json!({"jsonrpc":"2.0","id":agent_id,"result":{}}).to_string(),
+        );
+
+        let frame = replies.recv().await.expect("the -32071 reply");
+        let reply: Value = serde_json::from_slice(&frame).expect("reply json");
+        assert_eq!(reply["error"]["code"], SESSIONS_LIST_TIMEOUT, "{reply}");
+        assert_eq!(reply["id"], 9);
+        assert!(hub.catalog.deletes.is_empty());
+
+        // Neither the generic 21.4 path nor the handler may have queued a
+        // removal: flush and read the catalog back.
+        recorder.flush().await;
+        let (entries, agents) = recorder.load_catalog().await.expect("catalog");
+        assert_eq!(entries.len(), 1, "a late answer must not remove the row");
+        assert_eq!(entries[0].0, "cat");
+        let state: Value = serde_json::from_str(&agents[0].1).expect("state json");
+        assert_eq!(state["listed_at"], 5, "{state}");
+        assert_eq!(state["can_delete"], true, "{state}");
+    }
+
+    #[test]
+    fn only_a_live_instance_of_the_same_agent_is_in_use() {
+        let mut hub = test_hub();
+        let mut instance = test_instance("i1", "cat");
+        // Populate section 11 tracking the way a successful session/load does.
+        let (agent_id, _frame) = instance
+            .relay
+            .service_request("session/load", json!({ "sessionId": "s1", "cwd": "/tmp" }));
+        instance
+            .relay
+            .agent_message_full(&json!({"jsonrpc":"2.0","id":agent_id,"result":{}}), &[]);
+        assert!(instance.relay.tracks_session("s1"));
+        hub.instances.insert("i1".to_string(), instance);
+
+        assert!(
+            hub.session_in_use("cat", "s1"),
+            "an unlisted live instance counts"
+        );
+        hub.instances.get_mut("i1").expect("instance").stopping = true;
+        assert!(
+            !hub.session_in_use("cat", "s1"),
+            "a stopping instance does not count"
+        );
+        hub.instances.get_mut("i1").expect("instance").stopping = false;
+        assert!(
+            !hub.session_in_use("other", "s1"),
+            "the agent id must match"
+        );
+    }
 }
