@@ -415,5 +415,99 @@ return function(t)
         handle:close()
       end)
     end)
+
+    t.describe("session browser snacks auto_close", function()
+      local function view()
+        return {
+          scopes = { "here" },
+          scope = "here",
+          entries = {
+            { agent = "opencode", sessionId = "a1", cwd = "/tmp", title = "Row", source = "live" },
+          },
+          agents = { "opencode" },
+          agent_state = {},
+          refreshing = {},
+          unavailable = {},
+          current_agent = "opencode",
+          current_id = "a1",
+          use_icons = true,
+          can_delete = function()
+            return true
+          end,
+          on_open = function() end,
+          on_delete = function(_, done)
+            done(true)
+          end,
+          on_refresh = function() end,
+          on_cycle_scope = function() end,
+          on_close = function() end,
+          is_dir = function()
+            return true
+          end,
+        }
+      end
+
+      ---Run `fn` with the user's picker auto_close config set to `value`.
+      local function with_auto_close(value, fn)
+        local Snacks = require("snacks")
+        local previous = Snacks.config.picker and Snacks.config.picker.auto_close
+        Snacks.config.picker.auto_close = value
+        local ok, err = pcall(fn)
+        Snacks.config.picker.auto_close = previous
+        if not ok then
+          error(err)
+        end
+      end
+
+      t.it("restores the configured value after a busy period", function()
+        local handle = session_snacks.open(view())
+        t.truthy(handle)
+        local picker = handle.picker
+        local original = picker.opts.auto_close
+        t.truthy(original ~= false, "snacks' default keeps auto_close enabled")
+        handle:set_busy(true)
+        t.eq(false, picker.opts.auto_close, "a modal period disables auto_close")
+        handle:set_busy(false)
+        t.eq(original, picker.opts.auto_close, "the original value must come back")
+        handle:close()
+      end)
+
+      t.it("restores auto_close=false and ignores nested exits", function()
+        with_auto_close(false, function()
+          local handle = session_snacks.open(view())
+          local picker = handle.picker
+          t.eq(false, picker.opts.auto_close, "the user config must reach the picker")
+          handle:set_busy(true)
+          handle:set_busy(true)
+          handle:set_busy(false)
+          t.eq(false, picker.opts.auto_close, "an inner exit must not restore")
+          handle:set_busy(false)
+          t.eq(false, picker.opts.auto_close, "auto_close=false must be restored exactly")
+          handle:close()
+        end)
+      end)
+
+      t.it("restores auto_close=false after a cancelled delete confirmation", function()
+        with_auto_close(false, function()
+          local handle = session_snacks.open(view())
+          local picker = handle.picker
+          local original_select = vim.ui.select
+          vim.ui.select = function(_, _, cb)
+            cb("Cancel")
+          end
+          local ok, err = pcall(function()
+            picker:action("ade_delete", picker:items()[1])
+            vim.wait(150)
+            t.eq(false, picker.opts.auto_close, "Cancel must restore the user's auto_close")
+            t.falsy(picker.closed, "Cancel keeps the picker")
+          end)
+          vim.ui.select = original_select
+          handle:close()
+          if not ok then
+            error(err)
+          end
+        end)
+      end)
+    end)
   end
 end

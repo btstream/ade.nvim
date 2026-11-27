@@ -122,6 +122,30 @@ function M.open(view)
   end
 
   local picker
+  -- `auto_close` is suspended while a modal period owns focus. The original
+  -- value (nil means snacks' own default, false is a user config) is captured
+  -- on the outermost entry and restored exactly on the outermost exit.
+  local modal_depth = 0
+  local original_auto_close = nil
+  local function enter_modal()
+    if modal_depth == 0 then
+      original_auto_close = picker.opts and picker.opts.auto_close
+      if picker.opts then
+        picker.opts.auto_close = false
+      end
+    end
+    modal_depth = modal_depth + 1
+  end
+  local function leave_modal()
+    if modal_depth == 0 then
+      return
+    end
+    modal_depth = modal_depth - 1
+    if modal_depth == 0 and picker.opts then
+      picker.opts.auto_close = original_auto_close
+    end
+  end
+
   picker = Snacks.picker({
     title = title_for(state, icon_set),
     layout = { preset = "select" },
@@ -176,20 +200,15 @@ function M.open(view)
           vim.notify("ade.nvim: this agent cannot delete sessions", vim.log.levels.WARN)
           return
         end
-        if picker.opts then
-          picker.opts.auto_close = false
-        end
-        local function restore()
-          if picker.opts then
-            picker.opts.auto_close = true
-          end
-        end
+        busy = true
+        enter_modal()
         vim.ui.select({ "Delete", "Cancel" }, {
           prompt = string.format('Delete "%s"?', model.label_of(entry)),
           kind = "ade_confirm_delete",
         }, function(choice)
           vim.schedule(function()
-            restore()
+            busy = false
+            leave_modal()
             if choice ~= "Delete" or p.closed then
               return
             end
@@ -284,9 +303,12 @@ function M.open(view)
   local handle = {}
   ---Keep the picker open while a modal confirmation owns focus.
   function handle:set_busy(value)
-    busy = value == true
-    if picker.opts then
-      picker.opts.auto_close = not busy
+    if value == true then
+      busy = true
+      enter_modal()
+    else
+      busy = false
+      leave_modal()
     end
   end
   function handle:update(next_state)

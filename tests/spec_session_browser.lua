@@ -1841,6 +1841,13 @@ return function(t)
         ui = { session_picker = "snacks", picker = "internal" },
       })
       close_snacks(t)
+      -- The user asked for a picker that survives focus loss.
+      local Snacks = require("snacks")
+      local previous_auto = Snacks.config.picker and Snacks.config.picker.auto_close
+      Snacks.config.picker.auto_close = false
+      t.cleanup(function()
+        Snacks.config.picker.auto_close = previous_auto
+      end)
       controller.open()
       wait(function()
         local state = controller.state()
@@ -1858,6 +1865,7 @@ return function(t)
         picker = snacks_browser()
         return picker ~= nil and row_of(picker, "sess_other") ~= nil
       end, 10000, "the snacks browser")
+      t.eq(false, picker.opts.auto_close, "the configured auto_close must reach the picker")
       picker:action("ade_open", row_of(picker, "sess_other"))
 
       local confirm
@@ -1874,6 +1882,7 @@ return function(t)
       vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
       vim.wait(600)
       t.falsy(picker.closed, "Cancel must keep the snacks browser open")
+      t.eq(false, picker.opts.auto_close, "Cancel must restore auto_close=false")
       t.eq(dir_a, vim.fn.getcwd(), "Cancel must not switch folders")
     end)
 
