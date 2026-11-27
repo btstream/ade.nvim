@@ -671,6 +671,9 @@ return function(t)
       t.eq(2, #connection.requests)
       t.eq("sessions.cached", connection.requests[1].method)
       t.eq("sessions.refresh", connection.requests[2].method)
+      local params = connection.requests[2].params.agents
+      t.eq(1, #params)
+      t.eq("alpha", params[1].agent)
       t.eq(1, connection:subscriber_count("sessions.updated"))
       connection:updated({
         agent = "alpha",
