@@ -91,6 +91,54 @@ return function(t)
       t.eq(1, boards, "an existing team view is kept, not repeated")
     end)
 
+    t.it("skips a team view already registered on another side", function()
+      local opts = {
+        right = {},
+        left = { { ft = "ade_team_tree", title = "Mine" } },
+      }
+      edgy_views.extend(opts)
+      local function count(list, ft)
+        local found = 0
+        for _, view in ipairs(list) do
+          if type(view) == "table" and view.ft == ft then
+            found = found + 1
+          end
+        end
+        return found
+      end
+      t.eq(0, count(opts.right, "ade_team_tree"), "a tree on the left must not be added to the right")
+      t.eq(1, count(opts.left, "ade_team_tree"), "the user's tree view is kept as it was")
+      t.eq("Mine", opts.left[1].title)
+      t.eq(1, count(opts.right, "ade_team_members"), "the other views are still added")
+    end)
+
+    t.it("never duplicates views across two extend calls with different mappings", function()
+      local opts = { right = {}, left = {}, bottom = {} }
+      edgy_views.extend(opts, { team = { tree = "left", members = "left", board = "bottom" } })
+      edgy_views.extend(opts, { team = { tree = "right", members = "right", board = "right" } })
+      for _, ft in ipairs({ "ade_chat", "ade_input", "ade_team_tree", "ade_team_members", "ade_team_board" }) do
+        local found = 0
+        for _, side in ipairs({ "right", "left", "bottom", "top" }) do
+          for _, view in ipairs(opts[side] or {}) do
+            if type(view) == "table" and view.ft == ft then
+              found = found + 1
+            end
+          end
+        end
+        t.eq(1, found, ft .. " must be registered exactly once")
+      end
+      local function has(list, ft)
+        for _, view in ipairs(list) do
+          if type(view) == "table" and view.ft == ft then
+            return true
+          end
+        end
+        return false
+      end
+      t.truthy(has(opts.left, "ade_team_tree"), "the first mapping wins")
+      t.falsy(has(opts.right, "ade_team_tree"))
+    end)
+
     if not has_edgy then
       t.it("has_view reports false without edgy", function()
         t.falsy(edgy_views.has_view("ade_chat"))

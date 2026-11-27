@@ -158,6 +158,10 @@ M.defaults = {
       backend = "inherit", -- inherit | native | external
       -- native only: below this editor width every pane is a float
       float_below = 160,
+      -- native only: same-side panes share one column/row. Off keeps the old
+      -- layout: every pane opens its own column (left/right) or row
+      -- (top/bottom), and an unsized pane takes the free space.
+      stack = false,
       panes = {
         tree = { position = "right", size = 32 },
         members = { position = "right", size = 32 },
@@ -902,9 +906,15 @@ end
 ---Defaults are deep-merged, so a new key that still holds its default is
 ---indistinguishable from one the user set. `raw` is the user's table before
 ---merging, which tells the two apart; a value set at the new key always wins.
+---
+---Without `raw` nothing is carried over: guessing from the merged table could
+---overwrite a new key the caller already set to its default.
 ---@param cfg table merged configuration
 ---@param raw table|nil user configuration
 function M.team_aliases(cfg, raw)
+  if type(raw) ~= "table" then
+    return
+  end
   local teams = cfg.teams
   if type(teams) ~= "table" then
     return
@@ -1737,6 +1747,9 @@ function M.validate(cfg, raw)
   check_number(team_layout.float_below, 40, 10000, "teams.layout.float_below")
   if team_layout.float_below % 1 ~= 0 then
     fail("teams.layout.float_below must be an integer")
+  end
+  if type(team_layout.stack) ~= "boolean" then
+    fail("teams.layout.stack must be a boolean, got %s", type(team_layout.stack))
   end
   if type(team_layout.panes) ~= "table" then
     fail("teams.layout.panes must be a table")

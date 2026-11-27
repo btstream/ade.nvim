@@ -136,10 +136,20 @@ function Pane:size(name, position)
   local total = horizontal_axis and vim.o.columns or (vim.o.lines - vim.o.cmdheight)
   local cells = size <= 1 and math.floor(total * size + 0.5) or math.floor(size)
   if horizontal_axis then
+    -- The configured clamp. Vim still keeps the focused window at least
+    -- 'winwidth' wide, so a pane asking for less opens that wide.
     return math.max(16, math.min(120, cells))
   end
   -- Never take the whole height: the ordinary windows above/below need lines.
   return math.max(3, math.min(math.max(3, total - 4), cells))
+end
+
+---Whether same-side panes share one column/row (`teams.layout.stack`).
+---@return boolean
+function Pane:stack()
+  local cfg = self.dashboard.config() or {}
+  local layout = ((cfg.teams or {}).layout or {})
+  return layout.stack == true
 end
 
 ---@return integer
@@ -348,8 +358,14 @@ local function restore_pinned(pinned, horizontal_axis)
 end
 
 ---Close a team pane window without moving the pinned windows of its tab.
+---
+---The external backend owns the geometry, so there it only closes the window.
 ---@param win integer
 local function close_keeping_pins(self, win)
+  if self:backend() == "external" then
+    pcall(vim.api.nvim_win_close, win, true)
+    return
+  end
   local ok, tab = pcall(vim.api.nvim_win_get_tabpage, win)
   local widths = ok and self:pinned_widths(tab) or {}
   local heights = ok and self:pinned_heights(tab) or {}
@@ -358,35 +374,58 @@ local function close_keeping_pins(self, win)
   restore_pinned(heights, false)
 end
 
----The pane a new one stacks with on the same side, if any.
+---The open pane of the same side a new one is inserted next to, when
+---`teams.layout.stack` is on.
 ---
 ---Panes on one side share a column (left/right) or a row (top/bottom) and are
----stacked in `PANES` order. The last open pane on that side is used so a new
----pane lands below/right of the previous one instead of between siblings.
+---ordered by `PANES` (tree, members, board), whatever order they were opened
+---in. A new pane goes before its next open successor when there is one,
+---otherwise after its previous open predecessor.
 ---@param name string
 ---@param position string
----@return integer|nil
-function Pane:side_anchor(name, position)
+---@return { win: integer, before: boolean }|nil
+function Pane:side_neighbour(name, position)
   if position == "float" then
     return nil
   end
   local tab = vim.api.nvim_get_current_tabpage()
-  local anchor
-  for _, candidate in ipairs(PANES) do
-    if candidate ~= name and self:is_open_pane(candidate) then
-      local win = self.windows[candidate]
-      local ok, win_tab = pcall(vim.api.nvim_win_get_tabpage, win)
-      if
-        ok
-        and win_tab == tab
-        and vim.api.nvim_win_get_config(win).relative == ""
-        and self:position(candidate) == position
-      then
-        anchor = win
-      end
+  local index = #PANES + 1
+  for position_index, candidate in ipairs(PANES) do
+    if candidate == name then
+      index = position_index
     end
   end
-  return anchor
+  ---@param candidate string
+  ---@return integer|nil
+  local function usable(candidate)
+    if candidate == name or not self:is_open_pane(candidate) then
+      return nil
+    end
+    local win = self.windows[candidate]
+    local ok, win_tab = pcall(vim.api.nvim_win_get_tabpage, win)
+    if
+      ok
+      and win_tab == tab
+      and vim.api.nvim_win_get_config(win).relative == ""
+      and self:position(candidate) == position
+    then
+      return win
+    end
+    return nil
+  end
+  for successor = index + 1, #PANES do
+    local win = usable(PANES[successor])
+    if win then
+      return { win = win, before = true }
+    end
+  end
+  for predecessor = index - 1, 1, -1 do
+    local win = usable(PANES[predecessor])
+    if win then
+      return { win = win, before = false }
+    end
+  end
+  return nil
 end
 
 ---Widen/heighten a fresh pane into the space the pinned windows leave free.
@@ -463,10 +502,11 @@ function Pane:create_split(name, position)
   local horizontal_axis = horizontal(position)
   local pin = pin_option(horizontal_axis)
   local previous = vim.api.nvim_get_current_win()
-  -- Several panes on one side stack: split the previous one on that side
-  -- instead of splitting the base window again.
-  local anchor = self:side_anchor(name, position)
-  local base = anchor or self:split_base(position)
+  -- With `teams.layout.stack` on, several panes on one side share a column/
+  -- row and are inserted in `PANES` order. Off (the default) every pane opens
+  -- its own column/row from the ordinary split base.
+  local neighbour = self:stack() and self:side_neighbour(name, position) or nil
+  local base = neighbour and neighbour.win or self:split_base(position)
   if base and base ~= previous and vim.api.nvim_win_is_valid(base) then
     pcall(vim.api.nvim_set_current_win, base)
   end
@@ -508,9 +548,12 @@ function Pane:create_split(name, position)
   local equalalways = vim.o.equalalways
   vim.o.equalalways = false
   local cmd
-  if anchor then
-    -- Stack below (left/right) or beside (top/bottom) the sibling.
-    cmd = horizontal_axis and "belowright split" or "belowright vsplit"
+  if neighbour then
+    -- Insert before the next open successor (above/left of it) or after the
+    -- previous open predecessor (below/right of it), so the visual order stays
+    -- tree, members, board.
+    local side = neighbour.before and "aboveleft " or "belowright "
+    cmd = side .. (horizontal_axis and "split" or "vsplit")
   elseif position == "left" then
     cmd = "topleft vsplit"
   elseif position == "top" then
@@ -533,16 +576,11 @@ function Pane:create_split(name, position)
     return nil
   end
   local win = vim.api.nvim_get_current_win()
-  -- Vim applies 'winwidth' to the *current* window: a pane narrower than that
-  -- (16..120 allows it) can only be sized while another window has the focus.
-  local focused = previous and previous ~= win and vim.api.nvim_win_is_valid(previous) and previous or nil
-  if focused then
-    pcall(vim.api.nvim_set_current_win, focused)
-  end
   local size = self:size(name, position)
   if size then
-    -- The size applies to this new pane; a failed size call must not skip the
-    -- restore below, so both are guarded and nothing throws.
+    -- The new pane is current here; sizing it while pinned takes effect and
+    -- survives the 'equalalways' restore below. A failed size call must not
+    -- skip the restore, so both are guarded and nothing throws.
     set_win_size(horizontal_axis, win, size)
     pcall(function()
       vim.wo[win][pin] = true
@@ -550,10 +588,10 @@ function Pane:create_split(name, position)
   end
   -- Pin the older panes again at their own size: the split is free to shrink
   -- a pane while its pin is released, so restoring the pin alone would keep the
-  -- shrunken pane. A stacked pane shares the split's axis with its sibling, so
-  -- there is nothing to restore there.
-  restore_fixed(win, not anchor)
-  if not anchor and size == nil then
+  -- shrunken pane. A stacked pane shares the split's axis with its neighbour,
+  -- so there is nothing to restore there.
+  restore_fixed(win, not neighbour)
+  if not neighbour and size == nil then
     -- Fill the cells the pinned windows leave free, but never shrink below the
     -- size the split itself gave: the ordinary chat may carry the pin, so a
     -- smaller target could only squeeze this pane into a sliver.
@@ -570,17 +608,33 @@ function Pane:create_split(name, position)
   return win, previous
 end
 
+---True when `win` is a real floating window (not a split).
+---@param win integer|nil
+---@return boolean
+local function is_float(win)
+  return win ~= nil and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_config(win).relative ~= ""
+end
+
 ---@param name string
 ---@return integer|nil win
 function Pane:create_float(name)
-  local names = self:open_names()
-  if not vim.tbl_contains(names, name) then
-    names[#names + 1] = name
+  -- Only real floats share the float geometry. A pane that is currently a
+  -- split must never be turned into a float (explicit position = "float" for
+  -- one pane must leave another split pane alone), so splits are not
+  -- repositioned and take no space in the stack.
+  local floating = {}
+  for _, candidate in ipairs(PANES) do
+    if is_float(self:win(candidate)) then
+      floating[#floating + 1] = candidate
+    end
+  end
+  if not vim.tbl_contains(floating, name) then
+    floating[#floating + 1] = name
   end
   -- Keep PANES order so adding a pane never reshuffles the other float.
   local ordered = {}
   for _, candidate in ipairs(PANES) do
-    if vim.tbl_contains(names, candidate) then
+    if vim.tbl_contains(floating, candidate) then
       ordered[#ordered + 1] = candidate
     end
   end
@@ -590,7 +644,7 @@ function Pane:create_float(name)
   for _, other in ipairs(ordered) do
     local win = self:win(other)
     local geo = geometry[other]
-    if win and geo then
+    if is_float(win) and geo then
       pcall(vim.api.nvim_win_set_config, win, {
         relative = "editor",
         width = geo.width,

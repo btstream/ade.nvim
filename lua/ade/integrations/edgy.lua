@@ -63,20 +63,28 @@ function M.views(opts)
   return views
 end
 
----Whether `ft` is already an entry of the array part of `views`.
----@param views table
----@param ft string
----@return boolean
-local function listed(views, ft)
-  for _, view in ipairs(views) do
-    if type(view) == "table" and view.ft == ft then
-      return true
-    end
-    if view == ft then
-      return true
+---The filetypes registered on every side of an edgy config.
+---
+---edgy only reads the array parts of `left`/`right`/`top`/`bottom`. A view is
+---registered once no matter which side it sits on, so extending must never add
+---a second definition for an ft that already appears somewhere else.
+---@param edgy_opts table
+---@return table<string, boolean>
+local function registered(edgy_opts)
+  local present = {}
+  for _, side in ipairs({ "left", "right", "top", "bottom" }) do
+    local views = edgy_opts[side]
+    if type(views) == "table" then
+      for _, view in ipairs(views) do
+        if type(view) == "table" and view.ft then
+          present[view.ft] = true
+        elseif type(view) == "string" then
+          present[view] = true
+        end
+      end
     end
   end
-  return false
+  return present
 end
 
 ---Default positions of the team views: the same side as the chat panel.
@@ -114,30 +122,26 @@ function M.extend(edgy_opts, view_opts)
   end
   edgy_opts[position] = edgy_opts[position] or {}
   local views = M.views(view_opts)
-  local present = {}
-  for _, view in ipairs(edgy_opts[position]) do
-    if type(view) == "table" and view.ft then
-      present[view.ft] = true
-    elseif type(view) == "string" then
-      present[view] = true
-    end
-  end
+  -- Registered means present on any side: a user who put ade_team_tree on
+  -- `left` must not get a second tree on `right`.
+  local present = registered(edgy_opts)
   if not present["ade_chat"] then
     table.insert(edgy_opts[position], 1, views.chat)
+    present["ade_chat"] = true
   end
   if not present["ade_input"] then
     table.insert(edgy_opts[position], 2, views.input)
+    present["ade_input"] = true
   end
   local team = view_opts and view_opts.team
   if team ~= false then
     local sides = type(team) == "table" and team or default_team_positions(position)
     for _, view in ipairs(M.TEAM_VIEWS) do
       local side = sides[view.name] or position
-      if views[view.name] and side ~= false then
+      if views[view.name] and side ~= false and not present[view.ft] then
         edgy_opts[side] = edgy_opts[side] or {}
-        if not listed(edgy_opts[side], view.ft) then
-          table.insert(edgy_opts[side], views[view.name])
-        end
+        table.insert(edgy_opts[side], views[view.name])
+        present[view.ft] = true
       end
     end
   end

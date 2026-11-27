@@ -1334,6 +1334,7 @@ leader 保存流程时，只有你在对话里明确提到 leader 的 agent、�
       layout = {
         backend = "inherit",       -- inherit = 跟随 layout.backend
         float_below = 160,         -- 仅 native：窄于此列数时改用浮窗
+        stack = false,             -- 仅 native：同侧面板是否共用一列/一行
         panes = {
           tree    = { position = "right", size = 32 },
           members = { position = "right", size = 32 },
@@ -1464,8 +1465,9 @@ teams.templates = { worker = { agent = "inherit", worktree = true } }。
 会话树、成员面板和看板都在当前 tabpage 内独立打开、聚焦和关闭。位置和大小由
 teams.layout.panes.<tree|members|board> 决定：position 取 left / right / top /
 bottom / float，size 为左右面板的列数或上下面板的行数，0 < size <= 1 表示占
-编辑器比例，省略 size 则占满剩余空间。同一侧打开多个面板时按 tree、members、
-board 的顺序堆叠（左右在下方，上下在右侧）。teams.layout.backend = "inherit"
+编辑器比例，省略 size 则占满剩余空间。teams.layout.stack = false（默认）时
+每个面板各自占一列（左右）或一行（上下）；设为 true 时同侧面板共用一列/一行，
+按 tree、members、board 的顺序排列，与打开顺序无关。teams.layout.backend = "inherit"
 （默认）跟随 layout.backend：native 模式下列数少于 teams.layout.float_below
 （默认 160）时只显示请求的浮窗；external 模式（edgy 等）只创建普通分栏，
 位置和尺寸交给布局管理器。旧键 teams.dashboard.wide 等价于

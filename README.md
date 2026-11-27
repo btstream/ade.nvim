@@ -832,6 +832,7 @@ teams = {
   layout = {
     backend = "inherit",         -- inherit = 跟随 layout.backend；native | external
     float_below = 160,           -- 仅 native：屏幕窄于此列数时面板改用浮窗
+    stack = false,               -- 仅 native：同侧多个面板是否共用一个列/行
     panes = {
       tree    = { position = "right", size = 32 },
       members = { position = "right", size = 32 },
@@ -910,8 +911,10 @@ load 打上一次性转发标记并注入工具），load 成功后才继续；�
 会话树、成员面板和看板都留在当前 Tab，各自打开和关闭。位置和大小由
 `teams.layout.panes` 决定：`position` 取 `left` / `right` / `top` / `bottom` / `float`，
 `size` 为列数（左右）或行数（上下），`0 < size <= 1` 表示占编辑器比例，省略 `size`
-则占满剩余空间。同一侧打开多个面板时按 tree、members、board 的顺序堆叠（左右在下方，
-上下在右侧）。`teams.layout.backend = "inherit"`（默认）跟随 `layout.backend`：native
+则占满剩余空间。默认 `teams.layout.stack = false`：每个面板各自占一列（左右）或一行
+（上下）；设为 `true` 时同侧面板共用一列/一行，并按 tree、members、board 的顺序排列，
+与打开顺序无关（左右在下方，上下在右侧）。`teams.layout.backend = "inherit"`（默认）
+跟随 `layout.backend`：native
 模式下窄于 `teams.layout.float_below`（默认 160）列时改用浮窗，只显示请求的面板；
 external 模式（edgy 等）只创建普通分栏，尺寸和位置交给布局管理器，不套用 `size`。
 会话树按键：`<CR>` 打开会话（按正常
