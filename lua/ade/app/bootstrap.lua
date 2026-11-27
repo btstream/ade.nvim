@@ -94,7 +94,9 @@ function M.build(ctx, opts, action)
     or Resolve.provenance(opts)
   local merged = config_mod.merge(config_mod.defaults, opts or {})
   merged.launch_origin = launch_origin
-  local ok, err = pcall(config_mod.validate, merged)
+  -- `opts` is still the user's table here: validation uses it to tell a
+  -- deprecated key the user wrote from a default that only looks like one.
+  local ok, err = pcall(config_mod.validate, merged, opts)
   if not ok then
     error(err, 0)
   end
