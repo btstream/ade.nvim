@@ -108,7 +108,9 @@ function M.open(view)
     for _, entry in ipairs(state.entries or {}) do
       if state.scope ~= "all" or agent_filter == nil or entry.agent == agent_filter then
         items[#items + 1] = {
-          text = tostring(entry.agent or "") .. "  " .. model.label_of(entry) .. "  " .. tostring(entry.cwd or ""),
+          -- Same per-scope haystack as the built-in window: here matches only
+          -- title/id, agent/all also match the agent and directory.
+          text = model.haystack(entry, state.scope),
           session = entry,
           preview = {
             text = render_preview(entry),

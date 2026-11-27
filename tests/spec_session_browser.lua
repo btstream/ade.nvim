@@ -1079,6 +1079,49 @@ return function(t)
     end)
   end)
 
+  t.describe("session browser filter scope", function()
+    local model = require("ade.ui.session_browser.model")
+    local rows = {
+      {
+        agent = "opencode",
+        sessionId = "sess_mock",
+        cwd = "/tmp/Development/old",
+        title = "New conversation",
+        source = "live",
+      },
+      {
+        agent = "opencode",
+        sessionId = "sess_old",
+        cwd = "/tmp/Development/old",
+        title = "Old conversation",
+        source = "live",
+      },
+      {
+        agent = "claude",
+        sessionId = "sess_beta",
+        cwd = "/tmp/other/project",
+        title = "Beta work",
+        source = "catalog",
+      },
+    }
+
+    t.it("here matches the title and id, never the shared cwd", function()
+      local here = model.visible(rows, "old", nil, "here")
+      t.eq(1, #here)
+      t.eq("sess_old", here[1].sessionId)
+      -- "development" and "tmp" live only in the path: no row may survive.
+      t.eq(0, #model.visible(rows, "development", nil, "here"))
+      t.eq(0, #model.visible(rows, "tmp", nil, "here"))
+    end)
+
+    t.it("agent and all match the agent, the directory and the title", function()
+      t.eq(1, #model.visible(rows, "claude", nil, "all"))
+      t.eq(2, #model.visible(rows, "development", nil, "all"))
+      t.eq(1, #model.visible(rows, "other", nil, "all"))
+      t.eq(1, #model.visible(rows, "beta work", nil, "agent"))
+    end)
+  end)
+
   t.describe("session browser window", function()
     local dir_a, dir_b, dir_missing
     local internal = require("ade.ui.session_browser.internal")
@@ -1214,6 +1257,38 @@ return function(t)
         key("<S-Tab>")
       end
       t.eq(nil, handle:agent_filter(), "cycling past the last agent returns to all")
+    end)
+
+    t.it("ignores the shared cwd when filtering here rows", function()
+      dir_a = tmpdir("uia5")
+      dir_b = tmpdir("uib5")
+      dir_missing = tmpdir("uimissing5")
+      local handle = open_window(state())
+      for _, char in ipairs(vim.fn.split("uia5", "\\zs")) do
+        key(char)
+      end
+      t.eq(0, #handle:visible(), "the cwd must not match in the here scope")
+      t.match("no matching sessions", table.concat(handle:lines(), "\n"))
+    end)
+
+    t.it("matches the agent and the directory in the all scope", function()
+      dir_a = tmpdir("uia6")
+      dir_b = tmpdir("uib6")
+      dir_missing = tmpdir("uimissing6")
+      local handle = open_window(state({ scope = "all" }))
+      for _, char in ipairs(vim.fn.split("beta", "\\zs")) do
+        key(char)
+      end
+      local visible = handle:visible()
+      t.eq(1, #visible)
+      t.eq("beta", visible[1].agent)
+      key("<C-u>")
+      for _, char in ipairs(vim.fn.split("uib6", "\\zs")) do
+        key(char)
+      end
+      visible = handle:visible()
+      t.eq(1, #visible)
+      t.eq(dir_b, visible[1].cwd)
     end)
 
     t.it("opens the row under the cursor and closes, and refreshes with <C-r>", function()

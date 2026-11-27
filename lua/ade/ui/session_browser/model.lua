@@ -155,17 +155,34 @@ function M.compare_entries(a, b)
   return M.label_of(a):lower() < M.label_of(b):lower()
 end
 
+---The text a query is matched against for one scope.
+---
+---`here` keeps the old session picker's semantics: only the title and the
+---session id, because every row shares the editor's cwd and a fuzzy
+---subsequence over a long absolute path would match almost any short query.
+---`agent`/`all` keep the old cross-agent manager's agent + cwd + title.
+---@param entry table
+---@param scope string|nil
+---@return string
+function M.haystack(entry, scope)
+  if scope == "here" or scope == nil then
+    return M.label_of(entry) .. " " .. tostring(entry.sessionId or "")
+  end
+  return tostring(entry.agent or "") .. " " .. tostring(entry.cwd or "") .. " " .. M.label_of(entry)
+end
+
 ---Filter then sort the rows for display.
 ---@param entries table[]
 ---@param query string
 ---@param agent_filter string|nil
+---@param scope string|nil
 ---@return table[]
-function M.visible(entries, query, agent_filter)
+function M.visible(entries, query, agent_filter, scope)
   local list = {}
   for _, entry in ipairs(entries or {}) do
     local matches_agent = agent_filter == nil or entry.agent == agent_filter
     if matches_agent then
-      local haystack = tostring(entry.agent or "") .. " " .. tostring(entry.cwd or "") .. " " .. M.label_of(entry)
+      local haystack = M.haystack(entry, scope)
       if query == "" or M.fuzzy(query, haystack) then
         list[#list + 1] = entry
       end

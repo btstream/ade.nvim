@@ -5,12 +5,19 @@ return function(t)
 
   local root = vim.fn.fnamemodify(vim.fn.getcwd(), ":p")
 
+  -- A fixed cwd whose path contains the letters the filter tests type ("old"
+  -- and "development"): the here scope must ignore the path, so these tests
+  -- do not depend on where the repository happens to be checked out.
+  local filter_cwd = string.format("/tmp/opencode/ade-sessions-filter-%d-old/Development", vim.uv.os_getpid())
+
   local function setup()
+    vim.fn.mkdir(filter_cwd, "p")
     ade.setup({
       agent = "opencode",
       agents = { opencode = { command = "python3", args = { root .. "tests/mock_agent.py" } } },
       ui = { session_picker = "internal" },
       permissions = { prompt = "native" },
+      cwd = filter_cwd,
     })
     controller.open()
     local S = controller.state()
@@ -176,6 +183,24 @@ return function(t)
       local joined = table.concat(browser_lines(browser), "\n")
       t.match("Old conversation", joined)
       t.falsy(joined:find("sess_mock", 1, true), "the other session should be filtered out")
+      pcall(vim.api.nvim_win_close, browser.win, true)
+      controller.hide()
+    end)
+
+    t.it("filters here rows by title, not by the shared cwd", function()
+      local S = setup()
+      t.eq(filter_cwd, S.sess.current.cwd, "the test cwd must be the fixed one")
+      local browser = open_browser(S)
+      t.truthy(browser)
+      -- The cwd contains "development"; in the here scope every row shares it,
+      -- so it must not keep rows whose title/id do not match.
+      for _, ch in ipairs({ "d", "e", "v", "e", "l", "o", "p" }) do
+        vim.api.nvim_feedkeys(ch, "x", false)
+      end
+      local joined = table.concat(browser_lines(browser), "\n")
+      t.falsy(joined:find("sess_mock", 1, true), "the cwd must not match in the here scope")
+      t.falsy(joined:find("Old conversation", 1, true), "the cwd must not match in the here scope")
+      t.match("no matching sessions", joined)
       pcall(vim.api.nvim_win_close, browser.win, true)
       controller.hide()
     end)
