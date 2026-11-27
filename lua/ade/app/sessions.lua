@@ -3,7 +3,6 @@
 -- The runtime still owns the registry, replay staging and the outbox. This
 -- module orchestrates the user-visible flow and reports activation through
 -- callbacks, so it never touches the panel or the composer directly.
-local presenter = require("ade.app.presenter")
 local capabilities = require("ade.protocol.capabilities")
 local log = require("ade.log")
 local last_sessions = require("ade.storage.last_sessions")
@@ -825,50 +824,6 @@ function Sessions:delete(session_id, done)
     finish(false)
   end, function()
     finish(false) -- cancelled picker operations also have a terminal outcome
-  end)
-end
-
----Browse stored sessions. <CR> opens, <C-d> deletes, typing filters.
-function Sessions:pick()
-  if not self:ready() then
-    self.notify("No agent process is running", vim.log.levels.WARN)
-    return
-  end
-  local client, generation = self.get_client(), self.generation()
-  local function ui_current()
-    return self.get_client() == client and self.generation() == generation
-  end
-  self.catalog:list(self.resolve_cwd(), function(ok, sessions)
-    if not ok then
-      return
-    end
-    if #sessions == 0 then
-      self.notify("No stored sessions found", vim.log.levels.INFO)
-      return
-    end
-    local active = self.current()
-    local picker_opts = {
-      sessions = sessions,
-      current_id = active and active.id or nil,
-      can_delete = capabilities.supports(capabilities.agent(client), "sessionCapabilities.delete"),
-      use_icons = self.config().ui.icons,
-      on_open = function(session_id)
-        if ui_current() then
-          self:load(session_id)
-        end
-      end,
-      on_delete = function(session_id, done)
-        if ui_current() then
-          self:delete(session_id, done)
-        else
-          done(false)
-        end
-      end,
-    }
-
-    -- snacks is the default when it is installed; the presenter falls back to
-    -- the built-in window instead of failing.
-    presenter.open_session_browser(picker_opts, self.config().ui.session_picker)
   end)
 end
 

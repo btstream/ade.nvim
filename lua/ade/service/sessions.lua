@@ -9,6 +9,7 @@ local M = {}
 M.CACHED = "sessions.cached"
 M.REFRESH = "sessions.refresh"
 M.UPDATED = "sessions.updated"
+M.DELETE = "sessions.delete"
 
 ---Read the cached catalog. Answers immediately, without contacting an agent.
 ---@param connection table
@@ -37,6 +38,24 @@ end
 ---@param fn fun(payload: table)
 function M.subscribe(connection, channel_id, fn)
   connection:subscribe(channel_id, M.UPDATED, fn)
+end
+
+---Delete one stored session of any configured agent (PROTOCOL.md 21.8).
+---
+---`agent` is the same launch item `sessions.refresh` takes. The service answers
+---`-32073` when the agent cannot delete and `-32074` when a running instance
+---still holds the session.
+---@param connection table
+---@param agent table
+---@param session_id string
+---@param cb fun(ok: boolean, value: any)
+---@param timeout_ms integer|nil the service defaults to 30s
+function M.delete(connection, agent, session_id, cb, timeout_ms)
+  local params = { agent = agent, sessionId = session_id }
+  if timeout_ms then
+    params.timeout_ms = timeout_ms
+  end
+  connection:request(M.DELETE, params, cb)
 end
 
 ---@param connection table

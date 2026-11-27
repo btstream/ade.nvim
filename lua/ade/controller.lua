@@ -466,20 +466,23 @@ function M.load_session(session_id)
   end
 end
 
----Browse stored sessions. <CR> opens, <C-d> deletes, typing filters.
+---Browse stored sessions: the current agent in the editor directory.
+---
+---`<C-r>` refreshes, `<C-d>` deletes and typing filters; `<Tab>` cycles to the
+---other agents/directories when the service is available.
 function M.pick_session()
-  if S.sess.service then
-    S.sess.service:pick()
+  if S.view.session_browser then
+    S.view.session_browser:open("here")
   end
 end
 
----Open the cross-agent session manager (`:Ade sessions all`).
+---Open the session browser on every configured agent (`:Ade sessions all`).
 ---
----Works before the panel has connected: it uses the shared service connection,
----and falls back to `pick_session()` on a direct backend or an old service.
+---Works before the panel has connected: the catalog uses the shared service
+---connection, and a missing service falls back to the live scope.
 function M.session_manager()
-  if S.view.session_manager then
-    S.view.session_manager:open()
+  if S.view.session_browser then
+    S.view.session_browser:open("all")
   end
 end
 
