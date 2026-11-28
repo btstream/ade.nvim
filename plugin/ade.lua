@@ -45,7 +45,7 @@ local SUBCOMMANDS = {
 local SERVICE_SUBCOMMANDS = { "install", "status", "start", "stop", "agents", "kill" }
 
 ---Subcommands of `:Ade team`.
-local TEAM_SUBCOMMANDS = { "agents", "board", "start", "close", "answer", "on", "off", "stop", "leader" }
+local TEAM_SUBCOMMANDS = { "agents", "board", "files", "start", "close", "answer", "on", "off", "stop", "leader" }
 
 ---Workflow names known from the configuration and the last service listing.
 ---@return string[]
@@ -193,8 +193,9 @@ local function setup()
       elseif sub == "agents" then
         ade.manage_agents()
       elseif sub == "team" then
-        -- `:Ade team` opens the team tree; `agents`/`board` open the members and
-        -- board panes, `start [workflow]` starts a workflow in this session,
+        -- `:Ade team` opens the team tree; `agents`/`board`/`files` open the
+        -- members, board and files panes, `start [workflow]` starts a workflow
+        -- in this session,
         -- `on`/`off` flip the per-session switch, `stop[!] <worker>` stops (or
         -- removes) one worker, `leader` takes the lead and `close` ends the team
         -- (PROTOCOL.md 20).
@@ -215,6 +216,8 @@ local function setup()
           ade.open_team("members")
         elseif action == "board" then
           ade.open_team("board")
+        elseif action == "files" then
+          ade.open_team("files")
         elseif action == "start" then
           ade.start_team(argument ~= "" and argument or nil)
         elseif action == "close" then

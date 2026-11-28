@@ -1287,7 +1287,9 @@ A template may set `"worktree": true`, and `config` may carry
 
 The worktree and its branch are **kept** when the worker exits or the team
 closes: they hold the worker's work. `team.list` participants carry
-`worktree: {path, branch}`. `team.remove_worktree {team, participant, force?}`
+`worktree: {path, branch, base}`, where `base` is the commit the branch started
+from (18.16); changed-file views use it as the comparison point.
+`team.remove_worktree {team, participant, force?}`
 `<- {}` removes an exited worker's worktree (`git worktree remove [--force]`)
 and deletes its branch only when it is merged into the toplevel's current
 `HEAD` (`git branch -d`); a running worker is `-32061`, a failing git command

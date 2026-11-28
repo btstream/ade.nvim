@@ -12,6 +12,7 @@ M.TEAM_VIEWS = {
   { name = "tree", ft = "ade_team_tree", title = "Team" },
   { name = "members", ft = "ade_team_members", title = "Members" },
   { name = "board", ft = "ade_team_board", title = "Board" },
+  { name = "files", ft = "ade_team_files", title = "Files" },
 }
 
 ---@param opts {agent_title?: string, width?: number, input_height?: number, toolbar_winbar?: boolean, title_winbar?: boolean, team?: boolean}|nil
@@ -91,7 +92,7 @@ end
 ---@param position string
 ---@return table<string, string>
 local function default_team_positions(position)
-  return { tree = position, members = position, board = position }
+  return { tree = position, members = position, board = position, files = position }
 end
 
 ---Append the ADE views to an edgy config in place.

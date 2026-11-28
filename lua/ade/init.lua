@@ -68,8 +68,8 @@ function M.manage_agents()
   ensure().manage_agents()
 end
 
----Open the team pane. `kind` is "tree", "members" (default), "board" or
----"all"; with no team the pane shows its empty state.
+---Open the team pane. `kind` is "tree", "members" (default), "board", "files"
+---or "all"; with no team the pane shows its empty state.
 ---@param kind string|nil
 ---@return boolean opened
 function M.open_team(kind)

@@ -167,6 +167,9 @@ M.defaults = {
         members = { position = "right", size = 32 },
         -- No size: the board takes the free space.
         board = { position = "right" },
+        -- The files pane stays docked on narrow editors unless explicitly
+        -- configured to float.
+        files = { position = "right", size = 32 },
       },
     },
   },
@@ -1754,7 +1757,7 @@ function M.validate(cfg, raw)
   if type(team_layout.panes) ~= "table" then
     fail("teams.layout.panes must be a table")
   end
-  for _, name in ipairs({ "tree", "members", "board" }) do
+  for _, name in ipairs({ "tree", "members", "board", "files" }) do
     local pane = team_layout.panes[name]
     local at = "teams.layout.panes." .. name
     if type(pane) ~= "table" then

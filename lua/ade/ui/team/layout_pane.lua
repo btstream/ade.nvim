@@ -12,18 +12,23 @@ local M = {}
 local Pane = {}
 Pane.__index = Pane
 
-local PANES = { "tree", "members", "board" }
+local PANES = { "tree", "members", "board", "files" }
+-- `:Ade team all`/`open("all")` keeps its previous set: the new files pane has
+-- its own command and must not change how the existing all layout opens.
+local DEFAULT_PANES = { "tree", "members", "board" }
 
 local TITLES = {
   tree = " ade.nvim · team · 项目与会话 ",
   members = " ade.nvim · team · 成员 ",
   board = " ade.nvim · team · 看板 ",
+  files = " ade.nvim · team · 文件 ",
 }
 
 local FILETYPES = {
   tree = "ade_team_tree",
   members = "ade_team_members",
   board = "ade_team_board",
+  files = "ade_team_files",
 }
 
 ---Whether a position shares the editor's columns (left/right) instead of its
@@ -695,7 +700,7 @@ end
 ---@param name string
 ---@return boolean
 function Pane:show(name)
-  if name ~= "members" and name ~= "board" and name ~= "tree" then
+  if name ~= "members" and name ~= "board" and name ~= "tree" and name ~= "files" then
     return false
   end
   local existing = self:win(name)
@@ -712,6 +717,11 @@ function Pane:show(name)
     win = self:create_float(name)
   elseif external then
     -- The layout manager decides; no float fallback for narrow editors.
+    win = self:create_split(name, position)
+  elseif name == "files" then
+    -- The files pane docks like the members pane on every editor width: a
+    -- narrow editor must not turn it into a float. An explicit
+    -- teams.layout.panes.files.position = "float" still floats above.
     win = self:create_split(name, position)
   elseif vim.o.columns >= self:wide() then
     win = self:create_split(name, position)
@@ -948,6 +958,9 @@ function Pane:refresh()
     end
   end
   self:update_cursor()
+  if self.dashboard and type(self.dashboard.after_refresh) == "function" then
+    pcall(self.dashboard.after_refresh, self.dashboard)
+  end
 end
 
 ---The pane window that owns `win`.
@@ -1086,6 +1099,7 @@ end
 
 M.Pane = Pane
 M.PANES = PANES
+M.DEFAULT_PANES = DEFAULT_PANES
 M.TITLES = TITLES
 
 return M

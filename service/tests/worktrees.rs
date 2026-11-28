@@ -409,8 +409,9 @@ fn a_worktree_worker_runs_in_the_worktree_subdirectory() {
         harness.server.stderr()
     );
     let head = git_ok(&harness.cwd, &["rev-parse", "HEAD"]);
-    // `team.read` carries the worktree and its base; `team.list` only the
-    // path and branch (18.12).
+    // Both `team.list` participants and `team.read` carry the worktree and its
+    // base (18.12/18.16).
+    assert_eq!(worktree["base"], head, "{worktree}");
     let read = harness.client.request(
         21,
         "team.read",

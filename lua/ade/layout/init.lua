@@ -11,6 +11,7 @@ local PANEL_FILETYPES = {
   ade_team_tree = true,
   ade_team_members = true,
   ade_team_board = true,
+  ade_team_files = true,
 }
 
 local state = {

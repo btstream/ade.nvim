@@ -18,6 +18,7 @@ local Roles = require("ade.ui.team.roles")
 local Detail = require("ade.ui.team.detail")
 local History = require("ade.ui.team.history")
 local Text = require("ade.ui.team.text")
+local Files = require("ade.ui.team.files")
 
 local M = {}
 
@@ -68,6 +69,7 @@ function M.dashboard(opts)
     tree_meta = {},
   }, Dashboard)
   self.layout = Pane.new(self)
+  self.files = Files.new(self)
   self.router = Router.new({
     team = opts.team,
     config = opts.config,
@@ -326,6 +328,9 @@ function Dashboard:render_pane(name)
   if name == "tree" then
     return self:render_tree()
   end
+  if name == "files" then
+    return self:render_files()
+  end
   return self:render_members()
 end
 
@@ -555,6 +560,23 @@ function Dashboard:render_board()
   return board_lines, board_ids, board_meta, board_marks or {}
 end
 
+---The files pane follows the team selected in the Agents pane (the same
+---`current_team` as `]t`/`[t`), and only asks `ade.app.team_files` for a scan
+---while it is open.
+---@return string[] lines, table<integer, string> ids, table<integer, table> meta, table[] marks
+function Dashboard:render_files()
+  local team = self:current_team()
+  -- What the pane actually shows, recorded before a close can clear the
+  -- selection (the same rule as the members pane).
+  self.files_team_id = team and team.id or nil
+  local width = 60
+  local win = self.layout:win("files")
+  if win then
+    width = math.max(20, vim.api.nvim_win_get_width(win))
+  end
+  return self.files:lines(team, { width = width })
+end
+
 ---The one-line summary for a pane's winbar.
 ---@param pane string|nil
 ---@return string
@@ -639,7 +661,7 @@ function Dashboard:open(kind, opts)
     self:load_workflows()
   end
   if kind == "all" then
-    for _, name in ipairs(Pane.PANES) do
+    for _, name in ipairs(Pane.DEFAULT_PANES) do
       if not self.layout:show(name) then
         return false
       end
@@ -647,12 +669,26 @@ function Dashboard:open(kind, opts)
     self:refresh()
     return true
   end
-  if not (kind == "members" or kind == "board" or kind == "tree") then
+  if not (kind == "members" or kind == "board" or kind == "tree" or kind == "files") then
     return false
   end
   local ok = self.layout:show(kind)
   if ok then
+    if kind == "files" then
+      self.files:ensure_timer()
+    end
     self:refresh()
+  end
+  return ok
+end
+
+---Open or focus the files pane, optionally on one worker's group.
+---@param worker string|nil
+---@return boolean
+function Dashboard:open_files(worker)
+  local ok = self:open("files")
+  if ok and self.files then
+    self.files:focus(worker)
   end
   return ok
 end
@@ -667,6 +703,9 @@ function Dashboard:close(kind)
     end
     self:hide_panes()
     return true
+  end
+  if kind == "files" then
+    self.files:stop_timer()
   end
   if self.layout:is_open_pane(kind) then
     self.layout:close_pane(kind)
@@ -702,6 +741,14 @@ function Dashboard:refresh()
   self.layout:refresh()
   self:update_headers()
   self:sync_aliases()
+end
+
+---Called by the layout pane after a repaint, so a refresh can keep the person
+---on the row they selected.
+function Dashboard:after_refresh()
+  if self.layout:is_open_pane("files") then
+    self.files:restore_cursor()
+  end
 end
 
 ---Merge frequent `team.changed`/`inbox`/`board_changed` redraws.
@@ -879,6 +926,7 @@ function Dashboard:team_closed(team_id, entry)
     members = self.members_team_id,
     board = self.board_team_id or self.open_board_target,
     tree = true,
+    files = self.files_team_id,
   }
   -- Drop the closed team from the kept rows so it cannot come back as stale.
   if self.snapshot then
@@ -907,6 +955,9 @@ function Dashboard:team_closed(team_id, entry)
   end
   if self.members_team_id == team_id then
     self.members_team_id = nil
+  end
+  if self.files_team_id == team_id then
+    self.files_team_id = nil
   end
   if self.board_team_id == team_id then
     self.board_team_id = nil
@@ -963,11 +1014,15 @@ function Dashboard:apply_closed(team_id, showed, cwd)
   local members = self.layout:is_open_pane("members") and keep("members") or nil
   local board = self.layout:is_open_pane("board") and keep("board") or nil
   local tree = self.layout:is_open_pane("tree") and tree_live or nil
+  local files = self.layout:is_open_pane("files") and keep("files") or nil
 
   -- Drop only the invalid panes; a pane that stays keeps its window and buffer.
-  for _, pane in ipairs({ "members", "board", "tree" }) do
-    local valid = ({ members = members, board = board, tree = tree })[pane]
+  for _, pane in ipairs({ "members", "board", "tree", "files" }) do
+    local valid = ({ members = members, board = board, tree = tree, files = files })[pane]
     if self.layout:is_open_pane(pane) and not valid then
+      if pane == "files" then
+        self.files:stop_timer()
+      end
       self.layout:close_pane(pane)
       if self.refresh_timer then
         pcall(function()
@@ -1057,6 +1112,7 @@ function Dashboard:hide_panes()
     end)
     self.refresh_timer = nil
   end
+  self.files:stop_timer()
   self.pending = false
   self.layout:close()
   -- External layout managers (edgy) own the geometry: re-run their layout so a
@@ -1080,6 +1136,53 @@ function Dashboard:home_team()
   return row and row.id or nil
 end
 
+---Keys that belong to the files pane. `r` here refreshes instead of resuming a
+---worker, and `<CR>` collapses a group or opens a file.
+---@param key string
+---@param info table cursor row metadata
+---@return boolean handled
+function Dashboard:handle_files_key(key, info)
+  if key == "cr" or key == "click" then
+    if info.kind == "file_group" and info.group then
+      self.files.expanded[info.group] = self.files.expanded[info.group] == false
+      self:refresh()
+    elseif info.kind == "file" then
+      self.files:open(info)
+    end
+    return true
+  end
+  if key == "r" then
+    self.files:refresh(true)
+    return true
+  end
+  if key == "help" then
+    self:notify(Files.HELP)
+    return true
+  end
+  return false
+end
+
+---A click in the files pane acts on the clicked row, like `<CR>` there.
+---@param mouse table result of `getmousepos()`
+function Dashboard:handle_mouse(mouse)
+  local win = self.layout:win("files")
+  if not win or type(mouse) ~= "table" then
+    return
+  end
+  if mouse.winid and mouse.winid ~= win then
+    return
+  end
+  local buf = self.layout:buf("files")
+  local line = tonumber(mouse.line)
+  if not (buf and line) or line < 1 then
+    return
+  end
+  line = math.min(line, vim.api.nvim_buf_line_count(buf))
+  pcall(vim.api.nvim_set_current_win, win)
+  pcall(vim.api.nvim_win_set_cursor, win, { line, 0 })
+  self:handle_key("click")
+end
+
 ---@param buf integer
 ---@param pane string|nil
 function Dashboard:attach_keys(buf, pane)
@@ -1097,6 +1200,7 @@ function Dashboard:attach_keys(buf, pane)
     ["w"] = "w",
     ["p"] = "p",
     ["r"] = "r",
+    ["f"] = "f",
     ["c"] = "c",
     ["D"] = "D",
     ["H"] = "H",
@@ -1117,6 +1221,11 @@ function Dashboard:attach_keys(buf, pane)
     ["<S-Tab>"] = "prev",
   }) do
     map(lhs, key)
+  end
+  if pane == "files" then
+    vim.keymap.set("n", "<LeftMouse>", function()
+      self:handle_mouse(vim.fn.getmousepos())
+    end, { buffer = buf, nowait = true, silent = true })
   end
 end
 
@@ -1395,8 +1504,24 @@ function Dashboard:handle_key(key)
   local kind, team_id, obj, info = self.layout:current()
   local pane = self.layout:name_of()
   local team = team_id or (self:pane_team(pane) and self:pane_team(pane).id) or self:home_team()
+  if pane == "files" and self:handle_files_key(key, info or {}) then
+    return
+  end
   if pane == "tree" and self:handle_tree_key(key, info or {}) then
     return
+  end
+  if key == "f" then
+    if pane == "members" and (kind == "team" or kind == "participant" or kind == "participant_detail") then
+      if kind == "team" then
+        -- The team row asks for every worker's files.
+        self:open_files(nil)
+      elseif obj and obj ~= "leader" and obj ~= "human" then
+        self:open_files(obj)
+      else
+        self:notify("leader/human 没有独立 worktree；在团队行按 f 查看全部文件", vim.log.levels.INFO)
+      end
+      return
+    end
   end
   if key == "next" then
     self.layout:cycle(1)
@@ -1423,7 +1548,7 @@ function Dashboard:handle_key(key)
   end
   if key == "help" then
     self:notify(
-      "team: <CR> card/member · a/! pending choice · m message · H history · s spawn · L leader · x close"
+      "team: <CR> card/member · f 文件面板 · a/! pending choice · m message · H history · s spawn · L leader · x close"
     )
     return
   end

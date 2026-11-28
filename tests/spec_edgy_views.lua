@@ -17,12 +17,19 @@ return function(t)
       edgy_views.extend(opts)
       -- The array part must hold every view; a named key would be ignored by
       -- edgy, which only iterates `ipairs(views)`.
-      t.eq(5, #opts.right)
+      t.eq(6, #opts.right)
       local fts = {}
       for _, view in ipairs(opts.right) do
         fts[view.ft] = true
       end
-      for _, ft in ipairs({ "ade_chat", "ade_input", "ade_team_tree", "ade_team_members", "ade_team_board" }) do
+      for _, ft in ipairs({
+        "ade_chat",
+        "ade_input",
+        "ade_team_tree",
+        "ade_team_members",
+        "ade_team_board",
+        "ade_team_files",
+      }) do
         t.truthy(fts[ft], ft .. " missing")
       end
     end)
@@ -32,15 +39,18 @@ return function(t)
       t.eq("ade_team_tree", views.tree.ft)
       t.eq("ade_team_members", views.members.ft)
       t.eq("ade_team_board", views.board.ft)
+      t.eq("ade_team_files", views.files.ft)
       t.eq(32, views.tree.size.width)
       t.eq(32, views.members.size.width)
       t.eq(nil, views.board.size, "the board has no configured size")
+      t.eq({ width = 32 }, views.files.size, "the files pane defaults to the members width")
       t.eq(false, views.tree.wo.winbar, "ade owns the pane winbar")
 
       local plain = edgy_views.views({ team = false })
       t.eq(nil, plain.tree)
       t.eq(nil, plain.members)
       t.eq(nil, plain.board)
+      t.eq(nil, plain.files)
       t.truthy(plain.chat and plain.input)
     end)
 
@@ -55,12 +65,13 @@ return function(t)
       t.truthy(fts.ade_team_tree)
       t.truthy(fts.ade_team_members)
       t.truthy(fts.ade_team_board)
+      t.truthy(fts.ade_team_files)
     end)
 
     t.it("places individual team views in the requested positions", function()
       local opts = { right = {}, left = {}, bottom = {} }
       edgy_views.extend(opts, {
-        team = { tree = "left", members = "left", board = "bottom" },
+        team = { tree = "left", members = "left", board = "bottom", files = "bottom" },
       })
       local function has(list, ft)
         for _, view in ipairs(list) do
@@ -73,7 +84,9 @@ return function(t)
       t.truthy(has(opts.left, "ade_team_tree"))
       t.truthy(has(opts.left, "ade_team_members"))
       t.truthy(has(opts.bottom, "ade_team_board"))
+      t.truthy(has(opts.bottom, "ade_team_files"))
       t.falsy(has(opts.right, "ade_team_board"))
+      t.falsy(has(opts.right, "ade_team_files"))
     end)
 
     t.it("skips the team views with team = false and never duplicates them", function()
@@ -116,7 +129,14 @@ return function(t)
       local opts = { right = {}, left = {}, bottom = {} }
       edgy_views.extend(opts, { team = { tree = "left", members = "left", board = "bottom" } })
       edgy_views.extend(opts, { team = { tree = "right", members = "right", board = "right" } })
-      for _, ft in ipairs({ "ade_chat", "ade_input", "ade_team_tree", "ade_team_members", "ade_team_board" }) do
+      for _, ft in ipairs({
+        "ade_chat",
+        "ade_input",
+        "ade_team_tree",
+        "ade_team_members",
+        "ade_team_board",
+        "ade_team_files",
+      }) do
         local found = 0
         for _, side in ipairs({ "right", "left", "bottom", "top" }) do
           for _, view in ipairs(opts[side] or {}) do
@@ -171,7 +191,13 @@ return function(t)
       edgy_views.extend(opts)
       t.eq(count_ipairs(opts.right), #opts.right, "right must stay a proper array")
       local right = fts(opts.right)
-      for _, ft in ipairs({ "ade_input", "ade_team_tree", "ade_team_members", "ade_team_board" }) do
+      for _, ft in ipairs({
+        "ade_input",
+        "ade_team_tree",
+        "ade_team_members",
+        "ade_team_board",
+        "ade_team_files",
+      }) do
         t.truthy(right[ft], ft .. " is not reachable through ipairs")
       end
       t.falsy(right.ade_chat, "ade_chat must not be registered twice")
@@ -183,7 +209,7 @@ return function(t)
         right = {},
         top = {},
       }
-      edgy_views.extend(opts, { team = { tree = "left", members = "left", board = "top" } })
+      edgy_views.extend(opts, { team = { tree = "left", members = "left", board = "top", files = "left" } })
       local counted = 0
       for _ in ipairs(opts.right) do
         counted = counted + 1
@@ -343,6 +369,7 @@ return function(t)
         { ft = "ade_team_tree" },
         { ft = "ade_team_members" },
         { ft = "ade_team_board" },
+        { ft = "ade_team_files" },
       }, function()
         local warned = false
         local original = vim.notify

@@ -837,6 +837,7 @@ teams = {
       tree    = { position = "right", size = 32 },
       members = { position = "right", size = 32 },
       board   = { position = "right" }, -- 不写 size：占满剩余空间
+      files   = { position = "right" }, -- 文件面板；窄屏也不自动浮窗
     },
   },
 }
@@ -884,6 +885,7 @@ teams = {
 | `:Ade team` | 打开项目/会话树：按项目分组，leader 标 `[leader]`，关掉的会话标 `[team off]`，leader 下列出 worker |
 | `:Ade team agents` | 打开或聚焦成员面板；没有团队时显示可用流程（`S` 启动，`<CR>` 看全文） |
 | `:Ade team board` | 打开或聚焦当前项目的看板；卡片上按 `<CR>` 看详情 |
+| `:Ade team files` | 打开或聚焦 Team Changed Files 面板：按 worker worktree 分组显示 `:Ade team agents` 选中团队的文件改动；组上 `<CR>` 折叠/展开，文件上 `<CR>`/单击打开，`r` 刷新，`q` 关闭 |
 | `:Ade team start [流程]` | 在当前会话上按流程启动团队；不给流程时先选（默认流程排第一） |
 | `:Ade team on` / `:Ade team off` | 打开/关闭当前会话的团队开关；off 时若该会话领导团队，确认后连团队一起关闭 |
 | `:Ade team stop[!] <worker>` | 停止一个 worker；`!` 表示停止后也从团队移除（worktree 保留） |
@@ -892,7 +894,7 @@ teams = {
 | `:Ade team answer [名字]` | 显示待处理的选项；带名字时用输入框回答该成员的无选项提问 |
 | `:Ade workflows` | 列出/查看/删除命名流程（`<CR>` 全文，`d` 删除，`q` 关闭） |
 
-补全：`:Ade team <Tab>` 补全 `agents` / `board` / `start` / `close` / `answer` / `on` /
+补全：`:Ade team <Tab>` 补全 `agents` / `board` / `files` / `start` / `close` / `answer` / `on` /
 `off` / `stop` / `leader`；`:Ade team start <Tab>` 补全配置里的流程名、已知的服务流程名和
 `default`；`:Ade team stop <Tab>` 补全当前团队的 worker 名。
 
@@ -908,14 +910,15 @@ load 打上一次性转发标记并注入工具），load 成功后才继续；�
 旧服务（api_version 5/6）上没有新接口：前端提示“服务版本过旧；空闲后会自动更新，或用
 `:Ade service stop` 手动重启”，不会反复重试看板。
 
-会话树、成员面板和看板都留在当前 Tab，各自打开和关闭。位置和大小由
+会话树、成员面板、看板和文件面板都留在当前 Tab，各自打开和关闭。位置和大小由
 `teams.layout.panes` 决定：`position` 取 `left` / `right` / `top` / `bottom` / `float`，
 `size` 为列数（左右）或行数（上下），`0 < size <= 1` 表示占编辑器比例，省略 `size`
 则占满剩余空间。默认 `teams.layout.stack = false`：每个面板各自占一列（左右）或一行
-（上下）；设为 `true` 时同侧面板共用一列/一行，并按 tree、members、board 的顺序排列，
+（上下）；设为 `true` 时同侧面板共用一列/一行，并按 tree、members、board、files 的顺序排列，
 与打开顺序无关（左右在下方，上下在右侧）。`teams.layout.backend = "inherit"`（默认）
 跟随 `layout.backend`：native
-模式下窄于 `teams.layout.float_below`（默认 160）列时改用浮窗，只显示请求的面板；
+模式下窄于 `teams.layout.float_below`（默认 160）列时改用浮窗，只显示请求的面板
+（文件面板除外：它默认停靠，只有 `teams.layout.panes.files.position = "float"` 才浮动）；
 external 模式（edgy 等）只创建普通分栏，尺寸和位置交给布局管理器，不套用 `size`。
 会话树按键：`<CR>` 打开会话（按正常
 `session/load` 路径加载；worker 行打开它的对话）、`t` 切换该会话的团队开关（未知时先
@@ -924,12 +927,20 @@ external 模式（edgy 等）只创建普通分栏，尺寸和位置交给布局
 行属于另一个服务实例、或该实例未连接时，`t/L/S/x` 会提示并拒绝执行。成员栏宽度由
 `teams.layout.panes.members.size`（默认 32，16..120；旧键
 `teams.dashboard.members_width` 仍可用）决定。成员面板按键作用于光标下的对象：
-成员上 `<CR>` / `w` 在普通聊天面板查看或联系成员，卡片上 `<CR>` 打开详情浮窗，
+成员上 `<CR>` / `w` 在普通聊天面板查看或联系成员，`f` 打开文件面板并展开/聚焦该
+worker 的 worktree 组（团队行上按 `f` 看全部），卡片上 `<CR>` 打开详情浮窗，
 `m` 给成员发消息/就卡片给 leader 发消息，`H` 看卡片历史版本，`a` 回答成员提问，
 `!` 打开待处理的选择（提问、spawn、权限、回合上限），
 `p`/`r`/`c` 暂停/恢复/取消，`D` 删除已退出 worker 的 worktree，`L` 跳到 leader
 聊天，`s` 按模板启动 worker，`R` 重置回合上限，`x` 结束团队，`<Tab>`/`<S-Tab>`
 切换窗口，`zh`/`zl` 横向滚动看板，`g?` 帮助，`q` 关闭所在面板。
+
+文件面板（`:Ade team files`）按 worker 的独立 worktree 分组，显示每个 worker 的改动
+文件与数量、worktree 分支和绝对路径；已退出但有 worktree 的 worker 仍可查看。没有
+独立 worktree 的 worker 合为一个“共享 cwd”组并说明无法按 worker 归属。组上 `<CR>`
+折叠/展开，`r` 刷新，`q` 关闭；文件名行 `<CR>` 或单击在普通编辑窗口打开该 worktree
+下的绝对路径，面板保持打开、复用 buffer、不切换 cwd；已删除文件打开只读的基线版本。
+面板打开期间默认每 15 秒在后台异步刷新一次，刷新时保留选中的文件和折叠状态。
 
 Leader 和 Worker 共用普通 `ade_chat` / `ade_input`。切换到 Worker 后可以回看历史
 并跟随实时消息（含工具、diff、plan 和回合分组）。`<C-s>` 将纯文本消息排队发给
@@ -1311,7 +1322,8 @@ require("ade").setup({
 ```
 
 `extend()` 只是把下面两个 view 定义插入你的 `opts.right`，不会覆盖已有配置。它同时
-注册团队面板的三个 view（`ade_team_tree` / `ade_team_members` / `ade_team_board`）：
+注册团队面板的四个 view（`ade_team_tree` / `ade_team_members` / `ade_team_board` /
+`ade_team_files`）：
 
 ```lua
 -- 默认：团队面板和聊天面板放同一侧
@@ -1319,7 +1331,7 @@ require("ade.integrations.edgy").extend(opts)
 
 -- 指定每个团队面板的位置；team = false 表示不交给 edgy。
 require("ade.integrations.edgy").extend(opts, {
-  team = { tree = "left", members = "left", board = "bottom" },
+  team = { tree = "left", members = "left", board = "bottom", files = "bottom" },
 })
 ```
 

@@ -4839,6 +4839,7 @@ fn team_entry(team: &Team) -> Value {
                 out["worktree"] = json!({
                     "path": worktree.path,
                     "branch": worktree.branch,
+                    "base": worktree.base,
                 });
             }
             out
@@ -6585,6 +6586,7 @@ mod tests {
             worker["worktree"]["path"],
             "/tmp/worktrees/repo-12345678/t1-w1"
         );
+        assert_eq!(worker["worktree"]["base"], "abc", "{worker}");
         let read = teams.read(&team, "w1", None).unwrap();
         assert_eq!(read["worktree"]["base"], "abc", "{read}");
         teams.worktree_removed(&team, "w1");
