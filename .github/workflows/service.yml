@@ -2,9 +2,8 @@ name: service
 
 # Format, lint and test the Rust service (service/).
 #
-# The toolchain is NOT hard-coded: every job reads the channel from
-# service/rust-toolchain.toml, so bumping the nightly only means editing that
-# one file. See service/README.md ("Nightly toolchain").
+# Every job reads the rolling nightly channel from service/rust-toolchain.toml,
+# the same file used for local builds. See service/README.md ("Building and testing").
 #
 # Third-party actions are pinned to a full commit SHA; the version they
 # correspond to is in the trailing comment. `actions/*` stay on their major tag.

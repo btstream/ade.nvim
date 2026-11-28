@@ -1,9 +1,8 @@
 # Single source of truth for the Rust toolchain used by the service.
 #
 # CI (.github/workflows/service.yml, .github/workflows/service-release.yml)
-# reads this file instead of hard-coding a channel, so upgrading the toolchain
-# only requires editing this file.
+# read this file to use the same rolling nightly channel as local builds.
 [toolchain]
-channel = "nightly-2026-05-28"
+channel = "nightly"
 profile = "minimal"
 components = ["rustfmt", "clippy"]

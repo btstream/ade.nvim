@@ -1676,8 +1676,8 @@ inline.allow_kinds 追加其它 kind），其余拒绝，回合结束自动删�
 其他插件管理器在安装或更新后执行一次 `:Ade service install`。安装流程：已装所需版本
 则跳过；否则先下载对应平台的预编译包并用 SHA256SUMS 校验（不一致直接拒绝），下载不可用时
 用 cargo 本地编译；两者都失败只给出提示，插件继续以直连模式工作。服务使用
-service/rust-toolchain.toml 锁定日期的 nightly 工具链，**建议安装 rustup**，它会自动获取
-指定的 nightly；编译仍失败时，提示会写明需要 rustup，或者用 service.path 指向自己编译
+service/rust-toolchain.toml 指定的 nightly 渠道，**建议安装 rustup**，它会在缺少 nightly 时
+自动安装；编译仍失败时，提示会写明需要 rustup，或者用 service.path 指向自己编译
 的二进制。设置 service.path 后只运行 `<path> version` 做版本检查，不下载也不编译。
 
     service = {

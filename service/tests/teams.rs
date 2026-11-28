@@ -2246,9 +2246,9 @@ fn escaping_and_role_checks() {
 fn mcp_handshake_and_leader_tools() {
     let harness = Harness::new("team-mcp", json!({}), None);
     let tools = mcp_tools(&harness.server, &harness.token);
-    assert!(tools.contains(&"team_spawn".to_string()), "{tools:?}");
-    assert!(tools.contains(&"bus_read".to_string()), "{tools:?}");
-    assert!(tools.contains(&"bus_send".to_string()), "{tools:?}");
+    assert!(tools.iter().any(|name| name == "team_spawn"), "{tools:?}");
+    assert!(tools.iter().any(|name| name == "bus_read"), "{tools:?}");
+    assert!(tools.iter().any(|name| name == "bus_send"), "{tools:?}");
 
     let old = mcp_session(
         &harness.server,
@@ -3545,7 +3545,9 @@ fn team_close_degrades_the_leader_session_and_keeps_its_token() {
     }));
     assert_eq!(hello["result"]["participant"]["role"], "session");
     assert!(
-        mcp_tools(&harness.server, &harness.token).contains(&"team_stop".to_string()),
+        mcp_tools(&harness.server, &harness.token)
+            .iter()
+            .any(|name| name == "team_stop"),
         "the leader set before close"
     );
     let closed = harness
@@ -3561,7 +3563,8 @@ fn team_close_degrades_the_leader_session_and_keeps_its_token() {
     );
     let tools = mcp_tools(&harness.server, &harness.token);
     assert!(
-        tools.contains(&"team_spawn".to_string()) && !tools.contains(&"team_stop".to_string()),
+        tools.iter().any(|name| name == "team_spawn")
+            && !tools.iter().any(|name| name == "team_stop"),
         "the non-leader set after close: {tools:?}"
     );
     // A leader-only tool is refused as a tool error, not `-32602`.
@@ -4415,11 +4418,11 @@ fn leader_instructions_and_tools_follow_the_role() {
         "bus_read",
     ] {
         assert!(
-            tools.contains(&tool.to_string()),
+            tools.iter().any(|name| name == tool),
             "{tool} missing from {tools:?}"
         );
     }
-    assert!(!tools.contains(&"card_update".to_string()), "{tools:?}");
+    assert!(!tools.iter().any(|name| name == "card_update"), "{tools:?}");
 
     // A worker's MCP session has no instructions and only its own tools.
     let mut harness = harness;
@@ -5962,7 +5965,9 @@ fn closing_a_team_keeps_the_session_token_and_allows_a_new_team() {
     );
     // The tool set is the non-leader one again, but the chat may lazily create
     // the next team (20.4).
-    assert!(mcp_tools(&harness.server, &token).contains(&"team_spawn".to_string()));
+    assert!(mcp_tools(&harness.server, &token)
+        .iter()
+        .any(|name| name == "team_spawn"));
     let spawned = mcp_call(
         &harness.server,
         &token,

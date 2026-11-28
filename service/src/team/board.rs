@@ -1443,7 +1443,7 @@ mod tests {
         worker(&mut board, "w1", json!({"card": "T1", "archive": true})).expect("archive");
         assert!(board.history_of("T1").is_empty());
         let persist = board.take_persist(101).expect("archive persist");
-        assert!(persist.cleared.contains(&"T1".to_string()));
+        assert!(persist.cleared.iter().any(|id| id == "T1"));
     }
 
     #[test]
@@ -1455,7 +1455,7 @@ mod tests {
         board.take_persist(1).expect("second");
         leader(&mut board, json!({"remove": ["T1"]})).expect("remove");
         let persist = board.take_persist(2).expect("remove persist");
-        assert!(persist.cleared.contains(&"T1".to_string()));
+        assert!(persist.cleared.iter().any(|id| id == "T1"));
         assert!(persist.history.is_empty());
     }
 

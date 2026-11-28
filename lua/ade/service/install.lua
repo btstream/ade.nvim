@@ -687,8 +687,8 @@ end
 
 ---Compile the service from `service/` with cargo.
 ---
----The toolchain is pinned by `service/rust-toolchain.toml`, so a rustup-managed
----cargo picks the right nightly on its own. A plain cargo that does not honour
+---The nightly channel is selected by `service/rust-toolchain.toml`, so a
+---rustup-managed cargo uses it automatically. A plain cargo that does not honour
 ---that file simply builds with whatever it has; the version probe afterwards
 ---decides whether the result is usable, so a wrong build is rejected rather
 ---than installed silently.
@@ -716,7 +716,7 @@ local function install_compiled(opts)
     "--target-dir",
     target_dir,
   }
-  progress(opts, "building the service with cargo (toolchain pinned by service/rust-toolchain.toml)")
+  progress(opts, "building the service with cargo (nightly selected by service/rust-toolchain.toml)")
   local result = opts.run(argv, { cwd = service_dir, timeout = opts.timeout })
   if type(result) ~= "table" or result.code ~= 0 then
     local tail = type(result) == "table" and vim.trim((result.stderr or result.stdout or ""):sub(-800)) or ""
@@ -759,7 +759,7 @@ function M.failure_hint(prebuilt_err, compiled_err)
     '  The plugin keeps working with backend = "direct".',
     "  To finish the install:",
     "    * keep rustup installed so `cargo` honours service/rust-toolchain.toml",
-    "      (it installs the pinned nightly automatically), then rerun",
+    "      (it installs nightly automatically if missing), then rerun",
     "      `:Ade service install`;",
     "    * or build the service yourself and set `service.path` to the binary;",
     "    * or download a prebuilt archive from",

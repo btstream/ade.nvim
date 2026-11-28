@@ -7822,7 +7822,12 @@ mod tests {
         assert!(teams.team(&team).unwrap().participants.contains_key("w2"));
         teams.worker_exited(&second, "stopped");
         assert!(!teams.team(&team).unwrap().participants.contains_key("w2"));
-        assert!(!teams.team(&team).unwrap().order.contains(&"w2".to_string()));
+        assert!(!teams
+            .team(&team)
+            .unwrap()
+            .order
+            .iter()
+            .any(|name| name == "w2"));
         assert!(teams.token_role(&second).is_none());
         assert_eq!(stopped.instance.as_deref(), Some(second.as_str()));
         // The name is free again: a new spawn may take it.

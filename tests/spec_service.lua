@@ -355,7 +355,7 @@ return function(t)
         service_dir .. "/Cargo.toml",
         '[package]\nname = "nvim_ade_server"\nversion = "' .. Version.VERSION .. '"\n'
       )
-      write(service_dir .. "/rust-toolchain.toml", '[toolchain]\nchannel = "nightly-2026-05-28"\n')
+      write(service_dir .. "/rust-toolchain.toml", '[toolchain]\nchannel = "nightly"\n')
 
       local ok, err = Install.run({
         data_dir = data,

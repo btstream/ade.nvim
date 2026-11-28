@@ -1311,7 +1311,7 @@ impl Writer {
             if self
                 .inner
                 .fail_team_saves
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                     left.checked_sub(1)
                 })
                 .is_ok()
@@ -1376,7 +1376,7 @@ impl Writer {
             if self
                 .inner
                 .fail_team_deletes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                     left.checked_sub(1)
                 })
                 .is_ok()
@@ -1449,7 +1449,7 @@ impl Writer {
         if self
             .inner
             .fail_team_deletes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                 left.checked_sub(1)
             })
             .is_ok()

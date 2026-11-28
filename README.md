@@ -1008,8 +1008,8 @@ Agent 可以交给 Rust 后台服务 `nvim_ade_server` 持有，这样 Neovim �
 1. 已经装了需要的版本就跳过；
 2. 优先下载对应平台的预编译包，并用发行版里的 `SHA256SUMS` 校验（不一致直接拒绝）；
 3. 下载不可用（无网络、平台不在构建矩阵、该版本还没发布）时用 `cargo` 本地编译。服务使用
-   `service/rust-toolchain.toml` 锁定日期的 nightly 工具链，**建议安装 rustup**，它会自动获取
-   指定的 nightly；编译仍然失败时，提示会写明需要 rustup，或者改用 `service.path` 指向你自己
+   `service/rust-toolchain.toml` 指定的 nightly 渠道，**建议安装 rustup**，它会在缺少 nightly 时自动安装；
+   编译仍然失败时，提示会写明需要 rustup，或者改用 `service.path` 指向你自己
    编译的二进制；
 4. 两种方式都失败时给出提示，插件继续以直连模式工作，不会因此不可用。
 

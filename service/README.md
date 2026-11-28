@@ -190,10 +190,10 @@ without an `id` are notifications and never get a response.
 
 ## Building and testing
 
-The toolchain is pinned in `rust-toolchain.toml` (currently
-`nightly-2026-05-28`, with `rustfmt` and `clippy`). Both CI workflows read the
-channel from that file, so **upgrading the nightly only requires editing
-`rust-toolchain.toml`**.
+`rust-toolchain.toml` selects the rolling `nightly` channel with `rustfmt` and
+`clippy`. The service needs nightly for `std::random`, and both CI workflows
+read the same toolchain file. To update an installed local nightly, run
+`rustup update nightly`.
 
 ```sh
 cd service
@@ -460,4 +460,3 @@ workflow`) with `dry_run` checked. Then:
 
 Leave `dry_run` unchecked (the default) to publish, and use `force` when the
 release already exists but its assets must be rebuilt.
-
